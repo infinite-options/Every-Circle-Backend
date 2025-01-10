@@ -19,8 +19,8 @@ MarkupSafe==3.0.2
 oauth2client==4.1.3
 pyasn1==0.6.1
 pyasn1_modules==0.4.1
-# if you get error for PyJWT, try installing 1.7.1 version
-PyJWT==2.10.1
+# if you get error for PyJWT, try installing 2.10.1 version
+PyJWT==1.7.1
 PyMySQL==1.1.1
 pyparsing==3.2.1
 python-dateutil==2.9.0.post0
