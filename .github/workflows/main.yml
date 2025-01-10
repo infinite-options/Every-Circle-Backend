@@ -1,0 +1,72 @@
+name: Every-Circle-Backend CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - master
+      - ss_0109
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Clone Repository
+        run: |
+          git clone https://github.com/infinite-options/Every-Circle-Backend.git
+          cd Every-Circle-Backend
+          ls
+      
+      - name: Set Up Python
+        run: |
+          sudo apt update
+          sudo apt install -y python3 python3-pip
+          python3 --version
+      
+      - name: Install Dependencies
+        run: |
+          cd Every-Circle-Backend
+          pip3 install -r requirements.txt
+
+      - name: Run app to test
+        id: test
+        run: |
+          cd Every-Circle-Backend
+          python3 ec_api.py &
+          sleep 10
+          if ! pgrep -f "python3 ec_api.py"; then
+            echo "App failed to start"
+            exit 1
+          fi
+      
+      - name: Deploy to EC2
+        if: success()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER}}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          echo "${SSH_PRIVATE_KEY}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << EOF
+            echo "Connected to EC2 instance"
+            cd /home/ec2-user/every-circle-backend
+            source .venv/bin/activate
+            cd Every-Circle-Backend
+            
+            # Pull latest code
+            echo "Pulling latest code..."
+            git pull origin master
+            
+            # Install dependencies
+            echo "Installing dependencies..."
+            pip3 install -r requirements.txt --no-deps
+            
+            # Restart the application using supervisor
+            echo "Restarting application..."
+            sudo supervisorctl restart every-circle
+            
+            echo "Deployment completed"
+            exit 0
+          EOF
