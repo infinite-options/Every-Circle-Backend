@@ -3,7 +3,7 @@ from flask_restful import Resource
 from werkzeug.exceptions import BadRequest
 from datetime import datetime
 
-from data_ec import connect, uploadImage, s3
+from data_ec import connect, uploadImage, s3, processImage
 
 class Profile(Resource):
     def get(self, uid):
@@ -45,7 +45,7 @@ class Profile(Resource):
         response = {}
 
         try:
-            payload = request.get_json()
+            payload = request.form.to_dict()
 
             if 'user_uid' not in payload or 'referred_by_code' not in payload:
                     response['message'] = 'Both user_uid and referred_by_code are required'
@@ -90,7 +90,7 @@ class Profile(Resource):
         response = {}
 
         try:
-            payload = request.get_json()
+            payload = request.form.to_dict()
 
             if 'profile_uid' not in payload:
                     response['message'] = 'profile_uid is required'
@@ -109,10 +109,10 @@ class Profile(Resource):
                     response['message'] = 'Profile does not exist'
                     response['code'] = 404
                     return response, 404
+                
+                processImage(key, payload)
 
-                print('before payload: ', payload)
                 payload['profile_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                print('before payload: ', payload)
                 
                 response = db.update('every_circle.profile', key, payload)
             
