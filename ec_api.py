@@ -14,6 +14,8 @@
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
+from connections import Connections
+from user_profile import Profile
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -37,7 +39,7 @@ from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt_identi
 from pytz import timezone as ptz  # Not sure what the difference is
 from decimal import Decimal
 from hashlib import sha512
-# from twilio.rest import Client
+from twilio.rest import Client
 from oauth2client import GOOGLE_REVOKE_URI, GOOGLE_TOKEN_URI, client
 # from google_auth_oauthlib.flow import InstalledAppFlow
 from urllib.parse import urlparse
@@ -360,6 +362,8 @@ class stripe_key(Resource):
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
+api.add_resource(Connections, "/connections")
+api.add_resource(Profile, "/profile", "/profile/<uid>")
 
 
 
