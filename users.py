@@ -16,7 +16,7 @@ class UserInfo(Resource):
                 userQuery = db.execute("""                     
                         SELECT *
                         FROM every_circle.users 
-                        WHERE user_uid = \'""" + user_id + """\' OR email = \'""" + user_id + """\'  ;
+                        WHERE user_uid = \'""" + user_id + """\';
                         """)
                 # print(userQuery)                                    
 
