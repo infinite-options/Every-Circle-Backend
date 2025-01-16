@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - ss_0109
 
 jobs:
   test-and-deploy:
