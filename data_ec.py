@@ -136,8 +136,8 @@ def uploadImage(file, key, content):
 # --------------- PROCESS IMAGES ------------------
 
 def processImage(key, payload):
-    # print("\nIn Process Image: ", payload)
-    # print("Key Passed into processImage: ", key)
+    print("\nIn Process Image: ", payload)
+    print("Key Passed into processImage: ", key)
 
     response = {}
     bucket = os.getenv('BUCKET_NAME')
@@ -156,6 +156,40 @@ def processImage(key, payload):
                     print("4: ", payload_query.get('result', [{}])[0].get('profile_images_url', None))
                 payload_images = payload_query['result'][0]['profile_images_url'] if payload_query['result'] else None  # Current Images from database
                 payload_fav_images = payload.get("profile_favorite_image", None) or payload.pop("img_favorite", None)   # (PUT & POST)
+                print("5: ", payload_fav_images)
+            else:
+                return payload
+        
+        elif 'business_uid' in key:
+            print("Business Key passed")
+            key_type = 'business'
+            key_uid = key['business_uid']
+            payload_delete_images = payload.pop('delete_images', None)      # Images to Delete
+            if 'img_0' in request.files or payload_delete_images != None:   #  New appliance images are passed in as img_0, img_1.  No Image attributes are passed in
+                payload_query = db.execute(""" SELECT business_images_url FROM every_circle.business WHERE business_uid = \'""" + key_uid + """\'; """)     # Current Images
+                print("1: ", payload_query)
+                print("2: ", payload_query['result'], type(payload_query['result']))
+                if len(payload_query['result']) > 0:
+                    print("4: ", payload_query.get('result', [{}])[0].get('business_images_url', None))
+                payload_images = payload_query['result'][0]['business_images_url'] if payload_query['result'] else None  # Current Images from database
+                payload_fav_images = payload.get("business_favorite_image", None) or payload.pop("img_favorite", None)   # (PUT & POST)
+                print("5: ", payload_fav_images)
+            else:
+                return payload
+        
+        elif 'rating_uid' in key:
+            print("Rating Key passed")
+            key_type = 'rating'
+            key_uid = key['rating_uid']
+            payload_delete_images = payload.pop('delete_images', None)      # Images to Delete
+            if 'img_0' in request.files or payload_delete_images != None:   #  New appliance images are passed in as img_0, img_1.  No Image attributes are passed in
+                payload_query = db.execute(""" SELECT rating_images_url FROM every_circle.ratings WHERE rating_uid = \'""" + key_uid + """\'; """)     # Current Images
+                print("1: ", payload_query)
+                print("2: ", payload_query['result'], type(payload_query['result']))
+                if len(payload_query['result']) > 0:
+                    print("4: ", payload_query.get('result', [{}])[0].get('rating_images_url', None))
+                payload_images = payload_query['result'][0]['rating_images_url'] if payload_query['result'] else None  # Current Images from database
+                payload_fav_images = payload.get("rating_favorite_image", None) or payload.pop("img_favorite", None)   # (PUT & POST)
                 print("5: ", payload_fav_images)
             else:
                 return payload
@@ -213,6 +247,8 @@ def processImage(key, payload):
 
                 if filename == payload_fav_images:
                     if key_type == 'profile': payload["profile_favorite_image"] = image
+                    if key_type == 'business': payload["business_favorite_image"] = image
+                    if key_type == 'rating': payload["rating_favorite_image"] = image
 
             elif s3Link:
                 # payload.pop(f'img_{i}')
@@ -221,6 +257,8 @@ def processImage(key, payload):
 
                 if filename == payload_fav_images:
                     if key_type == 'profile': payload["profile_favorite_image"] = s3Link
+                    if key_type == 'business': payload["business_favorite_image"] = s3Link
+                    if key_type == 'rating': payload["rating_favorite_image"] = s3Link
             
             else:
                 break
@@ -338,6 +376,8 @@ def processImage(key, payload):
         # print("Key Type: ", key_type)
         
         if key_type == 'profile': payload['profile_images_url'] = json.dumps(current_images) 
+        if key_type == 'business': payload['business_images_url'] = json.dumps(current_images) 
+        if key_type == 'rating': payload['rating_images_url'] = json.dumps(current_images) 
 
         print("Payload before return: ", payload)
         return payload
