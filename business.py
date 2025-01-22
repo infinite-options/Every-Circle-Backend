@@ -7,8 +7,39 @@ from data_ec import connect, uploadImage, s3, processImage
 
 
 class Business(Resource):
-    def get(self):
-        pass
+  
+
+
+    def get(self, uid):
+        print("In Business GET")
+        response = {}
+        try:
+            print(uid, type(uid))
+            with connect() as db:
+                key = {}
+                if uid[:3] == "200":  # Assuming business_uid starts with 200
+                    key['business_uid'] = uid
+                else:
+                    response['message'] = 'Invalid UID'
+                    response['code'] = 400
+                    return response, 400
+
+                # Query the business table for the given UID
+                response = db.select('every_circle.business', where=key)
+
+            if not response['result']:
+                response.pop('result')
+                response['message'] = f'Business does not exist. No business found for the {uid} uid'
+                response['code'] = 404
+                return response, 404
+
+            return response, 200
+
+        except Exception as e:
+            response['message'] = f'Internal Server Error: {str(e)}'
+            response['code'] = 500
+            return response, 500
+
 
     def post(self):
         print("In Business POST")

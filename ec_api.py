@@ -366,8 +366,8 @@ api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Connections, "/connections")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
-api.add_resource(Business, "/business", "/business/<string:business_id>")
-api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
+api.add_resource(Business, "/business", "/business/<string:uid>")
+api.add_resource(Ratings, "/ratings", "/ratings/<string:business_id>")
 
 
 
