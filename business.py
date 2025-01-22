@@ -7,8 +7,38 @@ from data_ec import connect, uploadImage, s3, processImage
 
 
 class Business(Resource):
-    def get(self):
-        pass
+    def get(self, uid):
+        print("In Business GET")
+        response = {}
+        try:
+            print(uid, type(uid))
+            with connect() as db:
+                key = {}
+                if uid[:3] == "200":
+                    key['business_uid'] = uid
+                
+                elif uid[:3] == "210":
+                    key['business_category_id'] = uid
+
+                else:
+                    response['message'] = 'Invalid UID'
+                    response['code'] = 400
+                    return response, 400
+            
+                response = db.select('every_circle.business', where=key)
+
+            if not response['result']:
+                response.pop('result')
+                response['message'] = f'No business found for {key}'
+                response['code'] = 404
+                return response, 404
+
+            return response, 200
+
+        except:
+            response['message'] = 'Internal Server Error'
+            response['code'] = 500
+            return response, 500
 
     def post(self):
         print("In Business POST")
@@ -35,10 +65,13 @@ class Business(Resource):
 
                 business_stored_procedure_response = db.call(procedure='new_business_uid')
                 new_business_uid = business_stored_procedure_response['result'][0]['new_id']
+                key = {'business_uid': new_business_uid}
 
                 payload['business_uid'] = new_business_uid
                 payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                processImage(key, payload)
 
                 response = db.insert('every_circle.business', payload)
             
