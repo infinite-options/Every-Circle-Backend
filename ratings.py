@@ -7,8 +7,38 @@ from data_ec import connect, uploadImage, s3, processImage
 
 
 class Ratings(Resource):
-    def get(self):
-        pass
+    def get(self, uid):
+        print("In Ratings GET")
+        response = {}
+        try:
+            print(uid, type(uid))
+            with connect() as db:
+                key = {}
+                if uid[:3] == "100":
+                    key['rating_user_id'] = uid
+                
+                elif uid[:3] == "200":
+                    key['rating_business_id'] = uid
+
+                else:
+                    response['message'] = 'Invalid UID'
+                    response['code'] = 400
+                    return response, 400
+            
+                response = db.select('every_circle.ratings', where=key)
+
+            if not response['result']:
+                response.pop('result')
+                response['message'] = f'No ratings found for {key}'
+                response['code'] = 404
+                return response, 404
+
+            return response, 200
+
+        except:
+            response['message'] = 'Internal Server Error'
+            response['code'] = 500
+            return response, 500
 
     def post(self):
         print("In Rating POST")
