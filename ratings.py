@@ -47,13 +47,18 @@ class Ratings(Resource):
         try:
             payload = request.form.to_dict()
 
-            if 'user_uid' not in payload or 'business_uid' not in payload:
-                    response['message'] = 'Both user_uid and business_uid are required'
+            if 'user_uid' not in payload:
+                    response['message'] = 'user_uid is required'
                     response['code'] = 400
                     return response, 400
+            
+            # if 'user_uid' not in payload or 'business_uid' not in payload:
+            #         response['message'] = 'Both user_uid and business_uid are required'
+            #         response['code'] = 400
+            #         return response, 400
 
             user_uid = payload.pop('user_uid')
-            business_uid = payload.pop('business_uid')
+            # business_uid = payload.pop('business_uid')
 
             with connect() as db:
 
@@ -65,18 +70,18 @@ class Ratings(Resource):
                     return response, 404
                 
                 # Check if the business exists
-                business_exists_query = db.select('every_circle.business', where={'business_uid': business_uid})
-                if not business_exists_query['result']:
-                    response['message'] = 'Business does not exist'
-                    response['code'] = 404
-                    return response, 404
+                # business_exists_query = db.select('every_circle.business', where={'business_uid': business_uid})
+                # if not business_exists_query['result']:
+                #     response['message'] = 'Business does not exist'
+                #     response['code'] = 404
+                #     return response, 404
 
                 rating_stored_procedure_response = db.call(procedure='new_rating_uid')
                 new_rating_uid = rating_stored_procedure_response['result'][0]['new_id']
 
                 payload['rating_uid'] = new_rating_uid
                 payload['rating_user_id'] = user_uid
-                payload['rating_business_id'] = business_uid
+                # payload['rating_business_id'] = business_uid
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 response = db.insert('every_circle.ratings', payload)
