@@ -259,16 +259,16 @@ def getNow():
 
 def sendEmail(recipient, subject, body):
     with app.app_context():
-        # print("In sendEmail: ", recipient, subject, body)
+        print("In sendEmail: ", recipient, subject, body)
         sender="support@manifestmy.space"
-        # print("sender: ", sender)
+        print("sender: ", sender)
         msg = Message(
             sender=sender,
             recipients=[recipient],
             subject=subject,
             body=body
         )
-        # print("sender: ", sender)
+        print("sender: ", sender)
         # print("Email message: ", msg)
         mail.send(msg)
         # print("email sent")
@@ -359,6 +359,75 @@ class stripe_key(Resource):
         else:
             return {"publicKey": stripe_public_live_key}
 
+class Refer(Resource):
+    def post(self):
+        print("In Refer POST")
+        # current user_id, email or number of the person being referred
+        payload = request.get_json()
+        response = {}
+
+        if 'user_uid' not in payload:
+            response['message'] = 'user_uid is required to refer a friend'
+            response['code'] = 400
+            return response, 400
+        
+        if  'user_referred_email' not in payload and 'user_referred_number' not in payload:
+            response['message'] = 'Either user_referred_email or user_referred_number is required'
+            response['code'] = 400
+            return response, 400
+        
+        try:
+            with connect() as db:
+                user_exists_query = db.select('every_circle.users', where={'user_uid': payload['user_uid']})
+                if not user_exists_query['result']:
+                    response['message'] = 'User does not exist'
+                    response['code'] = 404
+                    return response, 404
+                
+                print(user_exists_query)
+
+                user_profile_query = db.select('every_circle.profile', where={'profile_user_id': payload['user_uid']})
+                if not user_profile_query['result']:
+                    response['message'] = 'User exists in User table but does not exists in the profile table'
+                    response['code'] = 404
+                    return response, 404
+                
+                print(user_profile_query)
+                user_profile_details = user_profile_query['result'][0]
+            
+            if 'user_referred_email' in payload and payload['user_referred_email']:
+                # send email
+                # print(payload['user_referred_email'], type(payload['user_referred_email']))
+                recipient = payload['user_referred_email']
+                subject = "Every-Circle referreal from a friend"
+                body = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app/"
+
+                try:
+                    print("Now about to send email")
+                    sendEmail(recipient, subject, body)
+                    response['Email Status'] = 'Sent'
+                except:
+                    response['Email Status'] = 'Failed'
+            
+            if 'user_referred_number' in payload and payload['user_referred_number']:
+                # send SMS
+                message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle. Please click on the link to sign up. https://everycircle.netlify.app/"
+                phone_number = payload['user_referred_number']
+
+                try:
+                    Send_Twilio_SMS(message, phone_number)
+                    response['SMS Status'] = 'Sent'
+                except:
+                    response['SMS Status'] = "Failed"
+            
+            return response, 200
+        
+        except:
+            response['message'] = 'Internal Server Error'
+            return response, 500
+        
+
+
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
 # api.add_resource(Dashboard, '/dashboard/<string:user_id>')
@@ -370,6 +439,7 @@ api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Search, "/search/<string:user_id>")
+api.add_resource(Refer, "/refer-a-friend")
 
 
 
