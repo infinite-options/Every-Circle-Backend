@@ -18,6 +18,8 @@ from connections import Connections
 from user_profile import Profile
 from business import Business
 from ratings import Ratings
+from charges import Charges
+from lists import Lists
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -368,9 +370,9 @@ api.add_resource(Connections, "/connections")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:business_id>")
+api.add_resource(Charges, "/charges", "/charges/<string:business_id>")
 
-
-
+api.add_resource(Lists, "/lists", "/lists/<string:list_uid>")
 
 
 # @app.route('/decrypt', methods=['POST'])
