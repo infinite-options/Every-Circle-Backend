@@ -395,12 +395,18 @@ class Refer(Resource):
                 print(user_profile_query)
                 user_profile_details = user_profile_query['result'][0]
             
+            if 'message' in payload:
+                message = payload['message']
+                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
+            else:
+                message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
+            
             if 'user_referred_email' in payload and payload['user_referred_email']:
                 # send email
                 # print(payload['user_referred_email'], type(payload['user_referred_email']))
                 recipient = payload['user_referred_email']
                 subject = "Every-Circle referreal from a friend"
-                body = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app/"
+                body = message
 
                 try:
                     print("Now about to send email")
@@ -408,10 +414,10 @@ class Refer(Resource):
                     response['Email Status'] = 'Sent'
                 except:
                     response['Email Status'] = 'Failed'
-            
+
             if 'user_referred_number' in payload and payload['user_referred_number']:
                 # send SMS
-                message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle. Please click on the link to sign up. https://everycircle.netlify.app/"
+                # message = message
                 phone_number = payload['user_referred_number']
 
                 try:
