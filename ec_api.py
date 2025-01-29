@@ -447,7 +447,7 @@ api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Search, "/search/<string:user_id>")
 api.add_resource(Refer, "/refer-a-friend")
-api.add_resource(Lists, "/lists/<string:list_uid>")
+api.add_resource(Lists, "/lists")
 
 
 
