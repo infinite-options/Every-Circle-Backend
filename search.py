@@ -95,8 +95,21 @@ class Search(Resource):
                                             )
                                     )
                                     -- Final selection from RatingMatches to get the required output
-                                    SELECT * 
-                                    FROM RatingMatches;
+                                    -- SELECT * 
+                                    -- FROM RatingMatches;
+                                    SELECT 
+                                        rm.*, 
+                                        b.business_name,
+                                        b.business_phone_number,
+                                        b.business_address_line_1,
+                                        b.business_address_line_2,
+                                        b.business_city,
+                                        b.business_state,
+                                        b.business_country,
+                                        b.business_zip_code,
+                                        b.business_google_id
+                                    FROM RatingMatches rm
+                                    LEFT JOIN every_circle.business b ON rm.rating_business_id = b.business_uid;
                             '''
                 
                 rating_query_response = db.execute(rating_query)
