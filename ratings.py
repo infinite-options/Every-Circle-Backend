@@ -78,11 +78,14 @@ class Ratings(Resource):
 
                 rating_stored_procedure_response = db.call(procedure='new_rating_uid')
                 new_rating_uid = rating_stored_procedure_response['result'][0]['new_id']
+                key = {'rating_uid': new_rating_uid}
 
                 payload['rating_uid'] = new_rating_uid
                 payload['rating_user_id'] = user_uid
                 # payload['rating_business_id'] = business_uid
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                processImage(key, payload)
 
                 response = db.insert('every_circle.ratings', payload)
             

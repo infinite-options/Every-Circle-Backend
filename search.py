@@ -35,46 +35,58 @@ class Search(Resource):
                 rating_query = f'''
                                     WITH UserConnections AS (
                                         WITH RECURSIVE Referrals AS (
+                                            -- Base case: Start from the given user_id
                                             SELECT 
                                                 profile_user_id AS user_id,
                                                 profile_referred_by_user_id,
-                                                1 AS degree,
-                                                CAST(profile_referred_by_user_id AS CHAR(300)) AS connection_path
-                                            FROM 
-                                                profile
-                                            WHERE 
-                                                profile_referred_by_user_id = '{user_id}'
-                                                
+                                                0 AS degree, 
+                                                CAST(profile_user_id AS CHAR(300)) AS connection_path
+                                            FROM profile
+                                            WHERE profile_user_id = '{user_id}'
+
                                             UNION ALL
 
+                                            -- Forward expansion: Find users referred by the current user
                                             SELECT 
                                                 p.profile_user_id AS user_id,
                                                 p.profile_referred_by_user_id,
-                                                c.degree + 1 AS degree,
-                                                CONCAT(c.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path
-                                            FROM 
-                                                profile p
-                                            INNER JOIN 
-                                                Referrals c ON p.profile_referred_by_user_id = c.user_id
-                                            WHERE 
-                                                c.degree < 3
+                                                r.degree + 1 AS degree,
+                                                CONCAT(r.connection_path, ' -> ', p.profile_user_id) AS connection_path
+                                            FROM profile p
+                                            INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
+                                            WHERE r.degree < 3 
+                                            AND NOT POSITION(p.profile_user_id IN r.connection_path) > 0  -- Prevent revisiting users
+
+                                            UNION ALL
+
+                                            -- Backward expansion: Find the user who referred the current user
+                                            SELECT 
+                                                p.profile_referred_by_user_id AS user_id,
+                                                p.profile_user_id AS profile_referred_by_user_id,
+                                                r.degree + 1 AS degree,
+                                                CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path -- Append correctly
+                                            FROM profile p
+                                            INNER JOIN Referrals r ON p.profile_user_id = r.user_id
+                                            WHERE r.degree < 3
+                                            AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0  -- Prevent revisiting users
                                         )
+                                        -- Final selection of all users within 3 degrees of connection
                                         SELECT DISTINCT
                                             user_id,
                                             degree,
                                             connection_path
-                                        FROM 
-                                            Referrals
-                                        ORDER BY 
-                                            degree, connection_path
+                                        FROM Referrals
+                                        ORDER BY degree, connection_path
                                     ),
                                     RatingMatches AS (
+                                        -- Match ratings based on UserConnections and business category
                                         SELECT
-                                            *
+                                            r.*,
+                                            u.degree,
+                                            u.connection_path
                                         FROM
                                             ratings r
-                                        INNER JOIN
-                                            UserConnections u ON r.rating_user_id = u.user_id
+                                        INNER JOIN UserConnections u ON r.rating_user_id = u.user_id
                                         WHERE
                                             r.rating_business_id IN (
                                                 SELECT business_uid
@@ -82,7 +94,9 @@ class Search(Resource):
                                                 WHERE business_category_id = '{category_uid}'
                                             )
                                     )
-                                    SELECT * FROM RatingMatches;
+                                    -- Final selection from RatingMatches to get the required output
+                                    SELECT * 
+                                    FROM RatingMatches;
                             '''
                 
                 rating_query_response = db.execute(rating_query)
