@@ -47,13 +47,13 @@ class Profile(Resource):
         try:
             payload = request.form.to_dict()
 
-            if 'user_uid' not in payload or 'referred_by_code' not in payload:
-                    response['message'] = 'Both user_uid and referred_by_code are required'
+            if 'user_uid' not in payload:
+                    response['message'] = 'user_uid is required'
                     response['code'] = 400
                     return response, 400
 
             user_uid = payload.pop('user_uid')
-            referred_by_code = payload.pop('referred_by_code')
+            # referred_by_code = payload.pop('referred_by_code')
 
             with connect() as db:
 
@@ -72,12 +72,13 @@ class Profile(Resource):
                 payload['profile_user_id'] = user_uid
                 payload['profile_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                if referred_by_code == "12345":
-                    payload['profile_referred_by_user_id'] = "100-000001"
-                    processImage(key, payload)
-                    response = db.insert('every_circle.profile', payload)
+                # if referred_by_code == "12345":
+                    # payload['profile_referred_by_user_id'] = "100-000001"
+                processImage(key, payload)
+                response = db.insert('every_circle.profile', payload)
             
             response['profile_uid'] = new_profile_uid
+            response['message'] = 'Profile created successfully'
 
             return response, 200
         
