@@ -4,6 +4,7 @@ from werkzeug.exceptions import BadRequest
 from datetime import datetime
 
 from data_ec import connect, uploadImage, s3, processImage
+from charges import Charges
 
 # query -> category
 # category -> business
@@ -26,11 +27,14 @@ class Search(Resource):
                 category_query_response = db.select('every_circle.category', where={'category_name': search_category})
 
                 category_uid = category_query_response['result'][0]['category_uid']
-
+                print(category_uid)
                 if not category_uid:
                     response['message'] = 'Category not found'
                     response['code'] = 404
                     return response, 404
+                
+                # business_uid_list_response = db.select('every_circle.business', where={'business_category_id': category_uid})                
+                # business_uid_list = tuple([business['business_uid'] for business in business_uid_list_response['result']])
                 
                 rating_query = f'''
                                     WITH UserConnections AS (
@@ -113,6 +117,23 @@ class Search(Resource):
                             '''
                 
                 rating_query_response = db.execute(rating_query)
+
+                business_uid_list = tuple(set([business['rating_business_id'] for business in rating_query_response['result']]))
+                print(business_uid_list)
+
+                for business_uid in business_uid_list:
+
+                    charges_stored_procedure_response = db.call(procedure='new_charge_uid')
+                    new_charge_uid = charges_stored_procedure_response['result'][0]['new_id']
+
+                    charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                    charges_query = f'''
+                                            INSERT INTO `every_circle`.`charges` (`charge_uid`, `charge_business_id`, `charge_caused_by_user_id`, `charge_reason`, `charge_amount`, `charge_timestamp`) 
+                                            VALUES ('{new_charge_uid}', '{business_uid}', '{user_id}', 'impression', '1.00', '{charge_timestamp}');
+                                    '''
+
+                    charges_query_response = db.execute(charges_query, cmd='post')
 
                 return rating_query_response, 200
 

@@ -20,6 +20,7 @@ from business import Business
 from ratings import Ratings
 from search import Search
 from lists import Lists
+from charges import Charges
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -448,7 +449,7 @@ api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Search, "/search/<string:user_id>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
-
+api.add_resource(Charges, "/charges")
 
 
 
