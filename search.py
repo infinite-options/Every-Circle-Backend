@@ -13,7 +13,7 @@ from charges import Charges
 # add miles in the location
 
 class Search(Resource):
-    def get(self, user_id):
+    def get(self, profile_id):
         print("In Search GET")
         search_category = request.args.get('category')
         
@@ -25,16 +25,12 @@ class Search(Resource):
         try:
             with connect() as db:
                 category_query_response = db.select('every_circle.category', where={'category_name': search_category})
-
-                category_uid = category_query_response['result'][0]['category_uid']
-                print(category_uid)
-                if not category_uid:
+                if not category_query_response['result']:
                     response['message'] = 'Category not found'
-                    response['code'] = 404
-                    return response, 404
+                    response['code'] = 200
+                    return response, 200
                 
-                # business_uid_list_response = db.select('every_circle.business', where={'business_category_id': category_uid})                
-                # business_uid_list = tuple([business['business_uid'] for business in business_uid_list_response['result']])
+                category_uid = category_query_response['result'][0]['category_uid']
                 
                 rating_query = f'''
                                     WITH UserConnections AS (
@@ -46,7 +42,7 @@ class Search(Resource):
                                                 0 AS degree, 
                                                 CAST(profile_user_id AS CHAR(300)) AS connection_path
                                             FROM profile
-                                            WHERE profile_user_id = '{user_id}'
+                                            WHERE profile_user_id = '{profile_id}'
 
                                             UNION ALL
 
@@ -130,7 +126,7 @@ class Search(Resource):
 
                     charges_query = f'''
                                             INSERT INTO `every_circle`.`charges` (`charge_uid`, `charge_business_id`, `charge_caused_by_user_id`, `charge_reason`, `charge_amount`, `charge_timestamp`) 
-                                            VALUES ('{new_charge_uid}', '{business_uid}', '{user_id}', 'impression', '1.00', '{charge_timestamp}');
+                                            VALUES ('{new_charge_uid}', '{business_uid}', '{profile_id}', 'impression', '1.00', '{charge_timestamp}');
                                     '''
 
                     charges_query_response = db.execute(charges_query, cmd='post')

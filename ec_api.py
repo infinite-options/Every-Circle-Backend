@@ -369,8 +369,8 @@ class Refer(Resource):
         payload = request.get_json()
         response = {}
 
-        if 'user_uid' not in payload:
-            response['message'] = 'user_uid is required to refer a friend'
+        if 'profile_uid' not in payload:
+            response['message'] = 'profile_uid is required to refer a friend'
             response['code'] = 400
             return response, 400
         
@@ -381,26 +381,27 @@ class Refer(Resource):
         
         try:
             with connect() as db:
-                user_exists_query = db.select('every_circle.users', where={'user_uid': payload['user_uid']})
-                if not user_exists_query['result']:
+                profile_exists_query = db.select('every_circle.profile', where={'profile_uid': payload['profile_uid']})
+                if not profile_exists_query['result']:
                     response['message'] = 'User does not exist'
                     response['code'] = 404
                     return response, 404
                 
-                print(user_exists_query)
+                print(profile_exists_query)
+                user_profile_details = profile_exists_query['result'][0]
 
-                user_profile_query = db.select('every_circle.profile', where={'profile_user_id': payload['user_uid']})
-                if not user_profile_query['result']:
-                    response['message'] = 'User exists in User table but does not exists in the profile table'
-                    response['code'] = 404
-                    return response, 404
+                # user_profile_query = db.select('every_circle.profile', where={'profile_user_id': payload['user_uid']})
+                # if not user_profile_query['result']:
+                #     response['message'] = 'User exists in User table but does not exists in the profile table'
+                #     response['code'] = 404
+                #     return response, 404
                 
-                print(user_profile_query)
-                user_profile_details = user_profile_query['result'][0]
+                # print(user_profile_query)
+                # user_profile_details = user_profile_query['result'][0]
             
             if 'message' in payload:
                 message = payload['message']
-                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
+                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['profile_uid']}"
             else:
                 message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
             
@@ -447,7 +448,7 @@ api.add_resource(Connections, "/connections")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
-api.add_resource(Search, "/search/<string:user_id>")
+api.add_resource(Search, "/search/<string:profile_id>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
 api.add_resource(Charges, "/charges")
