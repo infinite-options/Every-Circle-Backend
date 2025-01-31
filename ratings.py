@@ -44,44 +44,40 @@ class Ratings(Resource):
         print("In Rating POST")
         response = {}
 
-        def check_business_exists(business_google_id=None, business_name=None):
-            business_payload = {}
+        def check_business(payload, business_google_id=None, business_name=None):
 
             if business_google_id:
                 business_query = db.select('every_circle.business', where={'business_google_id': business_google_id})
-
-                if not business_query['result']:
-                    business_stored_procedure_response = db.call(procedure='new_business_uid')
-                    business_uid = business_stored_procedure_response['result'][0]['new_id']
-                    
-                    business_payload['business_uid'] = business_uid         
-                    business_payload['business_google_id'] = business_google_id
-                    business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                    business_insert_query = db.insert('every_circle.business', business_payload)
-
-                else:
-                    business_uid = business_query['result'][0]['business_uid']   
-
-                return business_uid         
-
             elif business_name:
                 business_query = db.select('every_circle.business', where={'business_name': business_name})
-                
-                if not business_query['result']:
-                    business_stored_procedure_response = db.call(procedure='new_business_uid')
-                    business_uid = business_stored_procedure_response['result'][0]['new_id']
-
-                    business_payload['business_uid'] = business_uid   
-                    business_payload['business_name'] = business_name      
-                    business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                    business_insert_query = db.insert('every_circle.business', business_payload)
-
-                else:
-                    business_uid = business_query['result'][0]['business_uid']
             
-                return business_uid
+            if not business_query['result']:
+                print("In NOT")
+                business_stored_procedure_response = db.call(procedure='new_business_uid')
+                business_uid = business_stored_procedure_response['result'][0]['new_id']
+
+                business_payload = {}
+                business_payload['business_uid'] = business_uid         
+                business_payload['business_google_id'] = business_google_id
+                business_payload['business_name'] = business_name
+                business_payload['business_address_line_1'] = payload.pop('rating_business_address_line_1', None)
+                business_payload['business_address_line_2'] = payload.pop('rating_business_address_line_2', None)
+                business_payload['business_city'] = payload.pop('rating_business_city', None)
+                business_payload['business_state'] = payload.pop('rating_business_state', None)
+                business_payload['business_country'] = payload.pop('rating_business_country', None)
+                business_payload['business_zip_code'] = payload.pop('rating_business_zip_code', None)
+                business_payload['business_latitude'] = payload.pop('rating_business_latitude', None)
+                business_payload['business_longitude'] = payload.pop('rating_business_longitude', None)
+                business_payload['business_yelp'] = payload.pop('rating_business_yelp', None)
+                business_payload['business_website'] = payload.pop('rating_business_website', None)
+                business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                business_insert_query = db.insert('every_circle.business', business_payload)
+            
+            else:
+                business_uid = business_query['result'][0]['business_uid']
+            
+            return business_uid, payload
 
         try:
             payload = request.form.to_dict()
@@ -101,21 +97,16 @@ class Ratings(Resource):
                     response['message'] = 'User does not exist'
                     response['code'] = 404
                     return response, 404
-
-                if 'rating_business_google_id' in payload:
-                    business_google_id = payload.pop('rating_business_google_id')
-                    business_uid = check_business_exists(business_google_id, None)
-                    payload['rating_business_id'] = business_uid
-
-                elif 'rating_business_name' in payload:
-                    business_name = payload.pop('rating_business_name')
-                    business_uid = check_business_exists(None, business_name)
-                    payload['rating_business_id'] = business_uid
                 
-                else:
+                business_google_id = payload.pop('rating_business_google_id', None)
+                business_name = payload.pop('rating_business_name', None)
+
+                if not business_google_id and not business_name:
                     response['message'] = 'rating_business_google_id or rating_business_name is required'
                     response['code'] = 400
                     return response, 400
+                
+                business_uid, payload = check_business(payload, business_google_id, business_name)
 
                 rating_stored_procedure_response = db.call(procedure='new_rating_uid')
                 new_rating_uid = rating_stored_procedure_response['result'][0]['new_id']
@@ -123,6 +114,7 @@ class Ratings(Resource):
 
                 payload['rating_uid'] = new_rating_uid
                 payload['rating_user_id'] = profile_uid
+                payload['rating_business_id'] = business_uid
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 processImage(key, payload)
@@ -130,6 +122,7 @@ class Ratings(Resource):
                 response = db.insert('every_circle.ratings', payload)
             
             response['rating_uid'] = new_rating_uid
+            response['business_uid'] = business_uid
 
             return response, 200
         
