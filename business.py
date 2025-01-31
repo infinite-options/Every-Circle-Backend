@@ -47,17 +47,17 @@ class Business(Resource):
         try:
             payload = request.form.to_dict()
 
-            if 'user_uid' not in payload:
-                    response['message'] = 'user_uid is required to register a business'
+            if 'profile_uid' not in payload:
+                    response['message'] = 'profile_uid is required to register a business'
                     response['code'] = 400
                     return response, 400
 
-            user_uid = payload.pop('user_uid')
+            profile_uid = payload.pop('profile_uid')
 
             with connect() as db:
 
                 # Check if the user exists
-                user_exists_query = db.select('every_circle.users', where={'user_uid': user_uid})
+                user_exists_query = db.select('every_circle.profile', where={'profile_uid': profile_uid})
                 if not user_exists_query['result']:
                     response['message'] = 'User does not exist'
                     response['code'] = 404
@@ -68,7 +68,7 @@ class Business(Resource):
                 key = {'business_uid': new_business_uid}
 
                 payload['business_uid'] = new_business_uid
-                payload['business_user_id'] = user_uid
+                payload['business_user_id'] = profile_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 processImage(key, payload)

@@ -14,7 +14,7 @@ class Ratings(Resource):
             print(uid, type(uid))
             with connect() as db:
                 key = {}
-                if uid[:3] == "100":
+                if uid[:3] == "110":
                     key['rating_user_id'] = uid
                 
                 elif uid[:3] == "200":
@@ -44,45 +44,85 @@ class Ratings(Resource):
         print("In Rating POST")
         response = {}
 
+        def check_business_exists(business_google_id=None, business_name=None):
+            business_payload = {}
+
+            if business_google_id:
+                business_query = db.select('every_circle.business', where={'business_google_id': business_google_id})
+
+                if not business_query['result']:
+                    business_stored_procedure_response = db.call(procedure='new_business_uid')
+                    business_uid = business_stored_procedure_response['result'][0]['new_id']
+                    
+                    business_payload['business_uid'] = business_uid         
+                    business_payload['business_google_id'] = business_google_id
+                    business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                    business_insert_query = db.insert('every_circle.business', business_payload)
+
+                else:
+                    business_uid = business_query['result'][0]['business_uid']   
+
+                return business_uid         
+
+            elif business_name:
+                business_query = db.select('every_circle.business', where={'business_name': business_name})
+                
+                if not business_query['result']:
+                    business_stored_procedure_response = db.call(procedure='new_business_uid')
+                    business_uid = business_stored_procedure_response['result'][0]['new_id']
+
+                    business_payload['business_uid'] = business_uid   
+                    business_payload['business_name'] = business_name      
+                    business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                    business_insert_query = db.insert('every_circle.business', business_payload)
+
+                else:
+                    business_uid = business_query['result'][0]['business_uid']
+            
+                return business_uid
+
         try:
             payload = request.form.to_dict()
 
-            if 'user_uid' not in payload:
-                    response['message'] = 'user_uid is required'
+            if 'profile_uid' not in payload:
+                    response['message'] = 'profile_uid is required'
                     response['code'] = 400
                     return response, 400
-            
-            # if 'user_uid' not in payload or 'business_uid' not in payload:
-            #         response['message'] = 'Both user_uid and business_uid are required'
-            #         response['code'] = 400
-            #         return response, 400
 
-            user_uid = payload.pop('user_uid')
-            # business_uid = payload.pop('business_uid')
+            profile_uid = payload.pop('profile_uid')
 
             with connect() as db:
 
                 # Check if the user exists
-                user_exists_query = db.select('every_circle.users', where={'user_uid': user_uid})
+                user_exists_query = db.select('every_circle.profile', where={'profile_uid': profile_uid})
                 if not user_exists_query['result']:
                     response['message'] = 'User does not exist'
                     response['code'] = 404
                     return response, 404
+
+                if 'rating_business_google_id' in payload:
+                    business_google_id = payload.pop('rating_business_google_id')
+                    business_uid = check_business_exists(business_google_id, None)
+                    payload['rating_business_id'] = business_uid
+
+                elif 'rating_business_name' in payload:
+                    business_name = payload.pop('rating_business_name')
+                    business_uid = check_business_exists(None, business_name)
+                    payload['rating_business_id'] = business_uid
                 
-                # Check if the business exists
-                # business_exists_query = db.select('every_circle.business', where={'business_uid': business_uid})
-                # if not business_exists_query['result']:
-                #     response['message'] = 'Business does not exist'
-                #     response['code'] = 404
-                #     return response, 404
+                else:
+                    response['message'] = 'rating_business_google_id or rating_business_name is required'
+                    response['code'] = 400
+                    return response, 400
 
                 rating_stored_procedure_response = db.call(procedure='new_rating_uid')
                 new_rating_uid = rating_stored_procedure_response['result'][0]['new_id']
                 key = {'rating_uid': new_rating_uid}
 
                 payload['rating_uid'] = new_rating_uid
-                payload['rating_user_id'] = user_uid
-                # payload['rating_business_id'] = business_uid
+                payload['rating_user_id'] = profile_uid
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 processImage(key, payload)
