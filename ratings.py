@@ -2,6 +2,8 @@ from flask import request, abort , jsonify
 from flask_restful import Resource
 from werkzeug.exceptions import BadRequest
 from datetime import datetime
+import ast
+import json
 
 from data_ec import connect, uploadImage, s3, processImage
 
@@ -15,7 +17,7 @@ class Ratings(Resource):
             with connect() as db:
                 key = {}
                 if uid[:3] == "110":
-                    key['rating_user_id'] = uid
+                    key['rating_profile_id'] = uid
                 
                 elif uid[:3] == "200":
                     key['rating_business_id'] = uid
@@ -44,8 +46,33 @@ class Ratings(Resource):
         print("In Rating POST")
         response = {}
 
-        def check_business(payload, business_google_id=None, business_name=None):
+        def check_category(sub_category, business_uid):
+            print("In Check Category")
+            with connect() as db:
+                category_query = db.select('every_circle.category', where={'sub_category': sub_category})
+                if not category_query['result']:
+                    category_stored_procedure_response = db.call(procedure='new_category_uid')
+                    category_uid = category_stored_procedure_response['result'][0]['new_id']
 
+                    category_payload = {}
+                    category_payload['category_uid'] = category_uid
+                    category_payload['sub_category'] = sub_category
+                    category_insert_query = db.insert('every_circle.category', category_payload)
+                
+                else:
+                    category_uid = category_query['result'][0]['category_uid']
+                
+                print(category_uid)
+                business_type_stored_procedure_response = db.call(procedure='new_bt_uid')
+                bt_uid = business_type_stored_procedure_response['result'][0]['new_id']
+                business_type_payload = {}
+                business_type_payload['bt_uid'] = bt_uid
+                business_type_payload['bt_business_id'] = business_uid
+                business_type_payload['bt_category_id'] = category_uid
+                business_type_insert_query = db.insert('every_circle.business_type', business_type_payload)
+
+        def check_business(payload, business_google_id=None, business_name=None):
+            print("In Check Business")
             if business_google_id:
                 business_query = db.select('every_circle.business', where={'business_google_id': business_google_id})
             elif business_name:
@@ -56,10 +83,20 @@ class Ratings(Resource):
                 business_stored_procedure_response = db.call(procedure='new_business_uid')
                 business_uid = business_stored_procedure_response['result'][0]['new_id']
 
+                if 'rating_business_types' in payload:
+                    business_types = payload.pop('rating_business_types')
+                    print('\n' + business_types)
+                    business_types = ast.literal_eval(business_types)
+                    print(business_types)
+                    for business_type in business_types:
+                        check_category(business_type, business_uid)
+
                 business_payload = {}
                 business_payload['business_uid'] = business_uid         
                 business_payload['business_google_id'] = business_google_id
                 business_payload['business_name'] = business_name
+                business_payload['business_phone_number'] = payload.pop('rating_business_phone_number', None)
+                business_payload['business_email_id'] = payload.pop('rating_business_email_id', None)
                 business_payload['business_address_line_1'] = payload.pop('rating_business_address_line_1', None)
                 business_payload['business_address_line_2'] = payload.pop('rating_business_address_line_2', None)
                 business_payload['business_city'] = payload.pop('rating_business_city', None)
@@ -70,9 +107,17 @@ class Ratings(Resource):
                 business_payload['business_longitude'] = payload.pop('rating_business_longitude', None)
                 business_payload['business_yelp'] = payload.pop('rating_business_yelp', None)
                 business_payload['business_website'] = payload.pop('rating_business_website', None)
+                business_payload['business_price_level'] = payload.pop('rating_business_price_level', None)
+                business_payload['business_google_rating'] = payload.pop('rating_business_google_rating', None)
+                if 'rating_business_google_photos' in payload:
+                    business_payload['business_google_photos'] = json.dumps(ast.literal_eval(payload.pop('rating_business_google_photos')))
                 business_payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+                print('business_payload', business_payload)
+
                 business_insert_query = db.insert('every_circle.business', business_payload)
+
+                print(business_insert_query)
             
             else:
                 business_uid = business_query['result'][0]['business_uid']
@@ -113,7 +158,7 @@ class Ratings(Resource):
                 key = {'rating_uid': new_rating_uid}
 
                 payload['rating_uid'] = new_rating_uid
-                payload['rating_user_id'] = profile_uid
+                payload['rating_profile_id'] = profile_uid
                 payload['rating_business_id'] = business_uid
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 

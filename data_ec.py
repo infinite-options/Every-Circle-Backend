@@ -181,6 +181,17 @@ def processImage(key, payload):
             print("Rating Key passed")
             key_type = 'rating'
             key_uid = key['rating_uid']
+            receiptImage = None
+
+            if 'img_receipt' in request.files:
+                receiptFile = request.files.get('img_receipt')
+                unique_filename = "receipt_" + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                image_key = f'{key_type}/{key_uid}/{unique_filename}'
+                receiptImage = uploadImage(receiptFile, image_key, '')
+                print("Image after upload: ", receiptImage)
+                # images.append(receiptImage)
+                # print("Image after upload: ", images)
+
             payload_delete_images = payload.pop('delete_images', None)      # Images to Delete
             if 'img_0' in request.files or payload_delete_images != None:   #  New appliance images are passed in as img_0, img_1.  No Image attributes are passed in
                 payload_query = db.execute(""" SELECT rating_images_url FROM every_circle.ratings WHERE rating_uid = \'""" + key_uid + """\'; """)     # Current Images
@@ -377,7 +388,9 @@ def processImage(key, payload):
         
         if key_type == 'profile': payload['profile_images_url'] = json.dumps(current_images) 
         if key_type == 'business': payload['business_images_url'] = json.dumps(current_images) 
-        if key_type == 'rating': payload['rating_images_url'] = json.dumps(current_images) 
+        if key_type == 'rating': 
+            payload['rating_images_url'] = json.dumps(current_images)
+            payload['rating_receipt_url'] = receiptImage if receiptImage else None
 
         print("Payload before return: ", payload)
         return payload
