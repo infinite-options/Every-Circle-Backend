@@ -95,6 +95,8 @@ class Ratings(Resource):
                 business_payload['business_uid'] = business_uid         
                 business_payload['business_google_id'] = business_google_id
                 business_payload['business_name'] = business_name
+                business_payload['business_owner_fn'] = payload.pop('rating_business_owner_fn', None)
+                business_payload['business_owner_ln'] = payload.pop('rating_business_owner_ln', None)
                 business_payload['business_phone_number'] = payload.pop('rating_business_phone_number', None)
                 business_payload['business_email_id'] = payload.pop('rating_business_email_id', None)
                 business_payload['business_address_line_1'] = payload.pop('rating_business_address_line_1', None)
@@ -125,7 +127,7 @@ class Ratings(Resource):
                 for key in list(payload.keys()):
                     if 'business' in key:
                         print(key, 'key')
-                        tmp = payload.pop(key)
+                        payload.pop(key)
             
             return business_uid, payload
 
