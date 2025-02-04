@@ -121,6 +121,11 @@ class Ratings(Resource):
             
             else:
                 business_uid = business_query['result'][0]['business_uid']
+                print("in else", business_uid)
+                for key in list(payload.keys()):
+                    if 'business' in key:
+                        print(key, 'key')
+                        tmp = payload.pop(key)
             
             return business_uid, payload
 
@@ -152,6 +157,7 @@ class Ratings(Resource):
                     return response, 400
                 
                 business_uid, payload = check_business(payload, business_google_id, business_name)
+                print("Business Check Completed")
 
                 rating_stored_procedure_response = db.call(procedure='new_rating_uid')
                 new_rating_uid = rating_stored_procedure_response['result'][0]['new_id']
