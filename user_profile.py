@@ -16,7 +16,7 @@ class Profile(Resource):
                 if uid[:3] == "100":
                     user_response = db.select('every_circle.users', where={'user_uid': uid})
                     if not user_response['result']:
-                        response['message'] = f'No user found for {key}'
+                        response['message'] = f'No user found for {uid}'
                         response['code'] = 404
                         return response, 404
                     
@@ -25,6 +25,11 @@ class Profile(Resource):
                         response = db.select('every_circle.profile', where={'profile_user_id': uid})
                     else:
                         response = db.select('every_circle.business', where={'business_user_id': uid})
+                    
+                    if response['result']:
+                        response['result'][0]['user_role'] = user_data['user_role']
+                    else:
+                        response['result'] = [{'user_role': user_data['user_role']}]
                     
                     return response, 200
 
