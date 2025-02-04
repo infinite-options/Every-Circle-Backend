@@ -14,25 +14,30 @@ class Profile(Resource):
             with connect() as db:
                 key = {}
                 if uid[:3] == "100":
-                    key['profile_user_id'] = uid
-                
+                    user_response = db.select('every_circle.users', where={'user_uid': uid})
+                    if not user_response['result']:
+                        response['message'] = f'No user found for {key}'
+                        response['code'] = 404
+                        return response, 404
+                    
+                    user_data = user_response['result'][0]
+                    if user_data['user_role'] == "user":
+                        response = db.select('every_circle.profile', where={'profile_user_id': uid})
+                    else:
+                        response = db.select('every_circle.business', where={'business_user_id': uid})
+                    
+                    return response, 200
+
                 elif uid[:3] == "110":
                     key['profile_uid'] = uid
+                    response = db.select('every_circle.profile', where={'profile_uid': uid})
+
+                    return response, 200
 
                 else:
                     response['message'] = 'Invalid UID'
                     response['code'] = 400
                     return response, 400
-            
-                response = db.select('every_circle.profile', where=key)
-
-            if not response['result']:
-                response.pop('result')
-                response['message'] = f'Profile does not exist. No Profile found for the {uid} uid'
-                response['code'] = 404
-                return response, 404
-
-            return response, 200
 
         except:
             response['message'] = 'Internal Server Error'
