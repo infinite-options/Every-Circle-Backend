@@ -104,8 +104,9 @@ class Search(Resource):
                                         WHERE
                                             r.rating_business_id IN (
                                                 SELECT business_uid
-                                                FROM every_circle.business
-                                                WHERE business_category_id = '{category_uid}'
+                                                FROM every_circle.business_type
+                                                LEFT JOIN every_circle.business ON business_uid = bt_business_id
+                                                WHERE bt_category_id = '{category_uid}'
                                             )
                                     )
                                     -- Final selection from RatingMatches to get the required output
