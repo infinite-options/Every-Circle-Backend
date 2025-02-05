@@ -22,6 +22,7 @@ from search import Search
 from lists import Lists
 from charges import Charges
 from business_budget import Business_Budget
+from feed import Feed
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -435,7 +436,7 @@ class Refer(Resource):
         except:
             response['message'] = 'Internal Server Error'
             return response, 500
-        
+
 
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
@@ -453,6 +454,7 @@ api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
 api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
+api.add_resource(Feed, "/feed/<string:profile_id>")
 
 
 
