@@ -7,8 +7,8 @@ from data_ec import connect, uploadImage, s3, processImage
 from charges import Charges
 from rapidfuzz import process
 
-# query -> category
-# category -> business
+# query -> type
+# type -> business
 # business -> ratings
 # business -> charges
 # add miles in the location
@@ -16,36 +16,36 @@ from rapidfuzz import process
 class Search(Resource):
     def get(self, profile_id):
         print("In Search GET")
-        search_category = request.args.get('category', "").strip()
+        search_type = request.args.get('type', "").strip()
         # profile_id = request.args.get('profile_id', "").strip()
         
-        if search_category is None:
-            abort(400, description="category is required")
+        if search_type is None:
+            abort(400, description="type is required")
         
         response = {}
         
         try:
             with connect() as db:
-                all_category_query = db.select('every_circle.category')
-                all_categories = {category['sub_category']: category['category_uid'] for category in all_category_query['result']}
+                all_type_query = db.select('every_circle.types')
+                all_types = {type['sub_type']: type['type_uid'] for type in all_type_query['result']}
 
-                match = process.extractOne(search_category, all_categories.keys(), score_cutoff=70)
+                match = process.extractOne(search_type, all_types.keys(), score_cutoff=70)
 
                 if match:
-                    matched_category = match[0]
-                    category_uid = all_categories[matched_category]
-                    print(matched_category, category_uid)
+                    matched_type = match[0]
+                    type_uid = all_types[matched_type]
+                    print(matched_type, type_uid)
                 else:
-                    response['message'] = 'Category not found'
+                    response['message'] = 'type not found'
                     response['code'] = 200
                     return response, 200
 
-                # category_query_response = db.select('every_circle.category', where={'category_name': search_category})
-                # if not category_query_response['result']:
-                #     response['message'] = 'Category not found'
+                # type_query_response = db.select('every_circle.type', where={'type_name': search_type})
+                # if not type_query_response['result']:
+                #     response['message'] = 'type not found'
                 #     response['code'] = 200
                 #     return response, 200
-                # category_uid = category_query_response['result'][0]['category_uid']
+                # type_uid = type_query_response['result'][0]['type_uid']
 
                 rating_query = f'''
                                     WITH UserConnections AS (
@@ -94,7 +94,7 @@ class Search(Resource):
                                         ORDER BY degree, connection_path
                                     ),
                                     RatingMatches AS (
-                                        -- Match ratings based on UserConnections and business category
+                                        -- Match ratings based on UserConnections and business type
                                         SELECT
                                             r.*,
                                             u.degree,
@@ -104,10 +104,10 @@ class Search(Resource):
                                         INNER JOIN UserConnections u ON r.rating_profile_id = u.user_id
                                         WHERE
                                             r.rating_business_id IN (
-                                                SELECT business_uid
+                                                SELECT bt_business_id
                                                 FROM every_circle.business_type
-                                                LEFT JOIN every_circle.business ON business_uid = bt_business_id
-                                                WHERE bt_category_id = '{category_uid}'
+                                                -- INNER JOIN every_circle.business ON business_uid = bt_business_id
+                                                WHERE bt_type_id = '{type_uid}'
                                             )
                                     )
                                     -- Final selection from RatingMatches to get the required output
@@ -167,7 +167,7 @@ class Search(Resource):
                 #                         ORDER BY degree, connection_path
                 #                     ),
                 #                     RatingMatches AS (
-                #                         -- Match ratings based on UserConnections and business category
+                #                         -- Match ratings based on UserConnections and business type
                 #                         SELECT
                 #                             r.*,
                 #                             u.degree,
@@ -179,7 +179,7 @@ class Search(Resource):
                 #                             r.rating_business_id IN (
                 #                                 SELECT business_uid
                 #                                 FROM every_circle.business
-                #                                 WHERE business_category_id = '{category_uid}'
+                #                                 WHERE business_type_id = '{type_uid}'
                 #                             )
                 #                     )
                 #                     -- Final selection from RatingMatches to get the required output
@@ -228,38 +228,38 @@ class Search(Resource):
 
     def post(self):
         print("In Search GET")
-        # search_category = request.args.get('category', "").strip()
+        # search_type = request.args.get('type', "").strip()
         # profile_id = request.args.get('profile_id', "").strip()
         payload = request.get_json()
-        search_category = payload['category']
+        search_type = payload['type']
         profile_id = payload['profile_id']
-        if search_category is None:
-            abort(400, description="category is required")
+        if search_type is None:
+            abort(400, description="type is required")
         
         response = {}
         
         try:
             with connect() as db:
-                all_category_query = db.select('every_circle.category')
-                all_categories = {category['sub_category']: category['category_uid'] for category in all_category_query['result']}
+                all_type_query = db.select('every_circle.type')
+                all_types = {type['sub_type']: type['type_uid'] for type in all_type_query['result']}
 
-                match = process.extractOne(search_category, all_categories.keys(), score_cutoff=70)
+                match = process.extractOne(search_type, all_types.keys(), score_cutoff=70)
 
                 if match:
-                    matched_category = match[0]
-                    category_uid = all_categories[matched_category]
-                    print(matched_category, category_uid)
+                    matched_type = match[0]
+                    type_uid = all_types[matched_type]
+                    print(matched_type, type_uid)
                 else:
-                    response['message'] = 'Category not found'
+                    response['message'] = 'type not found'
                     response['code'] = 200
                     return response, 200
 
-                # category_query_response = db.select('every_circle.category', where={'category_name': search_category})
-                # if not category_query_response['result']:
-                #     response['message'] = 'Category not found'
+                # type_query_response = db.select('every_circle.type', where={'type_name': search_type})
+                # if not type_query_response['result']:
+                #     response['message'] = 'type not found'
                 #     response['code'] = 200
                 #     return response, 200
-                # category_uid = category_query_response['result'][0]['category_uid']
+                # type_uid = type_query_response['result'][0]['type_uid']
 
                 rating_query = f'''
                                     WITH UserConnections AS (
@@ -308,7 +308,7 @@ class Search(Resource):
                                         ORDER BY degree, connection_path
                                     ),
                                     RatingMatches AS (
-                                        -- Match ratings based on UserConnections and business category
+                                        -- Match ratings based on UserConnections and business type
                                         SELECT
                                             r.*,
                                             u.degree,
@@ -321,7 +321,7 @@ class Search(Resource):
                                                 SELECT business_uid
                                                 FROM every_circle.business_type
                                                 LEFT JOIN every_circle.business ON business_uid = bt_business_id
-                                                WHERE bt_category_id = '{category_uid}'
+                                                WHERE bt_type_id = '{type_uid}'
                                             )
                                     )
                                     -- Final selection from RatingMatches to get the required output
@@ -389,7 +389,7 @@ class Search(Resource):
                 #                         ORDER BY degree, connection_path
                 #                     ),
                 #                     RatingMatches AS (
-                #                         -- Match ratings based on UserConnections and business category
+                #                         -- Match ratings based on UserConnections and business type
                 #                         SELECT
                 #                             r.*,
                 #                             u.degree,
@@ -401,7 +401,7 @@ class Search(Resource):
                 #                             r.rating_business_id IN (
                 #                                 SELECT business_uid
                 #                                 FROM every_circle.business
-                #                                 WHERE business_category_id = '{category_uid}'
+                #                                 WHERE business_type_id = '{type_uid}'
                 #                             )
                 #                     )
                 #                     -- Final selection from RatingMatches to get the required output
