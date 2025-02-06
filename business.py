@@ -25,9 +25,10 @@ class Business(Resource):
                     key['business_user_id'] = uid
 
                 else:
-                    response['message'] = 'Invalid UID'
-                    response['code'] = 400
-                    return response, 400
+                    key['business_google_id'] = uid
+                    # response['message'] = 'Invalid UID'
+                    # response['code'] = 400
+                    # return response, 400
             
                 response = db.select('every_circle.business', where=key)
 
