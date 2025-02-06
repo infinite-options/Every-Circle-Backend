@@ -6,7 +6,7 @@ import ast
 
 from data_ec import connect, uploadImage, s3, processImage
 
-
+# add google social id in GET api
 class Business(Resource):
     def get(self, uid):
         print("In Business GET")
@@ -19,7 +19,7 @@ class Business(Resource):
                     key['business_uid'] = uid
                 
                 elif uid[:3] == "210":
-                    key['business_category_id'] = uid
+                    key['business_type_id'] = uid
                 
                 elif uid[:3] == "100":
                     key['business_user_id'] = uid
@@ -48,29 +48,29 @@ class Business(Resource):
         print("In Business POST")
         response = {}
 
-        def check_category(sub_category, business_uid):
-            print("In Check Category")
+        def check_type(sub_type, business_uid):
+            print("In Check Type")
             with connect() as db:
-                category_query = db.select('every_circle.category', where={'sub_category': sub_category})
-                if not category_query['result']:
-                    category_stored_procedure_response = db.call(procedure='new_category_uid')
-                    category_uid = category_stored_procedure_response['result'][0]['new_id']
+                type_query = db.select('every_circle.types', where={'sub_type': sub_type})
+                if not type_query['result']:
+                    type_stored_procedure_response = db.call(procedure='new_type_uid')
+                    type_uid = type_stored_procedure_response['result'][0]['new_id']
 
-                    category_payload = {}
-                    category_payload['category_uid'] = category_uid
-                    category_payload['sub_category'] = sub_category
-                    category_insert_query = db.insert('every_circle.category', category_payload)
+                    type_payload = {}
+                    type_payload['type_uid'] = type_uid
+                    type_payload['sub_type'] = sub_type
+                    type_insert_query = db.insert('every_circle.types', type_payload)
                 
                 else:
-                    category_uid = category_query['result'][0]['category_uid']
+                    type_uid = type_query['result'][0]['type_uid']
                 
-                print(category_uid)
+                print(type_uid)
                 business_type_stored_procedure_response = db.call(procedure='new_bt_uid')
                 bt_uid = business_type_stored_procedure_response['result'][0]['new_id']
                 business_type_payload = {}
                 business_type_payload['bt_uid'] = bt_uid
                 business_type_payload['bt_business_id'] = business_uid
-                business_type_payload['bt_category_id'] = category_uid
+                business_type_payload['bt_type_id'] = type_uid
                 business_type_insert_query = db.insert('every_circle.business_type', business_type_payload)
 
         try:
@@ -116,7 +116,7 @@ class Business(Resource):
                         business_types = ast.literal_eval(business_types)
                         print(business_types)
                         for business_type in business_types:
-                            check_category(business_type, new_business_uid)
+                            check_type(business_type, new_business_uid)
 
                     payload['business_uid'] = new_business_uid
                     payload['business_user_id'] = user_uid

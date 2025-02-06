@@ -46,29 +46,29 @@ class Ratings(Resource):
         print("In Rating POST")
         response = {}
 
-        def check_category(sub_category, business_uid):
-            print("In Check Category")
+        def check_type(sub_type, business_uid):
+            print("In Check type")
             with connect() as db:
-                category_query = db.select('every_circle.category', where={'sub_category': sub_category})
-                if not category_query['result']:
-                    category_stored_procedure_response = db.call(procedure='new_category_uid')
-                    category_uid = category_stored_procedure_response['result'][0]['new_id']
+                type_query = db.select('every_circle.types', where={'sub_type': sub_type})
+                if not type_query['result']:
+                    type_stored_procedure_response = db.call(procedure='new_type_uid')
+                    type_uid = type_stored_procedure_response['result'][0]['new_id']
 
-                    category_payload = {}
-                    category_payload['category_uid'] = category_uid
-                    category_payload['sub_category'] = sub_category
-                    category_insert_query = db.insert('every_circle.category', category_payload)
+                    type_payload = {}
+                    type_payload['type_uid'] = type_uid
+                    type_payload['sub_type'] = sub_type
+                    type_insert_query = db.insert('every_circle.types', type_payload)
                 
                 else:
-                    category_uid = category_query['result'][0]['category_uid']
+                    type_uid = type_query['result'][0]['type_uid']
                 
-                print(category_uid)
+                print(type_uid)
                 business_type_stored_procedure_response = db.call(procedure='new_bt_uid')
                 bt_uid = business_type_stored_procedure_response['result'][0]['new_id']
                 business_type_payload = {}
                 business_type_payload['bt_uid'] = bt_uid
                 business_type_payload['bt_business_id'] = business_uid
-                business_type_payload['bt_category_id'] = category_uid
+                business_type_payload['bt_type_id'] = type_uid
                 business_type_insert_query = db.insert('every_circle.business_type', business_type_payload)
 
         def check_business(payload, business_google_id=None, business_name=None):
@@ -89,7 +89,7 @@ class Ratings(Resource):
                     business_types = ast.literal_eval(business_types)
                     print(business_types)
                     for business_type in business_types:
-                        check_category(business_type, business_uid)
+                        check_type(business_type, business_uid)
 
                 business_payload = {}
                 business_payload['business_uid'] = business_uid         
