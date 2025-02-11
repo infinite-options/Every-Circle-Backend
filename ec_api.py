@@ -18,7 +18,7 @@ from connections import Connections
 from user_profile import Profile
 from business import Business
 from ratings import Ratings
-from search import Search
+from search import Search, Search_v2
 from lists import Lists
 from charges import Charges
 from business_budget import Business_Budget
@@ -451,6 +451,7 @@ api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Search, "/search/<string:profile_id>")
+api.add_resource(Search_v2, "/api/v2/search/<string:profile_id>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
 api.add_resource(Charges, "/charges")
