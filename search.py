@@ -928,10 +928,6 @@ class Search_v2(Resource):
             return response, 500
 
 
-# sk-68a51ca6c7114c10ac35b98056bf7cf9
-# open-ai: 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
-
-# io open-ai: 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
 '''
 -- b.business_name,
 -- b.business_phone_number,
