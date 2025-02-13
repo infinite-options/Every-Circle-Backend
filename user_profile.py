@@ -23,6 +23,8 @@ class Profile(Resource):
                     user_data = user_response['result'][0]
                     if user_data['user_role'] == "user":
                         response = db.select('every_circle.profile', where={'profile_user_id': uid})
+                        rating_response = db.select('every_circle.ratings', where={'rating_profile_id': uid})
+                        response['ratings result'] = rating_response['result']
                     else:
                         response = db.select('every_circle.business', where={'business_user_id': uid})
                     
