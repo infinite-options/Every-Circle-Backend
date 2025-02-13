@@ -24,6 +24,7 @@ from charges import Charges
 from business_budget import Business_Budget
 from feed import Feed
 from category_list import CategoryList
+from chatbot import ChatbotAPI
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -458,6 +459,7 @@ api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 api.add_resource(Feed, "/feed/<string:profile_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
+api.add_resource(ChatbotAPI, "/api/v1/chatbot")
 
 
 
