@@ -90,8 +90,8 @@ class CategoryNavigator:
 class ChatbotAPI(Resource):
     def __init__(self):
         self.conversation_manager = ConversationManager()
-        self.open_ai_api_key = os.getenv("OPEN_AI_API_KEY")
-        self.open_ai_client = OpenAI(api_key=self.open_ai_api_key)
+        self.open_ai_key = os.getenv("OPEN_AI_API_KEY")
+        self.open_ai_client = OpenAI(api_key=self.open_ai_key)
         
         with connect() as db:
             self.category_navigator = CategoryNavigator(db, self.open_ai_client)
