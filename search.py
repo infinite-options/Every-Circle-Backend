@@ -368,10 +368,340 @@ class Search(Resource):
             return response, 500
 
 
+# class Search_v2(Resource):
+#     def get(self, profile_id):
+#         print("In Search GET")
+#         search_category = request.args.get('category', "").strip()
+        
+#         if search_category is None:
+#             abort(400, description="category is required")
+        
+#         response = {}
+        
+#         try:
+#             with connect() as db:
+#                 all_category_query = db.select('every_circle.category')
+#                 all_categories = {category['category_name']: category['category_uid'] for category in all_category_query['result']}
+
+#                 match = process.extractOne(search_category, all_categories.keys(), score_cutoff=70)
+
+#                 if match:
+#                     matched_category = match[0]
+#                     category_uid = all_categories[matched_category]
+#                     print(matched_category, category_uid)
+#                 else:
+#                     response['message'] = 'category not found'
+#                     response['code'] = 200
+#                     return response, 200
+
+
+#                 rating_query = f'''
+#                                     WITH UserConnections AS (
+#                                         WITH RECURSIVE Referrals AS (
+#                                             -- Base case: Start from the given user_id
+#                                             SELECT 
+#                                                 profile_uid AS user_id,
+#                                                 profile_referred_by_user_id,
+#                                                 0 AS degree, 
+#                                                 CAST(profile_uid AS CHAR(300)) AS connection_path
+#                                             FROM profile
+#                                             WHERE profile_uid = '{profile_id}'
+
+#                                             UNION ALL
+
+#                                             -- Forward expansion: Find users referred by the current user
+#                                             SELECT 
+#                                                 p.profile_uid AS user_id,
+#                                                 p.profile_referred_by_user_id,
+#                                                 r.degree + 1 AS degree,
+#                                                 CONCAT(r.connection_path, ' -> ', p.profile_uid) AS connection_path
+#                                             FROM profile p
+#                                             INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
+#                                             WHERE r.degree < 3 
+#                                             AND NOT POSITION(p.profile_uid IN r.connection_path) > 0  -- Prevent revisiting users
+
+#                                             UNION ALL
+
+#                                             -- Backward expansion: Find the user who referred the current user
+#                                             SELECT 
+#                                                 p.profile_referred_by_user_id AS user_id,
+#                                                 p.profile_uid AS profile_referred_by_user_id,
+#                                                 r.degree + 1 AS degree,
+#                                                 CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path -- Append correctly
+#                                             FROM profile p
+#                                             INNER JOIN Referrals r ON p.profile_uid = r.user_id
+#                                             WHERE r.degree < 3
+#                                             AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0  -- Prevent revisiting users
+#                                         )
+#                                         -- Final selection of all users within 3 degrees of connection
+#                                         SELECT DISTINCT
+#                                             user_id,
+#                                             degree,
+#                                             connection_path
+#                                         FROM Referrals
+#                                         ORDER BY degree, connection_path
+#                                     ),
+#                                     RatingMatches AS (
+#                                         -- Match ratings based on UserConnections and business type
+#                                         SELECT
+#                                             r.*,
+#                                             u.degree,
+#                                             u.connection_path
+#                                         FROM
+#                                             ratings r
+#                                         INNER JOIN UserConnections u ON r.rating_profile_id = u.user_id
+#                                         WHERE
+#                                             r.rating_business_id IN (
+#                                                 SELECT bc_business_id
+#                                                 FROM every_circle.business_category
+#                                                 WHERE bc_category_id = '{category_uid}'
+#                                             )
+#                                     )
+#                                     -- Final selection from RatingMatches to get the required output
+#                                     -- SELECT * 
+#                                     -- FROM RatingMatches;
+#                                     SELECT 
+#                                         rm.*, 
+#                                         b.*
+#                                     FROM RatingMatches rm
+#                                     LEFT JOIN every_circle.business b ON rm.rating_business_id = b.business_uid;
+#                             '''
+
+#                 rating_query_response = db.execute(rating_query)
+
+#                 business_uid_list = tuple(set([business['rating_business_id'] for business in rating_query_response['result']]))
+
+#                 for business_uid in business_uid_list:
+
+#                     charges_stored_procedure_response = db.call(procedure='new_charge_uid')
+#                     new_charge_uid = charges_stored_procedure_response['result'][0]['new_id']
+
+#                     charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+#                     charges_query = f'''
+#                                             INSERT INTO `every_circle`.`charges` (`charge_uid`, `charge_business_id`, `charge_caused_by_user_id`, `charge_reason`, `charge_amount`, `charge_timestamp`) 
+#                                             VALUES ('{new_charge_uid}', '{business_uid}', '{profile_id}', 'impression', '1.00', '{charge_timestamp}');
+#                                     '''
+
+#                     charges_query_response = db.execute(charges_query, cmd='post')
+
+#                 return rating_query_response, 200
+
+#         except:
+#             response['message'] = 'Internal Server Error'
+#             response['code'] = 500
+#             return response, 500
+        
+# this is working
+# class Search_v2(Resource):
+#     def get(self, profile_id):
+#         print("In Search GET")
+#         search_category = request.args.get('category', "").strip()
+        
+#         if search_category is None:
+#             abort(400, description="category is required")
+        
+#         response = {}
+        
+#         try:
+#             with connect() as db:
+#                 print(f"Searching for category: {search_category}")
+                
+#                 # Step 1: Find matching category using fuzzy logic
+#                 categories_query = "SELECT category_uid, category_name, category_parent_id FROM category"
+#                 categories_result = db.execute(categories_query)
+                
+#                 if 'result' not in categories_result:
+#                     response['message'] = 'No categories found'
+#                     response['code'] = 200
+#                     return response, 200
+                
+#                 categories = {cat['category_name']: cat for cat in categories_result['result']}
+#                 match = process.extractOne(search_category, categories.keys(), score_cutoff=70)
+                
+#                 if not match:
+#                     response['message'] = 'No matching category found'
+#                     response['code'] = 200
+#                     return response, 200
+                
+#                 matched_category = categories[match[0]]
+#                 matched_uid = matched_category['category_uid']
+#                 parent_id = matched_category['category_parent_id']
+#                 print(f"Matched category: {match[0]} (ID: {matched_uid})")
+
+#                 def get_businesses_for_category(category_id):
+#                     """Helper function to get businesses for a specific category with ratings and connections"""
+#                     rating_query = f"""
+#                         WITH UserConnections AS (
+#                             WITH RECURSIVE Referrals AS (
+#                                 -- Base case: Start from the given user_id
+#                                 SELECT 
+#                                     profile_uid AS user_id,
+#                                     profile_referred_by_user_id,
+#                                     0 AS degree, 
+#                                     CAST(profile_uid AS CHAR(300)) AS connection_path
+#                                 FROM profile
+#                                 WHERE profile_uid = '{profile_id}'
+
+#                                 UNION ALL
+
+#                                 -- Forward expansion: Find users referred by the current user
+#                                 SELECT 
+#                                     p.profile_uid AS user_id,
+#                                     p.profile_referred_by_user_id,
+#                                     r.degree + 1 AS degree,
+#                                     CONCAT(r.connection_path, ' -> ', p.profile_uid) AS connection_path
+#                                 FROM profile p
+#                                 INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
+#                                 WHERE r.degree < 3 
+#                                 AND NOT POSITION(p.profile_uid IN r.connection_path) > 0
+
+#                                 UNION ALL
+
+#                                 -- Backward expansion: Find the user who referred the current user
+#                                 SELECT 
+#                                     p.profile_referred_by_user_id AS user_id,
+#                                     p.profile_uid AS profile_referred_by_user_id,
+#                                     r.degree + 1 AS degree,
+#                                     CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path
+#                                 FROM profile p
+#                                 INNER JOIN Referrals r ON p.profile_uid = r.user_id
+#                                 WHERE r.degree < 3
+#                                 AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0
+#                             )
+#                             -- Final selection of all users within 3 degrees of connection
+#                             SELECT DISTINCT
+#                                 user_id,
+#                                 degree,
+#                                 connection_path
+#                             FROM Referrals
+#                             ORDER BY degree, connection_path
+#                         )
+#                         SELECT DISTINCT
+#                             r.*,
+#                             b.*,
+#                             uc.degree AS connection_degree,
+#                             uc.connection_path
+#                         FROM ratings r
+#                         INNER JOIN business b ON r.rating_business_id = b.business_uid
+#                         INNER JOIN business_category bc ON b.business_uid = bc.bc_business_id
+#                         INNER JOIN UserConnections uc ON r.rating_profile_id = uc.user_id
+#                         WHERE bc.bc_category_id = '{category_id}'
+#                         ORDER BY uc.degree, r.rating_star DESC;
+#                     """
+#                     return db.execute(rating_query)
+
+#                 # Step 2: Try to find businesses for the matched category
+#                 print("Searching businesses for matched category")
+#                 direct_results = get_businesses_for_category(matched_uid)
+                
+#                 if 'result' in direct_results and direct_results['result']:
+#                     print(f"Found {len(direct_results['result'])} direct matches")
+#                     direct_results['search_level'] = 'direct'
+#                     direct_results['message'] = f"Found businesses matching '{match[0]}'"
+                    
+#                     # Process charges for direct matches
+#                     business_uid_list = list(set([rating['rating_business_id'] for rating in direct_results['result']]))
+#                     for business_uid in business_uid_list:
+#                         new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+#                         charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+#                         charges_query = f"""
+#                             INSERT INTO charges (
+#                                 charge_uid, charge_business_id, charge_caused_by_user_id,
+#                                 charge_reason, charge_amount, charge_timestamp
+#                             ) VALUES (
+#                                 '{new_charge_uid}', '{business_uid}', '{profile_id}',
+#                                 'impression', '1.00', '{charge_timestamp}'
+#                             )
+#                         """
+#                         db.execute(charges_query, cmd='post')
+                    
+#                     return direct_results, 200
+                
+#                 # Step 3: If no direct matches, look for sibling categories
+#                 print("Looking for sibling categories")
+#                 if parent_id:
+#                     sibling_query = f"""
+#                         SELECT category_uid, category_name 
+#                         FROM category 
+#                         WHERE category_parent_id = '{parent_id}'
+#                         AND category_uid != '{matched_uid}'
+#                     """
+#                     siblings = db.execute(sibling_query)
+                    
+#                     if 'result' in siblings and siblings['result']:
+#                         print("Checking businesses in sibling categories")
+#                         for sibling in siblings['result']:
+#                             sibling_results = get_businesses_for_category(sibling['category_uid'])
+#                             if 'result' in sibling_results and sibling_results['result']:
+#                                 print(f"Found {len(sibling_results['result'])} matches in sibling category")
+#                                 sibling_results['search_level'] = 'sibling'
+#                                 sibling_results['message'] = f"Found businesses in related category '{sibling['category_name']}'"
+                                
+#                                 # Process charges for sibling matches
+#                                 business_uid_list = list(set([rating['rating_business_id'] for rating in sibling_results['result']]))
+#                                 for business_uid in business_uid_list:
+#                                     new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+#                                     charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+#                                     charges_query = f"""
+#                                         INSERT INTO charges (
+#                                             charge_uid, charge_business_id, charge_caused_by_user_id,
+#                                             charge_reason, charge_amount, charge_timestamp
+#                                         ) VALUES (
+#                                             '{new_charge_uid}', '{business_uid}', '{profile_id}',
+#                                             'impression', '1.00', '{charge_timestamp}'
+#                                         )
+#                                     """
+#                                     db.execute(charges_query, cmd='post')
+                                
+#                                 return sibling_results, 200
+                
+#                 # Step 4: If no sibling matches, try parent category
+#                 print("Looking for parent category businesses")
+#                 if parent_id:
+#                     parent_results = get_businesses_for_category(parent_id)
+#                     if 'result' in parent_results and parent_results['result']:
+#                         print(f"Found {len(parent_results['result'])} matches in parent category")
+#                         parent_results['search_level'] = 'parent'
+#                         parent_results['message'] = f"Found businesses in broader category"
+                        
+#                         # Process charges for parent matches
+#                         business_uid_list = list(set([rating['rating_business_id'] for rating in parent_results['result']]))
+#                         for business_uid in business_uid_list:
+#                             new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+#                             charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+#                             charges_query = f"""
+#                                 INSERT INTO charges (
+#                                     charge_uid, charge_business_id, charge_caused_by_user_id,
+#                                     charge_reason, charge_amount, charge_timestamp
+#                                 ) VALUES (
+#                                     '{new_charge_uid}', '{business_uid}', '{profile_id}',
+#                                     'impression', '1.00', '{charge_timestamp}'
+#                                 )
+#                             """
+#                             db.execute(charges_query, cmd='post')
+                        
+#                         return parent_results, 200
+                
+#                 # No results found at any level
+#                 response['message'] = 'No businesses found in this or related categories'
+#                 response['code'] = 200
+#                 return response, 200
+
+#         except Exception as e:
+#             print(f"Error in search: {str(e)}")
+#             print(f"Error details: {type(e).__name__}")
+#             import traceback
+#             print(traceback.format_exc())
+#             response['message'] = 'Internal Server Error'
+#             response['code'] = 500
+#             return response, 500
+
+
 class Search_v2(Resource):
     def get(self, profile_id):
         print("In Search GET")
-        search_category = request.args.get('category', "").strip()
+        search_category = request.args.get('category', "").strip().lower()
         
         if search_category is None:
             abort(400, description="category is required")
@@ -380,119 +710,228 @@ class Search_v2(Resource):
         
         try:
             with connect() as db:
-                all_category_query = db.select('every_circle.category')
-                all_categories = {category['category_name']: category['category_uid'] for category in all_category_query['result']}
-
-                match = process.extractOne(search_category, all_categories.keys(), score_cutoff=70)
-
-                if match:
-                    matched_category = match[0]
-                    category_uid = all_categories[matched_category]
-                    print(matched_category, category_uid)
+                print(f"Searching for category: {search_category}")
+                
+                # Split search terms and remove common words
+                search_words = set(search_category.split())
+                
+                # First try exact match
+                exact_match_query = f"""
+                    SELECT category_uid, category_name, category_parent_id 
+                    FROM category 
+                    WHERE LOWER(category_name) = '{search_category}'
+                """
+                exact_match = db.execute(exact_match_query)
+                
+                if 'result' in exact_match and exact_match['result']:
+                    matched_category = exact_match['result'][0]
+                    print(f"Found exact match: {matched_category['category_name']}")
                 else:
-                    response['message'] = 'category not found'
-                    response['code'] = 200
-                    return response, 200
+                    # If no exact match, search for partial matches
+                    search_conditions = " OR ".join([f"LOWER(category_name) LIKE '%{word}%'" for word in search_words])
+                    partial_match_query = f"""
+                        SELECT 
+                            category_uid, 
+                            category_name, 
+                            category_parent_id,
+                            (
+                                {" + ".join([f"(CASE WHEN LOWER(category_name) LIKE '%{word}%' THEN 1 ELSE 0 END)" for word in search_words])}
+                            ) as match_count
+                        FROM category 
+                        WHERE {search_conditions}
+                        ORDER BY match_count DESC, LENGTH(category_name)
+                        LIMIT 1
+                    """
+                    partial_matches = db.execute(partial_match_query)
+                    
+                    if 'result' not in partial_matches or not partial_matches['result']:
+                        response['message'] = 'No matching category found'
+                        response['code'] = 200
+                        return response, 200
+                        
+                    matched_category = partial_matches['result'][0]
+                    print(f"Found partial match: {matched_category['category_name']}")
+                
+                matched_uid = matched_category['category_uid']
+                parent_id = matched_category['category_parent_id']
 
+                # Rest of your existing code for getting businesses and user connections...
+                def get_businesses_for_category(category_id):
+                    """Helper function to get businesses for a specific category with ratings and connections"""
+                    rating_query = f"""
+                        WITH UserConnections AS (
+                            WITH RECURSIVE Referrals AS (
+                                -- Base case: Start from the given user_id
+                                SELECT 
+                                    profile_uid AS user_id,
+                                    profile_referred_by_user_id,
+                                    0 AS degree, 
+                                    CAST(profile_uid AS CHAR(300)) AS connection_path
+                                FROM profile
+                                WHERE profile_uid = '{profile_id}'
 
-                rating_query = f'''
-                                    WITH UserConnections AS (
-                                        WITH RECURSIVE Referrals AS (
-                                            -- Base case: Start from the given user_id
-                                            SELECT 
-                                                profile_uid AS user_id,
-                                                profile_referred_by_user_id,
-                                                0 AS degree, 
-                                                CAST(profile_uid AS CHAR(300)) AS connection_path
-                                            FROM profile
-                                            WHERE profile_uid = '{profile_id}'
+                                UNION ALL
 
-                                            UNION ALL
+                                -- Forward expansion: Find users referred by the current user
+                                SELECT 
+                                    p.profile_uid AS user_id,
+                                    p.profile_referred_by_user_id,
+                                    r.degree + 1 AS degree,
+                                    CONCAT(r.connection_path, ' -> ', p.profile_uid) AS connection_path
+                                FROM profile p
+                                INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
+                                WHERE r.degree < 3 
+                                AND NOT POSITION(p.profile_uid IN r.connection_path) > 0
 
-                                            -- Forward expansion: Find users referred by the current user
-                                            SELECT 
-                                                p.profile_uid AS user_id,
-                                                p.profile_referred_by_user_id,
-                                                r.degree + 1 AS degree,
-                                                CONCAT(r.connection_path, ' -> ', p.profile_uid) AS connection_path
-                                            FROM profile p
-                                            INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
-                                            WHERE r.degree < 3 
-                                            AND NOT POSITION(p.profile_uid IN r.connection_path) > 0  -- Prevent revisiting users
+                                UNION ALL
 
-                                            UNION ALL
+                                -- Backward expansion: Find the user who referred the current user
+                                SELECT 
+                                    p.profile_referred_by_user_id AS user_id,
+                                    p.profile_uid AS profile_referred_by_user_id,
+                                    r.degree + 1 AS degree,
+                                    CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path
+                                FROM profile p
+                                INNER JOIN Referrals r ON p.profile_uid = r.user_id
+                                WHERE r.degree < 3
+                                AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0
+                            )
+                            SELECT DISTINCT
+                                user_id,
+                                degree,
+                                connection_path
+                            FROM Referrals
+                            ORDER BY degree, connection_path
+                        )
+                        SELECT DISTINCT
+                            r.*,
+                            b.*,
+                            uc.degree AS connection_degree,
+                            uc.connection_path
+                        FROM ratings r
+                        INNER JOIN business b ON r.rating_business_id = b.business_uid
+                        INNER JOIN business_category bc ON b.business_uid = bc.bc_business_id
+                        INNER JOIN UserConnections uc ON r.rating_profile_id = uc.user_id
+                        WHERE bc.bc_category_id = '{category_id}'
+                        ORDER BY uc.degree, r.rating_star DESC
+                    """
+                    return db.execute(rating_query)
 
-                                            -- Backward expansion: Find the user who referred the current user
-                                            SELECT 
-                                                p.profile_referred_by_user_id AS user_id,
-                                                p.profile_uid AS profile_referred_by_user_id,
-                                                r.degree + 1 AS degree,
-                                                CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path -- Append correctly
-                                            FROM profile p
-                                            INNER JOIN Referrals r ON p.profile_uid = r.user_id
-                                            WHERE r.degree < 3
-                                            AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0  -- Prevent revisiting users
+                # Continue with the rest of your existing code for searching businesses, siblings, etc...
+                # [Previous implementation for direct search, sibling search, and parent search remains the same]
+                
+                # The rest of your code remains the same...
+                # Step 2: Try to find businesses for the matched category
+                print("Searching businesses for matched category")
+                direct_results = get_businesses_for_category(matched_uid)
+                
+                if 'result' in direct_results and direct_results['result']:
+                    print(f"Found {len(direct_results['result'])} direct matches")
+                    direct_results['search_level'] = 'direct'
+                    # direct_results['message'] = f"Found businesses matching '{match[0]}'"
+                    
+                    # Process charges for direct matches
+                    business_uid_list = list(set([rating['rating_business_id'] for rating in direct_results['result']]))
+                    for business_uid in business_uid_list:
+                        new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+                        charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        charges_query = f"""
+                            INSERT INTO charges (
+                                charge_uid, charge_business_id, charge_caused_by_user_id,
+                                charge_reason, charge_amount, charge_timestamp
+                            ) VALUES (
+                                '{new_charge_uid}', '{business_uid}', '{profile_id}',
+                                'impression', '1.00', '{charge_timestamp}'
+                            )
+                        """
+                        db.execute(charges_query, cmd='post')
+                    
+                    return direct_results, 200
+                
+                # Step 3: If no direct matches, look for sibling categories
+                print("Looking for sibling categories")
+                if parent_id:
+                    sibling_query = f"""
+                        SELECT category_uid, category_name 
+                        FROM category 
+                        WHERE category_parent_id = '{parent_id}'
+                        AND category_uid != '{matched_uid}'
+                    """
+                    siblings = db.execute(sibling_query)
+                    
+                    if 'result' in siblings and siblings['result']:
+                        print("Checking businesses in sibling categories")
+                        for sibling in siblings['result']:
+                            sibling_results = get_businesses_for_category(sibling['category_uid'])
+                            if 'result' in sibling_results and sibling_results['result']:
+                                print(f"Found {len(sibling_results['result'])} matches in sibling category")
+                                sibling_results['search_level'] = 'sibling'
+                                sibling_results['message'] = f"Found businesses in related category '{sibling['category_name']}'"
+                                
+                                # Process charges for sibling matches
+                                business_uid_list = list(set([rating['rating_business_id'] for rating in sibling_results['result']]))
+                                for business_uid in business_uid_list:
+                                    new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+                                    charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    charges_query = f"""
+                                        INSERT INTO charges (
+                                            charge_uid, charge_business_id, charge_caused_by_user_id,
+                                            charge_reason, charge_amount, charge_timestamp
+                                        ) VALUES (
+                                            '{new_charge_uid}', '{business_uid}', '{profile_id}',
+                                            'impression', '1.00', '{charge_timestamp}'
                                         )
-                                        -- Final selection of all users within 3 degrees of connection
-                                        SELECT DISTINCT
-                                            user_id,
-                                            degree,
-                                            connection_path
-                                        FROM Referrals
-                                        ORDER BY degree, connection_path
-                                    ),
-                                    RatingMatches AS (
-                                        -- Match ratings based on UserConnections and business type
-                                        SELECT
-                                            r.*,
-                                            u.degree,
-                                            u.connection_path
-                                        FROM
-                                            ratings r
-                                        INNER JOIN UserConnections u ON r.rating_profile_id = u.user_id
-                                        WHERE
-                                            r.rating_business_id IN (
-                                                SELECT bc_business_id
-                                                FROM every_circle.business_category
-                                                WHERE bc_category_id = '{category_uid}'
-                                            )
-                                    )
-                                    -- Final selection from RatingMatches to get the required output
-                                    -- SELECT * 
-                                    -- FROM RatingMatches;
-                                    SELECT 
-                                        rm.*, 
-                                        b.*
-                                    FROM RatingMatches rm
-                                    LEFT JOIN every_circle.business b ON rm.rating_business_id = b.business_uid;
-                            '''
-
-                rating_query_response = db.execute(rating_query)
-
-                business_uid_list = tuple(set([business['rating_business_id'] for business in rating_query_response['result']]))
-
-                for business_uid in business_uid_list:
-
-                    charges_stored_procedure_response = db.call(procedure='new_charge_uid')
-                    new_charge_uid = charges_stored_procedure_response['result'][0]['new_id']
-
-                    charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                    charges_query = f'''
-                                            INSERT INTO `every_circle`.`charges` (`charge_uid`, `charge_business_id`, `charge_caused_by_user_id`, `charge_reason`, `charge_amount`, `charge_timestamp`) 
-                                            VALUES ('{new_charge_uid}', '{business_uid}', '{profile_id}', 'impression', '1.00', '{charge_timestamp}');
-                                    '''
-
-                    charges_query_response = db.execute(charges_query, cmd='post')
-
-                return rating_query_response, 200
-
-        except:
+                                    """
+                                    db.execute(charges_query, cmd='post')
+                                
+                                return sibling_results, 200
+                
+                # Step 4: If no sibling matches, try parent category
+                print("Looking for parent category businesses")
+                if parent_id:
+                    parent_results = get_businesses_for_category(parent_id)
+                    if 'result' in parent_results and parent_results['result']:
+                        print(f"Found {len(parent_results['result'])} matches in parent category")
+                        parent_results['search_level'] = 'parent'
+                        parent_results['message'] = f"Found businesses in broader category"
+                        
+                        # Process charges for parent matches
+                        business_uid_list = list(set([rating['rating_business_id'] for rating in parent_results['result']]))
+                        for business_uid in business_uid_list:
+                            new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+                            charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            charges_query = f"""
+                                INSERT INTO charges (
+                                    charge_uid, charge_business_id, charge_caused_by_user_id,
+                                    charge_reason, charge_amount, charge_timestamp
+                                ) VALUES (
+                                    '{new_charge_uid}', '{business_uid}', '{profile_id}',
+                                    'impression', '1.00', '{charge_timestamp}'
+                                )
+                            """
+                            db.execute(charges_query, cmd='post')
+                        
+                        return parent_results, 200
+                
+                # No results found at any level
+                response['message'] = 'No businesses found in this or related categories'
+                response['code'] = 200
+                return response, 200
+        
+        except Exception as e:
+            print(f"Error in search: {str(e)}")
+            print(f"Error details: {type(e).__name__}")
+            import traceback
+            print(traceback.format_exc())
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
-        
 
+
+# sk-68a51ca6c7114c10ac35b98056bf7cf9
+# open-ai: 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
+
+# io open-ai: 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
 '''
 -- b.business_name,
 -- b.business_phone_number,

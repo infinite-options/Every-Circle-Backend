@@ -36,6 +36,9 @@ class Profile(Resource):
                 elif uid[:3] == "110":
                     key['profile_uid'] = uid
                     response = db.select('every_circle.profile', where={'profile_uid': uid})
+                    rating_response = db.select('every_circle.ratings', where={'rating_profile_id': uid})
+
+                    response['ratings result'] = rating_response['result']
 
                     return response, 200
 
