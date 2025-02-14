@@ -306,10 +306,11 @@ class Business_v2(Resource):
                 check_query = f'''
                                 SELECT *
                                 FROM every_circle.business_category
-                                WHERE bc_business_id = {business_uid} AND bc_category_id = {category_uid}  
+                                WHERE bc_business_id = "{business_uid}" AND bc_category_id = "{category_uid}";
                               '''
                 check_query_response = db.execute(check_query)
-                if check_query_response['result']:
+                print('CHECK QUERY RESPOSNE', check_query_response)
+                if len(check_query_response['result']) > 0:
                     return
                 
                 business_category_stored_procedure_response = db.call(procedure='new_bc_uid')
