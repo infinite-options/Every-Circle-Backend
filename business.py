@@ -299,6 +299,28 @@ class Business_v2(Resource):
         print("In Business PUT")
         response = {}
 
+        def check_category(category_uid, business_uid):
+            print("In Check Category")
+            with connect() as db:
+
+                check_query = f'''
+                                SELECT *
+                                FROM every_circle.business_category
+                                WHERE bc_business_id = {business_uid} AND bc_category_id = {category_uid}  
+                              '''
+                check_query_response = db.execute(check_query)
+                if check_query_response['result']:
+                    return
+                
+                business_category_stored_procedure_response = db.call(procedure='new_bc_uid')
+                bc_uid = business_category_stored_procedure_response['result'][0]['new_id']
+                business_category_payload = {}
+                business_category_payload['bc_uid'] = bc_uid
+                business_category_payload['bc_business_id'] = business_uid
+                business_category_payload['bc_category_id'] = category_uid
+                business_category_insert_query = db.insert('every_circle.business_category', business_category_payload)
+                print(business_category_insert_query)
+
         try:
             payload = request.form.to_dict()
 
@@ -320,6 +342,15 @@ class Business_v2(Resource):
                     response['code'] = 404
                     return response, 404
                 
+                if 'business_categories_uid' in payload:
+                    print("in business categories uid")
+                    business_categories_uid = payload.pop('business_categories_uid')
+                    print('\n' + business_categories_uid)
+                    business_categories_uid = ast.literal_eval(business_categories_uid)
+                    print(business_categories_uid)
+                    for business_category_uid in business_categories_uid:
+                        check_category(business_category_uid, business_uid)
+
                 processImage(key, payload)
                 
                 response = db.update('every_circle.business', key, payload)
