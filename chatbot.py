@@ -10,20 +10,17 @@ import os
 class ConversationManager:
     def __init__(self):
         self.conversations = {}
-        self.lock = Lock()  # Thread-safe operations for dictionary access
+        self.lock = Lock() 
 
     def get_conversation(self, conversation_id: str) -> Optional[Dict]:
-        """Retrieve conversation context from memory"""
         with self.lock:
             return self.conversations.get(conversation_id)
 
     def save_conversation(self, conversation_id: str, context: Dict):
-        """Save conversation context to memory"""
         with self.lock:
             self.conversations[conversation_id] = context
 
     def update_conversation(self, conversation_id: str, new_context: Dict):
-        """Update existing conversation context"""
         with self.lock:
             current = self.conversations.get(conversation_id)
             if current:
@@ -36,7 +33,6 @@ class CategoryNavigator:
         self.deepseek_client = deepseek_client
 
     def get_categories(self, parent_id: Optional[str] = None) -> List[Dict]:
-        """Get categories for a given parent ID"""
         query = """
             SELECT category_uid, category_name, category_description
             FROM every_circle.category
@@ -48,7 +44,6 @@ class CategoryNavigator:
         return result.get('result', []) if result else []
 
     def build_prompt(self, user_input: str, conversation_context: Dict) -> str:
-        """Build context-aware prompt for Deepseek"""
         current_categories = self.get_categories(
             conversation_context.get('current_category_id')
         )
@@ -90,7 +85,7 @@ class CategoryNavigator:
 class ChatbotAPI(Resource):
     def __init__(self):
         self.conversation_manager = ConversationManager()
-        self.open_ai_key = os.getenv("OPEN_AI_API_KEY")
+        self.open_ai_key = os.getenv("OPEN_AI_KEY")
         self.open_ai_client = OpenAI(api_key=self.open_ai_key)
         
         with connect() as db:
@@ -194,4 +189,3 @@ class ChatbotAPI(Resource):
         except Exception as e:
             print(f"Error in search: {str(e)}")
             return {'message': 'Search error', 'code': 500}, 500
-

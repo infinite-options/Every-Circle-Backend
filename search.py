@@ -928,6 +928,321 @@ class Search_v2(Resource):
             return response, 500
 
 
+# class Search_v2(Resource):
+#     def get(self, profile_id):
+#         print("In Search GET")
+#         search_category = request.args.get('category', "").strip().lower()
+        
+#         if search_category is None:
+#             abort(400, description="category is required")
+        
+#         response = {}
+        
+#         try:
+#             with connect() as db:
+#                 print(f"Searching for category: {search_category}")
+
+#                 def is_parent_category(category_uid):
+#                     """Check if the category is a parent category based on UID pattern"""
+#                     parts = category_uid.split('-')
+#                     if len(parts) != 2:
+#                         return False
+#                     return parts[1].endswith('0000') or parts[1].endswith('00')
+
+#                 def get_category_level(category_uid):
+#                     """
+#                     Determine the level of the category based on its UID
+#                     Returns: 'main_parent' (220-010000), 'sub_parent' (220-010100), or 'leaf' (220-010101)
+#                     """
+#                     if not category_uid:
+#                         return None
+#                     parts = category_uid.split('-')
+#                     if len(parts) != 2:
+#                         return None
+                    
+#                     num_part = parts[1]
+#                     if num_part.endswith('0000'):
+#                         return 'main_parent'
+#                     elif num_part.endswith('00'):
+#                         return 'sub_parent'
+#                     return 'leaf'
+
+#                 def get_parent_uid(uid):
+#                     """Get parent UID based on the current UID level"""
+#                     if not uid:
+#                         return None
+                    
+#                     level = get_category_level(uid)
+#                     if level == 'leaf':  # e.g., 220-010101 -> 220-010100
+#                         return f"{uid[:7]}00"
+#                     elif level == 'sub_parent':  # e.g., 220-010100 -> 220-010000
+#                         return f"{uid[:4]}0000"
+#                     return None
+
+#                 def get_all_child_categories(parent_uid):
+#                     """Get all child categories for a parent UID"""
+#                     if not parent_uid:
+#                         return []
+                    
+#                     level = get_category_level(parent_uid)
+#                     pattern = None
+                    
+#                     if level == 'main_parent':  # e.g., 220-010000
+#                         pattern = f"{parent_uid[:4]}%"
+#                     elif level == 'sub_parent':  # e.g., 220-010100
+#                         pattern = f"{parent_uid[:7]}%"
+                    
+#                     if not pattern:
+#                         return []
+                        
+#                     child_query = f"""
+#                         SELECT category_uid, category_name 
+#                         FROM category 
+#                         WHERE category_uid LIKE '{pattern}'
+#                         AND category_uid != '{parent_uid}'
+#                         ORDER BY category_uid
+#                     """
+#                     result = db.execute(child_query)
+#                     return result.get('result', [])
+
+#                 def find_matching_categories(search_term):
+#                     """Find all categories that match the search term, including parents"""
+#                     # First try exact match
+#                     exact_match_query = f"""
+#                         SELECT category_uid, category_name, 
+#                                CASE 
+#                                    WHEN category_uid LIKE '%-0000' THEN 'main_parent'
+#                                    WHEN category_uid LIKE '%-00' THEN 'sub_parent'
+#                                    ELSE 'leaf'
+#                                END as category_type
+#                         FROM category 
+#                         WHERE LOWER(category_name) = '{search_term}'
+#                     """
+#                     exact_match = db.execute(exact_match_query)
+                    
+#                     if 'result' in exact_match and exact_match['result']:
+#                         return exact_match['result']
+                    
+#                     # If no exact match, search for partial matches
+#                     search_words = set(search_term.split())
+#                     search_conditions = " OR ".join([f"LOWER(category_name) LIKE '%{word}%'" for word in search_words])
+                    
+#                     partial_match_query = f"""
+#                         SELECT 
+#                             category_uid, 
+#                             category_name,
+#                             CASE 
+#                                 WHEN category_uid LIKE '%-0000' THEN 'main_parent'
+#                                 WHEN category_uid LIKE '%-00' THEN 'sub_parent'
+#                                 ELSE 'leaf'
+#                             END as category_type,
+#                             (
+#                                 {" + ".join([f"(CASE WHEN LOWER(category_name) LIKE '%{word}%' THEN 1 ELSE 0 END)" for word in search_words])}
+#                             ) as match_count
+#                         FROM category 
+#                         WHERE {search_conditions}
+#                         ORDER BY match_count DESC, 
+#                                 CASE 
+#                                     WHEN category_uid LIKE '%-0000' THEN 1
+#                                     WHEN category_uid LIKE '%-00' THEN 2
+#                                     ELSE 3
+#                                 END,
+#                                 LENGTH(category_name)
+#                     """
+#                     partial_matches = db.execute(partial_match_query)
+#                     return partial_matches.get('result', [])
+
+#                 def get_businesses_for_category(category_id, relationship='direct'):
+#                     """Get businesses for a category with ratings and connections"""
+#                     rating_query = f"""
+#                         WITH UserConnections AS (
+#                             WITH RECURSIVE Referrals AS (
+#                                 SELECT 
+#                                     profile_uid AS user_id,
+#                                     profile_referred_by_user_id,
+#                                     0 AS degree, 
+#                                     CAST(profile_uid AS CHAR(300)) AS connection_path
+#                                 FROM profile
+#                                 WHERE profile_uid = '{profile_id}'
+
+#                                 UNION ALL
+
+#                                 SELECT 
+#                                     p.profile_uid AS user_id,
+#                                     p.profile_referred_by_user_id,
+#                                     r.degree + 1 AS degree,
+#                                     CONCAT(r.connection_path, ' -> ', p.profile_uid) AS connection_path
+#                                 FROM profile p
+#                                 INNER JOIN Referrals r ON p.profile_referred_by_user_id = r.user_id
+#                                 WHERE r.degree < 3 
+#                                 AND NOT POSITION(p.profile_uid IN r.connection_path) > 0
+
+#                                 UNION ALL
+
+#                                 SELECT 
+#                                     p.profile_referred_by_user_id AS user_id,
+#                                     p.profile_uid AS profile_referred_by_user_id,
+#                                     r.degree + 1 AS degree,
+#                                     CONCAT(r.connection_path, ' -> ', p.profile_referred_by_user_id) AS connection_path
+#                                 FROM profile p
+#                                 INNER JOIN Referrals r ON p.profile_uid = r.user_id
+#                                 WHERE r.degree < 3
+#                                 AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0
+#                             )
+#                             SELECT DISTINCT
+#                                 user_id,
+#                                 degree,
+#                                 connection_path
+#                             FROM Referrals
+#                             ORDER BY degree, connection_path
+#                         )
+#                         SELECT DISTINCT
+#                             r.*,
+#                             b.*,
+#                             c.category_name,
+#                             c.category_uid,
+#                             uc.degree AS connection_degree,
+#                             uc.connection_path,
+#                             '{relationship}' as result_type
+#                         FROM ratings r
+#                         INNER JOIN business b ON r.rating_business_id = b.business_uid
+#                         INNER JOIN business_category bc ON b.business_uid = bc.bc_business_id
+#                         INNER JOIN category c ON bc.bc_category_id = c.category_uid
+#                         INNER JOIN UserConnections uc ON r.rating_profile_id = uc.user_id
+#                         WHERE bc.bc_category_id = '{category_id}'
+#                         ORDER BY uc.degree, r.rating_star DESC
+#                     """
+#                     return db.execute(rating_query)
+
+#                 def process_charges(business_results):
+#                     """Process charges for business impressions"""
+#                     if 'result' in business_results and business_results['result']:
+#                         business_uid_list = list(set([rating['rating_business_id'] for rating in business_results['result']]))
+#                         for business_uid in business_uid_list:
+#                             new_charge_uid = db.call(procedure='new_charge_uid')['result'][0]['new_id']
+#                             charge_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+#                             charges_query = f"""
+#                                 INSERT INTO charges (
+#                                     charge_uid, charge_business_id, charge_caused_by_user_id,
+#                                     charge_reason, charge_amount, charge_timestamp
+#                                 ) VALUES (
+#                                     '{new_charge_uid}', '{business_uid}', '{profile_id}',
+#                                     'impression', '1.00', '{charge_timestamp}'
+#                                 )
+#                             """
+#                             db.execute(charges_query, cmd='post')
+
+#                 # Find all matching categories
+#                 matching_categories = find_matching_categories(search_category)
+                
+#                 if not matching_categories:
+#                     response['message'] = 'No matching category found'
+#                     response['code'] = 200
+#                     return response, 200
+
+#                 # Initialize results structure
+#                 combined_results = {
+#                     'exact_matches': [],
+#                     'child_categories': [],
+#                     'sibling_categories': [],
+#                     'parent_categories': [],
+#                     'related_categories': []
+#                 }
+
+#                 processed_categories = set()  # Track processed categories to avoid duplicates
+
+#                 # Process each matching category
+#                 for category in matching_categories:
+#                     category_uid = category['category_uid']
+#                     if category_uid in processed_categories:
+#                         continue
+                        
+#                     category_level = get_category_level(category_uid)
+                    
+#                     # Get direct matches
+#                     direct_results = get_businesses_for_category(category_uid, 'direct')
+#                     if 'result' in direct_results and direct_results['result']:
+#                         combined_results['exact_matches'].extend(direct_results['result'])
+#                         process_charges(direct_results)
+#                         processed_categories.add(category_uid)
+
+#                     # If it's a parent category, get all child businesses
+#                     if is_parent_category(category_uid):
+#                         child_categories = get_all_child_categories(category_uid)
+#                         for child in child_categories:
+#                             if child['category_uid'] in processed_categories:
+#                                 continue
+#                             child_results = get_businesses_for_category(child['category_uid'], 'child')
+#                             if 'result' in child_results and child_results['result']:
+#                                 combined_results['child_categories'].extend(child_results['result'])
+#                                 process_charges(child_results)
+#                                 processed_categories.add(child['category_uid'])
+
+#                     # Get sibling and parent categories
+#                     parent_uid = get_parent_uid(category_uid)
+#                     if parent_uid:
+#                         # Get parent results
+#                         if parent_uid not in processed_categories:
+#                             parent_results = get_businesses_for_category(parent_uid, 'parent')
+#                             if 'result' in parent_results and parent_results['result']:
+#                                 combined_results['parent_categories'].extend(parent_results['result'])
+#                                 process_charges(parent_results)
+#                                 processed_categories.add(parent_uid)
+
+#                         # Get sibling results
+#                         siblings = get_all_child_categories(parent_uid)
+#                         for sibling in siblings:
+#                             if sibling['category_uid'] in processed_categories:
+#                                 continue
+#                             sibling_results = get_businesses_for_category(sibling['category_uid'], 'sibling')
+#                             if 'result' in sibling_results and sibling_results['result']:
+#                                 combined_results['sibling_categories'].extend(sibling_results['result'])
+#                                 process_charges(sibling_results)
+#                                 processed_categories.add(sibling['category_uid'])
+
+#                         # Get parent's siblings (related categories)
+#                         grandparent_uid = get_parent_uid(parent_uid)
+#                         if grandparent_uid:
+#                             parent_siblings = get_all_child_categories(grandparent_uid)
+#                             for parent_sibling in parent_siblings:
+#                                 if parent_sibling['category_uid'] in processed_categories:
+#                                     continue
+#                                 related_results = get_businesses_for_category(
+#                                     parent_sibling['category_uid'], 
+#                                     'related'
+#                                 )
+#                                 if 'result' in related_results and related_results['result']:
+#                                     combined_results['related_categories'].extend(related_results['result'])
+#                                     process_charges(related_results)
+#                                     processed_categories.add(parent_sibling['category_uid'])
+
+#                 # Prepare final response
+#                 if any(results for results in combined_results.values()):
+#                     response = {
+#                         'code': 200,
+#                         'message': 'Found businesses in various categories',
+#                         'results': combined_results,
+#                         'search_term': search_category
+#                     }
+#                     return response, 200
+                
+#                 response['message'] = 'No businesses found in this or related categories'
+#                 response['code'] = 200
+#                 return response, 200
+        
+#         except Exception as e:
+#             print(f"Error in search: {str(e)}")
+#             print(f"Error details: {type(e).__name__}")
+#             import traceback
+#             print(traceback.format_exc())
+#             response['message'] = 'Internal Server Error'
+#             response['code'] = 500
+#             return response, 500
+
+
+
+
+
 '''
 -- b.business_name,
 -- b.business_phone_number,
