@@ -21,6 +21,7 @@ from search import Search, Search_v2
 from lists import Lists
 from charges import Charges
 from business_budget import Business_Budget
+from business_revenue import BusinessRevenue
 from feed import Feed
 from category_list import CategoryList
 from chatbot import ChatbotAPI
@@ -462,6 +463,7 @@ api.add_resource(Feed, "/feed/<string:profile_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
 api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
+api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
 
 
 
