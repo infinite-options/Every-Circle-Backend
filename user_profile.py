@@ -84,12 +84,13 @@ class Profile(Resource):
                 new_profile_uid = profile_stored_procedure_response['result'][0]['new_id']
                 key = {'profile_uid': new_profile_uid}
 
+                if not ('profile_referred_by_user_id' in payload):
+                    payload['profile_referred_by_user_id'] = "110-000001"
+
                 payload['profile_uid'] = new_profile_uid
                 payload['profile_user_id'] = user_uid
                 payload['profile_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                # if referred_by_code == "12345":
-                    # payload['profile_referred_by_user_id'] = "100-000001"
                 processImage(key, payload)
                 response = db.insert('every_circle.profile', payload)
             

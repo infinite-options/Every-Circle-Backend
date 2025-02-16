@@ -193,10 +193,7 @@ class Business_v2(Resource):
 
                 else:
                     key['business_google_id'] = uid
-                    # response['message'] = 'Invalid UID'
-                    # response['code'] = 400
-                    # return response, 400
-            
+
                 response = db.select('every_circle.business', where=key)
 
             if not response['result']:

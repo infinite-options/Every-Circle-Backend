@@ -14,7 +14,6 @@
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from connections import Connections
 from user_profile import Profile
 from business import Business, Business_v2
 from ratings import Ratings, Ratings_v2
@@ -25,6 +24,7 @@ from business_budget import Business_Budget
 from feed import Feed
 from category_list import CategoryList
 from chatbot import ChatbotAPI
+from user_connections import Connections
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -447,7 +447,6 @@ class Refer(Resource):
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
-api.add_resource(Connections, "/connections")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Business_v2, "/api/v2/business", "/api/v2/business/<string:uid>")
@@ -462,6 +461,7 @@ api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 api.add_resource(Feed, "/feed/<string:profile_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
+api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
 
 
 
