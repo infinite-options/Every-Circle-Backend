@@ -84,7 +84,9 @@ class Profile(Resource):
                 new_profile_uid = profile_stored_procedure_response['result'][0]['new_id']
                 key = {'profile_uid': new_profile_uid}
 
-                if not ('profile_referred_by_user_id' in payload):
+                if 'profile_referred_by_user_id' not in payload:
+                    payload['profile_referred_by_user_id'] = "110-000001"
+                elif payload['profile_referred_by_user_id'].strip() in ['', None, 'null']:
                     payload['profile_referred_by_user_id'] = "110-000001"
 
                 payload['profile_uid'] = new_profile_uid
@@ -92,7 +94,10 @@ class Profile(Resource):
                 payload['profile_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 processImage(key, payload)
+
+                print(payload)
                 response = db.insert('every_circle.profile', payload)
+                print(response)
             
             response['profile_uid'] = new_profile_uid
             response['message'] = 'Profile created successfully'
