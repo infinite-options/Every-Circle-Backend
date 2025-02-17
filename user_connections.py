@@ -41,14 +41,26 @@ class Connections(Resource):
                                         AND NOT POSITION(p.profile_referred_by_user_id IN r.connection_path) > 0
                                     )
                                     SELECT 
-                                        degree,
-                                        COUNT(DISTINCT user_id) as connection_count
-                                    FROM Referrals
-                                    GROUP BY degree
-                                    ORDER BY degree;
+                                        r.degree,
+                                        r.connection_count,
+                                        JSON_ARRAYAGG(d.user_id) as profile_id
+                                    FROM (
+                                        SELECT 
+                                            degree,
+                                            COUNT(DISTINCT user_id) as connection_count
+                                        FROM Referrals
+                                        GROUP BY degree
+                                    ) r
+                                    JOIN (
+                                        SELECT DISTINCT degree, user_id
+                                        FROM Referrals
+                                    ) d ON r.degree = d.degree
+                                    GROUP BY r.degree, r.connection_count
+                                    ORDER BY r.degree;
                             '''
             
             response = db.execute(connection_query)
+            print(response)
 
             if not response['result']:
                 response['message'] = 'No connection found'
