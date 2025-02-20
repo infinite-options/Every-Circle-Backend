@@ -18,6 +18,7 @@ from user_profile import Profile
 from business import Business, Business_v2
 from business_v3 import Business_v3
 from ratings import Ratings, Ratings_v2
+from ratings_v3 import Ratings_v3
 from search import Search, Search_v2
 from lists import Lists
 from charges import Charges
@@ -472,6 +473,7 @@ api.add_resource(AISearch, '/api/v1/aisearch/<string:profile_id>')
 api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
 api.add_resource(AISearchTag, '/api/v2/AITagSearch/<string:profile_id>')
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
+api.add_resource(Ratings_v3, '/api/v3/ratings_v3')
 
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():
