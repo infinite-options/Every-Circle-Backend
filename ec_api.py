@@ -29,6 +29,7 @@ from chatbot import ChatbotAPI
 from user_connections import Connections
 from aisearch import AISearch
 from aisearch_v2 import AISearchTag
+from tag_generator_api import TagGeneratorAPI
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -470,7 +471,7 @@ api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>'
 api.add_resource(AISearch, '/api/v1/aisearch/<string:profile_id>')
 api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
 api.add_resource(AISearchTag, '/api/v2/AITagSearch/<string:profile_id>')
-
+api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():

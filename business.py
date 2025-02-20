@@ -176,7 +176,7 @@ class Business(Resource):
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
-        
+
 class Business_v2(Resource):
     def get(self, uid):
         print("In Business GET")
@@ -202,6 +202,21 @@ class Business_v2(Resource):
                 response['code'] = 404
                 return response, 404
 
+            # final_response = {}
+            # for business in response['result']:
+            #     print(business)
+            #     query = f'''
+            #                 SELECT *
+            #                 FROM every_circle.business_category
+            #                 WHERE bc_business_id = "{business['business_uid']}";
+            #             '''
+
+            #     category_response = db.execute(query)
+            #     # category_response = db.select('every_circle.business_category', where={'bc_business_id': business['business_uid']})
+            #     print(category_response, '\n\nCategory Response')
+            #     final_response[business['business_uid']] = [business, category_response['result']]
+
+            #     print(final_response)
             return response, 200
 
         except:
