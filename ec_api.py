@@ -16,6 +16,7 @@ from data_ec import connect, uploadImage, s3
 from users import UserInfo
 from user_profile import Profile
 from business import Business, Business_v2
+from business_v3 import Business_v3
 from ratings import Ratings, Ratings_v2
 from search import Search, Search_v2
 from lists import Lists
@@ -26,6 +27,8 @@ from feed import Feed
 from category_list import CategoryList
 from chatbot import ChatbotAPI
 from user_connections import Connections
+from aisearch import AISearch
+from aisearch_v2 import AISearchTag
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -464,8 +467,9 @@ api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
 api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
 api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
-
-
+api.add_resource(AISearch, '/api/v1/aisearch/<string:profile_id>')
+api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
+api.add_resource(AISearchTag, '/api/v2/AITagSearch/<string:profile_id>')
 
 
 # @app.route('/decrypt', methods=['POST'])

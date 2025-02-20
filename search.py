@@ -7,11 +7,6 @@ from data_ec import connect, uploadImage, s3, processImage
 from charges import Charges
 from rapidfuzz import process
 
-# query -> type
-# type -> business
-# business -> ratings
-# business -> charges
-# add miles in the location
 
 class Search(Resource):
     def get(self, profile_id):
