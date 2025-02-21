@@ -438,6 +438,7 @@ class Ratings_v3(Resource):
                     'rating_business_id': business_uid,
                     'rating_star': payload.get('rating_star'),
                     'rating_description': payload.get('rating_description'),
+                    'rating_receipt_date': payload.get('rating_receipt_date'),
                     'rating_updated_at_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
 
