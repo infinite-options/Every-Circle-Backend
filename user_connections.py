@@ -43,7 +43,13 @@ class Connections(Resource):
                                     SELECT 
                                         r.degree,
                                         r.connection_count,
-                                        JSON_ARRAYAGG(d.user_id) as profile_id
+                                        JSON_ARRAYAGG(
+                                            JSON_OBJECT(
+                                                'user_id', d.user_id,
+                                                'first_name', p.profile_first_name,
+                                                'last_name', p.profile_last_name
+                                            )
+                                        ) as profiles
                                     FROM (
                                         SELECT 
                                             degree,
@@ -55,6 +61,7 @@ class Connections(Resource):
                                         SELECT DISTINCT degree, user_id
                                         FROM Referrals
                                     ) d ON r.degree = d.degree
+                                    JOIN profile p ON d.user_id = p.profile_uid
                                     GROUP BY r.degree, r.connection_count
                                     ORDER BY r.degree;
                             '''

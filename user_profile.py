@@ -24,7 +24,17 @@ class Profile(Resource):
                     if user_data['user_role'] == "user":
                         response = db.select('every_circle.profile', where={'profile_user_id': uid})
                         profile_id = response['result'][0]['profile_uid']
-                        rating_response = db.select('every_circle.ratings', where={'rating_profile_id': profile_id})
+
+                        rating_query = f'''
+                                        SELECT *
+                                        FROM every_circle.ratings
+                                        LEFT JOIN every_circle.business ON rating_business_id = business_uid
+                                        WHERE rating_profile_id = '{profile_id}';
+                                        '''
+                        
+                        rating_response = db.execute(rating_query)
+
+                        # rating_response = db.select('every_circle.ratings', where={'rating_profile_id': profile_id})
                         response['ratings result'] = rating_response['result']
                     else:
                         response = db.select('every_circle.business', where={'business_user_id': uid})
