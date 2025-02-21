@@ -17,16 +17,29 @@ class Ratings_v3(Resource):
             with connect() as db:
                 key = {}
                 if uid[:3] == "110":
-                    key['rating_profile_id'] = uid
+                    query = f'''
+                                SELECT *
+                                FROM every_circle.ratings
+                                LEFT JOIN every_circle.business ON rating_business_id = business_uid
+                                WHERE rating_profile_id = '{uid}';   
+                            '''
+                    
+                    response = db.execute(query)
+                    
                 elif uid[:3] == "200":
-                    key['rating_business_id'] = uid
+                    query = f'''
+                                SELECT *
+                                FROM every_circle.ratings
+                                LEFT JOIN every_circle.business ON rating_business_id = business_uid
+                                WHERE rating_business_id = '{uid}';
+                            '''
+                    response = db.execute(query)
+
                 else:
                     response['message'] = 'Invalid UID'
                     response['code'] = 400
                     return response, 400
             
-                response = db.select('every_circle.ratings', where=key)
-
             if not response['result']:
                 response.pop('result')
                 response['message'] = f'No ratings found for {key}'
