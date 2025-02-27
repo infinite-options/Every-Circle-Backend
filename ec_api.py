@@ -29,7 +29,7 @@ from category_list import CategoryList
 from chatbot import ChatbotAPI
 from user_connections import Connections
 from aisearch import AISearch
-from aisearch_v2 import AISearchTag
+from aisearch_v2 import AISearchTag, AISearchTag_v3
 from tag_generator_api import TagGeneratorAPI
 
 # from jwtToken import JwtToken
@@ -449,8 +449,6 @@ class Refer(Resource):
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
-# api.add_resource(Dashboard, '/dashboard/<string:user_id>')
-
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
@@ -472,6 +470,7 @@ api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>'
 api.add_resource(AISearch, '/api/v1/aisearch/<string:profile_id>')
 api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
 api.add_resource(AISearchTag, '/api/v2/AITagSearch/<string:profile_id>')
+api.add_resource(AISearchTag_v3, '/api/v3/AITagSearch/<string:profile_id>')
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
 
