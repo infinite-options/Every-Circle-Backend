@@ -354,6 +354,11 @@ class Business_v3(Resource):
                     
                     key = {'business_uid': new_business_uid}
                     processImage(key, payload)
+
+                    if 'business_template' not in payload:
+                        payload['business_template'] = "5"
+                    elif payload['business_template'].strip() in ['', None, 'null']:
+                        payload['business_template'] = "5"
                     
                     # Insert business
                     business_response = db.insert('every_circle.business', payload)
