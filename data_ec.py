@@ -141,6 +141,9 @@ def processImage(key, payload):
 
     response = {}
     bucket = os.getenv('BUCKET_NAME')
+    payload_images = None
+    payload_fav_images = None
+    payload_delete_images = None
     with connect() as db:
 
         if 'profile_uid' in key:
@@ -204,6 +207,44 @@ def processImage(key, payload):
                 print("5: ", payload_fav_images)
             else:
                 return payload
+        
+        elif 'profile_personal_uid' in key:
+            print("Profile Personal Key passed")
+            key_type = 'profile_personal'
+            key_uid = key['profile_personal_uid']
+            profilePersonalImage = None
+            profile_image = None
+
+            profile_personal_data = db.execute(""" SELECT profile_personal_image FROM every_circle.profile_personal WHERE profile_personal_uid = \'""" + key_uid + """\'; """)
+            if profile_personal_data['result']:
+                profile_image = profile_personal_data['result'][0]['profile_personal_image']
+            
+            if 'delete_profile_image' in payload and payload['delete_profile_image'] not in {None, '', 'null'}:
+                image = payload['delete_profile_image']
+                delete_key = image.split(f'{bucket}/', 1)[1]
+                # print("Delete key", delete_key)
+                deleteImage(delete_key)
+                profile_image = None
+
+            elif 'profile_image' in request.files and profile_image:
+                image = profile_image
+                delete_key = image.split(f'{bucket}/', 1)[1]
+                # print("Delete key", delete_key)
+                deleteImage(delete_key)
+                profile_image = None
+
+            if 'profile_image' in request.files and profile_image in {None, '', 'null'}:
+                profileImageFile = request.files.get('profile_image')
+                unique_filename = 'profile_image_' + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                image_key = f'{key_type}/{key_uid}/{unique_filename}'
+                profilePersonalImage = uploadImage(profileImageFile, image_key, '')
+                print("Image after upload: ", profilePersonalImage)
+                return profilePersonalImage
+                # images.append(receiptImage)
+                # print("Image after upload: ", images)
+            
+            else:
+                return payload
 
         else:
             print("No UID found in key")
@@ -223,7 +264,7 @@ def processImage(key, payload):
         # Put current db images into current_images
         print("\nAbout to process CURRENT imagess in database")
         current_images = []
-        if payload_images not in {None, '', 'null'}:
+        if payload_images and payload_images not in {None, '', 'null'}:
             # print("Current Database Images: ", payload_images)
             current_images =ast.literal_eval(payload_images)
             print("Current images     : ", current_images, type(current_images))
@@ -391,6 +432,7 @@ def processImage(key, payload):
         if key_type == 'rating': 
             payload['rating_images_url'] = json.dumps(current_images)
             payload['rating_receipt_url'] = receiptImage if receiptImage else None
+        if key_type == 'profile_personal': payload['profile_personal_image'] = profilePersonalImage if profilePersonalImage else None
 
         print("Payload before return: ", payload)
         return payload
