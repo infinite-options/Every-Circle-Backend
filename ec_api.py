@@ -33,6 +33,7 @@ from aisearch_v2 import AISearchTag, AISearchTag_v3
 from tag_generator_api import TagGeneratorAPI
 from sambanovasearch import AIDirectBusinessSearch
 from user_profile_info import UserProfileInfo
+from business_info import BusinessInfo
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -477,6 +478,7 @@ api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
 api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
+api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():
