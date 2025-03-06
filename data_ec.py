@@ -246,45 +246,46 @@ def processImage(key, payload):
             return profilePersonalImage
                 
         elif 'business_personal_uid' in key:
-            if 'business_img_0' not in request.files:
+            if 'business_img_0' not in request.files and 'delete_business_images' not in payload:
                 return None
             
-            print("Profile Personal Key passed")
+            print("Business Personal Key passed")
             key_type = 'business_personal'
             key_uid = key['business_personal_uid']
             businessImage = []
-            business_images = None
+            business_images = []
 
             business_data = db.execute(""" SELECT business_images_url FROM every_circle.business WHERE business_uid = \'""" + key_uid + """\'; """)
-            if business_data['result']:
-                business_images = business_data['result'][0]['profile_personal_image']
+            if business_data['result'] and business_data['result'][0]['business_images_url']:
+                business_images = ast.literal_eval(business_data['result'][0]['business_images_url'])
+                print("\nBusiness IMages", business_images, type(business_images))
             
             if 'delete_business_images' in payload and payload['delete_business_images'] not in {None, '', 'null'}:
-                image = payload['delete_business_images']
-                delete_key = image.split(f'{bucket}/', 1)[1]
-                # print("Delete key", delete_key)
-                deleteImage(delete_key)
-                profile_image = None
-
-            elif 'profile_image' in request.files and profile_image:
-                image = profile_image
-                delete_key = image.split(f'{bucket}/', 1)[1]
-                # print("Delete key", delete_key)
-                deleteImage(delete_key)
-                profile_image = None
-
-            if 'business_image_1' in request.files and profile_image in {None, '', 'null'}:
-                profileImageFile = request.files.get('profile_image')
-                unique_filename = 'profile_image_' + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
-                image_key = f'{key_type}/{key_uid}/{unique_filename}'
-                profilePersonalImage = uploadImage(profileImageFile, image_key, '')
-                print("Image after upload: ", profilePersonalImage)
-                return profilePersonalImage
-                # images.append(receiptImage)
-                # print("Image after upload: ", images)
+                for image in json.loads(payload.pop('delete_business_images')):
+                    delete_key = image.split(f'{bucket}/', 1)[1]
+                    # print("Delete key", delete_key)
+                    deleteImage(delete_key)
+                    print("\nimage", image, type(image))
+                    business_images.remove(image)
+                    print(business_images)
             
-            else:
-                return payload
+            i = 0
+            while True:
+                filename = f'business_img_{i}'
+                file = request.files.get(filename)
+
+                if file:
+                    unique_filename = filename + "_" + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                    image_key = f'{key_type}/{key_uid}/{unique_filename}'
+                    image = uploadImage(file, image_key, '')
+                    business_images.append(image)
+
+                else:
+                    break
+
+                i += 1
+
+            return business_images
 
         else:
             print("No UID found in key")

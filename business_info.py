@@ -3,6 +3,7 @@ from flask import request
 from datetime import datetime
 import ast
 import traceback
+import json
 
 from data_ec import connect, processImage
 
@@ -120,8 +121,10 @@ class BusinessInfo(Resource):
                 payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
-                key = {'business_personal_uid': new_business_uid}
-                processImage(key, payload)
+                if 'business_img_0' in request.files or 'delete_business_images' in payload:
+                    key = {'business_personal_uid': new_business_uid}
+                    images = processImage(key, payload)
+                    payload['business_images_url'] = json.dumps(images)
 
                 insert_response = db.insert('every_circle.business', payload)
                 
@@ -177,9 +180,16 @@ class BusinessInfo(Resource):
                 if 'social_links' in payload:
                     social_links_str = payload.pop('social_links')
                     self._update_social_links(db, social_links_str, business_uid)
+
+                if 'business_img_0' in request.files or 'delete_business_images' in payload:
+                    key_personal = {'business_personal_uid': business_uid}
+                    images = processImage(key_personal, payload)
+                    print("OUTSIDE IMAGEs", images)
+                    payload['business_images_url'] = (json.dumps(images) if images else None)
                 
+                print(payload)
                 update_response = db.update('every_circle.business', key, payload)
-                
+                print(update_response)
                 response = {
                     'message': 'Business updated successfully',
                     'code': 200
