@@ -66,6 +66,7 @@ class UserProfileInfo(Resource):
                     
                     # Add user_role from users table
                     response['user_role'] = user_data['user_role']
+                    response['user_email'] = user_data['user_email_id']
                     
                     return response, 200
                     
@@ -87,6 +88,7 @@ class UserProfileInfo(Resource):
                     user_id = personal_info['result'][0]['profile_personal_user_id']
                     user_info = db.select('every_circle.users', where={'user_uid': user_id})
                     response['user_role'] = user_info['result'][0]['user_role'] if user_info['result'] else "unknown"
+                    response['user_email'] = user_info['result'][0]['user_email_id']
                     
                     # Get social media links
                     social_links_query = f"""
