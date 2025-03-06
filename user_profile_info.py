@@ -646,11 +646,12 @@ class UserProfileInfo(Resource):
                     if field in payload:
                         personal_info[field] = payload.pop(field)
                 
-                if 'profile_image' in request.files:
+                if 'profile_image' in request.files or 'delete_profile_image' in payload:
                     payload_images = {}
-                    payload_images['profile_image'] = request.files['profile_image']
-                    if 'delete_profile_image' in request.files:
-                        payload_images['delete_profile_image'] = request.files['delete_profile_image']
+                    if 'profile_image' in request.files:
+                        payload_images['profile_image'] = request.files['profile_image']
+                    if 'delete_profile_image' in payload:
+                        payload_images['delete_profile_image'] = payload['delete_profile_image']
                     key = {'profile_personal_uid': profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
 
