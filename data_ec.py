@@ -239,6 +239,46 @@ def processImage(key, payload):
                 image_key = f'{key_type}/{key_uid}/{unique_filename}'
                 profilePersonalImage = uploadImage(profileImageFile, image_key, '')
                 print("Image after upload: ", profilePersonalImage)
+                
+                # images.append(receiptImage)
+                # print("Image after upload: ", images)
+            
+            return profilePersonalImage
+                
+        elif 'business_personal_uid' in key:
+            if 'business_img_0' not in request.files:
+                return None
+            
+            print("Profile Personal Key passed")
+            key_type = 'business_personal'
+            key_uid = key['business_personal_uid']
+            businessImage = []
+            business_images = None
+
+            business_data = db.execute(""" SELECT business_images_url FROM every_circle.business WHERE business_uid = \'""" + key_uid + """\'; """)
+            if business_data['result']:
+                business_images = business_data['result'][0]['profile_personal_image']
+            
+            if 'delete_business_images' in payload and payload['delete_business_images'] not in {None, '', 'null'}:
+                image = payload['delete_business_images']
+                delete_key = image.split(f'{bucket}/', 1)[1]
+                # print("Delete key", delete_key)
+                deleteImage(delete_key)
+                profile_image = None
+
+            elif 'profile_image' in request.files and profile_image:
+                image = profile_image
+                delete_key = image.split(f'{bucket}/', 1)[1]
+                # print("Delete key", delete_key)
+                deleteImage(delete_key)
+                profile_image = None
+
+            if 'business_image_1' in request.files and profile_image in {None, '', 'null'}:
+                profileImageFile = request.files.get('profile_image')
+                unique_filename = 'profile_image_' + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                image_key = f'{key_type}/{key_uid}/{unique_filename}'
+                profilePersonalImage = uploadImage(profileImageFile, image_key, '')
+                print("Image after upload: ", profilePersonalImage)
                 return profilePersonalImage
                 # images.append(receiptImage)
                 # print("Image after upload: ", images)

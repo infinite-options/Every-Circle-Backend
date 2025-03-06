@@ -120,6 +120,9 @@ class BusinessInfo(Resource):
                 payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
+                key = {'business_personal_uid': new_business_uid}
+                processImage(key, payload)
+
                 insert_response = db.insert('every_circle.business', payload)
                 
                 if categories_uid_str:
