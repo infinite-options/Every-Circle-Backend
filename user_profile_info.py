@@ -189,7 +189,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
                     'profile_personal_short_bio_is_public', 'profile_personal_resume', 
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
-                    'profile_personal_location_preference'
+                    'profile_personal_location_preference', 'profile_personal_banner_ads'
                 ]
                 
                 for field in personal_info_fields:
@@ -641,7 +641,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
                     'profile_personal_short_bio_is_public', 'profile_personal_resume', 
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
-                    'profile_personal_location_preference'
+                    'profile_personal_location_preference', 'profile_personal_banner_ads'
                 ]
                 
                 for field in personal_info_fields:
