@@ -49,10 +49,19 @@ class BusinessInfo(Resource):
                 """
                 links_response = db.execute(links_query)
                 
+                # Added query for business services
+                services_query = f"""
+                    SELECT bs_uid, bs_service_name, bs_bounty
+                    FROM every_circle.business_services
+                    WHERE bs_business_id = "{business_uid}"
+                """
+                services_response = db.execute(services_query)
+                
                 response = {
                     'business': business_data,
                     'categories': category_response['result'] if 'result' in category_response else [],
                     'social_links': links_response['result'] if 'result' in links_response else [],
+                    'services': services_response['result'] if 'result' in services_response else [],
                     'code': 200,
                     'message': 'Business data retrieved successfully'
                 }
@@ -110,12 +119,17 @@ class BusinessInfo(Resource):
                 
                 categories_uid_str = None
                 social_links_str = None
+                services_str = None
                 
                 if 'business_categories_uid' in payload:
                     categories_uid_str = payload.pop('business_categories_uid')
                 
                 if 'social_links' in payload:
                     social_links_str = payload.pop('social_links')
+                
+                # Extract services data
+                if 'business_services' in payload:
+                    services_str = payload.pop('business_services')
                 
                 payload['business_uid'] = new_business_uid
                 payload['business_user_id'] = user_uid
@@ -133,6 +147,10 @@ class BusinessInfo(Resource):
                 
                 if social_links_str:
                     self._add_social_links(db, social_links_str, new_business_uid)
+                
+                # Add services if provided
+                if services_str:
+                    self._add_services(db, services_str, new_business_uid)
                 
                 response = {
                     'business_uid': new_business_uid,
@@ -172,6 +190,7 @@ class BusinessInfo(Resource):
                 
                 categories_uid_str = None
                 social_links_str = None
+                delete_services_str = None
                 
                 if 'business_categories_uid' in payload:
                     categories_uid_str = payload.pop('business_categories_uid')
@@ -181,15 +200,69 @@ class BusinessInfo(Resource):
                     social_links_str = payload.pop('social_links')
                     self._update_social_links(db, social_links_str, business_uid)
 
+                if 'delete_business_services' in payload:
+                    delete_services_str = payload.pop('delete_business_services')
+                    delete_services = ast.literal_eval(delete_services_str)
+                    for service_uid in delete_services:
+                        db.delete(f"""DELETE FROM every_circle.business_services 
+                                  WHERE bs_uid = "{service_uid}";""")
+                
+                # Handle services update
+                if 'business_services' in payload:
+                    try:
+                        import json
+                        services_data = json.loads(payload.pop('business_services'))
+                        service_uids = []
+                        
+                        # Process each service entry
+                        for service_data in services_data:
+                            print(service_data)
+                            
+                            # Check if this is an existing service (has UID)
+                            if 'bs_uid' in service_data:
+                                # Get the existing service UID
+                                service_uid = service_data.pop('bs_uid')
+                                
+                                # Check if service exists
+                                service_exists_query = db.select('every_circle.business_services', 
+                                                               where={'bs_uid': service_uid})
+                                
+                                if not service_exists_query['result']:
+                                    # Skip this one if it doesn't exist
+                                    print(f"Warning: Service with UID {service_uid} not found")
+                                    continue
+                                
+                                # Update the existing service
+                                if service_data:
+                                    db.update('every_circle.business_services', 
+                                           {'bs_uid': service_uid}, service_data)
+                                    
+                                service_uids.append(service_uid)
+                            else:
+                                # This is a new service entry
+                                service_stored_procedure_response = db.call(procedure='new_bs_uid')
+                                new_service_uid = service_stored_procedure_response['result'][0]['new_id']
+                                service_data['bs_uid'] = new_service_uid
+                                service_data['bs_business_id'] = business_uid
+                                
+                                # Insert the service record
+                                db.insert('every_circle.business_services', service_data)
+                                service_uids.append(new_service_uid)
+                    
+                    except Exception as e:
+                        print(f"Error processing business_services JSON in PUT: {str(e)}")
+
                 if 'business_img_0' in request.files or 'delete_business_images' in payload:
+                    import json
                     key_personal = {'business_personal_uid': business_uid}
                     images = processImage(key_personal, payload)
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
                 
                 print(payload)
-                update_response = db.update('every_circle.business', key, payload)
-                print(update_response)
+                if payload:
+                    update_response = db.update('every_circle.business', key, payload)
+                    print(update_response)
                 response = {
                     'message': 'Business updated successfully',
                     'code': 200
@@ -214,6 +287,10 @@ class BusinessInfo(Resource):
                     response['message'] = 'Business does not exist'
                     response['code'] = 404
                     return response, 404
+                
+                # Delete business services
+                db.delete(f"""DELETE FROM every_circle.business_services 
+                              WHERE bs_business_id = "{uid}";""")
                 
                 db.delete(f"""DELETE FROM every_circle.business_link 
                               WHERE business_link_business_id = "{uid}";""")
@@ -342,4 +419,22 @@ class BusinessInfo(Resource):
                     db.insert('every_circle.business_link', link_payload)
         except Exception as e:
             print(f"Error updating social links: {str(e)}")
+            raise
+    
+    # New method to add services
+    def _add_services(self, db, services_str, business_uid):
+        try:
+            import json
+            services = json.loads(services_str)
+            for service in services:
+                # Generate a new bs_uid
+                bs_uid_response = db.call(procedure='new_bs_uid')
+                bs_uid = bs_uid_response['result'][0]['new_id']
+                
+                service['bs_uid'] = bs_uid
+                service['bs_business_id'] = business_uid
+                
+                db.insert('every_circle.business_services', service)
+        except Exception as e:
+            print(f"Error processing services: {str(e)}")
             raise
