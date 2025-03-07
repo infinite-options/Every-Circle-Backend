@@ -189,7 +189,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
                     'profile_personal_short_bio_is_public', 'profile_personal_resume', 
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
-                    'profile_personal_location_preference', 'profile_personal_banner_ads',
+                    'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public'
                 ]
@@ -643,7 +643,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
                     'profile_personal_short_bio_is_public', 'profile_personal_resume', 
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
-                    'profile_personal_location_preference', 'profile_personal_banner_ads',
+                    'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public'
                 ]
