@@ -34,6 +34,7 @@ from tag_generator_api import TagGeneratorAPI
 from sambanovasearch import AIDirectBusinessSearch
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
+from transactions import Transactions
 
 # from jwtToken import JwtToken
 from functools import wraps
@@ -479,6 +480,7 @@ api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:u
 api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
+api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:uid>')
 
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():

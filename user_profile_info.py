@@ -63,6 +63,10 @@ class UserProfileInfo(Resource):
                     education_info = db.select('every_circle.profile_education', 
                                             where={'profile_education_profile_personal_id': profile_id})
                     response['education_info'] = education_info['result'] if education_info['result'] else []
+
+                    business_info = db.select('every_circle.business',
+                                             where={'business_user_id': uid})
+                    response['business_info'] = business_info['result'] if business_info['result'] else []
                     
                     # Add user_role from users table
                     response['user_role'] = user_data['user_role']
@@ -119,6 +123,10 @@ class UserProfileInfo(Resource):
                     education_info = db.select('every_circle.profile_education', 
                                             where={'profile_education_profile_personal_id': profile_id})
                     response['education_info'] = education_info['result'] if education_info['result'] else []
+
+                    business_info = db.select('every_circle.business',
+                                             where={'business_user_id': user_id})
+                    response['business_info'] = business_info['result'] if business_info['result'] else []
                     
                     return response, 200
                 
