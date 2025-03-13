@@ -51,7 +51,7 @@ class BusinessInfo(Resource):
                 
                 # Added query for business services
                 services_query = f"""
-                    SELECT bs_uid, bs_service_name, bs_bounty
+                    SELECT bs_uid, bs_service_name, bs_bounty, bs_cost
                     FROM every_circle.business_services
                     WHERE bs_business_id = "{business_uid}"
                 """
