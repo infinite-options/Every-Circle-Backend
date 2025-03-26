@@ -81,6 +81,7 @@ import base64
 
 load_dotenv()
 
+print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
 # == Using Cryptography library for AES encryption ==
 

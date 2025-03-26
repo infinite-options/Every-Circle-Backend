@@ -2,7 +2,8 @@ from flask import request
 from flask_restful import Resource
 from datetime import datetime
 
-from data_ec import connect, processImage
+
+from data_ec import connect, processImage, processDocument
 
 class UserProfileInfo(Resource):
     def get(self, uid):
@@ -499,9 +500,11 @@ class UserProfileInfo(Resource):
     def put(self):
         print("In UserProfileInfo PUT")
         response = {}
+        import json
 
         try:
             payload = request.form.to_dict()
+            print("PUT Payload: ", payload)
 
             if 'profile_uid' not in payload:
                 response['message'] = 'profile_uid is required'
@@ -509,12 +512,15 @@ class UserProfileInfo(Resource):
                 return response, 400
 
             profile_uid = payload.pop('profile_uid')
+            key = {'profile_personal_uid': profile_uid}
+            print("UPDATED Payload: ", payload)
             updated_uids = {}
             deleted_uids = {}
 
             with connect() as db:
                 # Check if the profile exists
                 profile_exists_query = db.select('every_circle.profile_personal', where={'profile_personal_uid': profile_uid})
+                print("Current Profile: ", profile_exists_query)
                 if not profile_exists_query['result']:
                     response['message'] = 'Profile does not exist'
                     response['code'] = 404
@@ -660,14 +666,54 @@ class UserProfileInfo(Resource):
                     if field in payload:
                         personal_info[field] = payload.pop(field)
                 
+                print("Remaining payload fields: ", payload)
+                
                 if 'profile_image' in request.files or 'delete_profile_image' in payload:
                     payload_images = {}
                     if 'profile_image' in request.files:
                         payload_images['profile_image'] = request.files['profile_image']
                     if 'delete_profile_image' in payload:
                         payload_images['delete_profile_image'] = payload['delete_profile_image']
-                    key = {'profile_personal_uid': profile_uid}
+                    # key = {'profile_personal_uid': profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
+
+                if ('profile_resume_details' in payload and 'file_0' in request.files) or 'delete_profile_resume' in payload:
+                    print("In Profile Personal Resume")
+                    # if new resume is added check if there is an existing resume.  Delete existing resume and add new resume
+                    # --------------- PROCESS DOCUMENTS ------------------
+        
+                    processDocument(key, payload)
+                    print("Payload after processDocument function: ", payload, type(payload))
+
+                    # Convert JSON string to a Python list
+                    resumes = json.loads(payload['profile_personal_resume'])
+
+                    # Access the first link
+                    first_link = resumes[0]['link']
+
+                    print(first_link)
+
+                    personal_info['profile_personal_resume'] = first_link
+                    print("Data to update: ", personal_info)
+
+                    
+                    # --------------- PROCESS DOCUMENTS ------------------
+
+
+                    # if just deleting, then delete resume
+
+
+                    # if just adding, then add resume
+
+
+                    # payload_images = {}
+                    # if 'profile_resume' in request.files:
+                    #     payload_images['profile_resume'] = request.files['profile_resume']
+                    # if 'delete_profile__resume' in payload:
+                    #     payload_images['delete_profile_resume'] = payload['delete_profile_resume']
+                    # key = {'profile_personal_uid': profile_uid}
+                    # personal_info['profile_personal_resume'] = processDocument(key, payload)
+                    # print(personal_info['profile_personal_resume'], type(personal_info['profile_personal_resume']))
 
                 if personal_info:
                     # Process profile image if provided

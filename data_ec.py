@@ -56,7 +56,7 @@ def deleteFolder(folder, uid):
 
     # List all objects with the given prefix
     s3Objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=folder_prefix)
-    print(s3Objects)
+    print("S3 Objects: ", s3Objects)
 
     if 'Contents' in s3Objects:
         print("In Contents")
@@ -215,8 +215,9 @@ def processImage(key, payload):
             profilePersonalImage = None
             profile_image = None
 
-            profile_personal_data = db.execute(""" SELECT profile_personal_image FROM every_circle.profile_personal WHERE profile_personal_uid = \'""" + key_uid + """\'; """)
+            profile_personal_data = db.execute(""" SELECT profile_personal_image, profile_personal_resume FROM every_circle.profile_personal WHERE profile_personal_uid = \'""" + key_uid + """\'; """)
             if profile_personal_data['result']:
+                print("Profile Data: ", profile_personal_data['result'])
                 profile_image = profile_personal_data['result'][0]['profile_personal_image']
             
             if 'delete_profile_image' in payload and payload['delete_profile_image'] not in {None, '', 'null'}:
@@ -242,6 +243,13 @@ def processImage(key, payload):
                 
                 # images.append(receiptImage)
                 # print("Image after upload: ", images)
+
+            if 'profile_resume' in request.files and profile_image in {None, '', 'null'}:
+                profileImageFile = request.files.get('profile_resume')
+                unique_filename = 'profile_resume_' + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                image_key = f'{key_type}/{key_uid}/{unique_filename}'
+                profilePersonalImage = uploadImage(profileImageFile, image_key, '')
+                print("Resume after upload: ", profilePersonalImage)
             
             return profilePersonalImage
                 
@@ -598,6 +606,22 @@ def processDocument(key, payload):
             else:
                 return payload
             
+
+        elif 'profile_personal_uid' in key:
+            print("Profile Personal Key passed")
+            key_type = 'profile_personal'
+            key_uid = key['profile_personal_uid']
+            payload_changed_documents = payload.pop('business_documents', None)                # Current Documents     (if there is a change in a current document)
+            payload_document_details = payload.pop('profile_resume_details', None)             # New Documents
+            print(payload_document_details)
+            payload_delete_documents = payload.pop('delete_documents', None)                   # Documents to Delete
+            if payload_changed_documents != None or payload_document_details != None or payload_delete_documents != None:
+                payload_query = db.execute(""" SELECT profile_personal_resume FROM every_circle.profile_personal WHERE profile_personal_uid = \'""" + key_uid + """\'; """)                # Current Resume
+                payload_documents = payload_query['result'][0]['profile_personal_resume'] if payload_query['result'] else None                                          
+            else:
+                print("In else")
+                return payload
+            
         elif 'employee_uid' in key:
             print("Employee Key passed")
             # No employee documents are passed
@@ -609,8 +633,8 @@ def processDocument(key, payload):
 
         print("\nkey_type: ", key_type, type(key_type))
         print("key_uid: ", key_uid, type(key_uid))
-        print("payload_documents: ", payload_documents, type(payload_documents))                            # Current Documents.  For POST requests there are no current documents
-        print("payload_changed_documents: ", payload_changed_documents, type(payload_changed_documents))    # Documents being Changed
+        print("payload_documents: ", payload_documents, type(payload_documents))                            # Current Documents in Database.  For POST requests there are no current documents
+        print("payload_changed_documents: ", payload_changed_documents, type(payload_changed_documents))    # Current Documents being Changed
         print("payload_document_details: ", payload_document_details, type(payload_document_details))       # New Documents  
         print("payload_documents delete: ", payload_delete_documents, type(payload_delete_documents))       # Documents to Delete
         
@@ -648,8 +672,12 @@ def processDocument(key, payload):
         
 
         # Put New Document Details into document_details
-        print("\nAbout to process NEW documents in database;")
+        print("\nAbout to process NEW documents in database;", payload_document_details)
         if payload_document_details not in {None, '', 'null'}:
+            print("In if", key_type)
+            # if key_type == 'profile': 
+            #     payload_document_details = json.dumps(payload_document_details) 
+            # print(payload_document_details, type(payload_document_details))
             documents_details = json.loads(payload_document_details)
             print("documents_details: ", documents_details, type(documents_details))
         print("processed new documents")
@@ -714,6 +742,7 @@ def processDocument(key, payload):
             # if key_type == 'quotes': payload['quote_documents'] = json.dumps(current_documents) 
             # if key_type == 'tenants': payload['tenant_documents'] = json.dumps(current_documents) 
             # if key_type == 'business': payload['business_documents'] = json.dumps(current_documents) 
+            # if key_type == 'profile_personal': payload['profile_personal_resume'] = json.dumps(current_documents) 
 
         print("processed ADDED documents")
 
@@ -755,6 +784,7 @@ def processDocument(key, payload):
         if key_type == 'quotes': payload['quote_documents'] = json.dumps(current_documents)
         if key_type == 'tenants': payload['tenant_documents'] = json.dumps(current_documents)
         if key_type == 'business': payload['business_documents'] = json.dumps(current_documents) 
+        if key_type == 'profile_personal': payload['profile_personal_resume'] = json.dumps(current_documents) 
             
         
         print("Payload before return: ", payload)
