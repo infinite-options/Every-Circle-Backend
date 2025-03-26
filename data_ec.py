@@ -495,6 +495,7 @@ def processDocument(key, payload):
     print("Key Passed into processDocuments: ", key)
     response = {}
     bucket = os.getenv('BUCKET_NAME')
+    print(bucket)
     with connect() as db:
 
         if 'contract_uid' in key:
@@ -754,13 +755,16 @@ def processDocument(key, payload):
             delete_documents = ast.literal_eval(payload_delete_documents)
             print("After ast: ", delete_documents, type(delete_documents), len(delete_documents))
             for document in delete_documents:
-                # print("Document to Delete: ", document, type(document))
-                # print("Payload Doc:", current_documents, type(current_documents))
-                # print("Current documents before deletion:", [doc['link'] for doc in current_documents])
+                print("Document to Delete: ", document, type(document))
+                print("Payload Doc:", current_documents, type(current_documents))
+                print("Current documents before deletion:", [doc['link'] for doc in current_documents])
 
                 # Delete from db list assuming it is in db list
                 try:
-                    current_documents = [doc for doc in current_documents if doc['link'] != document]
+                    print("current_documents before: ", current_documents)
+                    # current_documents = [doc for doc in current_documents if doc['link'] != document]
+                    current_documents = [doc for doc in current_documents if doc['link'] != document['link']]
+                    print("current_documents after: ", current_documents)
                 except:
                     print("Document not in list")
 
@@ -768,8 +772,9 @@ def processDocument(key, payload):
                 try:
                     # delete_key = document.split('io-pm/', 1)[1]
                     # delete_key = document.split('space-prod/', 1)[1]
-                    delete_key = document.split(f'{bucket}/', 1)[1]
-                    # print("Delete key", delete_key)
+                    delete_key = document['link'].split('every-circle/', 1)[1]
+                    # delete_key = document.split(f'{bucket}/', 1)[1]
+                    print("Delete key", delete_key)
                     deleteImage(delete_key)
                 except: 
                     print("could not delete from S3")
@@ -1000,6 +1005,7 @@ class DatabaseConnection:
                     sql += ' AND '
             # print("SQL Query: ", sql, object)
             response = self.execute(sql, object, 'post')
+            # print("Response: ", response)
         except Exception as e:
             print(e)
         return response

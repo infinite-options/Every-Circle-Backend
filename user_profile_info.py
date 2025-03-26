@@ -685,15 +685,21 @@ class UserProfileInfo(Resource):
                     processDocument(key, payload)
                     print("Payload after processDocument function: ", payload, type(payload))
 
-                    # Convert JSON string to a Python list
-                    resumes = json.loads(payload['profile_personal_resume'])
+                    # # Convert JSON string to a Python list
+                    # resumes = json.loads(payload['profile_personal_resume'])
 
-                    # Access the first link
-                    first_link = resumes[0]['link']
+                    # # Access the first link
+                    # first_link = resumes[0]['link']
 
-                    print(first_link)
+                    # print(first_link)
 
-                    personal_info['profile_personal_resume'] = first_link
+                    # personal_info['profile_personal_resume'] = first_link
+
+                    personal_info['profile_personal_resume'] = payload['profile_personal_resume']
+                    # print(personal_info['profile_personal_resume'], type(personal_info['profile_personal_resume']))
+
+
+
                     print("Data to update: ", personal_info)
 
                     
@@ -727,6 +733,7 @@ class UserProfileInfo(Resource):
                     db.update('every_circle.profile_personal', {'profile_personal_uid': profile_uid}, personal_info)
 
                     updated_uids['profile_personal_uid'] = profile_uid
+                    print("Update complete ", updated_uids['profile_personal_uid'])
                 
                 # Update social media links if provided
                 # First, get all social media platforms from the social_link table
