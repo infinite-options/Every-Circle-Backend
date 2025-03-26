@@ -677,7 +677,7 @@ class UserProfileInfo(Resource):
                     # key = {'profile_personal_uid': profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
 
-                if ('profile_resume_details' in payload and 'file_0' in request.files) or 'delete_profile_resume' in payload:
+                if ('profile_resume_details' in payload and 'file_0' in request.files) or 'delete_documents' in payload:
                     print("In Profile Personal Resume")
                     # if new resume is added check if there is an existing resume.  Delete existing resume and add new resume
                     # --------------- PROCESS DOCUMENTS ------------------
