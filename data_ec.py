@@ -762,8 +762,8 @@ def processDocument(key, payload):
                 # Delete from db list assuming it is in db list
                 try:
                     print("current_documents before: ", current_documents)
-                    # current_documents = [doc for doc in current_documents if doc['link'] != document]
-                    current_documents = [doc for doc in current_documents if doc['link'] != document['link']]
+                    current_documents = [doc for doc in current_documents if doc['link'] != document]
+                    # current_documents = [doc for doc in current_documents if doc['link'] != document['link']]
                     print("current_documents after: ", current_documents)
                 except:
                     print("Document not in list")
@@ -772,8 +772,8 @@ def processDocument(key, payload):
                 try:
                     # delete_key = document.split('io-pm/', 1)[1]
                     # delete_key = document.split('space-prod/', 1)[1]
-                    delete_key = document['link'].split('every-circle/', 1)[1]
-                    # delete_key = document.split(f'{bucket}/', 1)[1]
+                    # delete_key = document['link'].split('every-circle/', 1)[1]
+                    delete_key = document.split(f'{bucket}/', 1)[1]
                     print("Delete key", delete_key)
                     deleteImage(delete_key)
                 except: 
