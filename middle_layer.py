@@ -382,7 +382,7 @@ def get_business_results():
     elif score_one_count > 0:
         threshold = 1.0
     else:
-        threshold = float("-Inf")
+        threshold = 0.0
     
     print('Threshold list of business ids', threshold)
 
