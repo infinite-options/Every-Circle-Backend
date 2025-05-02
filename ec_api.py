@@ -21,6 +21,7 @@ from ratings import Ratings, Ratings_v2
 from ratings_v3 import Ratings_v3
 from search import Search, Search_v2
 from lists import Lists
+from middle_layer import Business_Results
 from charges import Charges
 from business_budget import Business_Budget
 from business_revenue import BusinessRevenue
@@ -482,6 +483,8 @@ api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:uid>')
+
+api.add_resource(Business_Results, '/api/business_results/<string:query>')
 
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():

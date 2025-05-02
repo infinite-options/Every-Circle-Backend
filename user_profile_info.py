@@ -668,7 +668,17 @@ class UserProfileInfo(Resource):
                 
                 print("Remaining payload fields: ", payload)
                 
+                # if 'profile_image' in request.files or 'delete_profile_image' in payload:
+                #     payload_images = {}
+                #     if 'profile_image' in request.files:
+                #         payload_images['profile_image'] = request.files['profile_image']
+                #     if 'delete_profile_image' in payload:
+                #         payload_images['delete_profile_image'] = payload['delete_profile_image']
+                #     # key = {'profile_personal_uid': profile_uid}
+                #     personal_info['profile_personal_image'] = processImage(key, payload_images)
+
                 if 'profile_image' in request.files or 'delete_profile_image' in payload:
+                    print("In Profile Image")
                     payload_images = {}
                     if 'profile_image' in request.files:
                         payload_images['profile_image'] = request.files['profile_image']
@@ -677,8 +687,10 @@ class UserProfileInfo(Resource):
                     # key = {'profile_personal_uid': profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
 
+
+
                 if ('profile_resume_details' in payload and 'file_0' in request.files) or 'delete_documents' in payload:
-                    print("In Profile Personal Resume")
+                    print("In Profile Document")
                     # if new resume is added check if there is an existing resume.  Delete existing resume and add new resume
                     # --------------- PROCESS DOCUMENTS ------------------
         
