@@ -132,7 +132,7 @@ class BusinessInfo(Resource):
                     services_str = payload.pop('business_services')
                 
                 payload['business_uid'] = new_business_uid
-                payload['business_user_id'] = user_uid
+                # payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
                 if 'business_img_0' in request.files or 'delete_business_images' in payload:
@@ -140,7 +140,9 @@ class BusinessInfo(Resource):
                     images = processImage(key, payload)
                     payload['business_images_url'] = json.dumps(images)
 
+                # print("Insert Payload: ", payload)
                 insert_response = db.insert('every_circle.business', payload)
+                # print("insert_response: ", insert_response)
                 
                 if categories_uid_str:
                     self._add_categories(db, categories_uid_str, new_business_uid)
@@ -152,11 +154,21 @@ class BusinessInfo(Resource):
                 if services_str:
                     self._add_services(db, services_str, new_business_uid)
                 
-                response = {
-                    'business_uid': new_business_uid,
-                    'message': 'Business created successfully',
-                    'code': 200
-                }
+
+                
+                # print(insert_response["code"])
+                if(insert_response["code"] == 200):
+                    response = {
+                        'business_uid': new_business_uid,
+                        'message': 'Business created successfully',
+                        'code': insert_response["code"]
+                    }
+                else:
+                    response = {
+                        'Error': f"{new_business_uid} - Not Created",
+                        'message': insert_response["message"],
+                        'code': insert_response["code"]
+                    }
                 
                 return response, 200
         
