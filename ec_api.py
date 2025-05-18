@@ -466,7 +466,7 @@ class Refer(Resource):
 # api.add_resource(Search, "/search/<string:profile_id>")
 # api.add_resource(Search_v2, "/api/v2/search/<string:profile_id>")
 # api.add_resource(Refer, "/refer-a-friend")
-# api.add_resource(Lists, "/lists")
+api.add_resource(Lists, "/lists")
 # api.add_resource(Charges, "/charges")
 # api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 # api.add_resource(Feed, "/feed/<string:profile_id>")
@@ -481,7 +481,7 @@ class Refer(Resource):
 # api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 # api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
 # api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
-api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
+# api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 # api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 # api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:uid>')
 
