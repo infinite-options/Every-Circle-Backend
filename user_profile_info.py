@@ -13,6 +13,7 @@ class UserProfileInfo(Resource):
             print(uid, type(uid))
             with connect() as db:
                 if uid[:3] == "100":
+                    print("User UID Passed - Consider Changing")
                     # This is a user UID
                     user_response = db.select('every_circle.users', where={'user_uid': uid})
                     if not user_response['result']:
@@ -76,6 +77,7 @@ class UserProfileInfo(Resource):
                     return response, 200
                     
                 elif uid[:3] == "110":
+                    print("Profile UID Passed")
                     # This is a profile UID (profile_personal)
                     personal_info = db.select('every_circle.profile_personal', where={'profile_personal_uid': uid})
                     
@@ -84,6 +86,7 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    print("1")
                     profile_id = uid
                     
                     # Get all associated profile data
@@ -94,7 +97,7 @@ class UserProfileInfo(Resource):
                     user_info = db.select('every_circle.users', where={'user_uid': user_id})
                     response['user_role'] = user_info['result'][0]['user_role'] if user_info['result'] else "unknown"
                     response['user_email'] = user_info['result'][0]['user_email_id']
-                    
+                    print("2")
                     # Get social media links
                     social_links_query = f"""
                         SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
@@ -104,7 +107,7 @@ class UserProfileInfo(Resource):
                     """
                     social_links_response = db.execute(social_links_query)
                     response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
-                    
+                    print("3")
                     # Get expertise info - returning all expertise entries
                     expertise_info = db.select('every_circle.profile_expertise', 
                                             where={'profile_expertise_profile_personal_id': profile_id})
@@ -114,7 +117,7 @@ class UserProfileInfo(Resource):
                     wishes_info = db.select('every_circle.profile_wish', 
                                          where={'profile_wish_profile_personal_id': profile_id})
                     response['wishes_info'] = wishes_info['result'] if wishes_info['result'] else []
-                    
+                    print("4")
                     # Get experience info - returning all experiences
                     experience_info = db.select('every_circle.profile_experience', 
                                              where={'profile_experience_profile_personal_id': profile_id})
@@ -124,10 +127,10 @@ class UserProfileInfo(Resource):
                     education_info = db.select('every_circle.profile_education', 
                                             where={'profile_education_profile_personal_id': profile_id})
                     response['education_info'] = education_info['result'] if education_info['result'] else []
-
-                    business_info = db.select('every_circle.business',
-                                             where={'business_user_id': user_id})
-                    response['business_info'] = business_info['result'] if business_info['result'] else []
+                    print("5")
+                    # business_info = db.select('every_circle.business',
+                    #                          where={'business_user_id': user_id})
+                    # response['business_info'] = business_info['result'] if business_info['result'] else []
                     
                     return response, 200
                 
