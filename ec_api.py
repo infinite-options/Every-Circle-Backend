@@ -38,7 +38,8 @@ from business_info import BusinessInfo
 from transactions import Transactions
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
-
+from tagSearch_direct import TagSearchDirect
+from tagCategorySearch import TagCategorySearch
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -489,6 +490,8 @@ api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<str
 api.add_resource(Business_Results, '/api/business_results')
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
+api.add_resource(TagSearchDirect, "/api/tagsearch/<string:query>")
+api.add_resource(TagCategorySearch, "/api/tagcategory/<string:query>")
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():
 #     try:
