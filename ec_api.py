@@ -502,6 +502,7 @@ api.add_resource(ProfileWishInfo, "/api/profilewishinfo/<string:query>")
 api.add_resource(TagSplitSearch, "/api/tagsplitsearchdistinct/<string:query>")
 api.add_resource(TagSplitNLPSearch, "/api/tagsplitnlpsearch/<string:query>")
 api.add_resource(SplitSearch, "/api/tagsplitcategorysearch/<string:query>")
+
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():
 #     try:
