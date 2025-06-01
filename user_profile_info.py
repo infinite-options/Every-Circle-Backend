@@ -839,9 +839,10 @@ class UserProfileInfo(Resource):
                             expertise_info = {}
                             
                             # Check if this is an existing expertise (has UID)
-                            if 'uid' in exp_data:
+                            if 'profile_expertise_uid' in exp_data:
+                                print("In existing expertise entry", exp_data['profile_expertise_uid'])
                                 # Get the existing expertise UID
-                                expertise_uid = exp_data.pop('uid')
+                                expertise_uid = exp_data.pop('profile_expertise_uid')
                                 
                                 # Check if expertise exists
                                 expertise_exists_query = db.select('every_circle.profile_expertise', 
@@ -952,9 +953,10 @@ class UserProfileInfo(Resource):
                             wish_info = {}
                             
                             # Check if this is an existing wish (has UID)
-                            if 'uid' in wish_data:
+                            if 'profile_wish_uid' in wish_data:
+                                print("In existing wish entry", wish_data['profile_wish_uid'])
                                 # Get the existing wish UID
-                                wish_uid = wish_data.pop('uid')
+                                wish_uid = wish_data.pop('profile_wish_uid')
                                 
                                 # Check if wish exists
                                 wish_exists_query = db.select('every_circle.profile_wish', 
@@ -1061,10 +1063,11 @@ class UserProfileInfo(Resource):
                             experience_info = {}
                             
                             # Check if this is an existing experience (has UID)
-                            if 'uid' in exp_data:
+                            if 'profile_experience_uid' in exp_data:
+                                print("In existing experience entry", exp_data['profile_experience_uid'])
                                 # Get the existing experience UID
                                 print("In existing experience entry")
-                                experience_uid = exp_data.pop('uid')
+                                experience_uid = exp_data.pop('profile_experience_uid')
                                 
                                 # Check if experience exists
                                 experience_exists_query = db.select('every_circle.profile_experience', 
@@ -1177,9 +1180,10 @@ class UserProfileInfo(Resource):
                             education_info = {}
                             
                             # Check if this is an existing education (has UID)
-                            if 'uid' in edu_data:
+                            if 'profile_education_uid' in edu_data:
+                                print("In existing education entry", edu_data['profile_education_uid'])
                                 # Get the existing education UID
-                                education_uid = edu_data.pop('uid')
+                                education_uid = edu_data.pop('profile_education_uid')
                                 
                                 # Check if education exists
                                 education_exists_query = db.select('every_circle.profile_education', 
