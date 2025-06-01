@@ -1159,10 +1159,10 @@ class UserProfileInfo(Resource):
                             business_info = {}
                             
                             # Check if this is an existing business (has UID)
-                            if 'business_uid' in business_data:
-                                print("In existing business entry", business_data['business_uid'])
+                            if 'profile_business_uid' in business_data:
+                                print("In existing business entry", business_data['profile_business_uid'])
                                 # Get the existing business UID
-                                business_uid = business_data.pop('business_uid')
+                                business_uid = business_data.pop('profile_business_uid')
                                 
                                 # Check if business exists                                      
                                 business_exists_query = db.select('every_circle.business', 
@@ -1174,12 +1174,13 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the business data
-                                if 'name' in business_data:
-                                    business_info['business_name'] = business_data['name']
-                                if 'description' in business_data:
-                                    business_info['business_description'] = business_data['description']
+                                if 'profile_business_role' in business_data:
+                                    business_info['profile_business_role'] = business_data['profile_business_role']
                                 if 'isPublic' in business_data:
-                                    business_info['business_is_public'] = business_data['isPublic']
+                                    business_info['profile_business_is_visible'] = business_data['isPublic']
+                                if 'isApproved' in business_data:
+                                    business_info['profile_business_approved'] = business_data['isApproved']
+                                    business_info['profile_business_approver_id'] = business_data['approverId']
                                 
                                 # Update the existing business
                                 if business_info:
@@ -1195,14 +1196,13 @@ class UserProfileInfo(Resource):
                                 business_info['profile_business_profile_personal_id'] = profile_uid
                                 
                                 # Map fields from the business data
-                                if 'business_id' in business_data:
-                                    business_info['profile_business_business_id'] = business_data['business_id']
                                 if 'profile_business_role' in business_data:
                                     business_info['profile_business_role'] = business_data['profile_business_role']
                                 if 'isPublic' in business_data:
                                     business_info['profile_business_is_visible'] = business_data['isPublic']
                                 if 'isApproved' in business_data:
                                     business_info['profile_business_approved'] = business_data['isApproved']
+                                    business_info['profile_business_approver_id'] = business_data['approverId']
                                 
                                 # Insert the business record
                                 print("Inserting business record", business_info)
