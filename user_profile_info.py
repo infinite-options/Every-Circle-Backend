@@ -654,15 +654,17 @@ class UserProfileInfo(Resource):
                 personal_info_fields = [
                     'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
                     'profile_personal_phone_number', 'profile_personal_phone_number_is_public', 
-                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country',
-                    'profile_personal_location_is_public', 'profile_personal_latitude', 'profile_personal_longitude', 
-                    'profile_personal_image', 'profile_personal_image_is_public', 'profile_personal_tag_line', 
-                    'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
-                    'profile_personal_short_bio_is_public', 'profile_personal_resume', 
-                    'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
-                    'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
-                    'profile_personal_experience_is_public', 'profile_personal_education_is_public',
-                    'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public'
+                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country','profile_personal_location_is_public', 
+                    'profile_personal_latitude', 'profile_personal_longitude', 
+                    'profile_personal_image', 'profile_personal_image_is_public', 
+                    'profile_personal_tag_line', 'profile_personal_tag_line_is_public', 
+                    'profile_personal_short_bio', 'profile_personal_short_bio_is_public', 
+                    'profile_personal_resume', 'profile_personal_resume_is_public', 
+                    'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
+                    'profile_personal_experience_is_public', 
+                    'profile_personal_education_is_public',
+                    'profile_personal_expertise_is_public', 
+                    'profile_personal_wishes_is_public'
                 ]
                 
                 for field in personal_info_fields:
@@ -761,6 +763,7 @@ class UserProfileInfo(Resource):
                 
                 # Check for social media links in the payload
                 if 'social_links' in payload:
+                    print("In social_links")
                     try:
                         import json
                         social_media_links = json.loads(payload.pop('social_links'))
@@ -823,14 +826,16 @@ class UserProfileInfo(Resource):
                         print(f"Error processing social_links JSON: {str(e)}")
                 
                 # Handle multiple expertise entries
-                if 'expertises' in payload:
+                if 'expertise_info' in payload:
+                    print("In expertises")
                     try:
                         import json
-                        expertises_data = json.loads(payload.pop('expertises'))
+                        expertises_data = json.loads(payload.pop('expertise_info'))
                         expertise_uids = []
                         
                         # Process each expertise entry
                         for exp_data in expertises_data:
+                            print("exp_data", exp_data)
                             expertise_info = {}
                             
                             # Check if this is an existing expertise (has UID)
@@ -848,14 +853,16 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the expertise data
-                                if 'title' in exp_data:
-                                    expertise_info['profile_expertise_title'] = exp_data['title']
+                                if 'name' in exp_data:
+                                    expertise_info['profile_expertise_title'] = exp_data['name']
                                 if 'description' in exp_data:
                                     expertise_info['profile_expertise_description'] = exp_data['description']
                                 if 'cost' in exp_data:
                                     expertise_info['profile_expertise_cost'] = exp_data['cost']
                                 if 'bounty' in exp_data:
                                     expertise_info['profile_expertise_bounty'] = exp_data['bounty']
+                                if 'isPublic' in exp_data:
+                                    expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
                                 
                                 # Update the existing expertise
                                 if expertise_info:
@@ -871,14 +878,16 @@ class UserProfileInfo(Resource):
                                 expertise_info['profile_expertise_profile_personal_id'] = profile_uid
                                 
                                 # Map fields from the expertise data
-                                if 'title' in exp_data:
-                                    expertise_info['profile_expertise_title'] = exp_data['title']
+                                if 'name' in exp_data:
+                                    expertise_info['profile_expertise_title'] = exp_data['name']
                                 if 'description' in exp_data:
                                     expertise_info['profile_expertise_description'] = exp_data['description']
                                 if 'cost' in exp_data:
                                     expertise_info['profile_expertise_cost'] = exp_data['cost']
                                 if 'bounty' in exp_data:
                                     expertise_info['profile_expertise_bounty'] = exp_data['bounty']
+                                if 'isPublic' in exp_data:
+                                    expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
                                 
                                 # Insert the expertise record
                                 db.insert('every_circle.profile_expertise', expertise_info)
@@ -888,55 +897,58 @@ class UserProfileInfo(Resource):
                     except Exception as e:
                         print(f"Error processing expertises JSON in PUT: {str(e)}")
                 
-                # Handle individual expertise update (legacy format)
-                elif any(key.startswith('profile_expertise_') and key != 'profile_expertise_profile_personal_id' for key in payload):
-                    expertise_info = {k: v for k, v in payload.items() if k.startswith('profile_expertise_')}
+                # # Handle individual expertise update (legacy format)
+                # elif any(key.startswith('profile_expertise_') and key != 'profile_expertise_profile_personal_id' for key in payload):
+                #     print("In individual expertise update")
+                #     expertise_info = {k: v for k, v in payload.items() if k.startswith('profile_expertise_')}
                     
-                    if 'profile_expertise_uid' in expertise_info:
-                        # Update specific expertise entry
-                        expertise_uid = expertise_info.pop('profile_expertise_uid')
+                #     if 'profile_expertise_uid' in expertise_info:
+                #         # Update specific expertise entry
+                #         expertise_uid = expertise_info.pop('profile_expertise_uid')
                         
-                        # Check if expertise exists
-                        expertise_exists_query = db.select('every_circle.profile_expertise', 
-                                                         where={'profile_expertise_uid': expertise_uid})
+                #         # Check if expertise exists
+                #         expertise_exists_query = db.select('every_circle.profile_expertise', 
+                #                                          where={'profile_expertise_uid': expertise_uid})
                         
-                        if not expertise_exists_query['result']:
-                            response['message'] = f'Expertise with UID {expertise_uid} not found'
-                            response['code'] = 404
-                            return response, 404
+                #         if not expertise_exists_query['result']:
+                #             response['message'] = f'Expertise with UID {expertise_uid} not found'
+                #             response['code'] = 404
+                #             return response, 404
                         
-                        # Remove profile_id if present
-                        if 'profile_expertise_profile_personal_id' in expertise_info:
-                            expertise_info.pop('profile_expertise_profile_personal_id')
+                #         # Remove profile_id if present
+                #         if 'profile_expertise_profile_personal_id' in expertise_info:
+                #             expertise_info.pop('profile_expertise_profile_personal_id')
                         
-                        # Update existing expertise
-                        if expertise_info:
-                            db.update('every_circle.profile_expertise', 
-                                     {'profile_expertise_uid': expertise_uid}, expertise_info)
-                            updated_uids['profile_expertise_uid'] = expertise_uid
-                    else:
-                        # Add new expertise
-                        expertise_stored_procedure_response = db.call(procedure='new_profile_expertise_uid')
-                        new_expertise_uid = expertise_stored_procedure_response['result'][0]['new_id']
-                        expertise_info['profile_expertise_uid'] = new_expertise_uid
-                        expertise_info['profile_expertise_profile_personal_id'] = profile_uid
-                        db.insert('every_circle.profile_expertise', expertise_info)
-                        updated_uids['profile_expertise_uid'] = new_expertise_uid
+                #         # Update existing expertise
+                #         if expertise_info:
+                #             db.update('every_circle.profile_expertise', 
+                #                      {'profile_expertise_uid': expertise_uid}, expertise_info)
+                #             updated_uids['profile_expertise_uid'] = expertise_uid
+                #     else:
+                #         # Add new expertise
+                #         expertise_stored_procedure_response = db.call(procedure='new_profile_expertise_uid')
+                #         new_expertise_uid = expertise_stored_procedure_response['result'][0]['new_id']
+                #         expertise_info['profile_expertise_uid'] = new_expertise_uid
+                #         expertise_info['profile_expertise_profile_personal_id'] = profile_uid
+                #         db.insert('every_circle.profile_expertise', expertise_info)
+                #         updated_uids['profile_expertise_uid'] = new_expertise_uid
                     
-                    # Remove used items
-                    for k in list(expertise_info.keys()):
-                        if k in payload:
-                            payload.pop(k)
+                #     # Remove used items
+                #     for k in list(expertise_info.keys()):
+                #         if k in payload:
+                #             payload.pop(k)
                 
                 # Handle multiple wishes entries
-                if 'wishes' in payload:
+                if 'wishes_info' in payload:
+                    print("In wishes")
                     try:
                         import json
-                        wishes_data = json.loads(payload.pop('wishes'))
+                        wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_uids = []
                         
                         # Process each wish entry
                         for wish_data in wishes_data:
+                            print("wish_data", wish_data)
                             wish_info = {}
                             
                             # Check if this is an existing wish (has UID)
@@ -954,12 +966,14 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the wish data
-                                if 'title' in wish_data:
-                                    wish_info['profile_wish_title'] = wish_data['title']
-                                if 'description' in wish_data:
-                                    wish_info['profile_wish_description'] = wish_data['description']
-                                if 'bounty' in wish_data:
-                                    wish_info['profile_wish_bounty'] = wish_data['bounty']
+                                if 'helpNeeds' in wish_data:
+                                    wish_info['profile_wish_title'] = wish_data['helpNeeds']
+                                if 'details' in wish_data:
+                                    wish_info['profile_wish_description'] = wish_data['details']
+                                if 'amount' in wish_data:
+                                    wish_info['profile_wish_bounty'] = wish_data['amount']
+                                if 'isPublic' in exp_data:
+                                    wish_info['profile_wish_is_public'] = wish_data['isPublic']
                                 
                                 # Update the existing wish
                                 if wish_info:
@@ -975,12 +989,14 @@ class UserProfileInfo(Resource):
                                 wish_info['profile_wish_profile_personal_id'] = profile_uid
                                 
                                 # Map fields from the wish data
-                                if 'title' in wish_data:
-                                    wish_info['profile_wish_title'] = wish_data['title']
-                                if 'description' in wish_data:
-                                    wish_info['profile_wish_description'] = wish_data['description']
-                                if 'bounty' in wish_data:
-                                    wish_info['profile_wish_bounty'] = wish_data['bounty']
+                                if 'helpNeeds' in wish_data:
+                                    wish_info['profile_wish_title'] = wish_data['helpNeeds']
+                                if 'details' in wish_data:
+                                    wish_info['profile_wish_description'] = wish_data['details']
+                                if 'amount' in wish_data:
+                                    wish_info['profile_wish_bounty'] = wish_data['amount']
+                                if 'isPublic' in exp_data:
+                                    wish_info['profile_wish_is_public'] = wish_data['isPublic']
                                 
                                 # Insert the wish record
                                 db.insert('every_circle.profile_wish', wish_info)
@@ -990,60 +1006,64 @@ class UserProfileInfo(Resource):
                     except Exception as e:
                         print(f"Error processing wishes JSON in PUT: {str(e)}")
                 
-                # Handle individual wish update (legacy format)
-                elif any(key.startswith('profile_wish_') and key != 'profile_wish_profile_personal_id' for key in payload):
-                    wish_info = {k: v for k, v in payload.items() if k.startswith('profile_wish_')}
+                # # Handle individual wish update (legacy format)
+                # elif any(key.startswith('profile_wish_') and key != 'profile_wish_profile_personal_id' for key in payload):
+                #     print("In individual wish update")
+                #     wish_info = {k: v for k, v in payload.items() if k.startswith('profile_wish_')}
                     
-                    if 'profile_wish_uid' in wish_info:
-                        # Update specific wish entry
-                        wish_uid = wish_info.pop('profile_wish_uid')
+                #     if 'profile_wish_uid' in wish_info:
+                #         # Update specific wish entry
+                #         wish_uid = wish_info.pop('profile_wish_uid')
                         
-                        # Check if wish exists
-                        wish_exists_query = db.select('every_circle.profile_wish', 
-                                                     where={'profile_wish_uid': wish_uid})
+                #         # Check if wish exists
+                #         wish_exists_query = db.select('every_circle.profile_wish', 
+                #                                      where={'profile_wish_uid': wish_uid})
                         
-                        if not wish_exists_query['result']:
-                            response['message'] = f'Wish with UID {wish_uid} not found'
-                            response['code'] = 404
-                            return response, 404
+                #         if not wish_exists_query['result']:
+                #             response['message'] = f'Wish with UID {wish_uid} not found'
+                #             response['code'] = 404
+                #             return response, 404
                         
-                        # Remove profile_id if present
-                        if 'profile_wish_profile_personal_id' in wish_info:
-                            wish_info.pop('profile_wish_profile_personal_id')
+                #         # Remove profile_id if present
+                #         if 'profile_wish_profile_personal_id' in wish_info:
+                #             wish_info.pop('profile_wish_profile_personal_id')
                         
-                        # Update existing wish
-                        if wish_info:
-                            db.update('every_circle.profile_wish', 
-                                     {'profile_wish_uid': wish_uid}, wish_info)
-                            updated_uids['profile_wish_uid'] = wish_uid
-                    else:
-                        # Add new wish
-                        wishes_stored_procedure_response = db.call(procedure='new_profile_wish_uid')
-                        new_wish_uid = wishes_stored_procedure_response['result'][0]['new_id']
-                        wish_info['profile_wish_uid'] = new_wish_uid
-                        wish_info['profile_wish_profile_personal_id'] = profile_uid
-                        db.insert('every_circle.profile_wish', wish_info)
-                        updated_uids['profile_wish_uid'] = new_wish_uid
+                #         # Update existing wish
+                #         if wish_info:
+                #             db.update('every_circle.profile_wish', 
+                #                      {'profile_wish_uid': wish_uid}, wish_info)
+                #             updated_uids['profile_wish_uid'] = wish_uid
+                #     else:
+                #         # Add new wish
+                #         wishes_stored_procedure_response = db.call(procedure='new_profile_wish_uid')
+                #         new_wish_uid = wishes_stored_procedure_response['result'][0]['new_id']
+                #         wish_info['profile_wish_uid'] = new_wish_uid
+                #         wish_info['profile_wish_profile_personal_id'] = profile_uid
+                #         db.insert('every_circle.profile_wish', wish_info)
+                #         updated_uids['profile_wish_uid'] = new_wish_uid
                     
-                    # Remove used items
-                    for k in list(wish_info.keys()):
-                        if k in payload:
-                            payload.pop(k)
+                #     # Remove used items
+                #     for k in list(wish_info.keys()):
+                #         if k in payload:
+                #             payload.pop(k)
                 
                 # Handle multiple experiences
-                if 'experiences' in payload:
+                if 'experience_info' in payload:
+                    print("In experiences")
                     try:
                         import json
-                        experiences_data = json.loads(payload.pop('experiences'))
+                        experiences_data = json.loads(payload.pop('experience_info'))
                         experience_uids = []
                         
                         # Process each experience entry
                         for exp_data in experiences_data:
+                            print("exp_data", exp_data)
                             experience_info = {}
                             
                             # Check if this is an existing experience (has UID)
                             if 'uid' in exp_data:
                                 # Get the existing experience UID
+                                print("In existing experience entry")
                                 experience_uid = exp_data.pop('uid')
                                 
                                 # Check if experience exists
@@ -1056,14 +1076,16 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the experience data
-                                if 'company_name' in exp_data:
-                                    experience_info['profile_experience_company_name'] = exp_data['company_name']
-                                if 'position' in exp_data:
-                                    experience_info['profile_experience_position'] = exp_data['position']
-                                if 'start_date' in exp_data:
-                                    experience_info['profile_experience_start_date'] = exp_data['start_date']
-                                if 'end_date' in exp_data:
-                                    experience_info['profile_experience_end_date'] = exp_data['end_date']
+                                if 'company' in exp_data:
+                                    experience_info['profile_experience_company_name'] = exp_data['company']
+                                if 'title' in exp_data:
+                                    experience_info['profile_experience_position'] = exp_data['title']
+                                if 'startDate' in exp_data:
+                                    experience_info['profile_experience_start_date'] = exp_data['startDate']
+                                if 'endDate' in exp_data:
+                                    experience_info['profile_experience_end_date'] = exp_data['endDate']
+                                if 'isPublic' in exp_data:
+                                    experience_info['profile_experience_is_public'] = exp_data['isPublic']
                                 
                                 # Update the existing experience
                                 if experience_info:
@@ -1072,23 +1094,27 @@ class UserProfileInfo(Resource):
                                     
                                 experience_uids.append(experience_uid)
                             else:
-                                # This is a new experience entry
+                                # This is a new experience entr
+                                print("In new experience entry")
                                 experience_stored_procedure_response = db.call(procedure='new_profile_experience_uid')
                                 new_experience_uid = experience_stored_procedure_response['result'][0]['new_id']
                                 experience_info['profile_experience_uid'] = new_experience_uid
                                 experience_info['profile_experience_profile_personal_id'] = profile_uid
                                 
                                 # Map fields from the experience data
-                                if 'company_name' in exp_data:
-                                    experience_info['profile_experience_company_name'] = exp_data['company_name']
-                                if 'position' in exp_data:
-                                    experience_info['profile_experience_position'] = exp_data['position']
-                                if 'start_date' in exp_data:
-                                    experience_info['profile_experience_start_date'] = exp_data['start_date']
-                                if 'end_date' in exp_data:
-                                    experience_info['profile_experience_end_date'] = exp_data['end_date']
+                                if 'company' in exp_data:
+                                    experience_info['profile_experience_company_name'] = exp_data['company']
+                                if 'title' in exp_data:
+                                    experience_info['profile_experience_position'] = exp_data['title']
+                                if 'startDate' in exp_data:
+                                    experience_info['profile_experience_start_date'] = exp_data['startDate']
+                                if 'endDate' in exp_data:
+                                    experience_info['profile_experience_end_date'] = exp_data['endDate']
+                                if 'isPublic' in exp_data:
+                                    experience_info['profile_experience_is_public'] = exp_data['isPublic']
                                 
                                 # Insert the experience record
+                                print("Inserting experience record", experience_info)
                                 db.insert('every_circle.profile_experience', experience_info)
                                 experience_uids.append(new_experience_uid)
                         
@@ -1096,55 +1122,58 @@ class UserProfileInfo(Resource):
                     except Exception as e:
                         print(f"Error processing experiences JSON in PUT: {str(e)}")
                 
-                # Handle individual experience update (legacy format)
-                elif any(key.startswith('profile_experience_') and key != 'profile_experience_profile_personal_id' for key in payload):
-                    experience_info = {k: v for k, v in payload.items() if k.startswith('profile_experience_')}
+                # # Handle individual experience update (legacy format)
+                # elif any(key.startswith('profile_experience_') and key != 'profile_experience_profile_personal_id' for key in payload):
+                #     print("In individual experience update")
+                #     experience_info = {k: v for k, v in payload.items() if k.startswith('profile_experience_')}
                     
-                    if 'profile_experience_uid' in experience_info:
-                        # Update specific experience entry
-                        experience_uid = experience_info.pop('profile_experience_uid')
+                #     if 'profile_experience_uid' in experience_info:
+                #         # Update specific experience entry
+                #         experience_uid = experience_info.pop('profile_experience_uid')
                         
-                        # Check if experience exists
-                        experience_exists_query = db.select('every_circle.profile_experience', 
-                                                          where={'profile_experience_uid': experience_uid})
+                #         # Check if experience exists
+                #         experience_exists_query = db.select('every_circle.profile_experience', 
+                #                                           where={'profile_experience_uid': experience_uid})
                         
-                        if not experience_exists_query['result']:
-                            response['message'] = f'Experience with UID {experience_uid} not found'
-                            response['code'] = 404
-                            return response, 404
+                #         if not experience_exists_query['result']:
+                #             response['message'] = f'Experience with UID {experience_uid} not found'
+                #             response['code'] = 404
+                #             return response, 404
                         
-                        # Remove profile_id if present
-                        if 'profile_experience_profile_personal_id' in experience_info:
-                            experience_info.pop('profile_experience_profile_personal_id')
+                #         # Remove profile_id if present
+                #         if 'profile_experience_profile_personal_id' in experience_info:
+                #             experience_info.pop('profile_experience_profile_personal_id')
                         
-                        # Update existing experience
-                        if experience_info:
-                            db.update('every_circle.profile_experience', 
-                                     {'profile_experience_uid': experience_uid}, experience_info)
-                            updated_uids['profile_experience_uid'] = experience_uid
-                    else:
-                        # Add new experience
-                        experience_stored_procedure_response = db.call(procedure='new_profile_experience_uid')
-                        new_experience_uid = experience_stored_procedure_response['result'][0]['new_id']
-                        experience_info['profile_experience_uid'] = new_experience_uid
-                        experience_info['profile_experience_profile_personal_id'] = profile_uid
-                        db.insert('every_circle.profile_experience', experience_info)
-                        updated_uids['profile_experience_uid'] = new_experience_uid
+                #         # Update existing experience
+                #         if experience_info:
+                #             db.update('every_circle.profile_experience', 
+                #                      {'profile_experience_uid': experience_uid}, experience_info)
+                #             updated_uids['profile_experience_uid'] = experience_uid
+                #     else:
+                #         # Add new experience
+                #         experience_stored_procedure_response = db.call(procedure='new_profile_experience_uid')
+                #         new_experience_uid = experience_stored_procedure_response['result'][0]['new_id']
+                #         experience_info['profile_experience_uid'] = new_experience_uid
+                #         experience_info['profile_experience_profile_personal_id'] = profile_uid
+                #         db.insert('every_circle.profile_experience', experience_info)
+                #         updated_uids['profile_experience_uid'] = new_experience_uid
                     
-                    # Remove used items
-                    for k in list(experience_info.keys()):
-                        if k in payload:
-                            payload.pop(k)
+                #     # Remove used items
+                #     for k in list(experience_info.keys()):
+                #         if k in payload:
+                #             payload.pop(k)
                 
                 # Handle multiple education entries
-                if 'educations' in payload:
+                if 'education_info' in payload:
+                    print("In educations")
                     try:
                         import json
-                        educations_data = json.loads(payload.pop('educations'))
+                        educations_data = json.loads(payload.pop('education_info'))
                         education_uids = []
                         
                         # Process each education entry
                         for edu_data in educations_data:
+                            print("edu_data", edu_data)
                             education_info = {}
                             
                             # Check if this is an existing education (has UID)
@@ -1162,16 +1191,18 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the education data
-                                if 'school_name' in edu_data:
-                                    education_info['profile_education_school_name'] = edu_data['school_name']
+                                if 'school' in edu_data:
+                                    education_info['profile_education_school_name'] = edu_data['school']
                                 if 'degree' in edu_data:
                                     education_info['profile_education_degree'] = edu_data['degree']
                                 if 'course' in edu_data:
                                     education_info['profile_education_course'] = edu_data['course']
-                                if 'start_date' in edu_data:
-                                    education_info['profile_education_start_date'] = edu_data['start_date']
-                                if 'end_date' in edu_data:
-                                    education_info['profile_education_end_date'] = edu_data['end_date']
+                                if 'startDate' in edu_data:
+                                    education_info['profile_education_start_date'] = edu_data['startDate']
+                                if 'endDate' in edu_data:
+                                    education_info['profile_education_end_date'] = edu_data['endDate']
+                                if 'isPublic' in edu_data:
+                                    education_info['profile_education_is_public'] = edu_data['isPublic']
                                 
                                 # Update the existing education
                                 if education_info:
@@ -1187,16 +1218,18 @@ class UserProfileInfo(Resource):
                                 education_info['profile_education_profile_personal_id'] = profile_uid
                                 
                                 # Map fields from the education data
-                                if 'school_name' in edu_data:
-                                    education_info['profile_education_school_name'] = edu_data['school_name']
+                                if 'school' in edu_data:
+                                    education_info['profile_education_school_name'] = edu_data['school']
                                 if 'degree' in edu_data:
                                     education_info['profile_education_degree'] = edu_data['degree']
                                 if 'course' in edu_data:
                                     education_info['profile_education_course'] = edu_data['course']
-                                if 'start_date' in edu_data:
-                                    education_info['profile_education_start_date'] = edu_data['start_date']
-                                if 'end_date' in edu_data:
-                                    education_info['profile_education_end_date'] = edu_data['end_date']
+                                if 'startDate' in edu_data:
+                                    education_info['profile_education_start_date'] = edu_data['startDate']
+                                if 'endDate' in edu_data:
+                                    education_info['profile_education_end_date'] = edu_data['endDate']
+                                if 'isPublic' in edu_data:
+                                    education_info['profile_education_is_public'] = edu_data['isPublic']
                                 
                                 # Insert the education record
                                 db.insert('every_circle.profile_education', education_info)
@@ -1206,45 +1239,46 @@ class UserProfileInfo(Resource):
                     except Exception as e:
                         print(f"Error processing educations JSON in PUT: {str(e)}")
                 
-                # Handle individual education update (legacy format)
-                elif any(key.startswith('profile_education_') and key != 'profile_education_profile_personal_id' for key in payload):
-                    education_info = {k: v for k, v in payload.items() if k.startswith('profile_education_')}
+                # # Handle individual education update (legacy format)
+                # elif any(key.startswith('profile_education_') and key != 'profile_education_profile_personal_id' for key in payload):
+                #     print("In individual education update")
+                #     education_info = {k: v for k, v in payload.items() if k.startswith('profile_education_')}
                     
-                    if 'profile_education_uid' in education_info:
-                        # Update specific education entry
-                        education_uid = education_info.pop('profile_education_uid')
+                #     if 'profile_education_uid' in education_info:
+                #         # Update specific education entry
+                #         education_uid = education_info.pop('profile_education_uid')
                         
-                        # Check if education exists
-                        education_exists_query = db.select('every_circle.profile_education', 
-                                                         where={'profile_education_uid': education_uid})
+                #         # Check if education exists
+                #         education_exists_query = db.select('every_circle.profile_education', 
+                #                                          where={'profile_education_uid': education_uid})
                         
-                        if not education_exists_query['result']:
-                            response['message'] = f'Education with UID {education_uid} not found'
-                            response['code'] = 404
-                            return response, 404
+                #         if not education_exists_query['result']:
+                #             response['message'] = f'Education with UID {education_uid} not found'
+                #             response['code'] = 404
+                #             return response, 404
                         
-                        # Remove profile_id if present
-                        if 'profile_education_profile_personal_id' in education_info:
-                            education_info.pop('profile_education_profile_personal_id')
+                #         # Remove profile_id if present
+                #         if 'profile_education_profile_personal_id' in education_info:
+                #             education_info.pop('profile_education_profile_personal_id')
                         
-                        # Update existing education
-                        if education_info:
-                            db.update('every_circle.profile_education', 
-                                     {'profile_education_uid': education_uid}, education_info)
-                            updated_uids['profile_education_uid'] = education_uid
-                    else:
-                        # Add new education
-                        education_stored_procedure_response = db.call(procedure='new_profile_education_uid')
-                        new_education_uid = education_stored_procedure_response['result'][0]['new_id']
-                        education_info['profile_education_uid'] = new_education_uid
-                        education_info['profile_education_profile_personal_id'] = profile_uid
-                        db.insert('every_circle.profile_education', education_info)
-                        updated_uids['profile_education_uid'] = new_education_uid
+                #         # Update existing education
+                #         if education_info:
+                #             db.update('every_circle.profile_education', 
+                #                      {'profile_education_uid': education_uid}, education_info)
+                #             updated_uids['profile_education_uid'] = education_uid
+                #     else:
+                #         # Add new education
+                #         education_stored_procedure_response = db.call(procedure='new_profile_education_uid')
+                #         new_education_uid = education_stored_procedure_response['result'][0]['new_id']
+                #         education_info['profile_education_uid'] = new_education_uid
+                #         education_info['profile_education_profile_personal_id'] = profile_uid
+                #         db.insert('every_circle.profile_education', education_info)
+                #         updated_uids['profile_education_uid'] = new_education_uid
                     
-                    # Remove used items
-                    for k in list(education_info.keys()):
-                        if k in payload:
-                            payload.pop(k)
+                #     # Remove used items
+                #     for k in list(education_info.keys()):
+                #         if k in payload:
+                #             payload.pop(k)
             
             # Prepare the response with both updated and deleted UIDs
             response['updated_uids'] = updated_uids
