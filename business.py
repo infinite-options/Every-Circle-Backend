@@ -375,3 +375,22 @@ class Business_v2(Resource):
             response['code'] = 500
             return response, 500
         
+
+class Businesses(Resource):
+    def get(self):
+        print("In Businesses GET")
+        response = {}
+        try:
+            with connect() as db:
+                # Get list of businesses
+                business_list = f"""
+                        SELECT business_uid, business_name FROM every_circle.business
+                        ORDER BY business_name
+                """
+                businesses = db.execute(business_list)
+                response = businesses['result']
+                return response, 200
+        except:
+            response['message'] = 'Internal Server Error'
+            response['code'] = 500
+            return response, 500
