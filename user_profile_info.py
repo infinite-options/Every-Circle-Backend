@@ -74,7 +74,7 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                        SELECT pb.*, b.business_name
+                                        SELECT pb.*, b.business_name AS profile_business_name
                                         FROM every_circle.profile_has_business pb
                                         LEFT JOIN every_circle.business b ON b.business_uid = pb.profile_business_business_id
                                         WHERE pb.profile_business_profile_personal_id = '{profile_id}'
@@ -146,7 +146,7 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                        SELECT pb.*, b.business_name
+                                        SELECT pb.*, b.business_name AS profile_business_name
                                         FROM every_circle.profile_has_business pb
                                         LEFT JOIN every_circle.business b ON b.business_uid = pb.profile_business_business_id
                                         WHERE pb.profile_business_profile_personal_id = '{profile_id}'
