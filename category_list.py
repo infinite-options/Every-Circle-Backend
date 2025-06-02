@@ -12,18 +12,20 @@ class CategoryList(Resource):
                     query = '''
                                 SELECT *
                                 FROM every_circle.category
-                                WHERE category_uid LIKE '%0000';
+                                WHERE category_uid LIKE '%0000'
+                                ORDER BY category_name;
                             '''
                     response = db.execute(query, cmd='get')
 
                 elif uid == "all":
-                    response = db.select('every_circle.category')
+                    response = db.select('every_circle.category ORDER BY category_name')
 
                 elif uid[:3] == "220":
                     query = f'''
                                 SELECT *
                                 FROM every_circle.category
-                                WHERE category_parent_id = '{uid}';
+                                WHERE category_parent_id = '{uid}'
+                                ORDER BY category_name;
                             '''
                     response = db.execute(query, cmd='get')
 
