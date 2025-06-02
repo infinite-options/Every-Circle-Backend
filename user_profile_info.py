@@ -1195,13 +1195,24 @@ class UserProfileInfo(Resource):
                                 businesses_uids.append(business_uid)
                             else:
                                 # This is a new business entry
-                                business_stored_procedure_response = db.call(procedure='new_profile_business_uid')
-                                new_business_uid = business_stored_procedure_response['result'][0]['new_id']
+
+                                # Create New Business
+                                new_business_info = {}
+                                new_business_info['business_uid'] = db.call(procedure='new_business_uid')['result'][0]['new_id']
+                                if 'name' in business_data:
+                                    new_business_info['business_name'] = business_data['name']
+                                db.insert('every_circle.business', new_business_info)
+
+
+                                # Add Business to Profile
+                                new_business_uid = db.call(procedure='new_profile_business_uid')['result'][0]['new_id']
                                 print("new_business_uid", new_business_uid)
                                 business_info['profile_business_uid'] = new_business_uid
                                 business_info['profile_business_profile_personal_id'] = profile_uid
-                                
+
+                                                                
                                 # Map fields from the business data
+                                business_info['profile_business_business_id'] = new_business_info['business_uid']
                                 if 'role' in business_data:
                                     business_info['profile_business_role'] = business_data['role']
                                 print("here 2")
