@@ -33,22 +33,24 @@ class BusinessResults(Resource):
         )
 
         print("**** Connection established to openSearch ****")
+
+
          # Load NLP model
-        nlp = spacy.load("en_core_web_sm")
+        # nlp = spacy.load("en_core_web_sm")
 
-        def extract_keywords(user_query: str):
-            doc = nlp(user_query)
+        # def extract_keywords(user_query: str):
+        #     doc = nlp(user_query)
             
-            # Extract nouns and proper nouns
-            keywords = [token.lemma_.lower() for token in doc if token.pos_ in ['NOUN', 'PROPN'] 
-                        and not token.is_stop]
+        #     # Extract nouns and proper nouns
+        #     keywords = [token.lemma_.lower() for token in doc if token.pos_ in ['NOUN', 'PROPN'] 
+        #                 and not token.is_stop]
 
-            return keywords
+        #     return keywords
 
 
-        keywords = extract_keywords(user_query)
-        in_keywords = str(", ".join(keywords))
-        #print('Extracted keywords from the input query', keywords)
+        # keywords = extract_keywords(user_query)
+        # in_keywords = str(", ".join(keywords))
+        # #print('Extracted keywords from the input query', keywords)
 
 
          # Encode the user query to vector
@@ -57,7 +59,7 @@ class BusinessResults(Resource):
         # query_vector = model.encode(in_keywords).tolist()
 
 
-        print("**** query_vector ****", query_vector)
+        # print("**** query_vector ****", query_vector)
 
         # Define the search query for business data
         # Build KNN semantic search query
