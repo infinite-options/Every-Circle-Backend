@@ -132,7 +132,7 @@ class BusinessInfo(Resource):
                     services_str = payload.pop('business_services')
                 
                 payload['business_uid'] = new_business_uid
-                # payload['business_user_id'] = user_uid
+                payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
                 if 'business_img_0' in request.files or 'delete_business_images' in payload:

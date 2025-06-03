@@ -15,7 +15,7 @@
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
 from user_profile import Profile
-from business import Business, Business_v2
+from business import Business, Business_v2, Businesses
 from business_v3 import Business_v3
 from ratings import Ratings, Ratings_v2
 from ratings_v3 import Ratings_v3
@@ -469,6 +469,7 @@ api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Business_v2, "/api/v2/business", "/api/v2/business/<string:uid>")
+api.add_resource(Businesses, "/businesses")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Ratings_v2, "/api/v2/ratings", "/api/v2/ratings/<string:uid>")
 api.add_resource(Search, "/search/<string:profile_id>")
