@@ -5,8 +5,11 @@ from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
 import pymysql
 import os
-import spacy
+from dotenv import load_dotenv
+# import spacy
 from data_ec import connect
+
+load_dotenv()
 
 # Load model only once, globally
 model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -24,14 +27,21 @@ class BusinessResults(Resource):
 
         print('user_query:', user_query)
 
+        
+        # Read environment variables
+        host = os.getenv("OPENSEARCH_HOST")
+        port = int(os.getenv("OPENSEARCH_PORT"))
+        username = os.getenv("OPENSEARCH_USERNAME")
+        password = os.getenv("OPENSEARCH_PASSWORD")
+        
         # Connect to OpenSearch
         client = OpenSearch(
-            hosts=[{'host': 'search-my-backend-lbghsfyddvevdy5kmj3hcbmbgq.aos.us-east-2.on.aws', 'port': 443}],
-            http_auth=('Asharma@2', 'Asharma@2'),  # Use master user
+            hosts=[{'host': host, 'port': port}],
+            http_auth=(username, password),
             use_ssl=True,
             verify_certs=True
         )
-
+        
         print("**** Connection established to openSearch ****")
 
 
@@ -63,17 +73,6 @@ class BusinessResults(Resource):
 
         # Define the search query for business data
         # Build KNN semantic search query
-        # search_body = {
-        #     "size": 10,
-        #     "_source": ["business_uid", "business_name"],
-        #     "knn": {
-        #         "field": "business_name_vector",
-        #         "query_vector": query_vector,
-        #         "k": 10,
-        #         "num_candidates": 100
-        #     }
-        # }
-
         search_body = {
                         "size": 10,
                         "_source": ["business_uid", "business_name"],
@@ -97,15 +96,10 @@ class BusinessResults(Resource):
 
 
         #print('search_body', search_body)
+
         # Perform the search
         try:
             response = client.search(index="business", body=search_body)
-            # response = client.transport.perform_request(
-            #             method="POST",
-            #             url="/business/_knn_search",
-            #             body=search_body
-            #         )
-
 
             #print("response from openSearch", response)
             hits = response["hits"]["hits"]
