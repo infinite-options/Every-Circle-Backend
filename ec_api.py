@@ -46,6 +46,7 @@ from tagSearch_split import TagSplitSearch
 from tagSearch_split_nlp import TagSplitNLPSearch
 from alltagSearch_split import SplitSearch
 from middle_layer_opensearch import BusinessResults
+from transaction_cost import TransactionCost
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -505,6 +506,7 @@ api.add_resource(TagSplitSearch, "/api/tagsplitsearchdistinct/<string:query>")
 api.add_resource(TagSplitNLPSearch, "/api/tagsplitnlpsearch/<string:query>")
 api.add_resource(SplitSearch, "/api/tagsplitcategorysearch/<string:query>")
 api.add_resource(BusinessResults, '/api/businessresults/<string:query>')
+api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
 # @app.route('/decrypt', methods=['POST'])
 # def decrypt_data():
 #     try:
