@@ -10,20 +10,21 @@ class TagSplitNLPSearch(Resource):
     
     def get(self, query):
 
-        print('query', query)
+        print('TagSplitNLPSearch query', query)
 
         # Load SpaCy English pipeline
         nlp = spacy.load("en_core_web_sm")
+        print("here 1")
 
         def clean_query_spacy(query):
             doc = nlp(query.lower())
-
+            print("here 2")
             # Keep only alphabetic tokens, lemmatize, remove stopwords
             clean_tokens = [
                 token.lemma_ for token in doc
                 if token.is_alpha and not token.is_stop and token.pos_ in {"NOUN", "ADJ"}
             ]
-
+            print("here 3")
             return clean_tokens
 
         # word_list = query.lower().split(' ')
