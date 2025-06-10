@@ -103,8 +103,8 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 # # print("Block Size: ", BLOCK_SIZE)
 # POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
 # # print("POSTMAN_SECRET: ", POSTMAN_SECRET)
-OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
-print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
+# OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
+# print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
 
 
 # Encrypt dictionary - Currently commented
