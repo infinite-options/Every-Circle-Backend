@@ -26,7 +26,13 @@ jobs:
       - name: Install Dependencies
         run: |
           cd Every-Circle-Backend
-          pip3 install -r requirements.txt
+          # pip3 install -r requirements.txt
+          pip3 install -r requirements-part1.txt
+          pip3 cache purge
+          pip3 install -r requirements-part2.txt
+          pip3 cache purge
+          # Immediately downgrade numpy to avoid runtime crashes
+          pip install numpy==1.24.3
 
       - name: Run app to test
         id: test
