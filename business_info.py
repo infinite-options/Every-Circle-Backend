@@ -4,8 +4,10 @@ from datetime import datetime
 import ast
 import traceback
 import json
+import googlemaps
+import os
 
-from data_ec import connect, processImage
+from data_ec import connect, processImage, uploadImage, deleteImage
 
 
 class BusinessInfo(Resource):
@@ -75,7 +77,7 @@ class BusinessInfo(Resource):
             return response, 500
 
     def post(self):
-        print("In Business POST")
+        print("In BusinessInfo POST")
         response = {}
 
         try:
@@ -110,7 +112,7 @@ class BusinessInfo(Resource):
                     business_look_up_query = db.select('every_circle.business', where={'business_name': business_name})
                 
                 if business_look_up_query and business_look_up_query['result']:
-                    response['message'] = 'Business already exists'
+                    response['message'] = 'BusinessInfo: Business already exists'
                     response['code'] = 409
                     return response, 409
                 
@@ -152,7 +154,7 @@ class BusinessInfo(Resource):
                 
                 # Add services if provided
                 if services_str:
-                    self._add_services(db, services_str, new_business_uid)
+                    self._add_services(db, services_str, new_business_uid, user_uid, request.files)
                 
 
                 
@@ -173,7 +175,7 @@ class BusinessInfo(Resource):
                 return response, 200
         
         except Exception as e:
-            print(f"Error in Business POST: {str(e)}")
+            print(f"Error in BusinessInfo POST: {str(e)}")
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
@@ -203,6 +205,7 @@ class BusinessInfo(Resource):
                 categories_uid_str = None
                 social_links_str = None
                 delete_services_str = None
+                services_str = None
                 
                 if 'business_categories_uid' in payload:
                     categories_uid_str = payload.pop('business_categories_uid')
@@ -222,9 +225,8 @@ class BusinessInfo(Resource):
                 # Handle services update
                 if 'business_services' in payload:
                     try:
-                        import json
                         services_data = json.loads(payload.pop('business_services'))
-                        service_uids = []
+                        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         
                         # Process each service entry
                         for service_data in services_data:
@@ -232,7 +234,7 @@ class BusinessInfo(Resource):
                             
                             # Check if this is an existing service (has UID)
                             if 'bs_uid' in service_data:
-                                # Get the existing service UID
+                                # Update existing service
                                 service_uid = service_data.pop('bs_uid')
                                 
                                 # Check if service exists
@@ -244,22 +246,17 @@ class BusinessInfo(Resource):
                                     print(f"Warning: Service with UID {service_uid} not found")
                                     continue
                                 
-                                # Update the existing service
+                                # Add updated timestamp and user
+                                service_data['bs_updated_at'] = current_time
+                                service_data['bs_updated_by'] = business_exists_query['result'][0]['business_user_id']
+                                
                                 if service_data:
                                     db.update('every_circle.business_services', 
                                            {'bs_uid': service_uid}, service_data)
-                                    
-                                service_uids.append(service_uid)
                             else:
-                                # This is a new service entry
-                                service_stored_procedure_response = db.call(procedure='new_bs_uid')
-                                new_service_uid = service_stored_procedure_response['result'][0]['new_id']
-                                service_data['bs_uid'] = new_service_uid
-                                service_data['bs_business_id'] = business_uid
-                                
-                                # Insert the service record
-                                db.insert('every_circle.business_services', service_data)
-                                service_uids.append(new_service_uid)
+                                # Add new service
+                                self._add_services(db, json.dumps([service_data]), business_uid, 
+                                                 business_exists_query['result'][0]['business_user_id'], request.files)
                     
                     except Exception as e:
                         print(f"Error processing business_services JSON in PUT: {str(e)}")
@@ -434,19 +431,197 @@ class BusinessInfo(Resource):
             raise
     
     # New method to add services
-    def _add_services(self, db, services_str, business_uid):
+    def _add_services(self, db, services_str, business_uid, user_uid, request_files=None):
         try:
             import json
             services = json.loads(services_str)
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
             for service in services:
                 # Generate a new bs_uid
                 bs_uid_response = db.call(procedure='new_bs_uid')
                 bs_uid = bs_uid_response['result'][0]['new_id']
                 
-                service['bs_uid'] = bs_uid
-                service['bs_business_id'] = business_uid
+                # Handle service images if present
+                service_images = []
+                if request_files and 'bs_image_key' in service:
+                    image_key = service.pop('bs_image_key')
+                    # Look for images with the matching key prefix
+                    for key in request_files:
+                        if key.startswith(f"{image_key}_img_"):
+                            file = request_files[key]
+                            if file and file.filename:
+                                # Use the existing uploadImage function
+                                unique_filename = f"service_{business_uid}_{bs_uid}_{file.filename}"
+                                image_key = f'services/{business_uid}/{unique_filename}'
+                                image_url = uploadImage(file, image_key, '')
+                                if image_url:
+                                    service_images.append(image_url)
                 
-                db.insert('every_circle.business_services', service)
+                # Set default values for required fields
+                service_data = {
+                    'bs_uid': bs_uid,
+                    'bs_business_id': business_uid,
+                    'bs_is_visible': service.get('bs_is_visible', 1),
+                    'bs_status': service.get('bs_status', 'active'),
+                    'bs_service_name': service.get('bs_service_name'),
+                    'bs_service_desc': service.get('bs_service_desc'),
+                    'bs_notes': service.get('bs_notes'),
+                    'bs_sku': service.get('bs_sku'),
+                    'bs_bounty': service.get('bs_bounty'),
+                    'bs_bounty_currency': service.get('bs_bounty_currency'),
+                    'bs_is_taxable': service.get('bs_is_taxable', 0),
+                    'bs_tax_rate': service.get('bs_tax_rate'),
+                    'bs_discount_allowed': service.get('bs_discount_allowed', 0),
+                    'bs_refund_policy': service.get('bs_refund_policy'),
+                    'bs_return_window_days': service.get('bs_return_window_days'),
+                    'bs_image_url': json.dumps(service_images) if service_images else None,
+                    'bs_display_order': service.get('bs_display_order'),
+                    'bs_tags': service.get('bs_tags'),
+                    'bs_created_at': current_time,
+                    'bs_updated_at': current_time,
+                    'bs_created_by': user_uid,
+                    'bs_updated_by': user_uid,
+                    'bs_duration_minutes': service.get('bs_duration_minutes'),
+                    'bs_cost': service.get('bs_cost'),
+                    'bs_cost_currency': service.get('bs_cost_currency')
+                }
+                
+                # Remove None values to use database defaults
+                service_data = {k: v for k, v in service_data.items() if v is not None}
+                
+                db.insert('every_circle.business_services', service_data)
         except Exception as e:
             print(f"Error processing services: {str(e)}")
             raise
+
+    def get_google_places_info(self, place_id, user_uid):
+        """Get business information from Google Places API and save to database"""
+        try:
+            if not place_id:
+                return {'error': 'place_id is required'}, 400
+                
+            if not user_uid:
+                return {'error': 'user_uid is required'}, 400
+            
+            # Initialize Google Maps client
+            api_key = os.getenv('GOOGLE_MAPS_API_KEY')
+            gmaps = googlemaps.Client(key=api_key)
+            
+            # Get place details
+            place_details = gmaps.place(place_id, fields=[
+                'name', 'formatted_address', 'formatted_phone_number',
+                'website', 'rating', 'user_ratings_total', 'opening_hours',
+                'geometry', 'type', 'price_level', 'business_status'
+            ])
+            
+            if not place_details or 'result' not in place_details:
+                return {'error': 'Place not found'}, 404
+                
+            place_data = place_details['result']
+            print("Google Places Info: ", place_data)
+            
+            with connect() as db:
+                # Verify user exists
+                user_exists_query = db.select('every_circle.users', where={'user_uid': user_uid})
+                if not user_exists_query['result']:
+                    return {'error': 'User does not exist'}, 404
+                
+                # Start transaction
+                db.execute("START TRANSACTION")
+                
+                # Get new business_uid
+                business_stored_procedure_response = db.call(procedure='new_business_uid')
+                business_uid = business_stored_procedure_response['result'][0]['new_id']
+                print(f"Generated business_uid: {business_uid}")
+                
+                # Parse address components
+                address_parts = place_data.get('formatted_address', '').split(',')
+                address_line_1 = address_parts[0].strip() if address_parts else ''
+                city = address_parts[1].strip() if len(address_parts) > 1 else ''
+                state_zip = address_parts[2].strip() if len(address_parts) > 2 else ''
+                country = address_parts[3].strip() if len(address_parts) > 3 else ''
+                
+                # Split state and zip code
+                state_zip_parts = state_zip.split()
+                state = ' '.join(state_zip_parts[:-1]) if len(state_zip_parts) > 1 else state_zip
+                zip_code = state_zip_parts[-1] if len(state_zip_parts) > 1 else ''
+                
+                # Prepare data for database insertion
+                business_data = {
+                    'business_uid': business_uid,
+                    'business_user_id': user_uid,
+                    'business_google_id': place_id,
+                    'business_name': place_data.get('name'),
+                    'business_phone_number': place_data.get('formatted_phone_number'),
+                    'business_address_line_1': address_line_1,
+                    'business_city': city,
+                    'business_state': state,
+                    'business_country': country,
+                    'business_zip_code': zip_code,
+                    'business_latitude': place_data.get('geometry', {}).get('location', {}).get('lat'),
+                    'business_longitude': place_data.get('geometry', {}).get('location', {}).get('lng'),
+                    'business_joined_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'business_price_level': place_data.get('price_level'),
+                    'business_google_rating': str(place_data.get('rating')),
+                    'business_website': place_data.get('website')
+                }
+                
+                # Insert into database
+                query = """
+                    INSERT INTO every_circle.business 
+                        (business_uid, business_user_id, business_google_id, business_name, 
+                        business_phone_number, business_phone_number_is_public,
+                        business_address_line_1, business_city, business_state, 
+                        business_country, business_zip_code, business_latitude, 
+                        business_longitude, business_joined_timestamp, 
+                        business_price_level, business_google_rating, 
+                        business_website, business_is_active)
+                    VALUES 
+                        (%(business_uid)s, %(business_user_id)s, %(business_google_id)s, %(business_name)s,
+                        %(business_phone_number)s, 1,
+                        %(business_address_line_1)s, %(business_city)s, %(business_state)s,
+                        %(business_country)s, %(business_zip_code)s, %(business_latitude)s,
+                        %(business_longitude)s, %(business_joined_timestamp)s,
+                        %(business_price_level)s, %(business_google_rating)s,
+                        %(business_website)s, 1)
+                    ON DUPLICATE KEY UPDATE
+                        business_user_id = %(business_user_id)s,
+                        business_name = %(business_name)s,
+                        business_phone_number = %(business_phone_number)s,
+                        business_address_line_1 = %(business_address_line_1)s,
+                        business_city = %(business_city)s,
+                        business_state = %(business_state)s,
+                        business_country = %(business_country)s,
+                        business_zip_code = %(business_zip_code)s,
+                        business_latitude = %(business_latitude)s,
+                        business_longitude = %(business_longitude)s,
+                        business_price_level = %(business_price_level)s,
+                        business_google_rating = %(business_google_rating)s,
+                        business_website = %(business_website)s;
+                """
+                
+                result = db.execute(query, business_data)
+                print("Database insert result:", result)
+                
+                # Verify the insert
+                verify_query = "SELECT * FROM every_circle.business WHERE business_uid = %s"
+                verify_result = db.execute(verify_query, (business_uid,))
+                
+                if not verify_result['result']:
+                    print("Warning: Record not found after insert!")
+                    db.execute("ROLLBACK")
+                    return {'error': 'Failed to save business data'}, 500
+                
+                # Commit the transaction
+                db.execute("COMMIT")
+                
+                return {
+                    'message': 'Business information saved successfully',
+                    'business_id': business_uid,
+                    'place_details': place_data
+                }, 200
+                
+        except Exception as e:
+            print(f"Error in get_google_places_info: {str(e)}")
+            return {'error': str(e)}, 500

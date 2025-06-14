@@ -128,7 +128,7 @@ class Business(Resource):
                     response = db.insert('every_circle.business', payload)
                 
                 else:
-                    response['message'] = 'Business already exists'
+                    response['message'] = 'Business: Business already exists'
                     response['code'] = 409
                     return response, 409
             
@@ -294,7 +294,7 @@ class Business_v2(Resource):
                     response = db.insert('every_circle.business', payload)
                 
                 else:
-                    response['message'] = 'Business already exists'
+                    response['message'] = 'Business v2: Business already exists'
                     response['code'] = 409
                     return response, 409
             
