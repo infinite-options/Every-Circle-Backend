@@ -230,12 +230,13 @@ class BusinessInfo(Resource):
                         
                         # Process each service entry
                         for service_data in services_data:
-                            print(service_data)
+                            print("Processing service data:", service_data)
                             
                             # Check if this is an existing service (has UID)
                             if 'bs_uid' in service_data:
                                 # Update existing service
                                 service_uid = service_data.pop('bs_uid')
+                                print(f"Updating existing service with UID: {service_uid}")
                                 
                                 # Check if service exists
                                 service_exists_query = db.select('every_circle.business_services', 
@@ -250,25 +251,89 @@ class BusinessInfo(Resource):
                                 service_data['bs_updated_at'] = current_time
                                 service_data['bs_updated_by'] = business_exists_query['result'][0]['business_user_id']
                                 
+                                # Handle service images if present
+                                if 'bs_image_key' in service_data:
+                                    image_key = service_data.pop('bs_image_key')
+                                    service_images = []
+                                    
+                                    # Get existing images if any
+                                    if service_exists_query['result'][0].get('bs_image_url'):
+                                        try:
+                                            service_images = json.loads(service_exists_query['result'][0]['bs_image_url'])
+                                        except:
+                                            service_images = []
+                                    
+                                    # Handle image deletion if specified
+                                    if 'delete_images' in service_data:
+                                        delete_images = json.loads(service_data.pop('delete_images'))
+                                        for image_url in delete_images:
+                                            if image_url in service_images:
+                                                service_images.remove(image_url)
+                                                # Delete from S3
+                                                try:
+                                                    delete_key = image_url.split(f"{os.getenv('BUCKET_NAME')}/", 1)[1]
+                                                    deleteImage(delete_key)
+                                                except Exception as e:
+                                                    print(f"Error deleting image: {str(e)}")
+                                    
+                                    # Add new images
+                                    for key in request.files:
+                                        if key.startswith(f"{image_key}_img_"):
+                                            file = request.files[key]
+                                            if file and file.filename:
+                                                unique_filename = f"service_{business_uid}_{service_uid}_{file.filename}"
+                                                image_key = f'services/{business_uid}/{unique_filename}'
+                                                image_url = uploadImage(file, image_key, '')
+                                                if image_url:
+                                                    service_images.append(image_url)
+                                    
+                                    # Update the service with new image URLs
+                                    if service_images:
+                                        service_data['bs_image_url'] = json.dumps(service_images)
+                                    else:
+                                        service_data['bs_image_url'] = None
+                                
+                                print(f"Updating service with data: {service_data}")
                                 if service_data:
-                                    db.update('every_circle.business_services', 
+                                    update_response = db.update('every_circle.business_services', 
                                            {'bs_uid': service_uid}, service_data)
+                                    print(f"Update response: {update_response}")
                             else:
                                 # Add new service
+                                print("Adding new service")
                                 self._add_services(db, json.dumps([service_data]), business_uid, 
                                                  business_exists_query['result'][0]['business_user_id'], request.files)
                     
                     except Exception as e:
                         print(f"Error processing business_services JSON in PUT: {str(e)}")
+                        traceback.print_exc()  # Add this for better error tracking
 
                 if 'business_img_0' in request.files or 'delete_business_images' in payload:
-                    import json
                     key_personal = {'business_personal_uid': business_uid}
                     images = processImage(key_personal, payload)
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
                 
-                print(payload)
+                # List of valid business table columns
+                valid_columns = [
+                    'business_name', 'business_address_line_1', 'business_address_line_2',
+                    'business_city', 'business_state', 'business_country', 'business_zip_code',
+                    'business_phone_number', 'business_email_id', 'business_category_id',
+                    'business_short_bio', 'business_tag_line', 'business_ein_number',
+                    'business_website', 'business_images_url', 'business_email_id_is_public',
+                    'business_phone_number_is_public', 'business_tag_line_is_public',
+                    'business_short_bio_is_public', 'business_google_id', 'business_latitude',
+                    'business_longitude', 'business_price_level', 'business_google_rating',
+                    'business_joined_timestamp', 'business_is_active'
+                ]
+                
+                # Remove any fields that don't exist in the business table
+                invalid_fields = [field for field in payload.keys() if field not in valid_columns]
+                for field in invalid_fields:
+                    print(f"Removing invalid field: {field}")
+                    payload.pop(field)
+                
+                print("Final payload:", payload)
                 if payload:
                     update_response = db.update('every_circle.business', key, payload)
                     print(update_response)
@@ -281,6 +346,7 @@ class BusinessInfo(Resource):
         
         except Exception as e:
             print(f"Error in Business PUT: {str(e)}")
+            traceback.print_exc()  # Add this for better error tracking
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
