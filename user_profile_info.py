@@ -155,6 +155,11 @@ class UserProfileInfo(Resource):
                                          where={'profile_wish_profile_personal_id': profile_id})
                     response['wishes_info'] = wishes_info['result'] if wishes_info['result'] else []
 
+                    # Get ratings info - returning all ratings entries for this profile
+                    ratings_info = db.select('every_circle.ratings', 
+                                         where={'rating_profile_id': profile_id})
+                    response['ratings_info'] = ratings_info['result'] if ratings_info['result'] else []
+
                     # Get business info - returning all business entries for this profile
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
