@@ -7,7 +7,8 @@ from data_ec import connect
 
 class ConnectionsPath(Resource):
     def get(self, first_uid, second_uid):
-
+        print("first_uid: ", first_uid)
+        print("second_uid: ", second_uid)
         with connect() as db:
 
             first_connection_query = f''' WITH RECURSIVE ReferralPath AS (
