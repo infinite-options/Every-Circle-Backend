@@ -58,12 +58,22 @@ class BusinessInfo(Resource):
                     WHERE bs_business_id = "{business_uid}"
                 """
                 services_response = db.execute(services_query)
+
+                # Added query for business ratings
+                ratings_query = f"""
+                    SELECT *
+                    FROM every_circle.ratings
+                    -- WHERE rating_business_id = "200-000056"
+                    WHERE rating_business_id = "{business_uid}"
+                """
+                ratings_response = db.execute(ratings_query)
                 
                 response = {
                     'business': business_data,
                     'categories': category_response['result'] if 'result' in category_response else [],
                     'social_links': links_response['result'] if 'result' in links_response else [],
                     'services': services_response['result'] if 'result' in services_response else [],
+                    'ratings': ratings_response['result'] if 'result' in ratings_response else [],
                     'code': 200,
                     'message': 'Business data retrieved successfully'
                 }
