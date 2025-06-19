@@ -68,6 +68,24 @@ class Transactions(Resource):
                     tx_item['ti_bs_id']= item.get('bs_uid')
                     tx_item['ti_bs_qty']= item.get('quantity')
                     print("tx_item: ", tx_item)
+
+                    # Get other item details from business services table
+                    bs_query = f"""
+                        SELECT *
+                        FROM every_circle.business_services
+                        WHERE bs_uid = '{item.get('bs_uid')}'
+                    """
+                    bs_response = db.execute(bs_query)
+                    print("bs_response: ", bs_response)
+                    tx_item['ti_bs_cost'] = bs_response['result'][0]['bs_cost']
+                    tx_item['ti_bs_cost_currency'] = bs_response['result'][0]['bs_cost_currency']
+                    tx_item['ti_bs_sku'] = bs_response['result'][0]['bs_sku']
+                    tx_item['ti_bs_is_taxable'] = bs_response['result'][0]['bs_is_taxable']
+                    tx_item['ti_bs_tax_rate'] = bs_response['result'][0]['bs_tax_rate']
+                    tx_item['ti_bs_refund_policy'] = bs_response['result'][0]['bs_refund_policy']
+                    tx_item['ti_bs_return_window_days'] = bs_response['result'][0]['bs_return_window_days']
+                    print("tx_item: ", tx_item)
+    
                     response['transaction_item'] = db.insert('every_circle.transactions_items', tx_item)
                     print("transaction_item post response: ", response['transaction_item'])
                     if response['transaction_item']['code'] == 200:
