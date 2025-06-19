@@ -36,6 +36,7 @@ class Transactions(Resource):
 
             # Extract required fields from payload          
             transaction['transaction_profile_id'] = payload.get('user_profile_id')
+            transaction['transaction_business_id'] = payload.get('business_id')
             transaction['transaction_stripe_pi'] = payload.get('stripe_payment_intent')
             transaction['transaction_total'] = payload.get('total_amount_paid')
             transaction['transaction_amount'] = payload.get('total_costs')
