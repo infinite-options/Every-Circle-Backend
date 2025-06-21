@@ -46,6 +46,7 @@ from tagSearch_split import TagSplitSearch
 from tagSearch_split_nlp import TagSplitNLPSearch
 from alltagSearch_split import SplitSearch
 # from middle_layer_opensearch import BusinessResults
+from bounty_results import BountyResults
 from middle_layer_ec2opensearch import BusinessResults
 from transaction_cost import TransactionCost
 # from jwtToken import JwtToken
@@ -90,6 +91,7 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 # from cryptography.hazmat.backends import default_backend
 import json
 import base64
+import googlemaps
 
 load_dotenv()
 
@@ -105,6 +107,8 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 # # print("Block Size: ", BLOCK_SIZE)
 # POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
 # # print("POSTMAN_SECRET: ", POSTMAN_SECRET)
+# OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
+# print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
 
 
 # Encrypt dictionary - Currently commented
@@ -383,7 +387,7 @@ def Send_Twilio_SMS(message, phone_number):
 class stripe_key(Resource):
     def get(self, desc):
         print(desc)
-        if desc == "PMTEST":
+        if desc == "ECTEST":
             return {"publicKey": stripe_public_test_key}
         else:
             return {"publicKey": stripe_public_live_key}
@@ -508,164 +512,31 @@ api.add_resource(TagSplitNLPSearch, "/api/tagsplitnlpsearch/<string:query>")
 api.add_resource(SplitSearch, "/api/tagsplitcategorysearch/<string:query>")
 api.add_resource(BusinessResults, '/api/businessresults/<string:query>')
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
-# @app.route('/decrypt', methods=['POST'])
-# def decrypt_data():
-#     try:
-#         # Get the encrypted data from the request body
-#         encrypted_data_base64 = request.json.get('encrypted_data')
-#         # print("encrypted_data: ", encrypted_data_base64)
-#         decrypted_data = decrypt_dict(encrypted_data_base64)
-#         print("Decrypted Data: ", decrypt_data)
-        
-#         return jsonify({"decrypted_data": decrypted_data})
-#     except Exception as e:
-#         return jsonify({"error": str(e)}), 500
+api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 
-
-# def check_jwt_token():
-#     if request.path == '/auth/refreshToken' or request.path.startswith('/userInfo/') or request.path.startswith('/businessProfile'):
-#         return jsonify({'message': 'JWT not required!'}), 201
-#     try:
-#         print('Request Headers:', request.headers['Authorization'])
-#         verify_jwt_in_request()
-#         current_user = get_jwt_identity() 
-#         print(f"Current User ID: {current_user}")
-#         return jsonify({'message': 'JWT is present!'}), 201
-#     except jwt.ExpiredSignatureError:
-#         print('JWT Expired')
-#         return jsonify({'message': 'Token is expired!'}), 401
-
-#     except jwt.InvalidTokenError:
-#         print('JWT Invalid')
-#         return jsonify({'message': 'Invalid token!'}), 404
-
-#     except Exception as e:
-#         # This will catch any other exception, including missing token
-#         print('JWT Missing')
-#         return jsonify({'message': 'Missing token!'}), 404
-
-
-# Middleware for decrypting incoming request data
-# def decrypt_request():
-#     if request.is_json:
-#         print('Inside is_json')
-
-#         encrypted_data = request.get_json().get('encrypted_data')
-#         form_data = request.get_json().get('data_type') # True = Form data, False = JSON data
-#         if encrypted_data and form_data == False:
-#             decrypted_data = decrypt_dict(encrypted_data)
-#             # print('decrypted data', decrypted_data)
-
-#             # Override request.get_json() to return decrypted data
-#             def get_json_override(*args, **kwargs):
-#                 return decrypted_data
+class GooglePlacesInfo(Resource):
+    def post(self):
+        try:
+            data = request.get_json()
+            place_id = data.get('place_id')
+            user_uid = data.get('user_uid')
             
-#             request.get_json = get_json_override
-#         else:
-#             print("Data issue")
-#     elif request.content_type and request.content_type.startswith('multipart/form-data'):
-#         # For FormData directly in the request
-#         encrypted_data = request.form.get('encrypted_data')
+            if not place_id:
+                return {'error': 'place_id is required'}, 400
+                
+            if not user_uid:
+                return {'error': 'user_uid is required'}, 400
+            
+            # Create instance of BusinessInfo and call the method
+            business_info = BusinessInfo()
+            return business_info.get_google_places_info(place_id, user_uid)
+            
+        except Exception as e:
+            print(f"Error in GooglePlacesInfo: {str(e)}")
+            return {'error': str(e)}, 500
 
-#         if encrypted_data:
-#             decrypted_data = decrypt_dict(encrypted_data)
-#             # print("decrypted_data: ", decrypted_data)
-#             fields = {}
-#             files = {}
-
-#             for key, value in decrypted_data.items():
-#                 if isinstance(value, dict) and 'fileName' in value and 'fileType' in value:
-#                     # Handle file-specific data
-#                     # print("image - ", value)
-#                     file_binary = base64.b64decode(value['fileData'])
-#                     file_stream = BytesIO(file_binary)
-#                     files[key] = FileStorage(
-#                         stream=file_stream,
-#                         filename=value['fileName'],
-#                         content_type=value['fileType']
-#                     )
-#                 else:
-#                     fields[key] = value
-
-#             # Update `request.form` and `request.files`
-
-#             # print(" Fields: ", fields)
-#             request.form = ImmutableMultiDict(fields)
-#             request.files = ImmutableMultiDict(files)
-
-#             # print("Updated Form Data:", request.form)
-#             # print("Updated Files:", request.files)
-#         else:
-#             print("No encrypted data found in multipart/form-data request")
-#     else:
-#         print("GET Request, no JSON object received")
-
-# Middleware to encrypt response data
-# def encrypt_response(data):
-#     print("data: ",data)
-#     encrypted_data = encrypt_dict(data)
-#     return jsonify({'encrypted_data': encrypted_data})
-
-
-# Health check route (optional)
-# @app.route('/')
-# def health_check():
-#     print("In Health Check")
-#     return jsonify({"message": "API is running!"})
-
-
-# Actual middleware.  Commands before request (check JWT and then decrypt data) and after request (encrypt response before passing to FrontEnd)
-# @app.before_request 
-# def before_request():
-#     # all_headers = dict(request.headers)
-#     # print(all_headers)
-#     # print("Before Postman Secret: ", request.headers.get("Postman-Secret"))
-#     if request.headers.get("Postman-Secret") != POSTMAN_SECRET:
-#         if request.method != 'OPTIONS':  
-#             print("In Middleware before_request")
-#             response,code = check_jwt_token()
-#             if code == 201:
-#                 decrypt_request()
-
-#             else:
-#                 print("Response Code: ", code)
-#                 response = encrypt_response(response.get_json()) if response.is_json else response
-#                 response.status_code = code
-#                 return response
-
-# @app.after_request
-# def after_request(response):
-#     # print("After Postman Secret: ", request.headers.get("Postman-Secret"))
-#     if request.headers.get("Postman-Secret") != POSTMAN_SECRET:
-#         print("In Middleware after_request")
-#         # print("Actual endpoint response: ", type(response))
-#         # print("Actual endpoint response2: ", type(response.get_json()))
-#         original_status_code = response.status_code
-
-#         response = encrypt_response(response.get_json()) if response.is_json else response
-        
-#         response.status_code = original_status_code
-
-#     return response
-    
-
-# Apply middlewares
-# setup_middlewares(app)
-
-#This method is to refresh the jwt token from the FrontEnd
-# @app.route('/auth/refreshToken', methods=['GET'])
-# @jwt_required(refresh=True)  # This ensures that only refresh tokens can be used here
-# def refreshToken():
-#     try:
-#         print('Inside refresh token')
-#         current_user = get_jwt_identity()  # Get user identity from refresh token
-#         new_access_token = create_access_token(identity=current_user)  # Create new access token
-#         print('New token is', new_access_token)
-#         return jsonify(access_token=new_access_token)
-#     except Exception as e:
-#         print('Error refreshing token:', e)
-#         return jsonify({'message': 'Could not refresh token'}), 401
-    
+# Add the new endpoint to the API
+api.add_resource(GooglePlacesInfo, '/api/google-places')
 
 
 

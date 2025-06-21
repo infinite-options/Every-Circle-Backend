@@ -92,9 +92,10 @@ class BusinessResults(Resource):
 
         # Perform the search
         try:
+            print("**** search_body ****", search_body)
             response = client.search(index="business", body=search_body)
 
-            #print("response from openSearch", response)
+            print("response from openSearch", response)
             hits = response["hits"]["hits"]
 
             if not hits:

@@ -289,7 +289,7 @@ class Business_v3(Resource):
             return response, 500
 
     def post(self):
-        print("In Business POST")
+        print("In Business v3 POST")
         response = {}
 
         try:
@@ -375,7 +375,7 @@ class Business_v3(Resource):
                     response['tags'] = stored_tags
                     
                 else:
-                    response['message'] = 'Business already exists'
+                    response['message'] = 'Business v3: Business already exists'
                     response['code'] = 409
                     return response, 409
 

@@ -8,7 +8,7 @@ from data_ec import connect
 class TagSplitSearch(Resource):
     def get(self, query):
 
-        print('query', query)
+        print('TagSplitSearch query', query)
 
         word_list = query.lower().split(' ')
         word_str = ','.join(word_list)
@@ -60,6 +60,7 @@ class TagSplitSearch(Resource):
         try:
             with connect() as db:
                 response = db.execute(tag_query, cmd='get')
+                print("response from db", response)
 
             if not response['result']:
                 response['message'] = f"No item found"
