@@ -6,8 +6,6 @@ from sentence_transformers import SentenceTransformer
 import pymysql
 import os
 from dotenv import load_dotenv
-from requests_aws4auth import AWS4Auth
-import boto3
 
 # import spacy
 from data_ec import connect
@@ -20,8 +18,6 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 # Read environment variables
 host = os.getenv("OPENSEARCH_HOST")
 port = int(os.getenv("OPENSEARCH_PORT"))
-region = os.getenv("REGION")
-service =os.getenv("SERVICE")
 
 class BusinessResults(Resource):
     def get(self, query):
@@ -36,33 +32,20 @@ class BusinessResults(Resource):
 
         print('user_query:', user_query)
 
-        # Get AWS credentials from environment or CLI
-        session = boto3.Session(region_name=region)
-        credentials = session.get_credentials()
+        # print("Checking")
+        # print('host:', host, ' port:', port)
 
-        # print('session', session)
-        # print('credentials', credentials)
-        awsauth = AWS4Auth(
-            credentials.access_key,
-            credentials.secret_key,
-            region,
-            service,
-            session_token=credentials.token)
-
-        # OpenSearch connection
         client = OpenSearch(
-            hosts=[{'host': host, 'port': port}],
-            http_auth=awsauth,
-            use_ssl=True,
-            verify_certs=True,
-            connection_class=RequestsHttpConnection)
+        hosts=[{'host': host, 'port': port}],
+        use_ssl=False,
+        verify_certs=False,
+        scheme="http",
+        connection_class=RequestsHttpConnection)
+
+        print('info', client)
 
         # Encode the user query to vector
         query_vector = model.encode(user_query).tolist()
-        # query_vector = model.encode(in_keywords).tolist()
-
-
-        # print("**** query_vector ****", query_vector)
 
         # Define the search query for business data
         # Build KNN semantic search query

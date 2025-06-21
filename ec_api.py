@@ -45,7 +45,8 @@ from profile_wish import ProfileWishInfo
 from tagSearch_split import TagSplitSearch
 from tagSearch_split_nlp import TagSplitNLPSearch
 from alltagSearch_split import SplitSearch
-from middle_layer_opensearch import BusinessResults
+# from middle_layer_opensearch import BusinessResults
+from middle_layer_ec2opensearch import BusinessResults
 from transaction_cost import TransactionCost
 # from jwtToken import JwtToken
 from functools import wraps
