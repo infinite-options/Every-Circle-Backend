@@ -25,6 +25,7 @@ jobs:
       - name: Install Dependencies
         run: |
           cd Every-Circle-Backend
+          pip install torch==2.0.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
           # pip3 install -r requirements.txt
           pip3 install -r requirements-part1.txt
           pip3 cache purge
