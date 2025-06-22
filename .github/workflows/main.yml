@@ -77,7 +77,8 @@ jobs:
           echo "${EC2_SSH_KEY}" > ssh_key.pem
           chmod 400 ssh_key.pem
           
-          echo "Adding EC2 host to known_hosts to handle Elastic IP change..."
+          echo "Setting up SSH directory and adding EC2 host to known_hosts..."
+          mkdir -p ~/.ssh
           ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts
           
           echo "Connecting to EC2 instance at ${EC2_HOST}..."
