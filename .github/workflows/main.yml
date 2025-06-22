@@ -51,9 +51,28 @@ jobs:
         if: success()
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER}}
+          EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
+          # Debug: Check if environment variables are set
+          echo "EC2_HOST: ${EC2_HOST}"
+          echo "EC2_USER: ${EC2_USER}"
+          echo "SSH key length: ${#EC2_SSH_KEY}"
+          
+          # Fail if any required variable is empty
+          if [ -z "$EC2_HOST" ]; then
+            echo "Error: EC2_HOST is not set"
+            exit 1
+          fi
+          if [ -z "$EC2_USER" ]; then
+            echo "Error: EC2_USER is not set"
+            exit 1
+          fi
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "Error: EC2_SSH_KEY is not set"
+            exit 1
+          fi
+          
           echo "${EC2_SSH_KEY}" > ssh_key.pem
           chmod 600 ssh_key.pem
           ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << 'EOF'
