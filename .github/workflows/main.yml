@@ -56,9 +56,11 @@ jobs:
         run: |
           echo "${SSH_PRIVATE_KEY}" > ssh_key.pem
           chmod 600 ssh_key.pem
-          ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << EOF
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << 'EOF'
             echo "Connected to EC2 instance"
             cd /home/ec2-user/every-circle
+            
+            # Activate virtual environment
             source .venv/bin/activate
             cd Every-Circle-Backend
             
@@ -66,13 +68,21 @@ jobs:
             echo "Pulling latest code..."
             git pull origin master
             
-            # Install dependencies
+            # Install dependencies in the correct order
             echo "Installing dependencies..."
-            pip3 install -r requirements.txt --no-deps
+            pip install torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
+            pip3 install -r requirements-part1.txt
+            pip3 cache purge
+            pip3 install -r requirements-part2.txt
+            pip3 cache purge
+            pip3 install numpy==1.24.3
             
-            # Restart the application using supervisor
+            # Restart the application using supervisor (correct program name)
             echo "Restarting application..."
-            sudo supervisorctl restart every-circle
+            sudo supervisorctl restart ec-api
+            
+            # Check status
+            sudo supervisorctl status ec-api
             
             echo "Deployment completed"
             exit 0
