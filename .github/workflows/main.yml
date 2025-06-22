@@ -84,9 +84,11 @@ jobs:
           
           echo "Setting up SSH directory and adding EC2 host to known_hosts..."
           mkdir -p ~/.ssh
+          echo "1"
           ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts
-          
+          echo "2"
           echo "Connecting to EC2 instance at ${EC2_HOST}..."
+          echo "3"
           ssh -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
             echo "Connected to EC2 instance"
             cd /home/ec2-user/every-circle
