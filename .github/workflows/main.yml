@@ -58,7 +58,7 @@ jobs:
           chmod 600 ssh_key.pem
           ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << EOF
             echo "Connected to EC2 instance"
-            cd /home/ec2-user/every-circle-backend
+            cd /home/ec2-user/every-circle
             source .venv/bin/activate
             cd Every-Circle-Backend
             
