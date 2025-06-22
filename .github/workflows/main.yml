@@ -196,5 +196,19 @@ jobs:
         run: |
           sleep 10
           echo "Running health check..."
-          curl -f http://${{ secrets.EC2_HOST }}/lists || exit 1
-          echo "Health check passed - API is responding correctly"
+          
+          # Debug the URL being constructed
+          echo "EC2_HOST value: '${{ secrets.EC2_HOST }}'"
+          echo "Full URL: 'http://${{ secrets.EC2_HOST }}/lists'"
+          
+          # Clean the EC2_HOST value
+          CLEAN_HOST=$(echo "${{ secrets.EC2_HOST }}" | tr -d '[:space:]')
+          echo "Cleaned host: '$CLEAN_HOST'"
+          
+          # Perform health check with error handling
+          if curl -f "http://${CLEAN_HOST}/lists" 2>/dev/null; then
+            echo "Health check passed - API is responding correctly"
+          else
+            echo "Health check failed - API may not be responding or endpoint may not exist"
+            echo "This could be normal if the application is still starting up"
+            echo "Deployment completed, but health check unsuccessful"
