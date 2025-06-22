@@ -52,9 +52,9 @@ jobs:
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER}}
-          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
-          echo "${SSH_PRIVATE_KEY}" > ssh_key.pem
+          echo "${EC2_SSH_KEY}" > ssh_key.pem
           chmod 600 ssh_key.pem
           ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << 'EOF'
             echo "Connected to EC2 instance"
@@ -87,3 +87,10 @@ jobs:
             echo "Deployment completed"
             exit 0
           EOF
+
+      - name: Health Check
+        run: |
+          sleep 10
+          echo "Running health check..."
+          curl -f http://${{ secrets.EC2_HOST }}/lists || exit 1
+          echo "Health check passed - API is responding correctly"
