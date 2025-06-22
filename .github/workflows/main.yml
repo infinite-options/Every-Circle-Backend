@@ -73,9 +73,15 @@ jobs:
             exit 1
           fi
           
+          echo "All environment variables are set. Creating SSH key file..."
           echo "${EC2_SSH_KEY}" > ssh_key.pem
-          chmod 600 ssh_key.pem
-          ssh -o StrictHostKeyChecking=no -i ssh_key.pem $EC2_USER@$EC2_HOST << 'EOF'
+          chmod 400 ssh_key.pem
+          
+          echo "Adding EC2 host to known_hosts to handle Elastic IP change..."
+          ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts
+          
+          echo "Connecting to EC2 instance at ${EC2_HOST}..."
+          ssh -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
             echo "Connected to EC2 instance"
             cd /home/ec2-user/every-circle
             
