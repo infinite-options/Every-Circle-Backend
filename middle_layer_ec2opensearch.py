@@ -49,6 +49,7 @@ class BusinessResults(Resource):
 
         # Define the search query for business data
         # Build KNN semantic search query
+        print("1")
         search_body = {
                         "size": 10,
                         "_source": ["business_uid", "business_name"],
@@ -69,14 +70,15 @@ class BusinessResults(Resource):
                             }
                         }
                     }
-
+        print("2")
 
         #print('search_body', search_body)
 
         # Perform the search
         try:
+            print("body:", search_body)
             response = client.search(index="business", body=search_body)
-
+            print("3")
             #print("response from openSearch", response)
             hits = response["hits"]["hits"]
 
