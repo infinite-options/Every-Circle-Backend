@@ -285,7 +285,36 @@ def getNow():
 # NOTIFICATION_HUB_NAME = os.environ.get('NOTIFICATION_HUB_NAME')
 # NOTIFICATION_HUB_NAME = os.environ.get('NOTIFICATION_HUB_NAME'
 
+# Logging Info
+import logging
+from logging.handlers import RotatingFileHandler
+# import os
 
+LOG_FILE = "logs/ec_api.log"
+
+# Only create directory if path includes one
+log_dir = os.path.dirname(LOG_FILE)
+if log_dir:
+    os.makedirs(log_dir, exist_ok=True)
+
+# Set up rotating log handler
+log_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3
+)
+log_handler.setLevel(logging.INFO)
+log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s"
+))
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        log_handler,
+        logging.StreamHandler()
+    ]
+)
+
+logging.info("🚀 ec_api.py has started successfully.")
 
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
