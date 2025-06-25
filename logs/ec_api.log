@@ -19,3 +19,17 @@
 2025-06-24 18:09:59,491 [INFO] 🚀 ec_api.py has started successfully.
 2025-06-24 18:09:59,559 [WARNING]  * Debugger is active!
 2025-06-24 18:09:59,590 [INFO]  * Debugger PIN: 291-233-707
+2025-06-24 23:48:40,135 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-24 23:48:40,246 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.27:4090
+2025-06-24 23:48:40,246 [INFO] [33mPress CTRL+C to quit[0m
+2025-06-24 23:48:40,248 [INFO]  * Restarting with stat
+2025-06-24 23:48:53,345 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-24 23:48:53,419 [WARNING]  * Debugger is active!
+2025-06-24 23:48:53,461 [INFO]  * Debugger PIN: 291-233-707
+2025-06-24 23:49:21,194 [INFO] 127.0.0.1 - - [24/Jun/2025 23:49:21] "[31m[1mPOST /api/v1/userprofileinfo HTTP/1.1[0m" 400 -
+2025-06-24 23:50:00,645 [INFO] 127.0.0.1 - - [24/Jun/2025 23:50:00] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -
+2025-06-24 23:52:14,734 [INFO] 127.0.0.1 - - [24/Jun/2025 23:52:14] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -
+2025-06-24 23:54:12,801 [INFO] 127.0.0.1 - - [24/Jun/2025 23:54:12] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -

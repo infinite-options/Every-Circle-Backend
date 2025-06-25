@@ -182,6 +182,13 @@ class UserProfileInfo(Resource):
                     
                     return response, 200
                 
+                elif "@" in uid:
+                    print("Email UID Passed")
+                    # This is an email UID
+                    user_info = db.select('every_circle.users', where={'user_email_id': uid})
+                    response['user_uid'] = user_info['result'][0]['user_uid'] if user_info['result'] else "unknown"
+                    return response, 200
+                
                 else:
                     response['message'] = 'Invalid UID'
                     response['code'] = 400
@@ -198,7 +205,8 @@ class UserProfileInfo(Resource):
         response = {}
 
         try:
-            payload = request.form.to_dict()
+            payload = request.form.to_dict() 
+            print("payload", payload)
 
             if 'user_uid' not in payload:
                 response['message'] = 'user_uid is required'
@@ -232,6 +240,7 @@ class UserProfileInfo(Resource):
                 personal_info['profile_personal_user_id'] = user_uid
                 
                 # Set default referred by if not provided
+                print("processing referred by")
                 if 'profile_personal_referred_by' not in payload:
                     personal_info['profile_personal_referred_by'] = "110-000001"
                 elif payload.get('profile_personal_referred_by', '').strip() in ['', 'null']:
@@ -239,8 +248,23 @@ class UserProfileInfo(Resource):
                 else:
                     referred_by_value = payload.pop('profile_personal_referred_by')
                     
+                    if referred_by_value [0:3] == "110":
+                        print("referred by is a profile uid")
+                        personal_info['profile_personal_referred_by'] = referred_by_value
+                    elif referred_by_value [0:3] == "100":
+                        print("referred by is a user uid")
+                        uid_query = f"""
+                            SELECT profile_personal_uid
+                            FROM every_circle.profile_personal
+                            WHERE profile_personal_user_id = "{referred_by_value}"
+                        """
+                        uid_result = db.execute(uid_query)
+                        print("uid_result", uid_result)
+                        personal_info['profile_personal_referred_by'] = uid_result['result'][0]['profile_personal_uid']
+
                     # Check if the value is an email address (contains @ symbol)
-                    if '@' in referred_by_value:
+                    elif '@' in referred_by_value:
+                        print("processing referred by email")
                         # Query to find profile_personal_uid by email
                         email_query = f"""
                             SELECT profile_personal_uid
@@ -249,6 +273,7 @@ class UserProfileInfo(Resource):
                             WHERE user_email_id = "{referred_by_value}"
                         """
                         email_result = db.execute(email_query)
+                        print("email_result", email_result)
                         
                         if email_result['result'] and len(email_result['result']) > 0:
                             personal_info['profile_personal_referred_by'] = email_result['result'][0]['profile_personal_uid']
