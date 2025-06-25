@@ -10,6 +10,12 @@
 # README:  if there are errors, make sure you have all requirements are loaded
 # pip3 install -r requirements.txt
 
+import os
+
+# Explicitly override Hugging Face cache directories
+os.environ["HF_HOME"] = "/home/ec2-user/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/home/ec2-user/.cache/huggingface"
+
 # Load environment variables first, before any imports
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,7 +64,7 @@ import jwt
 
 # from flask import Request
 
-import os
+# import os
 import boto3
 import json
 import pytz
