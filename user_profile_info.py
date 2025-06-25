@@ -237,7 +237,26 @@ class UserProfileInfo(Resource):
                 elif payload.get('profile_personal_referred_by', '').strip() in ['', 'null']:
                     personal_info['profile_personal_referred_by'] = "110-000001"
                 else:
-                    personal_info['profile_personal_referred_by'] = payload.pop('profile_personal_referred_by')
+                    referred_by_value = payload.pop('profile_personal_referred_by')
+                    
+                    # Check if the value is an email address (contains @ symbol)
+                    if '@' in referred_by_value:
+                        # Query to find profile_personal_uid by email
+                        email_query = f"""
+                            SELECT profile_personal_uid
+                            FROM every_circle.users
+                            LEFT JOIN every_circle.profile_personal ON user_uid = profile_personal_user_id
+                            WHERE user_email_id = "{referred_by_value}"
+                        """
+                        email_result = db.execute(email_query)
+                        
+                        if email_result['result'] and len(email_result['result']) > 0:
+                            personal_info['profile_personal_referred_by'] = email_result['result'][0]['profile_personal_uid']
+                        else:
+                            personal_info['profile_personal_referred_by'] = "110-000001"
+                    else:
+                        # Use the original value if it's not an email
+                        personal_info['profile_personal_referred_by'] = '110-000001'
                 
                 # Extract personal info fields from payload
                 personal_info_fields = [
