@@ -1,6 +1,6 @@
 # MANIFEST MY space_dev (PROPERTY MANAGEMENT) BACKEND PYTHON FILE
-# https://l0h6a9zi1e.execute-api.us-west-1.amazonaws.com/dev/<enter_endpoint_details>
-# https://qn4agnb0v9.execute-api.us-west-1.amazonaws.com/production/<enter_endpoint_details>
+https://l0h6a9zi1e.execute-api.us-west-1.amazonaws.com/dev/<enter_endpoint_details>
+https://qn4agnb0v9.execute-api.us-west-1.amazonaws.com/production/<enter_endpoint_details>
 
 
 # To run program:  python3 ec_api.py
@@ -12,9 +12,9 @@
 
 import os
 
-# Explicitly override Hugging Face cache directories
-os.environ["HF_HOME"] = "/home/ec2-user/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/home/ec2-user/.cache/huggingface"
+# # Explicitly override Hugging Face cache directories
+# os.environ["HF_HOME"] = "/home/ec2-user/.cache/huggingface"
+# os.environ["TRANSFORMERS_CACHE"] = "/home/ec2-user/.cache/huggingface"
 
 # Load environment variables first, before any imports
 from dotenv import load_dotenv

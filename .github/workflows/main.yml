@@ -194,12 +194,26 @@ jobs:
             echo "=== Step 5: Stopping current application ==="
             sudo supervisorctl stop ec-api || echo "ec-api was not running"
             sleep 3
+
+            # Backup .env file
+            if [ -f "$MAIN_DIR/.env" ]; then
+              cp "$MAIN_DIR/.env" /home/ec2-user/every-circle/.env-backup
+              echo "✅ .env file backed up"
+            fi
             
             # Step 6: Switch to new code
             echo "=== Step 6: Switching to new code ==="
             rm -rf "$MAIN_DIR"
             mv "$NEW_DIR" "$MAIN_DIR"
             echo "✅ Code switched successfully"
+
+            # Restore .env file
+            if [ -f "/home/ec2-user/every-circle/.env-backup" ]; then
+              cp /home/ec2-user/every-circle/.env-backup "$MAIN_DIR/.env"
+              echo "✅ .env file restored"
+            else
+              echo "⚠️ .env backup not found — skipping restore"
+            fi
             
             # Step 7: Start new application
             echo "=== Step 7: Starting new application ==="
