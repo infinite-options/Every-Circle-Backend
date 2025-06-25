@@ -10,21 +10,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Clone Repository
-        run: |
-          git clone https://github.com/infinite-options/Every-Circle-Backend.git
-          cd Every-Circle-Backend
-          ls
-      
       - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      
+
       - name: Install Dependencies
         run: |
-          cd Every-Circle-Backend
           echo "=== GITHUB ACTIONS: Installing PyTorch ==="
           pip3 install torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html || echo "PyTorch installation failed, but continuing..."
           echo "=== GITHUB ACTIONS: Installing requirements-part1 ==="
@@ -38,20 +33,21 @@ jobs:
           pip3 list
           echo "=== GITHUB ACTIONS: Installing numpy ==="
           pip3 install numpy==1.24.3 || echo "numpy installation failed, but continuing..."
-         
 
       - name: Run app to test
         id: test
         run: |
-          cd Every-Circle-Backend
           python3 ec_api.py &
+          APP_PID=$!
           sleep 10
           if ! pgrep -f "python3 ec_api.py"; then
             echo "App failed to start"
             exit 1
           fi
-      
-      - name: Deploy to EC2
+          # Kill the test process
+          kill $APP_PID 2>/dev/null || true
+
+      - name: Deploy to EC2 with Rollback Safety
         if: success()
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -62,153 +58,269 @@ jobs:
           EC2_HOST=$(echo "${EC2_HOST}" | tr -d '[:space:]')
           EC2_USER=$(echo "${EC2_USER}" | tr -d '[:space:]')
           
-          # Debug: Check if environment variables are set
+          echo "=== ENVIRONMENT VARIABLES VALIDATION ==="
           echo "EC2_HOST: '${EC2_HOST}'"
           echo "EC2_USER: '${EC2_USER}'"
-          echo "SSH key length: ${#EC2_SSH_KEY}"
+          echo "EC2_SSH_KEY length: ${#EC2_SSH_KEY}"
           echo "EC2_HOST length: ${#EC2_HOST}"
+          echo "EC2_USER length: ${#EC2_USER}"
           
-          # Fail if any required variable is empty
+          # Check if variables are set
           if [ -z "$EC2_HOST" ]; then
-            echo "Error: EC2_HOST is not set or empty"
+            echo "❌ ERROR: EC2_HOST is not set or empty"
             exit 1
           fi
           if [ -z "$EC2_USER" ]; then
-            echo "Error: EC2_USER is not set or empty"
+            echo "❌ ERROR: EC2_USER is not set or empty"
             exit 1
           fi
           if [ -z "$EC2_SSH_KEY" ]; then
-            echo "Error: EC2_SSH_KEY is not set or empty"
+            echo "❌ ERROR: EC2_SSH_KEY is not set or empty"
             exit 1
           fi
+          echo "✅ All environment variables are set"
           
-          echo "All environment variables are set. Creating SSH key file..."
+          # Validate expected values
+          echo "=== VALIDATING EXPECTED VALUES ==="
+          if [ "$EC2_HOST" != "204.236.135.231" ]; then
+            echo "❌ WARNING: EC2_HOST is '$EC2_HOST', expected '204.236.135.231'"
+            echo "Continuing with provided value..."
+          else
+            echo "✅ EC2_HOST validation: PASSED"
+          fi
+          
+          if [ "$EC2_USER" != "ec2-user" ]; then
+            echo "❌ WARNING: EC2_USER is '$EC2_USER', expected 'ec2-user'"
+            echo "Continuing with provided value..."
+          else
+            echo "✅ EC2_USER validation: PASSED"
+          fi
+          
+          # Validate SSH key format
+          echo "=== VALIDATING SSH KEY FORMAT ==="
+          if echo "${EC2_SSH_KEY}" | head -1 | grep -q "^-----BEGIN"; then
+            echo "✅ SSH key has proper PEM header"
+            
+            # Extract the first line of actual key data (skip the header)
+            KEY_START=$(echo "${EC2_SSH_KEY}" | sed -n '2p' | cut -c1-8)
+            echo "SSH key data starts with: '$KEY_START'"
+            
+            if [ "$KEY_START" = "MIIEpAIB" ] || [ "$KEY_START" = "MIIEpAI" ]; then
+              echo "✅ SSH key format validation: PASSED (starts with expected pattern)"
+            else
+              echo "❌ WARNING: SSH key does not start with 'MIIEpAI', starts with '$KEY_START'"
+              echo "This might still work, but please verify your SSH key format"
+            fi
+          else
+            echo "❌ WARNING: SSH key does not appear to have proper PEM header"
+            echo "First few characters: $(echo "${EC2_SSH_KEY}" | head -c 50)..."
+          fi
+          
+          echo "=== VALIDATION COMPLETE ==="
+          
+          echo "Creating SSH key file..."
           echo "${EC2_SSH_KEY}" > ssh_key.pem
           chmod 400 ssh_key.pem
           
-          # Validate SSH key format
-          echo "Checking SSH key format..."
-          if echo "${EC2_SSH_KEY}" | head -1 | grep -q "^-----BEGIN"; then
-            echo "SSH key appears to have proper header"
-            KEY_START=$(echo "${EC2_SSH_KEY}" | head -2 | tail -1 | cut -c1-8)
-            echo "SSH key starts with: '$KEY_START'"
-            if [ "$KEY_START" = "MIIEpAI" ]; then
-              echo "SSH key format validation: PASSED"
+          echo "Setting up SSH..."
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts 2>&1
+          
+          echo "Deploying to EC2 with rollback safety..."
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ConnectTimeout=30 -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
+            set -e
+            
+            echo "=== Starting Safe Deployment Process ==="
+            
+            # Define paths
+            MAIN_DIR="/home/ec2-user/every-circle/Every-Circle-Backend"
+            BACKUP_DIR="/home/ec2-user/every-circle/Every-Circle-Backend-backup"
+            NEW_DIR="/home/ec2-user/every-circle/Every-Circle-Backend-new"
+            
+            # Step 1: Create backup of current working code
+            echo "=== Step 1: Creating backup of current code ==="
+            if [ -d "$MAIN_DIR" ]; then
+              rm -rf "$BACKUP_DIR" || true
+              cp -r "$MAIN_DIR" "$BACKUP_DIR"
+              echo "✅ Backup created at $BACKUP_DIR"
+              
+              # Log current version
+              cd "$MAIN_DIR"
+              echo "Current version being backed up:"
+              git log --oneline -1 || echo "No git info available"
             else
-              echo "Warning: SSH key does not start with 'MIIEpAI', starts with '$KEY_START'"
+              echo "❌ Main directory doesn't exist: $MAIN_DIR"
+              exit 1
             fi
-          else
-            echo "Warning: SSH key does not appear to have proper PEM header"
-          fi
-          
-          # Validate expected values
-          if [ "$EC2_USER" != "ec2-user" ]; then
-            echo "Warning: EC2_USER is '$EC2_USER', expected 'ec2-user'"
-          else
-            echo "EC2_USER validation: PASSED"
-          fi
-          if [ "$EC2_HOST" != "204.236.135.231" ]; then
-            echo "Warning: EC2_HOST is '$EC2_HOST', expected '204.236.135.231'"
-          else
-            echo "EC2_HOST validation: PASSED"
-          fi
-          
-          echo "Setting up SSH directory and adding EC2 host to known_hosts..."
-          echo "Current working directory: $(pwd)"
-          echo "Home directory: $HOME"
-          
-          # Create SSH directory with detailed logging
-          echo "Creating SSH directory..."
-          mkdir -p ~/.ssh
-          echo "SSH directory creation result: $?"
-          ls -la ~/ | grep ssh || echo "No .ssh directory found in home"
-          
-          # Test if we can write to the SSH directory
-          echo "Testing SSH directory write access..."
-          touch ~/.ssh/test_file && rm ~/.ssh/test_file && echo "SSH directory is writable" || echo "SSH directory is not writable"
-          
-          echo "Adding EC2 host to known_hosts..."
-          ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts 2>&1
-          echo "ssh-keyscan result: $?"
-          
-          echo "Setting up SSH directory and adding EC2 host to known_hosts..."
-          echo "Current working directory: $(pwd)"
-          echo "Home directory: $HOME"
-          
-          # Create SSH directory with detailed logging
-          echo "Creating SSH directory..."
-          mkdir -p ~/.ssh
-          echo "SSH directory creation result: $?"
-          ls -la ~/ | grep ssh || echo "No .ssh directory found in home"
-          
-          # Test if we can write to the SSH directory
-          echo "Testing SSH directory write access..."
-          touch ~/.ssh/test_file && rm ~/.ssh/test_file && echo "SSH directory is writable" || echo "SSH directory is not writable"
-          
-          echo "Adding EC2 host to known_hosts..."
-          ssh-keyscan -H ${EC2_HOST} >> ~/.ssh/known_hosts 2>&1
-          echo "ssh-keyscan result: $?"
-          
-          echo "Connecting to EC2 instance at ${EC2_HOST}..."
-          echo "Testing basic connectivity..."
-          nc -zv ${EC2_HOST} 22 || echo "Port 22 is not reachable"
-          ssh -vvv -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ConnectTimeout=30 -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
-            echo "Connected to EC2 instance"
-            cd /home/ec2-user/every-circle
             
-            # Activate virtual environment
-            source .venv/bin/activate
-            cd Every-Circle-Backend
+            # Step 2: Clone new code to separate directory
+            echo "=== Step 2: Cloning new code ==="
+            rm -rf "$NEW_DIR" || true
+            git clone https://github.com/infinite-options/Every-Circle-Backend.git "$NEW_DIR"
+            cd "$NEW_DIR"
+            echo "New version to deploy:"
+            git log --oneline -1
             
-            # Pull latest code
-            echo "Pulling latest code..."
-            git pull origin master
+            # Step 3: Set up new environment
+            echo "=== Step 3: Setting up new environment ==="
+            source /home/ec2-user/every-circle/.venv/bin/activate
             
-            # Install dependencies in the correct order with timeout handling
-            echo "=== EC2: Installing PyTorch (this may take a few minutes) ==="
-            timeout 300 pip3 install torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html || {
-              echo "=== EC2: PyTorch installation timed out or failed, but continuing (likely already installed) ==="
-            }
-            
-            echo "=== EC2: Installing requirements-part1 ==="
-            pip3 install -r requirements-part1.txt || echo "requirements-part1 installation failed, but continuing..."
+            # Install dependencies for new version
+            pip3 install torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html || echo "PyTorch installation failed"
+            pip3 install -r requirements-part1.txt || echo "requirements-part1 failed"
             pip3 cache purge
-            
-            echo "=== EC2: Installing requirements-part2 ==="
-            pip3 install -r requirements-part2.txt || echo "requirements-part2 installation failed, but continuing..."
+            pip3 install -r requirements-part2.txt || echo "requirements-part2 failed"
             pip3 cache purge
+            pip3 install numpy==1.24.3 || echo "numpy installation failed"
             
-            echo "=== EC2: Installing numpy ==="
-            pip3 install numpy==1.24.3 || echo "numpy installation failed, but continuing..."
+            # Step 4: Test new code before switching
+            echo "=== Step 4: Testing new code ==="
+            timeout 30 python3 ec_api.py &
+            TEST_PID=$!
+            sleep 10
             
-            # Restart the application using supervisor (correct program name)
-            echo "Restarting application..."
-            sudo supervisorctl restart ec-api
+            if ! kill -0 $TEST_PID 2>/dev/null; then
+              echo "❌ New code failed to start properly"
+              kill $TEST_PID 2>/dev/null || true
+              echo "Deployment aborted - keeping current version"
+              exit 1
+            fi
             
-            # Check status
+            # Kill test process
+            kill $TEST_PID 2>/dev/null || true
+            echo "✅ New code test passed"
+            
+            # Step 5: Stop current application
+            echo "=== Step 5: Stopping current application ==="
+            sudo supervisorctl stop ec-api || echo "ec-api was not running"
+            sleep 3
+            
+            # Step 6: Switch to new code
+            echo "=== Step 6: Switching to new code ==="
+            rm -rf "$MAIN_DIR"
+            mv "$NEW_DIR" "$MAIN_DIR"
+            echo "✅ Code switched successfully"
+            
+            # Step 7: Start new application
+            echo "=== Step 7: Starting new application ==="
+            sudo supervisorctl start ec-api
+            sleep 5
+            
+            # Step 8: Verify new application is running
+            echo "=== Step 8: Verifying deployment ==="
+            if ! pgrep -f "ec_api.py"; then
+              echo "❌ New application failed to start!"
+              echo "=== INITIATING ROLLBACK ==="
+              
+              # Stop failed application
+              sudo supervisorctl stop ec-api || true
+              
+              # Restore backup
+              rm -rf "$MAIN_DIR"
+              mv "$BACKUP_DIR" "$MAIN_DIR"
+              
+              # Restart with old code
+              sudo supervisorctl start ec-api
+              sleep 5
+              
+              if pgrep -f "ec_api.py"; then
+                echo "✅ Successfully rolled back to previous version"
+                exit 1  # Still fail the deployment
+              else
+                echo "❌ CRITICAL: Rollback also failed!"
+                exit 1
+              fi
+            fi
+            
+            # Check supervisor status
             sudo supervisorctl status ec-api
+            echo "✅ Deployment completed successfully"
+            echo "Backup available at: $BACKUP_DIR"
             
-            echo "Deployment completed"
-            exit 0
           EOF
 
-      # - name: Health Check
-      #   run: |
-      #     sleep 10
-      #     echo "Running health check..."
+      - name: Health Check with Rollback
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          sleep 15
+          echo "Running health check with rollback capability..."
           
-      #     # Debug the URL being constructed
-      #     echo "EC2_HOST value: '${{ secrets.EC2_HOST }}'"
-      #     echo "Full URL: 'http://${{ secrets.EC2_HOST }}/lists'"
+          # Clean and validate environment variables for health check
+          EC2_HOST=$(echo "${EC2_HOST}" | tr -d '[:space:]')
+          EC2_USER=$(echo "${EC2_USER}" | tr -d '[:space:]')
           
-      #     # Clean the EC2_HOST value
-      #     CLEAN_HOST=$(echo "${{ secrets.EC2_HOST }}" | tr -d '[:space:]')
-      #     echo "Cleaned host: '$CLEAN_HOST'"
+          echo "=== HEALTH CHECK ENVIRONMENT VALIDATION ==="
+          echo "EC2_HOST: '${EC2_HOST}'"
+          echo "EC2_USER: '${EC2_USER}'"
           
-      #     # Perform health check with error handling
-      #     if curl -f "http://${CLEAN_HOST}/lists" 2>/dev/null; then
-      #       echo "Health check passed - API is responding correctly"
-      #     else
-      #       echo "Health check failed - API may not be responding or endpoint may not exist"
-      #       echo "This could be normal if the application is still starting up"
-      #       echo "Deployment completed, but health check unsuccessful"
+          # Validate expected values
+          if [ "$EC2_HOST" != "204.236.135.231" ]; then
+            echo "❌ WARNING: EC2_HOST is '$EC2_HOST', expected '204.236.135.231'"
+          else
+            echo "✅ EC2_HOST validation: PASSED"
+          fi
+          
+          if [ "$EC2_USER" != "ec2-user" ]; then
+            echo "❌ WARNING: EC2_USER is '$EC2_USER', expected 'ec2-user'"
+          else
+            echo "✅ EC2_USER validation: PASSED"
+          fi
+          
+          CLEAN_HOST="${EC2_HOST}"
+          # Try health check with retries
+          HEALTH_CHECK_PASSED=false
+          for i in {1..5}; do
+            echo "Health check attempt $i..."
+            if curl -f --connect-timeout 10 --max-time 30 "http://${CLEAN_HOST}/lists" 2>/dev/null; then
+              echo "✅ Health check passed"
+              HEALTH_CHECK_PASSED=true
+              break
+            else
+              echo "❌ Health check failed, retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          
+          # If health check failed, trigger rollback
+          if [ "$HEALTH_CHECK_PASSED" = false ]; then
+            echo "❌ Health check failed after 5 attempts - triggering rollback"
+            
+            # SSH back to server and rollback
+            echo "${EC2_SSH_KEY}" > ssh_key.pem
+            chmod 400 ssh_key.pem
+            
+            ssh -o StrictHostKeyChecking=no -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
+              echo "=== INITIATING ROLLBACK DUE TO HEALTH CHECK FAILURE ==="
+              
+              MAIN_DIR="/home/ec2-user/every-circle/Every-Circle-Backend"
+              BACKUP_DIR="/home/ec2-user/every-circle/Every-Circle-Backend-backup"
+              
+              # Stop current application
+              sudo supervisorctl stop ec-api || true
+              
+              # Restore backup
+              if [ -d "$BACKUP_DIR" ]; then
+                rm -rf "$MAIN_DIR"
+                mv "$BACKUP_DIR" "$MAIN_DIR"
+                
+                # Restart with old code
+                sudo supervisorctl start ec-api
+                sleep 5
+                
+                if pgrep -f "ec_api.py"; then
+                  echo "✅ Successfully rolled back to previous version"
+                else
+                  echo "❌ CRITICAL: Rollback failed!"
+                fi
+              else
+                echo "❌ No backup available for rollback!"
+              fi
+            EOF
+            
+            exit 1
+          fi
+          
+          echo "✅ Deployment and health check completed successfully"
