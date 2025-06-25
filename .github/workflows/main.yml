@@ -274,12 +274,26 @@ jobs:
           HEALTH_CHECK_PASSED=false
           for i in {1..5}; do
             echo "Health check attempt $i..."
-            if curl -f --connect-timeout 10 --max-time 30 "http://${CLEAN_HOST}/lists" 2>/dev/null; then
+            echo "Testing URL: http://${CLEAN_HOST}/lists"
+            
+            # More verbose curl with error details
+            if curl -f --connect-timeout 10 --max-time 30 -v "http://${CLEAN_HOST}/lists" 2>&1; then
               echo "✅ Health check passed"
               HEALTH_CHECK_PASSED=true
               break
             else
-              echo "❌ Health check failed, retrying in 10 seconds..."
+              CURL_EXIT_CODE=$?
+              echo "❌ Health check failed with curl exit code: $CURL_EXIT_CODE"
+              
+              # Try to get more info about what's happening
+              echo "Attempting basic connectivity test..."
+              if curl -f --connect-timeout 5 --max-time 10 "http://${CLEAN_HOST}/" 2>&1; then
+                echo "Basic connectivity works, but /lists endpoint failed"
+              else
+                echo "Basic connectivity also failed"
+              fi
+              
+              echo "Retrying in 10 seconds..."
               sleep 10
             fi
           done
@@ -292,7 +306,7 @@ jobs:
             echo "${EC2_SSH_KEY}" > ssh_key.pem
             chmod 400 ssh_key.pem
             
-            ssh -o StrictHostKeyChecking=no -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'EOF'
+            ssh -o StrictHostKeyChecking=no -i ssh_key.pem ${EC2_USER}@${EC2_HOST} << 'ROLLBACK_EOF'
               echo "=== INITIATING ROLLBACK DUE TO HEALTH CHECK FAILURE ==="
               
               MAIN_DIR="/home/ec2-user/every-circle/Every-Circle-Backend"
@@ -318,7 +332,7 @@ jobs:
               else
                 echo "❌ No backup available for rollback!"
               fi
-            EOF
+          ROLLBACK_EOF
             
             exit 1
           fi
