@@ -10,6 +10,9 @@
 # README:  if there are errors, make sure you have all requirements are loaded
 # pip3 install -r requirements.txt
 
+# Load environment variables first, before any imports
+from dotenv import load_dotenv
+load_dotenv()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
@@ -61,7 +64,6 @@ import json
 import pytz
 
 import calendar
-from dotenv import load_dotenv
 from datetime import datetime, date, timedelta, timezone
 from flask import Flask, request, render_template, url_for, redirect, jsonify, abort
 from flask_restful import Resource, Api
@@ -92,8 +94,6 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 import json
 import base64
 import googlemaps
-
-load_dotenv()
 
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 

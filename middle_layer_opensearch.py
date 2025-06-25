@@ -18,8 +18,8 @@ load_dotenv()
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Read environment variables
-host = os.getenv("OPENSEARCH_HOST")
-port = int(os.getenv("OPENSEARCH_PORT"))
+host = os.getenv("OPENSEARCH_HOST", "localhost")
+port = int(os.getenv("OPENSEARCH_PORT", "9200"))
 region = os.getenv("REGION")
 service =os.getenv("SERVICE")
 

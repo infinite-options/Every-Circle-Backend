@@ -16,8 +16,8 @@ load_dotenv()
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Read environment variables
-host = os.getenv("OPENSEARCH_HOST")
-port = int(os.getenv("OPENSEARCH_PORT"))
+host = os.getenv("OPENSEARCH_HOST", "localhost")
+port = int(os.getenv("OPENSEARCH_PORT", "9200"))
 
 class BusinessResults(Resource):
     def get(self, query):
@@ -49,7 +49,7 @@ class BusinessResults(Resource):
 
         # Define the search query for business data
         # Build KNN semantic search query
-        print("1")
+        # print("1")
         search_body = {
                         "size": 10,
                         "_source": ["business_uid", "business_name"],
@@ -70,15 +70,15 @@ class BusinessResults(Resource):
                             }
                         }
                     }
-        print("2")
+        # print("2")
 
         #print('search_body', search_body)
 
         # Perform the search
         try:
-            print("body:", search_body)
+            # print("body:", search_body)
             response = client.search(index="business", body=search_body)
-            print("3")
+            # print("3")
             #print("response from openSearch", response)
             hits = response["hits"]["hits"]
 

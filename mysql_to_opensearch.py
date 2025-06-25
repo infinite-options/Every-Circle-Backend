@@ -53,8 +53,8 @@ for row in rows:
 
 ###******** Index to OpenSearch *****###########
  # Read environment variables
-host = os.getenv("OPENSEARCH_HOST")
-port = int(os.getenv("OPENSEARCH_PORT"))
+host = os.getenv("OPENSEARCH_HOST", "localhost")
+port = int(os.getenv("OPENSEARCH_PORT", "9200"))
 username = os.getenv("OPENSEARCH_USERNAME")
 password = os.getenv("OPENSEARCH_PASSWORD")
 

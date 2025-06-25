@@ -33,3 +33,38 @@
 2025-06-24 23:50:00,645 [INFO] 127.0.0.1 - - [24/Jun/2025 23:50:00] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -
 2025-06-24 23:52:14,734 [INFO] 127.0.0.1 - - [24/Jun/2025 23:52:14] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -
 2025-06-24 23:54:12,801 [INFO] 127.0.0.1 - - [24/Jun/2025 23:54:12] "POST /api/v1/userprofileinfo HTTP/1.1" 200 -
+2025-06-24 23:58:41,368 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-24 23:58:41,447 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.27:4090
+2025-06-24 23:58:41,448 [INFO] [33mPress CTRL+C to quit[0m
+2025-06-24 23:58:41,451 [INFO]  * Restarting with stat
+2025-06-24 23:58:54,746 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-24 23:58:54,810 [WARNING]  * Debugger is active!
+2025-06-24 23:58:54,839 [INFO]  * Debugger PIN: 291-233-707
+2025-06-24 23:59:39,230 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/middle_layer_ec2opensearch.py', reloading
+2025-06-24 23:59:41,010 [INFO]  * Restarting with stat
+2025-06-24 23:59:54,642 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-24 23:59:54,707 [WARNING]  * Debugger is active!
+2025-06-24 23:59:54,734 [INFO]  * Debugger PIN: 291-233-707
+2025-06-24 23:59:58,260 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/mysql_to_ec2opensearch.py', reloading
+2025-06-24 23:59:59,633 [INFO]  * Restarting with stat
+2025-06-25 00:00:13,477 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-25 00:00:13,558 [WARNING]  * Debugger is active!
+2025-06-25 00:00:13,588 [INFO]  * Debugger PIN: 291-233-707
+2025-06-25 00:03:22,157 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/ec_api.py', reloading
+2025-06-25 00:03:23,891 [INFO]  * Restarting with stat
+2025-06-25 00:03:37,405 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-25 00:03:37,473 [WARNING]  * Debugger is active!
+2025-06-25 00:03:37,506 [INFO]  * Debugger PIN: 291-233-707
+2025-06-25 00:05:10,366 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/middle_layer_ec2opensearch.py', reloading
+2025-06-25 00:05:12,095 [INFO]  * Restarting with stat
+2025-06-25 00:05:26,620 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-25 00:05:26,692 [WARNING]  * Debugger is active!
+2025-06-25 00:05:26,721 [INFO]  * Debugger PIN: 291-233-707
+2025-06-25 00:05:33,542 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/ec_api.py', reloading
+2025-06-25 00:05:34,643 [INFO]  * Restarting with stat
+2025-06-25 00:05:45,828 [INFO] 🚀 ec_api.py has started successfully.
+2025-06-25 00:05:45,901 [WARNING]  * Debugger is active!
+2025-06-25 00:05:45,932 [INFO]  * Debugger PIN: 291-233-707
