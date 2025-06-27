@@ -283,6 +283,10 @@ class UserProfileInfo(Resource):
                         # Use the original value if it's not an email
                         personal_info['profile_personal_referred_by'] = '110-000001'
                 
+                # Determine Path to Main Node
+                personal_info['profile_personal_path'] = "[110-000109,110-000223,110-000001]"
+
+
                 # Extract personal info fields from payload
                 personal_info_fields = [
                     'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
