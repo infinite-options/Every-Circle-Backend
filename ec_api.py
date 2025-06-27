@@ -10,6 +10,15 @@
 # README:  if there are errors, make sure you have all requirements are loaded
 # pip3 install -r requirements.txt
 
+import os
+
+# # Explicitly override Hugging Face cache directories
+# os.environ["HF_HOME"] = "/home/ec2-user/.cache/huggingface"
+# os.environ["TRANSFORMERS_CACHE"] = "/home/ec2-user/.cache/huggingface"
+
+# Load environment variables first, before any imports
+from dotenv import load_dotenv
+load_dotenv()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
@@ -56,13 +65,12 @@ import jwt
 
 # from flask import Request
 
-import os
+# import os
 import boto3
 import json
 import pytz
 
 import calendar
-from dotenv import load_dotenv
 from datetime import datetime, date, timedelta, timezone
 from flask import Flask, request, render_template, url_for, redirect, jsonify, abort
 from flask_restful import Resource, Api
@@ -93,8 +101,6 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 import json
 import base64
 import googlemaps
-
-load_dotenv()
 
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
@@ -286,7 +292,36 @@ def getNow():
 # NOTIFICATION_HUB_NAME = os.environ.get('NOTIFICATION_HUB_NAME')
 # NOTIFICATION_HUB_NAME = os.environ.get('NOTIFICATION_HUB_NAME'
 
+# Logging Info
+import logging
+from logging.handlers import RotatingFileHandler
+# import os
 
+LOG_FILE = "logs/ec_api.log"
+
+# Only create directory if path includes one
+log_dir = os.path.dirname(LOG_FILE)
+if log_dir:
+    os.makedirs(log_dir, exist_ok=True)
+
+# Set up rotating log handler
+log_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3
+)
+log_handler.setLevel(logging.INFO)
+log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s"
+))
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        log_handler,
+        logging.StreamHandler()
+    ]
+)
+
+logging.info("🚀 ec_api.py has started successfully.")
 
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
