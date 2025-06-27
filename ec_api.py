@@ -49,6 +49,7 @@ from alltagSearch_split import SplitSearch
 from bounty_results import BountyResults
 from middle_layer_ec2opensearch import BusinessResults
 from transaction_cost import TransactionCost
+from expertise_search import ExpertiseSearch
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -512,6 +513,7 @@ api.add_resource(TagSplitNLPSearch, "/api/tagsplitnlpsearch/<string:query>")
 api.add_resource(SplitSearch, "/api/tagsplitcategorysearch/<string:query>")
 api.add_resource(BusinessResults, '/api/businessresults/<string:query>')
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
+api.add_resource(ExpertiseSearch, '/api/expertisesearch/<string:target_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 
 class GooglePlacesInfo(Resource):

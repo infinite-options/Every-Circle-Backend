@@ -3,6 +3,8 @@ from flask import Flask, request, jsonify
 import pandas as pd
 from opensearchpy import OpenSearch, helpers, RequestsHttpConnection
 from sentence_transformers import SentenceTransformer
+from tagSearch_direct import TagSearchDirect
+from tagCategorySearch import TagCategorySearch
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -81,7 +83,8 @@ class BusinessResults(Resource):
             hits = response["hits"]["hits"]
 
             if not hits:
-                return {"message": "No results found"}, 404
+                # return {"message": "No results found"}, 404
+                raise ValueError("No results found") 
 
             # Format response
             results = []
@@ -94,8 +97,52 @@ class BusinessResults(Resource):
                     "score": score
                 })
 
-            return jsonify({"results": results})
+            return jsonify({"message": "Retrieved OpenSearch results",
+                            "results": results})
 
         except Exception as e:
             print(f"OpenSearch query error: {e}")
-            return {"message": f"Internal Server Error: {str(e)}"}, 500
+            #return {"message": f"Internal Server Error: {str(e)}"}, 500
+            print("Trying fallback TagSearchDirect")
+
+            try:
+                fallback = TagSearchDirect()
+                fallback_res= fallback.get(query)
+                print('fallback_res', type(fallback_res))
+
+                if isinstance(fallback_res, tuple):
+                    data, status = fallback_res
+                    if status == 404:
+                        raise ValueError("Fallback TagSearchDirect -No results found")
+                
+                results = fallback_res[0]['result']
+                return jsonify({"message": "Retrieved TagSearchDirect results",
+                                "results": results})
+            
+            except Exception as e2:
+                print(f"Fallback TagSearchDirect failed: {e2}")
+                # return {"message": "Both primary and fallback TagSearchDirect failed"}, 502
+
+                print("Trying fallback TagCategorySearch")
+                try:
+                    fallback_2 = TagCategorySearch()
+                    fallback_2res= fallback_2.get(query)
+                    
+                    if isinstance(fallback_2res, tuple):
+                        data, status = fallback_2res
+                        if status == 404:
+                            msg = "Fallback TagCategorySearch -No results found"
+                            raise ValueError(msg)
+                
+                    results = fallback_2res[0]['result']
+                    return jsonify({"message": "Retrieved TagCategorySearch results",
+                                    "results": results})
+                
+                except Exception as ValueError:
+                    return {"message": msg}, 404
+                
+                except Exception as e3:
+                    print(f"Fallback TagCategorySearch failed: {e3}")
+                    # return {"message": "Both primary and fallback TagSearchDirect failed"}, 502
+                    print("Trying fallback TagCategorySearch")
+                    return {"message": "TagCategorySearch fallback failed"}, 502

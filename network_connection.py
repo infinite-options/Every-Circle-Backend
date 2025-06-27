@@ -31,13 +31,13 @@ class NetworkPath(Resource):
                                 FROM profile_personal
                                 WHERE profile_personal_referred_by in ({placeholders});
                             '''
-            print('down_query', down_query)
+            #print('down_query', down_query)
 
 
             with connect() as db:
                 response = db.execute(down_query)
             
-            print('down:', response)
+            #print('down:', response)
 
             if not response or 'result' not in response or not response['result']:
                 # response['message'] = 'No connection found'
@@ -47,17 +47,17 @@ class NetworkPath(Resource):
 
 
             down_query_details = response['result']
-            print('down_query_details: ', down_query_details)
+            #print('down_query_details: ', down_query_details)
 
             down_list = [item['profile_personal_uid'] for item in down_query_details]
             
-            print('down_list:', down_list)
+            #print('down_list:', down_list)
 
             return down_list
 
             
         def fetch_ancestors(uids):
-            print('Inside fetch_ancestors')
+            #print('Inside fetch_ancestors')
             
             if not uids:
                 return []
@@ -68,7 +68,7 @@ class NetworkPath(Resource):
                 FROM profile_personal
                 WHERE profile_personal_uid in ({placeholders});
         '''
-            print('up_query', up_query)
+            #print('up_query', up_query)
         
             with connect() as db:
                 response = db.execute(up_query)
@@ -81,11 +81,11 @@ class NetworkPath(Resource):
 
         
             up_query_details = response['result']
-            print('up_query_details: ', up_query_details)
+            #print('up_query_details: ', up_query_details)
 
             up_list = [item['profile_personal_referred_by'] for item in up_query_details]
 
-            print('up_list:', up_list)
+            #print('up_list:', up_list)
 
             return up_list
         
@@ -99,14 +99,14 @@ class NetworkPath(Resource):
 
             new_down = fetch_descendants(current_down)
 
-            print('new_down', new_down)
+            #print('new_down', new_down)
             new_down = [u for u in new_down if u not in seen]
             store['descendants'][deg] = new_down
             down_nodes.extend(new_down)
             seen.update(new_down)
             current_down = new_down
             # degree = deg
-            print('down_nodes', down_nodes)
+            #print('down_nodes', down_nodes)
             
 
             if len(seen) >= max_nodes:
@@ -114,7 +114,7 @@ class NetworkPath(Resource):
 
             new_up = fetch_ancestors(current_up)
 
-            print('new_up', new_up)
+            #print('new_up', new_up)
 
 
             new_up = [u for u in new_up if u not in seen]
@@ -122,19 +122,19 @@ class NetworkPath(Resource):
             up_nodes.extend(new_up)
             seen.update(new_up)
             current_up = new_up
-            print('up_nodes', up_nodes)
+            #print('up_nodes', up_nodes)
 
         total_count = sum(len(v) for v in store['ancestors'].values()) + sum(len(v) for v in store['descendants'].values())
-        print('total_count before the anscestors_down', total_count)
+        #print('total_count before the anscestors_down', total_count)
 
 
         for id, val in store['ancestors'].items():
 
-            print('id, val inside the anscestors_down', id, val)
+            #print('id, val inside the anscestors_down', id, val)
             
             total_count += sum(len(v) for v in store['ancestors_down'].values())
 
-            print('total_count inside the anscestors_down', total_count)
+            #print('total_count inside the anscestors_down', total_count)
 
             #if not val or '110-000001' in val:
             if not val:
@@ -158,8 +158,8 @@ class NetworkPath(Resource):
 
         # result_up = fetch_ancestors([target_uid])
         # print('result_up', result_up)
-        print('store', store)
-        print('store-ancestors', store['ancestors'])
+        # print('store', store)
+        # print('store-ancestors', store['ancestors'])
         
         #Flatlining the datasets
         final_rows = []
