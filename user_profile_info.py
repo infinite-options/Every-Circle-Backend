@@ -240,7 +240,7 @@ class UserProfileInfo(Resource):
                 personal_info['profile_personal_user_id'] = user_uid
                 
                 # Set default referred by if not provided
-                print("processing referred by")
+                print("processing referred by",new_profile_uid, user_uid)
                 if 'profile_personal_referred_by' not in payload:
                     personal_info['profile_personal_referred_by'] = "110-000001"
                 elif payload.get('profile_personal_referred_by', '').strip() in ['', 'null']:
@@ -252,7 +252,7 @@ class UserProfileInfo(Resource):
                         print("referred by is a profile uid")
                         personal_info['profile_personal_referred_by'] = referred_by_value
                     elif referred_by_value [0:3] == "100":
-                        print("referred by is a user uid")
+                        print("referred by is a user uid", 'referred_by_value:',referred_by_value)
                         uid_query = f"""
                             SELECT profile_personal_uid
                             FROM every_circle.profile_personal
@@ -282,10 +282,7 @@ class UserProfileInfo(Resource):
                     else:
                         # Use the original value if it's not an email
                         personal_info['profile_personal_referred_by'] = '110-000001'
-                
-                # Determine Path to Main Node
-                personal_info['profile_personal_path'] = "[110-000109,110-000223,110-000001]"
-
+                        
 
                 # Extract personal info fields from payload
                 personal_info_fields = [
@@ -320,6 +317,48 @@ class UserProfileInfo(Resource):
                 
                 # Insert personal info
                 db.insert('every_circle.profile_personal', personal_info)
+
+
+                # Determine Path to Main Node
+                personal_path_query = f'''
+                                            WITH RECURSIVE ReferralPath AS (
+                                SELECT 
+                                    profile_personal_uid AS user_id,
+                                    profile_personal_referred_by,
+                                    CAST(CONCAT("'", profile_personal_uid, "'") AS CHAR(255)) AS path
+                                FROM profile_personal
+                                WHERE profile_personal_uid = '110-000001'
+
+                                UNION ALL
+
+                                SELECT 
+                                    p.profile_personal_uid,
+                                    p.profile_personal_referred_by,
+                                    CONCAT(r.path, ',', "'", p.profile_personal_uid, "'")
+                                FROM profile_personal p
+                                JOIN ReferralPath r ON p.profile_personal_referred_by = r.user_id
+                                WHERE LOCATE(p.profile_personal_uid, r.path) = 0 
+                            )
+
+                            SELECT path
+                            FROM ReferralPath
+                            WHERE user_id = '{new_profile_uid}';
+                        '''
+                print(personal_path_query)
+                response = db.execute(personal_path_query)
+                print(response)
+
+                if not response['result']:
+                    response['message'] = 'No connection found'
+                    response['code'] = 404
+                    return response, 404
+
+                personal_path = response['result'][0]['path']
+                print('personal_path_query: ', personal_path)
+
+                # print('personal_path: ', personal_path['path'])
+
+                db.update('every_circle.profile_personal', {'profile_personal_uid': new_profile_uid}, {'profile_personal_path': personal_path})
                 
                 # Create social media links if provided
                 # First, get all social media platforms from the social_link table
