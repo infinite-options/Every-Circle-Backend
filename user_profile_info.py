@@ -1071,6 +1071,8 @@ class UserProfileInfo(Resource):
                                     experience_info['profile_experience_company_name'] = exp_data['company']
                                 if 'title' in exp_data:
                                     experience_info['profile_experience_position'] = exp_data['title']
+                                if 'description' in exp_data:
+                                    experience_info['profile_experience_description'] = exp_data['description']
                                 if 'startDate' in exp_data:
                                     experience_info['profile_experience_start_date'] = exp_data['startDate']
                                 if 'endDate' in exp_data:
