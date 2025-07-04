@@ -406,6 +406,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         expertises_data = json.loads(payload.pop('expertises'))
+                        print("expertise data: ", expertises_data)
                         
                         # Process each expertise entry
                         for exp_data in expertises_data:
@@ -457,6 +458,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         wishes_data = json.loads(payload.pop('wishes'))
+                        print("wishes data: ", wishes_data)
                         
                         # Process each wish entry
                         for wish_data in wishes_data:
@@ -506,6 +508,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         experiences_data = json.loads(payload.pop('experiences'))
+                        print("experience data: ", experiences_data)
                         
                         # Process each experience entry
                         for exp_data in experiences_data:
@@ -520,6 +523,8 @@ class UserProfileInfo(Resource):
                                 experience_info['profile_experience_company_name'] = exp_data['company_name']
                             if 'position' in exp_data:
                                 experience_info['profile_experience_position'] = exp_data['position']
+                            if 'description' in exp_data:
+                                experience_info['profile_experience_description'] = exp_data['description']
                             if 'start_date' in exp_data:
                                 experience_info['profile_experience_start_date'] = exp_data['start_date']
                             if 'end_date' in exp_data:
@@ -557,6 +562,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         educations_data = json.loads(payload.pop('educations'))
+                        print("education data: ", educations_data)
                         
                         # Process each education entry
                         for edu_data in educations_data:
@@ -1060,6 +1066,7 @@ class UserProfileInfo(Resource):
                                 # Check if experience exists
                                 experience_exists_query = db.select('every_circle.profile_experience', 
                                                                   where={'profile_experience_uid': experience_uid})
+                                print("experience_exists_query", experience_exists_query)
                                 
                                 if not experience_exists_query['result']:
                                     # Skip this one if it doesn't exist
@@ -1067,18 +1074,18 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the experience data
-                                if 'company' in exp_data:
-                                    experience_info['profile_experience_company_name'] = exp_data['company']
-                                if 'title' in exp_data:
-                                    experience_info['profile_experience_position'] = exp_data['title']
-                                if 'description' in exp_data:
-                                    experience_info['profile_experience_description'] = exp_data['description']
-                                if 'startDate' in exp_data:
-                                    experience_info['profile_experience_start_date'] = exp_data['startDate']
-                                if 'endDate' in exp_data:
-                                    experience_info['profile_experience_end_date'] = exp_data['endDate']
-                                if 'isPublic' in exp_data:
-                                    experience_info['profile_experience_is_public'] = exp_data['isPublic']
+                                if 'profile_experience_company_name' in exp_data:
+                                    experience_info['profile_experience_company_name'] = exp_data['profile_experience_company_name']
+                                if 'profile_experience_position' in exp_data:
+                                    experience_info['profile_experience_position'] = exp_data['profile_experience_position']
+                                if 'profile_experience_description' in exp_data:
+                                    experience_info['profile_experience_description'] = exp_data['profile_experience_description']
+                                if 'profile_experience_start_date' in exp_data:
+                                    experience_info['profile_experience_start_date'] = exp_data['profile_experience_start_date']
+                                if 'profile_experience_end_date' in exp_data:
+                                    experience_info['profile_experience_end_date'] = exp_data['profile_experience_end_date']
+                                if 'profile_experience_is_public' in exp_data:
+                                    experience_info['profile_experience_is_public'] = exp_data['profile_experience_is_public']
                                 
                                 # Update the existing experience
                                 if experience_info:
@@ -1099,6 +1106,8 @@ class UserProfileInfo(Resource):
                                     experience_info['profile_experience_company_name'] = exp_data['company']
                                 if 'title' in exp_data:
                                     experience_info['profile_experience_position'] = exp_data['title']
+                                if 'description' in exp_data:
+                                    experience_info['profile_experience_description'] = exp_data['description']
                                 if 'startDate' in exp_data:
                                     experience_info['profile_experience_start_date'] = exp_data['startDate']
                                 if 'endDate' in exp_data:
