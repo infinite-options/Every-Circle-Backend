@@ -519,10 +519,10 @@ class UserProfileInfo(Resource):
                             experience_info['profile_experience_profile_personal_id'] = new_profile_uid
                             
                             # Map fields from the experience data
-                            if 'company_name' in exp_data:
-                                experience_info['profile_experience_company_name'] = exp_data['company_name']
-                            if 'position' in exp_data:
-                                experience_info['profile_experience_position'] = exp_data['position']
+                            if 'company' in exp_data:
+                                experience_info['profile_experience_company_name'] = exp_data['company']
+                            if 'title' in exp_data:
+                                experience_info['profile_experience_position'] = exp_data['title']
                             if 'description' in exp_data:
                                 experience_info['profile_experience_description'] = exp_data['description']
                             if 'start_date' in exp_data:
@@ -1074,18 +1074,32 @@ class UserProfileInfo(Resource):
                                     continue
                                 
                                 # Map fields from the experience data
-                                if 'profile_experience_company_name' in exp_data:
-                                    experience_info['profile_experience_company_name'] = exp_data['profile_experience_company_name']
-                                if 'profile_experience_position' in exp_data:
-                                    experience_info['profile_experience_position'] = exp_data['profile_experience_position']
-                                if 'profile_experience_description' in exp_data:
-                                    experience_info['profile_experience_description'] = exp_data['profile_experience_description']
-                                if 'profile_experience_start_date' in exp_data:
-                                    experience_info['profile_experience_start_date'] = exp_data['profile_experience_start_date']
-                                if 'profile_experience_end_date' in exp_data:
-                                    experience_info['profile_experience_end_date'] = exp_data['profile_experience_end_date']
-                                if 'profile_experience_is_public' in exp_data:
-                                    experience_info['profile_experience_is_public'] = exp_data['profile_experience_is_public']
+                                if 'company' in exp_data:
+                                    experience_info['profile_experience_company_name'] = exp_data['company']
+                                if 'title' in exp_data:
+                                    experience_info['profile_experience_position'] = exp_data['title']
+                                if 'description' in exp_data:
+                                    experience_info['profile_experience_description'] = exp_data['description']
+                                if 'start_date' in exp_data:
+                                    experience_info['profile_experience_start_date'] = exp_data['start_date']
+                                if 'end_date' in exp_data:
+                                    experience_info['profile_experience_end_date'] = exp_data['end_date']
+                                if 'isPublic' in exp_data:
+                                    experience_info['profile_experience_is_public'] = exp_data['isPublic']
+                                
+                                # Map fields from the experience data
+                                # if 'profile_experience_company_name' in exp_data:
+                                #     experience_info['profile_experience_company_name'] = exp_data['profile_experience_company_name']
+                                # if 'profile_experience_position' in exp_data:
+                                #     experience_info['profile_experience_position'] = exp_data['profile_experience_position']
+                                # if 'profile_experience_description' in exp_data:
+                                #     experience_info['profile_experience_description'] = exp_data['profile_experience_description']
+                                # if 'profile_experience_start_date' in exp_data:
+                                #     experience_info['profile_experience_start_date'] = exp_data['profile_experience_start_date']
+                                # if 'profile_experience_end_date' in exp_data:
+                                #     experience_info['profile_experience_end_date'] = exp_data['profile_experience_end_date']
+                                # if 'profile_experience_is_public' in exp_data:
+                                #     experience_info['profile_experience_is_public'] = exp_data['profile_experience_is_public']
                                 
                                 # Update the existing experience
                                 if experience_info:
