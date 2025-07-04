@@ -525,10 +525,10 @@ class UserProfileInfo(Resource):
                                 experience_info['profile_experience_position'] = exp_data['title']
                             if 'description' in exp_data:
                                 experience_info['profile_experience_description'] = exp_data['description']
-                            if 'start_date' in exp_data:
-                                experience_info['profile_experience_start_date'] = exp_data['start_date']
-                            if 'end_date' in exp_data:
-                                experience_info['profile_experience_end_date'] = exp_data['end_date']
+                            if 'startDate' in exp_data:
+                                experience_info['profile_experience_start_date'] = exp_data['startDate']
+                            if 'endDate' in exp_data:
+                                experience_info['profile_experience_end_date'] = exp_data['endDate']
                             
                             # Insert the experience record
                             db.insert('every_circle.profile_experience', experience_info)
@@ -579,10 +579,10 @@ class UserProfileInfo(Resource):
                                 education_info['profile_education_degree'] = edu_data['degree']
                             if 'course' in edu_data:
                                 education_info['profile_education_course'] = edu_data['course']
-                            if 'start_date' in edu_data:
-                                education_info['profile_education_start_date'] = edu_data['start_date']
-                            if 'end_date' in edu_data:
-                                education_info['profile_education_end_date'] = edu_data['end_date']
+                            if 'startDate' in edu_data:
+                                education_info['profile_education_start_date'] = edu_data['startDate']
+                            if 'endDate' in edu_data:
+                                education_info['profile_education_end_date'] = edu_data['endDate']
                             
                             # Insert the education record
                             db.insert('every_circle.profile_education', education_info)
@@ -1080,26 +1080,13 @@ class UserProfileInfo(Resource):
                                     experience_info['profile_experience_position'] = exp_data['title']
                                 if 'description' in exp_data:
                                     experience_info['profile_experience_description'] = exp_data['description']
-                                if 'start_date' in exp_data:
-                                    experience_info['profile_experience_start_date'] = exp_data['start_date']
-                                if 'end_date' in exp_data:
-                                    experience_info['profile_experience_end_date'] = exp_data['end_date']
+                                if 'startDate' in exp_data:
+                                    experience_info['profile_experience_start_date'] = exp_data['startDate']
+                                if 'endDate' in exp_data:
+                                    experience_info['profile_experience_end_date'] = exp_data['endDate']
                                 if 'isPublic' in exp_data:
                                     experience_info['profile_experience_is_public'] = exp_data['isPublic']
                                 
-                                # Map fields from the experience data
-                                # if 'profile_experience_company_name' in exp_data:
-                                #     experience_info['profile_experience_company_name'] = exp_data['profile_experience_company_name']
-                                # if 'profile_experience_position' in exp_data:
-                                #     experience_info['profile_experience_position'] = exp_data['profile_experience_position']
-                                # if 'profile_experience_description' in exp_data:
-                                #     experience_info['profile_experience_description'] = exp_data['profile_experience_description']
-                                # if 'profile_experience_start_date' in exp_data:
-                                #     experience_info['profile_experience_start_date'] = exp_data['profile_experience_start_date']
-                                # if 'profile_experience_end_date' in exp_data:
-                                #     experience_info['profile_experience_end_date'] = exp_data['profile_experience_end_date']
-                                # if 'profile_experience_is_public' in exp_data:
-                                #     experience_info['profile_experience_is_public'] = exp_data['profile_experience_is_public']
                                 
                                 # Update the existing experience
                                 if experience_info:
