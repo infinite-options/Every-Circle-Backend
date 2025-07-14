@@ -1,4 +1,4 @@
-import mysql.connector # type: ignore
+import pymysql
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
 import os
@@ -18,12 +18,15 @@ db = os.getenv("RDS_DB")
 pwd = os.getenv("RDS_PW")
 user_role = os.getenv("RDS_USER")
 
-# Connect to MySQL
-mysql_conn = mysql.connector.connect(
+# Connect to MySQL using PyMySQL
+mysql_conn = pymysql.connect(
     host=host_info,
     user=user_role,
     password=pwd,
-    database=db
+    database=db,
+    port=port_info,
+    charset='utf8mb4',
+    cursorclass=pymysql.cursors.DictCursor
 )
 
 
