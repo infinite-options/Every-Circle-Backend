@@ -40,7 +40,9 @@ print('count fetched from backend',len(rows))
 
 ###******** # Transform data with embeddings *****###########
 docs = []
-for row in rows:
+for i, row in enumerate(rows):
+    if i % 2 == 0:  # Print every 50 businesses
+        print(f"Processing business {i+1}/{len(rows)}")
     embedding = model.encode(row["business_name"]).tolist()
     doc = {
         "_index": "business",
