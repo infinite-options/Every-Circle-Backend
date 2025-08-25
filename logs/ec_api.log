@@ -97,3 +97,107 @@
  * Running on http://10.0.0.8:4090
 2025-07-04 10:39:51,911 [INFO] [33mPress CTRL+C to quit[0m
 2025-07-04 10:39:51,912 [INFO]  * Restarting with stat
+2025-08-25 11:43:05,864 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 11:43:05,980 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 11:43:05,980 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 11:43:05,981 [INFO]  * Restarting with stat
+2025-08-25 11:43:08,930 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 11:43:08,983 [WARNING]  * Debugger is active!
+2025-08-25 11:43:09,004 [INFO]  * Debugger PIN: 317-871-169
+2025-08-25 12:49:24,091 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 12:49:24,201 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 12:49:24,202 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 12:49:24,203 [INFO]  * Restarting with stat
+2025-08-25 12:49:25,036 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 12:49:25,098 [WARNING]  * Debugger is active!
+2025-08-25 12:49:25,128 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 12:49:57,135 [INFO] 127.0.0.1 - - [25/Aug/2025 12:49:57] "GET /lists HTTP/1.1" 200 -
+2025-08-25 12:50:09,475 [INFO] 127.0.0.1 - - [25/Aug/2025 12:50:09] "GET /api/v1/businessinfo/200-000001 HTTP/1.1" 200 -
+2025-08-25 12:50:18,006 [INFO] 127.0.0.1 - - [25/Aug/2025 12:50:18] "GET /api/v1/userprofileinfo/pmarathay@mac.com HTTP/1.1" 200 -
+2025-08-25 12:50:27,732 [INFO] 127.0.0.1 - - [25/Aug/2025 12:50:27] "GET /api/v1/userprofileinfo/pmarathay@gmail.com HTTP/1.1" 200 -
+2025-08-25 12:50:38,716 [INFO] 127.0.0.1 - - [25/Aug/2025 12:50:38] "GET /api/v1/userprofileinfo/110-000010 HTTP/1.1" 200 -
+2025-08-25 12:55:17,559 [INFO] 127.0.0.1 - - [25/Aug/2025 12:55:17] "[33mGET /api/business_results/Great%20Auto%20Shop HTTP/1.1[0m" 404 -
+2025-08-25 12:55:24,762 [INFO] 127.0.0.1 - - [25/Aug/2025 12:55:24] "GET /businesses HTTP/1.1" 200 -
+2025-08-25 12:55:34,207 [INFO] 127.0.0.1 - - [25/Aug/2025 12:55:34] "GET /stripe_key/ECTEST HTTP/1.1" 200 -
+2025-08-25 13:09:34,138 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:09:34,227 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 13:09:34,227 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 13:09:34,228 [INFO]  * Restarting with stat
+2025-08-25 13:09:35,151 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:09:35,279 [WARNING]  * Debugger is active!
+2025-08-25 13:09:35,295 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 13:22:49,945 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:22:50,034 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 13:22:50,034 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 13:22:50,035 [INFO]  * Restarting with stat
+2025-08-25 13:22:50,856 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:22:50,902 [WARNING]  * Debugger is active!
+2025-08-25 13:22:50,915 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 13:30:50,034 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:30:50,121 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 13:30:50,121 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 13:30:50,122 [INFO]  * Restarting with stat
+2025-08-25 13:30:50,959 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:30:51,004 [WARNING]  * Debugger is active!
+2025-08-25 13:30:51,018 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 13:30:55,206 [INFO] 127.0.0.1 - - [25/Aug/2025 13:30:55] "GET /category_list/all HTTP/1.1" 200 -
+2025-08-25 13:31:08,296 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/ec_api.py', reloading
+2025-08-25 13:31:08,587 [INFO]  * Restarting with stat
+2025-08-25 13:31:10,317 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:31:10,344 [WARNING]  * Debugger is active!
+2025-08-25 13:31:10,355 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 13:31:15,173 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:31:15,224 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 13:31:15,224 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 13:31:15,225 [INFO]  * Restarting with stat
+2025-08-25 13:31:16,052 [INFO] 🚀 ec_api.py has started successfully.
+2025-08-25 13:31:16,088 [WARNING]  * Debugger is active!
+2025-08-25 13:31:16,098 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 14:43:22,434 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 14:43:22,502 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 14:43:22,502 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 14:43:22,504 [INFO]  * Restarting with stat
+2025-08-25 14:43:23,334 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 14:43:23,370 [WARNING]  * Debugger is active!
+2025-08-25 14:43:23,383 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 14:50:36,819 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 14:50:36,895 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 14:50:36,895 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 14:50:36,897 [INFO]  * Restarting with stat
+2025-08-25 14:50:37,732 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 14:50:37,771 [WARNING]  * Debugger is active!
+2025-08-25 14:50:37,787 [INFO]  * Debugger PIN: 104-466-528
+2025-08-25 16:33:33,710 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 16:33:33,785 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.249:4090
+2025-08-25 16:33:33,786 [INFO] [33mPress CTRL+C to quit[0m
+2025-08-25 16:33:33,787 [INFO]  * Restarting with stat
+2025-08-25 16:33:34,642 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-08-25 16:33:34,680 [WARNING]  * Debugger is active!
+2025-08-25 16:33:34,692 [INFO]  * Debugger PIN: 104-466-528

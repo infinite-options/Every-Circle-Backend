@@ -1,14 +1,11 @@
-# MANIFEST MY space_dev (PROPERTY MANAGEMENT) BACKEND PYTHON FILE
-# https://l0h6a9zi1e.execute-api.us-west-1.amazonaws.com/dev/<enter_endpoint_details>
-# https://qn4agnb0v9.execute-api.us-west-1.amazonaws.com/production/<enter_endpoint_details>
+# EVERY CIRCLE BACKEND PYTHON FILE
+# https://o7t5ikn907.execute-api.us-west-1.amazonaws.com/dev /<enter_endpoint_details>
+# No production endpoint yet
 
 
 # To run program:  python3 ec_api.py
+# Check README.md for more information
 
-# README:  if conn error make sure password is set properly in RDS PASSWORD section
-# README:  Debug Mode may need to be set to False when deploying live (although it seems to be working through Zappa)
-# README:  if there are errors, make sure you have all requirements are loaded
-# pip3 install -r requirements.txt
 
 import os
 
@@ -30,7 +27,6 @@ from ratings import Ratings, Ratings_v2
 from ratings_v3 import Ratings_v3
 from search import Search, Search_v2
 from lists import Lists
-from middle_layer import Business_Results
 from charges import Charges
 from business_budget import Business_Budget
 from business_revenue import BusinessRevenue
@@ -38,8 +34,6 @@ from feed import Feed
 from category_list import CategoryList
 from chatbot import ChatbotAPI
 from user_connections import Connections
-from aisearch import AISearch
-from aisearch_v2 import AISearchTag, AISearchTag_v3
 from tag_generator_api import TagGeneratorAPI
 from sambanovasearch import AIDirectBusinessSearch
 from user_profile_info import UserProfileInfo
@@ -47,18 +41,10 @@ from business_info import BusinessInfo
 from transactions import Transactions
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
-from tagSearch_direct import TagSearchDirect
-from tagCategorySearch import TagCategorySearch
 from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
-from tagSearch_split import TagSplitSearch
-from tagSearch_split_nlp import TagSplitNLPSearch
-from alltagSearch_split import SplitSearch
-# from middle_layer_opensearch import BusinessResults
 from bounty_results import BountyResults
-from middle_layer_ec2opensearch import BusinessResults
 from transaction_cost import TransactionCost
-from expertise_search import ExpertiseSearch
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -86,7 +72,6 @@ from oauth2client import GOOGLE_REVOKE_URI, GOOGLE_TOKEN_URI, client
 from urllib.parse import urlparse
 from io import BytesIO
 from dateutil.relativedelta import relativedelta
-from dateutil.relativedelta import *
 from math import ceil
 from werkzeug.exceptions import BadRequest, NotFound
 from werkzeug.datastructures import FileStorage  # For file handling
@@ -294,34 +279,56 @@ def getNow():
 
 # Logging Info
 import logging
-from logging.handlers import RotatingFileHandler
-# import os
+import os
 
-LOG_FILE = "logs/ec_api.log"
+# Check if we're running in AWS Lambda (read-only file system)
+is_lambda = os.environ.get('AWS_LAMBDA_FUNCTION_NAME') is not None
 
-# Only create directory if path includes one
-log_dir = os.path.dirname(LOG_FILE)
-if log_dir:
-    os.makedirs(log_dir, exist_ok=True)
+if not is_lambda:
+    # Only set up file logging when not running in Lambda
+    try:
+        from logging.handlers import RotatingFileHandler
+        
+        LOG_FILE = "logs/ec_api.log"
+        
+        # Only create directory if path includes one
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
 
-# Set up rotating log handler
-log_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3
-)
-log_handler.setLevel(logging.INFO)
-log_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s"
-))
+        # Set up rotating log handler
+        log_handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3
+        )
+        log_handler.setLevel(logging.INFO)
+        log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s"
+        ))
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        log_handler,
-        logging.StreamHandler()
-    ]
-)
-
-logging.info("🚀 ec_api.py has started successfully.")
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[
+                log_handler,
+                logging.StreamHandler()
+            ]
+        )
+        
+        logging.info("🚀 ec_api.py has started successfully (with file logging).")
+    except Exception as e:
+        # Fallback to console-only logging if file logging fails
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[logging.StreamHandler()]
+        )
+        logging.info("🚀 ec_api.py has started successfully (console logging only).")
+        logging.warning(f"File logging setup failed: {e}")
+else:
+    # Lambda environment - use console logging only
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[logging.StreamHandler()]
+    )
+    logging.info("🚀 ec_api.py has started successfully in Lambda environment.")
 
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
@@ -507,49 +514,38 @@ class Refer(Resource):
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
-api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
+# api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Business_v2, "/api/v2/business", "/api/v2/business/<string:uid>")
 api.add_resource(Businesses, "/businesses")
-api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
-api.add_resource(Ratings_v2, "/api/v2/ratings", "/api/v2/ratings/<string:uid>")
-api.add_resource(Search, "/search/<string:profile_id>")
-api.add_resource(Search_v2, "/api/v2/search/<string:profile_id>")
+# api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
+# api.add_resource(Ratings_v2, "/api/v2/ratings", "/api/v2/ratings/<string:uid>")
+# api.add_resource(Search, "/search/<string:profile_id>")
+# api.add_resource(Search_v2, "/api/v2/search/<string:profile_id>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
-api.add_resource(Charges, "/charges")
-api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
-api.add_resource(Feed, "/feed/<string:profile_id>")
+# api.add_resource(Charges, "/charges")
+# api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
+# api.add_resource(Feed, "/feed/<string:profile_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
-api.add_resource(ChatbotAPI, "/api/v1/chatbot")
-api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
-api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
-api.add_resource(AISearch, '/api/v1/aisearch/<string:profile_id>')
-api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
-api.add_resource(AISearchTag, '/api/v2/AITagSearch/<string:profile_id>')
-api.add_resource(AISearchTag_v3, '/api/v3/AITagSearch/<string:profile_id>')
-api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
-api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
-api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
+# api.add_resource(ChatbotAPI, "/api/v1/chatbot")
+# api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
+# api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
+# api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
+# api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
+# api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
+# api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:uid>')
 
-api.add_resource(Business_Results, '/api/business_results')
-api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
-api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
-api.add_resource(TagSearchDirect, "/api/tagsearchdistinct/<string:query>")
-api.add_resource(TagCategorySearch, "/api/tagcategorydistinct/<string:query>")
-api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
-api.add_resource(ProfileWishInfo, "/api/profilewishinfo/<string:query>")
-api.add_resource(TagSplitSearch, "/api/tagsplitsearchdistinct/<string:query>")
-api.add_resource(TagSplitNLPSearch, "/api/tagsplitnlpsearch/<string:query>")
-api.add_resource(SplitSearch, "/api/tagsplitcategorysearch/<string:query>")
-api.add_resource(BusinessResults, '/api/businessresults/<string:query>')
-api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
-api.add_resource(ExpertiseSearch, '/api/expertisesearch/<string:uid>/<string:query>')
-api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
+# api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
+# api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
+# api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
+# api.add_resource(ProfileWishInfo, "/api/profilewishinfo/<string:query>")
+# api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
+# api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 
 class GooglePlacesInfo(Resource):
     def post(self):
