@@ -1,254 +1,257 @@
-# App.py — Qdrant + E5 embeddings (instruction-tuned, L2-normalized)
-import os
-import uuid
-import pymysql
-import numpy as np
-from math import radians, cos, sin, asin, sqrt
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import (
-    VectorParams, Distance, Filter, FieldCondition, Range, MatchValue
-)
+# QdrntTest.py — Infinite Options RDS + Qdrant + OpenAI Tags (UUID-safe IDs, with business tags)
 
-# =========================
+import os
+import pymysql
+import json
+import re
+import uuid
+from flask import Flask, request, jsonify
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct, VectorParams, Distance
+from openai import OpenAI
+
+# -------------------------
 # Load environment
-# =========================
-print("[BOOT] Loading environment variables...")
+# -------------------------
 load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-print("[OK] Environment variables loaded.")
 
-# =========================
-# MySQL
-# =========================
-print("[BOOT] Setting up MySQL connection parameters...")
+# -------------------------
+# MySQL config (RDS)
+# -------------------------
 MYSQL = dict(
-    host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-    port=int(os.getenv("MYSQL_PORT", "3306")),
-    user=os.getenv("MYSQL_USER", "root"),
-    password=os.getenv("MYSQL_PASSWORD", ""),
-    database=os.getenv("MYSQL_DATABASE", "every_circle"),
-    cursorclass=pymysql.cursors.Cursor,  # tuple rows (we zip to dict)
+    host=os.getenv("RDS_HOST", "127.0.0.1"),
+    port=int(os.getenv("RDS_PORT", "3306")),
+    user=os.getenv("RDS_USER", "root"),
+    password=os.getenv("RDS_PW", ""),
+    database=os.getenv("RDS_DB", "every_circle")
 )
-print("[OK] MySQL config ready.")
 
-# =========================
-# Embedding Model (UPGRADED)
-# =========================
-# Use an instruction-tuned retrieval model with query/passages prefixes.
-# Strong choices: "intfloat/e5-large-v2" (1024-d) or "intfloat/e5-small-v2" (384-d)
+# -------------------------
+# Config
+# -------------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "intfloat/e5-large-v2")
-EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))  # 1024 for e5-large-v2, 384 for e5-small-v2
-TOP_K = int(os.getenv("TOP_K", "5"))
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+TOP_K = int(os.getenv("TOP_K", "5")) # TODO check top_k
 
-# Qdrant config
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "businesses")
 
-print(f"[BOOT] Config: MODEL_NAME={MODEL_NAME}, EMBED_DIM={EMBED_DIM}, TOP_K={TOP_K}")
-print("[BOOT] Loading embedding model...")
-model = SentenceTransformer(MODEL_NAME)
-print("[OK] Model loaded successfully.")
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def l2norm(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v)
-    return v / (n + 1e-12)
-
-def encode_query(text: str) -> list:
-    # E5 expects instruction prefix "query: "
-    v = model.encode(f"query: {text}", normalize_embeddings=False)
-    return l2norm(np.asarray(v)).tolist()
-
-def encode_doc(name: str, tagline: str, bio: str) -> list:
-    # E5 expects instruction prefix "passage: "
-    text = " ".join([str(name or ""), str(tagline or ""), str(bio or "")]).strip()
-    v = model.encode(f"passage: {text}", normalize_embeddings=False)
-    return l2norm(np.asarray(v)).tolist()
-
-# =========================
-# Business attributes used
-# =========================
-ATTRIBUTES = [
-    "business_uid",
-    "business_name",
-    "business_tag_line",
-    "business_short_bio",
-    "business_address_line_1",
-    "business_city",
-    "business_state",
-    "business_country",
-    "business_google_rating",
-    "business_price_level",
-    "business_latitude",
-    "business_longitude",
-]
-
-TEXT_FIELDS_FOR_EMBEDDING = [
-    "business_name",
-    "business_tag_line",
-    "business_short_bio",
-]
-
-# =========================
-# Flask
-# =========================
-print("[BOOT] Initializing Flask...")
+# -------------------------
+# Setup
+# -------------------------
 app = Flask(__name__)
-print("[OK] Flask app initialized.")
-
-# =========================
-# DB helper
-# =========================
-def get_db_connection():
-    print("[STEP] Connecting to MySQL...")
-    return pymysql.connect(**MYSQL)
-
-# =========================
-# Distance helper
-# =========================
-def haversine_miles(lat1, lon1, lat2, lon2):
-    """Great-circle distance between two lat/lon points (miles)."""
-    lat1, lon1, lat2, lon2 = map(radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = sin(dlat/2.0)**2 + cos(lat1) * cos(lat2) * sin(dlon/2.0)**2
-    c = 2.0 * asin(sqrt(a))
-    return 3959.0 * c  # Earth radius in miles
-
-# =========================
-# Qdrant
-# =========================
-print("[BOOT] Connecting to Qdrant...")
+embedder = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-def recreate_collection():
-    print("[STEP] (Re)creating Qdrant collection...")
-    if qdrant.collection_exists(QDRANT_COLLECTION):
-        qdrant.delete_collection(QDRANT_COLLECTION)
-    qdrant.create_collection(
-        collection_name=QDRANT_COLLECTION,
-        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-    )
-    print("[OK] Collection ready.")
+# -------------------------
+# Helpers
+# -------------------------
+def embed_text(text: str):
+    return embedder.encode(text).tolist()
 
-def initial_load():
-    print("[STEP] Loading businesses from MySQL into Qdrant...")
-    conn = get_db_connection()
-    with conn.cursor() as cursor:
-        cursor.execute(f"SELECT {', '.join(ATTRIBUTES)} FROM business")
-        rows = cursor.fetchall()
-    conn.close()
-    print(f"[OK] MySQL returned {len(rows)} rows for indexing.")
+def make_uuid(value: str) -> str:
+    """Deterministically convert a string (like business_uid) into a valid UUID."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))
 
-    # Build points
+# -------------------------
+# Recreate collections
+# -------------------------
+def recreate_collections():
+    for col in ["wishes", "expertise", "businesses"]:
+        qdrant.recreate_collection(
+            collection_name=col,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE)
+        )
+    print("✅ Qdrant collections recreated.")
+
+# -------------------------
+# Sync tables → Qdrant
+# -------------------------
+def sync_wishes():
+    conn = pymysql.connect(**MYSQL)
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute("SELECT profile_wish_uid, profile_wish_title, profile_wish_description FROM profile_wish")
+    rows = cur.fetchall()
     points = []
     for row in rows:
-        doc = dict(zip(ATTRIBUTES, row))
+        text = f"{row['profile_wish_title']} - {row['profile_wish_description'] or ''}"
+        points.append(PointStruct(
+            id=make_uuid(row['profile_wish_uid']),
+            vector=embed_text(text),
+            payload=row
+        ))
+        print(f"Inserted wish: {row['profile_wish_title']}")
+    qdrant.upsert(collection_name="wishes", points=points)
+    conn.close()
+    print(f"✅ Synced {len(points)} wishes.")
 
-        name = doc.get("business_name")
-        tagline = doc.get("business_tag_line")
-        bio = doc.get("business_short_bio")
+def sync_expertise():
+    conn = pymysql.connect(**MYSQL)
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute("SELECT profile_expertise_uid, profile_expertise_title, profile_expertise_description FROM profile_expertise")
+    rows = cur.fetchall()
+    points = []
+    for row in rows:
+        text = f"{row['profile_expertise_title']} - {row['profile_expertise_description'] or ''}"
+        points.append(PointStruct(
+            id=make_uuid(row['profile_expertise_uid']),
+            vector=embed_text(text),
+            payload=row
+        ))
+        print(f"Inserted expertise: {row['profile_expertise_title']}")
+    qdrant.upsert(collection_name="expertise", points=points)
+    conn.close()
+    print(f"✅ Synced {len(points)} expertise entries.")
 
-        vec = encode_doc(name, tagline, bio)
+def sync_businesses():
+    conn = pymysql.connect(**MYSQL)
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute("SELECT business_uid, business_name, business_short_bio, business_tag_line FROM business")
+    rows = cur.fetchall()
+    points = []
+    for row in rows:
+        # Embed name + bio + tag line (onion layering)
+        text = f"{row['business_name']} - {row['business_short_bio'] or ''} - {row['business_tag_line'] or ''}"
+        
+        # Still keep tags in payload for filtering if needed later
+        tags = [t.strip().lower() for t in (row.get("business_tag_line") or "").split(",") if t.strip()]
+        payload = row | {"tags": tags}
+        
+        points.append(PointStruct(
+            id=make_uuid(row['business_uid']),
+            vector=embed_text(text),
+            payload=payload
+        ))
+        print(f"Inserted business: {row['business_name']} with tags {tags}")
+    qdrant.upsert(collection_name="businesses", points=points)
+    conn.close()
+    print(f"✅ Synced {len(points)} businesses.")
 
-        # Deterministic UUID from business_uid (Qdrant IDs must be uint or UUID)
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(doc.get("business_uid"))))
+# -------------------------
+# Search Endpoints
+# -------------------------
+@app.route("/search_business", methods=["GET"])
+def search_business():
+    query = request.args.get("q", "")
+    tag = request.args.get("tag", "")
+    limit = int(request.args.get("limit", TOP_K))
 
-        points.append({"id": point_id, "vector": vec, "payload": doc})
+    vector = embed_text(query) if query else None
 
-    # Upsert (batching optional; small dataset can go as one)
-    if points:
-        qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points)
-    print(f"[OK] Inserted/updated {len(points)} docs in Qdrant.")
+    scroll_filter = None
+    if tag:
+        scroll_filter = {
+            "must": [
+                {"key": "tags", "match": {"value": tag.lower()}}
+            ]
+        }
 
-# =========================
-# Routes
-# =========================
-@app.route("/search", methods=["GET"])
-def search():
-    print("[ROUTE] /search called.")
+    if vector:  # semantic + optional tag filter
+        results = qdrant.search(
+            collection_name="businesses",
+            query_vector=vector,
+            query_filter=scroll_filter,
+            limit=limit
+        )
+        return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
 
-    query = request.args.get("q", "") or ""
-    city_filter = request.args.get("city")
-    min_rating = request.args.get("min_rating", type=float)
-    user_lat = request.args.get("lat", type=float)
-    user_lon = request.args.get("lon", type=float)
-    radius_miles = request.args.get("radius_miles", default=5.0, type=float)
+    elif tag:  # pure tag search
+        results, _ = qdrant.scroll(
+            collection_name="businesses",
+            scroll_filter=scroll_filter,
+            limit=limit
+        )
+        return jsonify([r.payload for r in results])
 
-    print(f"[DEBUG] Params: q='{query}', city='{city_filter}', min_rating={min_rating}, "
-          f"lat={user_lat}, lon={user_lon}, radius={radius_miles}")
-
-    # Encode query using upgraded model (E5) with instruction prefix + L2 norm
-    print("[STEP] Encoding query...")
-    query_vector = encode_query(query)
-    print("[OK] Query vector ready.")
-
-    # Build Qdrant filter from city/rating (others remain in Python, identical behavior)
-    conditions = []
-    if city_filter:
-        conditions.append(FieldCondition(key="business_city", match=MatchValue(value=city_filter)))
-        print(f"[DEBUG] City filter applied: {city_filter}")
-    if min_rating is not None:
-        conditions.append(FieldCondition(key="business_google_rating", range=Range(gte=min_rating)))
-        print(f"[DEBUG] Rating filter applied: >= {min_rating}")
-
-    q_filter = Filter(must=conditions) if conditions else None
-
-    # Search in Qdrant (fetch extra to allow geo pruning)
-    fetch_limit = TOP_K * 5
-    print(f"[STEP] Qdrant search: limit={fetch_limit}")
-    results = qdrant.search(
-        collection_name=QDRANT_COLLECTION,
-        query_vector=query_vector,
-        query_filter=q_filter,
-        limit=fetch_limit
-    )
-    print(f"[OK] Qdrant returned {len(results)} candidates.")
-
-    # Build docs + optional geo filter
-    docs = []
-    for res in results:
-        doc = res.payload
-        doc["score"] = float(res.score)
-
-        if user_lat is not None and user_lon is not None:
-            try:
-                b_lat = float(doc.get("business_latitude"))
-                b_lon = float(doc.get("business_longitude"))
-                distance = haversine_miles(user_lat, user_lon, b_lat, b_lon)
-                doc["distance_miles"] = round(distance, 2)
-                if distance > radius_miles:
-                    # Outside radius: skip
-                    continue
-            except Exception as e:
-                print(f"[WARN] Skipping doc due to invalid coords: {e}")
-                continue
-        else:
-            doc["distance_miles"] = None
-
-        docs.append(doc)
-
-    print(f"[OK] After geo filtering, {len(docs)} docs remain.")
-
-    # Sorting (unchanged): by distance first (if geo given), then by score desc
-    print("[STEP] Sorting results...")
-    if user_lat is not None and user_lon is not None:
-        docs.sort(key=lambda x: (x["distance_miles"], -x["score"]))
     else:
-        docs.sort(key=lambda x: -x["score"])
+        return jsonify({"error": "Must provide either q or tag"}), 400
 
-    print("[OK] Returning top-k results.")
-    return jsonify(docs[:TOP_K])
+@app.route("/search_wishes", methods=["GET"])
+def search_wishes_api():
+    query = request.args.get("q", "")
+    if not query:
+        return jsonify({"error": "Missing query parameter"}), 400
 
-# =========================
-# Run
-# =========================
+    vector = embed_text(query)
+    results = qdrant.search(collection_name="wishes", query_vector=vector, limit=TOP_K)
+
+    return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
+
+@app.route("/search_expertise", methods=["GET"])
+def search_expertise_api():
+    query = request.args.get("q", "")
+    if not query:
+        return jsonify({"error": "Missing query parameter"}), 400
+
+    vector = embed_text(query)
+    results = qdrant.search(collection_name="expertise", query_vector=vector, limit=TOP_K)
+
+    return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
+
+# -------------------------
+# AI Tag Generation
+# -------------------------
+def generate_tags(name, description, max_tags=10):
+    prompt = f"""
+You are a tagging assistant. Generate concise, single-word search tags.
+
+Rules:
+- ONE WORD PER TAG
+- lowercase only
+- Prefer common search terms
+- Avoid repeating the name
+- Return ONLY a JSON array of 5–10 strings
+
+Name: {name}
+Description: {description}
+"""
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You generate practical, single-word search tags."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    content = (resp.choices[0].message.content or "").strip()
+
+    try:
+        tags = json.loads(content)
+        if not isinstance(tags, list):
+            tags = [str(tags)]
+    except Exception:
+        tags = [t.strip() for t in re.split(r"[,;\n]+", content) if t.strip()]
+
+    return tags[:max_tags]
+
+@app.route("/generate_tags", methods=["POST"])
+def api_generate_tags():
+    data = request.json or {}
+    name = data.get("name", "")
+    description = data.get("description", "")
+    max_tags = int(data.get("max_tags", 10))
+
+    if not description and not name:
+        return jsonify({"error": "Name or description required"}), 400
+
+    tags = generate_tags(name, description, max_tags=max_tags)
+    return jsonify({"tags": tags})
+
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
-    print("[BOOT] Preparing Qdrant collection and indexing...")
-    recreate_collection()
-    initial_load()
-    print("[BOOT] Starting Flask app on 0.0.0.0:5001 ...")
-    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
+    recreate_collections()
+    sync_wishes()
+    sync_expertise()
+    sync_businesses()
+    app.run(host="0.0.0.0", port=5001, debug=True)
+
