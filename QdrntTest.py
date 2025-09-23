@@ -22,17 +22,17 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # MySQL config (RDS)
 # -------------------------
 MYSQL = dict(
-    host=os.getenv("RDS_HOST", "127.0.0.1"),
-    port=int(os.getenv("RDS_PORT", "3306")),
-    user=os.getenv("RDS_USER", "root"),
-    password=os.getenv("RDS_PW", ""),
-    database=os.getenv("RDS_DB", "every_circle")
+    host=os.environ["RDS_HOST"],
+    port=int(os.environ["RDS_PORT"]),
+    user=os.environ["RDS_USER"],
+    password=os.environ["RDS_PW"],
+    database=os.environ["RDS_DB"]
 )
 
 # -------------------------
 # Config
 # -------------------------
-MODEL_NAME = os.getenv("MODEL_NAME", "intfloat/e5-large-v2")
+MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-MiniLM-L6-v2")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 TOP_K = int(os.getenv("TOP_K", "5")) # TODO check top_k
 
@@ -254,4 +254,3 @@ if __name__ == "__main__":
     sync_expertise()
     sync_businesses()
     app.run(host="0.0.0.0", port=5001, debug=True)
-
