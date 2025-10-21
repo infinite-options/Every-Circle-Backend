@@ -538,7 +538,7 @@ api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:u
 api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
-api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:uid>')
+api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:profile_id>')
 
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
