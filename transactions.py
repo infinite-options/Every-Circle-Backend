@@ -492,7 +492,7 @@ class Transactions(Resource):
                     , transaction_stripe_pi
                     , transaction_total, transaction_amount, transaction_taxes -- , transaction_user_id - DNU, transactions_business_service_id -DNU, transaction_recommendation_used_id - DNU, ti_uid, ti_transaction_id
                     , ti_bs_id, ti_bs_qty, ti_bs_cost -- , ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate, ti_bs_refund_policy, ti_bs_return_window_days, tb_uid, tb_ti_id
-                    , tb_profile_id
+                    , tb_profile_id -- , tb_percentage, tb_amount
                     , ROUND(SUM(tb_percentage), 4) AS tb_percentage_sum
                     , ROUND(SUM(tb_amount), 4) AS tb_amount_sum --  , bs_uid, bs_business_id, bs_is_visible, bs_status
                     , bs_service_name, bs_service_desc -- , bs_notes, bs_sku, bs_bounty, bs_bounty_currency, bs_bounty_limit, bs_is_taxable, bs_tax_rate, bs_discount_allowed, bs_refund_policy, bs_return_window_days, bs_image_url, bs_display_order, bs_tags, bs_created_at, bs_updated_at, bs_created_by, bs_updated_by, bs_duration_minutes, bs_cost, bs_cost_currency, business_uid, business_user_id, business_google_id
@@ -504,7 +504,7 @@ class Transactions(Resource):
                 LEFT JOIN every_circle.business ON bs_business_id = business_uid
                 -- WHERE tb_profile_id = '110-000019'
                 WHERE tb_profile_id = %s
-                GROUP BY transaction_uid
+                GROUP BY transaction_uid, ti_bs_id
                 ORDER BY transaction_uid;
                 """
                 
