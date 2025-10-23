@@ -1,5 +1,3 @@
-# QdrntTest.py — Infinite Options RDS + Qdrant + OpenAI Tags (UUID-safe IDs, with business tags)
-
 import os
 import pymysql
 import json
@@ -17,6 +15,7 @@ from openai import OpenAI
 # -------------------------
 load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ["HF_HOME"] = "/home/ec2-user/.cache/huggingface"
 
 # -------------------------
 # MySQL config (RDS)
@@ -34,12 +33,9 @@ MYSQL = dict(
 # -------------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-MiniLM-L6-v2")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
-TOP_K = int(os.getenv("TOP_K", "5")) # TODO check top_k
-
+TOP_K = int(os.getenv("TOP_K", "5"))
 QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-
-# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -58,199 +54,145 @@ def embed_text(text: str):
     return embedder.encode(text).tolist()
 
 def make_uuid(value: str) -> str:
-    """Deterministically convert a string (like business_uid) into a valid UUID."""
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))
 
+def mysql_connect():
+    return pymysql.connect(**MYSQL)
+
 # -------------------------
-# Recreate collections
+# Ensure collections exist
 # -------------------------
-def recreate_collections():
-    for col in ["wishes", "expertise", "businesses"]:
-        qdrant.recreate_collection(
-            collection_name=col,
+def ensure_collections():
+    if not qdrant.collection_exists("businesses"):
+        qdrant.create_collection(
+            collection_name="businesses",
             vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE)
         )
-    print("✅ Qdrant collections recreated.")
+    print("✅ Collection 'businesses' ready.")
 
 # -------------------------
-# Sync tables → Qdrant
+# Sync Logic (Incremental per request)
 # -------------------------
-def sync_wishes():
-    conn = pymysql.connect(**MYSQL)
+def sync_businesses(biz_map):
+    """Re-query MySQL on each call, compare to in-memory map."""
+    conn = mysql_connect()
     cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("SELECT profile_wish_uid, profile_wish_title, profile_wish_description FROM profile_wish")
+    cur.execute("SELECT business_uid, updated_at FROM business")
     rows = cur.fetchall()
-    points = []
-    for row in rows:
-        text = f"{row['profile_wish_title']} - {row['profile_wish_description'] or ''}"
-        points.append(PointStruct(
-            id=make_uuid(row['profile_wish_uid']),
-            vector=embed_text(text),
-            payload=row
-        ))
-        print(f"Inserted wish: {row['profile_wish_title']}")
-    qdrant.upsert(collection_name="wishes", points=points)
     conn.close()
-    print(f"✅ Synced {len(points)} wishes.")
 
-def sync_expertise():
-    conn = pymysql.connect(**MYSQL)
-    cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("SELECT profile_expertise_uid, profile_expertise_title, profile_expertise_description FROM profile_expertise")
-    rows = cur.fetchall()
-    points = []
-    for row in rows:
-        text = f"{row['profile_expertise_title']} - {row['profile_expertise_description'] or ''}"
-        points.append(PointStruct(
-            id=make_uuid(row['profile_expertise_uid']),
-            vector=embed_text(text),
-            payload=row
-        ))
-        print(f"Inserted expertise: {row['profile_expertise_title']}")
-    qdrant.upsert(collection_name="expertise", points=points)
-    conn.close()
-    print(f"✅ Synced {len(points)} expertise entries.")
+    current_state = {r["business_uid"]: str(r["updated_at"]) for r in rows}
+    all_uids = set(biz_map.keys()) | set(current_state.keys())
 
-def sync_businesses():
-    conn = pymysql.connect(**MYSQL)
-    cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("SELECT business_uid, business_name, business_short_bio, business_tag_line FROM business")
-    rows = cur.fetchall()
-    points = []
-    for row in rows:
-        # Embed name + bio + tag line (onion layering)
-        text = f"{row['business_name']} - {row['business_short_bio'] or ''} - {row['business_tag_line'] or ''}"
-        
-        # Still keep tags in payload for filtering if needed later
-        tags = [t.strip().lower() for t in (row.get("business_tag_line") or "").split(",") if t.strip()]
-        payload = row | {"tags": tags}
-        
-        points.append(PointStruct(
-            id=make_uuid(row['business_uid']),
-            vector=embed_text(text),
-            payload=payload
-        ))
-        print(f"Inserted business: {row['business_name']} with tags {tags}")
-    qdrant.upsert(collection_name="businesses", points=points)
-    conn.close()
-    print(f"✅ Synced {len(points)} businesses.")
+    inserted, updated, deleted = [], [], []
+
+    for uid in all_uids:
+        if uid not in current_state:
+            qdrant.delete(collection_name="businesses", points_selector=[make_uuid(uid)])
+            biz_map.pop(uid, None)
+            deleted.append(uid)
+            print(f"🗑️ Deleted business {uid}")
+        elif uid not in biz_map:
+            print(f"🆕 New business found: {uid}")
+            upsert_business(uid)
+            biz_map[uid] = current_state[uid]
+            inserted.append(uid)
+        elif biz_map[uid] != current_state[uid]:
+            print(f"🔁 Business updated: {uid}")
+            upsert_business(uid)
+            biz_map[uid] = current_state[uid]
+            updated.append(uid)
+
+    return biz_map, {"inserted": inserted, "updated": updated, "deleted": deleted}
 
 # -------------------------
-# Search Endpoints
+# Upsert Business to Qdrant
+# -------------------------
+def upsert_business(uid):
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute("""
+        SELECT business_uid, business_name, business_short_bio, business_tag_line,
+               business_city, business_state, business_country, business_google_rating, updated_at
+        FROM business WHERE business_uid=%s
+    """, (uid,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        print(f"⚠️ Business {uid} not found in DB.")
+        return
+
+    text = f"{row['business_name']} - {row.get('business_short_bio') or ''} - {row.get('business_tag_line') or ''}"
+    tags = [t.strip().lower() for t in (row.get('business_tag_line') or '').split(',') if t.strip()]
+    payload = row | {"tags": tags}
+
+    try:
+        payload["business_google_rating"] = float(payload.get("business_google_rating", 0.0))
+    except (TypeError, ValueError):
+        payload["business_google_rating"] = 0.0
+
+    qdrant.upsert(
+        collection_name="businesses",
+        points=[PointStruct(id=make_uuid(uid), vector=embed_text(text), payload=payload)]
+    )
+    print(f"✅ Upserted business: {row['business_name']}")
+
+# -------------------------
+# Search Endpoint (Verbose)
 # -------------------------
 @app.route("/search_business", methods=["GET"])
 def search_business():
+    global biz_map
+    biz_map, changes = sync_businesses(biz_map)
+
     query = request.args.get("q", "")
     tag = request.args.get("tag", "")
+    location = request.args.get("location", "")
+    min_rating = request.args.get("min_rating", "")
     limit = int(request.args.get("limit", TOP_K))
 
     vector = embed_text(query) if query else None
+    must_filters = []
 
-    scroll_filter = None
     if tag:
-        scroll_filter = {
-            "must": [
-                {"key": "tags", "match": {"value": tag.lower()}}
-            ]
-        }
+        must_filters.append({"key": "tags", "match": {"value": tag.lower()}})
+    if location:
+        must_filters.append({"key": "business_city", "match": {"value": location}})
+    if min_rating:
+        try:
+            must_filters.append({"key": "business_google_rating", "range": {"gte": float(min_rating)}})
+        except ValueError:
+            pass
 
-    if vector:  # semantic + optional tag filter
-        results = qdrant.search(
-            collection_name="businesses",
-            query_vector=vector,
-            query_filter=scroll_filter,
-            limit=limit
-        )
-        return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
+    query_filter = {"must": must_filters} if must_filters else None
 
-    elif tag:  # pure tag search
-        results, _ = qdrant.scroll(
-            collection_name="businesses",
-            scroll_filter=scroll_filter,
-            limit=limit
-        )
-        return jsonify([r.payload for r in results])
-
+    results_payload = []
+    if vector:
+        results = qdrant.search("businesses", query_vector=vector, query_filter=query_filter, limit=limit)
+        results_payload = [{"score": r.score, **(r.payload or {})} for r in results]
+    elif must_filters:
+        results, _ = qdrant.scroll("businesses", scroll_filter=query_filter, limit=limit)
+        results_payload = [r.payload for r in results]
     else:
-        return jsonify({"error": "Must provide either q or tag"}), 400
+        return jsonify({"error": "Must provide q, tag, or filter"}), 400
 
-@app.route("/search_wishes", methods=["GET"])
-def search_wishes_api():
-    query = request.args.get("q", "")
-    if not query:
-        return jsonify({"error": "Missing query parameter"}), 400
-
-    vector = embed_text(query)
-    results = qdrant.search(collection_name="wishes", query_vector=vector, limit=TOP_K)
-
-    return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
-
-@app.route("/search_expertise", methods=["GET"])
-def search_expertise_api():
-    query = request.args.get("q", "")
-    if not query:
-        return jsonify({"error": "Missing query parameter"}), 400
-
-    vector = embed_text(query)
-    results = qdrant.search(collection_name="expertise", query_vector=vector, limit=TOP_K)
-
-    return jsonify([{"score": r.score, **(r.payload or {})} for r in results])
-
-# -------------------------
-# AI Tag Generation
-# -------------------------
-def generate_tags(name, description, max_tags=10):
-    prompt = f"""
-You are a tagging assistant. Generate concise, single-word search tags.
-
-Rules:
-- ONE WORD PER TAG
-- lowercase only
-- Prefer common search terms
-- Avoid repeating the name
-- Return ONLY a JSON array of 5–10 strings
-
-Name: {name}
-Description: {description}
-"""
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "You generate practical, single-word search tags."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.3
-    )
-    content = (resp.choices[0].message.content or "").strip()
-
-    try:
-        tags = json.loads(content)
-        if not isinstance(tags, list):
-            tags = [str(tags)]
-    except Exception:
-        tags = [t.strip() for t in re.split(r"[,;\n]+", content) if t.strip()]
-
-    return tags[:max_tags]
-
-@app.route("/generate_tags", methods=["POST"])
-def api_generate_tags():
-    data = request.json or {}
-    name = data.get("name", "")
-    description = data.get("description", "")
-    max_tags = int(data.get("max_tags", 10))
-
-    if not description and not name:
-        return jsonify({"error": "Name or description required"}), 400
-
-    tags = generate_tags(name, description, max_tags=max_tags)
-    return jsonify({"tags": tags})
+    return jsonify({
+        "sync_summary": changes,
+        "results": results_payload
+    })
 
 # -------------------------
 # Main
 # -------------------------
 if __name__ == "__main__":
-    recreate_collections()
-    sync_wishes()
-    sync_expertise()
-    sync_businesses()
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    ensure_collections()
+    biz_map = {}
+    print("🔄 Building initial state map...")
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute("SELECT business_uid, updated_at FROM business")
+    rows = cur.fetchall()
+    conn.close()
+    biz_map = {r["business_uid"]: str(r["updated_at"]) for r in rows}
+    print(f"✅ Initial state map contains {len(biz_map)} businesses. Ready for incremental updates.")
+    app.run(host="0.0.0.0", port=5001)
