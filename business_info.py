@@ -17,23 +17,37 @@ class BusinessInfo(Resource):
         
         try:
             with connect() as db:
-                key = {}
+                # Build WHERE clause based on uid type
+                where_clause = ""
                 if uid.startswith("200"):
-                    key['business_uid'] = uid
+                    where_clause = f'business.business_uid = "{uid}"'
                 elif uid.startswith("100"):
-                    key['business_user_id'] = uid
+                    where_clause = f'business_user.bu_user_id = "{uid}"'
                 else:
-                    key['business_google_id'] = uid
+                    where_clause = f'business.business_google_id = "{uid}"'
 
-                business_query = db.select('every_circle.business', where=key)
+                business_query = f"""
+                    SELECT business.*, 
+                           business_user.bu_uid,
+                           business_user.bu_role as business_role,
+                           business_user.bu_business_id,
+                           business_user.bu_user_id as business_user_id
+                    FROM every_circle.business
+                    LEFT JOIN every_circle.business_user ON business.business_uid = business_user.bu_business_id
+                    WHERE {where_clause}
+                """
+                business_response = db.execute(business_query)
                 
-                if not business_query['result']:
-                    response['message'] = f'No business found for {key}'
+                if not business_response['result']:
+                    response['message'] = f'No business found for {uid}'
                     response['code'] = 404
                     return response, 404
                 
-                business_data = business_query['result'][0]
+                business_data = business_response['result'][0]
                 business_uid = business_data['business_uid']
+                
+                # business_role and business_user_id are already included from the LEFT JOIN
+                # business_uid is already present from the business table
                 
                 category_query = f"""
                     SELECT c.*
@@ -143,8 +157,12 @@ class BusinessInfo(Resource):
                 if 'business_services' in payload:
                     services_str = payload.pop('business_services')
                 
+                # Extract business_user fields from payload
+                business_user_id = payload.pop('business_user_id', user_uid)  # Default to user_uid if not provided
+                business_role = payload.pop('business_role', None)
+                business_uid_param = payload.pop('business_uid', None)  # This should be None for POST, but handle if provided
+                
                 payload['business_uid'] = new_business_uid
-                payload['business_user_id'] = user_uid
                 payload['business_joined_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
                 if 'business_img_0' in request.files or 'delete_business_images' in payload:
@@ -156,6 +174,36 @@ class BusinessInfo(Resource):
                 insert_response = db.insert('every_circle.business', payload)
                 # print("insert_response: ", insert_response)
                 
+                # Insert into business_user table
+                # Always create a business_user record when creating a business
+                try:
+                    bu_uid_response = db.call(procedure='new_bu_uid')
+                    print(f"bu_uid_response: {bu_uid_response}")
+                    
+                    if 'result' not in bu_uid_response or not bu_uid_response['result']:
+                        error_msg = bu_uid_response.get("message", "Stored procedure 'new_bu_uid' may not exist or failed")
+                        print(f"Error: {error_msg}")
+                        print(f"Full response: {bu_uid_response}")
+                        response['message'] = f'Failed to generate bu_uid: {error_msg}'
+                        response['code'] = 500
+                        return response, 500
+                except Exception as e:
+                    print(f"Exception calling new_bu_uid: {str(e)}")
+                    traceback.print_exc()
+                    response['message'] = f'Error calling new_bu_uid stored procedure: {str(e)}'
+                    response['code'] = 500
+                    return response, 500
+                
+                new_bu_uid = bu_uid_response['result'][0]['new_id']
+                
+                business_user_payload = {
+                    'bu_uid': new_bu_uid,
+                    'bu_business_id': new_business_uid,
+                    'bu_user_id': business_user_id,
+                    'bu_role': business_role
+                }
+                db.insert('every_circle.business_user', business_user_payload)
+                
                 if categories_uid_str:
                     self._add_categories(db, categories_uid_str, new_business_uid)
                 
@@ -164,7 +212,7 @@ class BusinessInfo(Resource):
                 
                 # Add services if provided
                 if services_str:
-                    self._add_services(db, services_str, new_business_uid, user_uid, request.files)
+                    self._add_services(db, services_str, new_business_uid, business_user_id, request.files)
                 
 
                 
@@ -211,6 +259,61 @@ class BusinessInfo(Resource):
                     response['message'] = 'Business does not exist'
                     response['code'] = 404
                     return response, 404
+                
+                # Extract business_user fields from payload if provided
+                business_user_id = payload.pop('business_user_id', None)
+                business_role = payload.pop('business_role', None)
+                
+                # Handle business_user table update/insert
+                if business_role is not None and business_user_id is not None:
+                    # Check if a record exists with BOTH business_id AND user_id matching
+                    business_user_query = db.select('every_circle.business_user', 
+                                                   where={'bu_business_id': business_uid, 'bu_user_id': business_user_id})
+                    
+                    if business_user_query['result']:
+                        # Record exists - check if role is different and update if needed
+                        existing_record = business_user_query['result'][0]
+                        existing_role = existing_record.get('bu_role')
+                        
+                        if existing_role != business_role:
+                            # Role is different, update it
+                            bu_uid = existing_record['bu_uid']
+                            db.update('every_circle.business_user', {'bu_uid': bu_uid}, {'bu_role': business_role})
+                            print(f"Updated business_user role from '{existing_role}' to '{business_role}' for business {business_uid}, user {business_user_id}")
+                        else:
+                            print(f"Business_user role unchanged: '{business_role}' for business {business_uid}, user {business_user_id}")
+                    else:
+                        # No matching record exists - insert new one
+                        try:
+                            bu_uid_response = db.call(procedure='new_bu_uid')
+                            if 'result' not in bu_uid_response or not bu_uid_response['result']:
+                                response['message'] = f'Failed to generate bu_uid: {bu_uid_response.get("message", "Unknown error")}'
+                                response['code'] = 500
+                                return response, 500
+                            
+                            new_bu_uid = bu_uid_response['result'][0]['new_id']
+                            business_user_payload = {
+                                'bu_uid': new_bu_uid,
+                                'bu_business_id': business_uid,
+                                'bu_user_id': business_user_id,
+                                'bu_role': business_role
+                            }
+                            db.insert('every_circle.business_user', business_user_payload)
+                            print(f"Inserted new business_user record for business {business_uid}, user {business_user_id}, role {business_role}")
+                        except Exception as e:
+                            print(f"Exception creating new business_user record: {str(e)}")
+                            traceback.print_exc()
+                
+                # Get current business_user_id for service updates (fallback to first record if not provided)
+                if business_user_id:
+                    service_user_id = business_user_id
+                else:
+                    # Fallback: get the first business_user record for this business
+                    fallback_query = db.select('every_circle.business_user', where={'bu_business_id': business_uid})
+                    if fallback_query['result']:
+                        service_user_id = fallback_query['result'][0].get('bu_user_id')
+                    else:
+                        service_user_id = None
                 
                 categories_uid_str = None
                 social_links_str = None
@@ -259,7 +362,8 @@ class BusinessInfo(Resource):
                                 
                                 # Add updated timestamp and user
                                 service_data['bs_updated_at'] = current_time
-                                service_data['bs_updated_by'] = business_exists_query['result'][0]['business_user_id']
+                                if service_user_id:
+                                    service_data['bs_updated_by'] = service_user_id
                                 
                                 # Handle service images if present
                                 if 'bs_image_key' in service_data:
@@ -311,8 +415,11 @@ class BusinessInfo(Resource):
                             else:
                                 # Add new service
                                 print("Adding new service")
-                                self._add_services(db, json.dumps([service_data]), business_uid, 
-                                                 business_exists_query['result'][0]['business_user_id'], request.files)
+                                if service_user_id:
+                                    self._add_services(db, json.dumps([service_data]), business_uid, 
+                                                     service_user_id, request.files)
+                                else:
+                                    print("Warning: Cannot add service - service_user_id is None")
                     
                     except Exception as e:
                         print(f"Error processing business_services JSON in PUT: {str(e)}")
@@ -626,7 +733,6 @@ class BusinessInfo(Resource):
                 # Prepare data for database insertion
                 business_data = {
                     'business_uid': business_uid,
-                    'business_user_id': user_uid,
                     'business_google_id': place_id,
                     'business_name': place_data.get('name'),
                     'business_phone_number': place_data.get('formatted_phone_number'),
@@ -646,7 +752,7 @@ class BusinessInfo(Resource):
                 # Insert into database
                 query = """
                     INSERT INTO every_circle.business 
-                        (business_uid, business_user_id, business_google_id, business_name, 
+                        (business_uid, business_google_id, business_name, 
                         business_phone_number, business_phone_number_is_public,
                         business_address_line_1, business_city, business_state, 
                         business_country, business_zip_code, business_latitude, 
@@ -654,7 +760,7 @@ class BusinessInfo(Resource):
                         business_price_level, business_google_rating, 
                         business_website, business_is_active)
                     VALUES 
-                        (%(business_uid)s, %(business_user_id)s, %(business_google_id)s, %(business_name)s,
+                        (%(business_uid)s, %(business_google_id)s, %(business_name)s,
                         %(business_phone_number)s, 1,
                         %(business_address_line_1)s, %(business_city)s, %(business_state)s,
                         %(business_country)s, %(business_zip_code)s, %(business_latitude)s,
@@ -662,7 +768,6 @@ class BusinessInfo(Resource):
                         %(business_price_level)s, %(business_google_rating)s,
                         %(business_website)s, 1)
                     ON DUPLICATE KEY UPDATE
-                        business_user_id = %(business_user_id)s,
                         business_name = %(business_name)s,
                         business_phone_number = %(business_phone_number)s,
                         business_address_line_1 = %(business_address_line_1)s,
@@ -679,6 +784,22 @@ class BusinessInfo(Resource):
                 
                 result = db.execute(query, business_data)
                 print("Database insert result:", result)
+                
+                # Insert into business_user table
+                bu_uid_response = db.call(procedure='new_bu_uid')
+                if 'result' not in bu_uid_response or not bu_uid_response['result']:
+                    db.execute("ROLLBACK")
+                    return {'error': f'Failed to generate bu_uid: {bu_uid_response.get("message", "Unknown error")}'}, 500
+                
+                new_bu_uid = bu_uid_response['result'][0]['new_id']
+                
+                business_user_payload = {
+                    'bu_uid': new_bu_uid,
+                    'bu_business_id': business_uid,
+                    'bu_user_id': user_uid,
+                    'bu_role': None  # Default role, can be updated later
+                }
+                db.insert('every_circle.business_user', business_user_payload)
                 
                 # Verify the insert
                 verify_query = "SELECT * FROM every_circle.business WHERE business_uid = %s"
