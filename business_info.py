@@ -27,11 +27,7 @@ class BusinessInfo(Resource):
                     where_clause = f'business.business_google_id = "{uid}"'
 
                 business_query = f"""
-                    SELECT business.*, 
-                           business_user.bu_uid,
-                           business_user.bu_role as business_role,
-                           business_user.bu_business_id,
-                           business_user.bu_user_id as business_user_id
+                    SELECT *
                     FROM every_circle.business
                     LEFT JOIN every_circle.business_user ON business.business_uid = business_user.bu_business_id
                     WHERE {where_clause}
@@ -263,6 +259,11 @@ class BusinessInfo(Resource):
                 # Extract business_user fields from payload if provided
                 business_user_id = payload.pop('business_user_id', None)
                 business_role = payload.pop('business_role', None)
+                
+                # If business_user_id is not provided, try using user_uid as fallback
+                if business_user_id is None and 'user_uid' in payload:
+                    business_user_id = payload.get('user_uid')
+                    print(f"Using user_uid '{business_user_id}' as business_user_id")
                 
                 # Handle business_user table update/insert
                 if business_role is not None and business_user_id is not None:
