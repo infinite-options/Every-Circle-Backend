@@ -17,33 +17,67 @@ class BusinessInfo(Resource):
         
         try:
             with connect() as db:
-                # Build WHERE clause based on uid type
-                where_clause = ""
+                # First, find the business_uid based on the input uid
+                business_uid = None
                 if uid.startswith("200"):
-                    where_clause = f'business.business_uid = "{uid}"'
+                    # Direct business_uid lookup
+                    business_query = db.select('every_circle.business', where={'business_uid': uid})
+                    if business_query['result']:
+                        business_uid = uid
                 elif uid.startswith("100"):
-                    where_clause = f'business_user.bu_user_id = "{uid}"'
+                    # Look up business_uid from business_user table
+                    business_user_query = db.select('every_circle.business_user', where={'bu_user_id': uid})
+                    if business_user_query['result']:
+                        business_uid = business_user_query['result'][0]['bu_business_id']
                 else:
-                    where_clause = f'business.business_google_id = "{uid}"'
-
-                business_query = f"""
-                    SELECT *
-                    FROM every_circle.business
-                    LEFT JOIN every_circle.business_user ON business.business_uid = business_user.bu_business_id
-                    WHERE {where_clause}
-                """
-                business_response = db.execute(business_query)
+                    # Google ID lookup
+                    business_query = db.select('every_circle.business', where={'business_google_id': uid})
+                    if business_query['result']:
+                        business_uid = business_query['result'][0]['business_uid']
                 
-                if not business_response['result']:
+                if not business_uid:
                     response['message'] = f'No business found for {uid}'
                     response['code'] = 404
                     return response, 404
                 
-                business_data = business_response['result'][0]
-                business_uid = business_data['business_uid']
+                # Get business data
+                business_query = db.select('every_circle.business', where={'business_uid': business_uid})
+                if not business_query['result']:
+                    response['message'] = f'No business found for {uid}'
+                    response['code'] = 404
+                    return response, 404
                 
-                # business_role and business_user_id are already included from the LEFT JOIN
-                # business_uid is already present from the business table
+                business_data = business_query['result'][0]
+                
+                # Get all business_user records for this business with user email and profile information
+                business_users_query = f"""
+                    SELECT bu.*, 
+                           u.user_email_id,
+                           pp.profile_personal_uid as profile_id,
+                           pp.profile_personal_first_name as first_name,
+                           pp.profile_personal_last_name as last_name,
+                           pp.profile_personal_image as profile_photo
+                    FROM every_circle.business_user bu
+                    LEFT JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
+                    LEFT JOIN every_circle.profile_personal pp ON bu.bu_user_id = pp.profile_personal_user_id
+                    WHERE bu.bu_business_id = "{business_uid}"
+                """
+                business_users_response = db.execute(business_users_query)
+                
+                # Format business_users data
+                business_users = []
+                if business_users_response.get('result'):
+                    for bu_record in business_users_response['result']:
+                        business_users.append({
+                            'business_user_id': bu_record.get('bu_user_id'),
+                            'business_role': bu_record.get('bu_role'),
+                            'business_uid': bu_record.get('bu_uid'),
+                            'user_email': bu_record.get('user_email_id'),
+                            'profile_id': bu_record.get('profile_id'),
+                            'first_name': bu_record.get('first_name'),
+                            'last_name': bu_record.get('last_name'),
+                            'profile_photo': bu_record.get('profile_photo')
+                        })
                 
                 category_query = f"""
                     SELECT c.*
@@ -80,6 +114,7 @@ class BusinessInfo(Resource):
                 
                 response = {
                     'business': business_data,
+                    'business_users': business_users,
                     'categories': category_response['result'] if 'result' in category_response else [],
                     'social_links': links_response['result'] if 'result' in links_response else [],
                     'services': services_response['result'] if 'result' in services_response else [],
@@ -210,6 +245,11 @@ class BusinessInfo(Resource):
                 if services_str:
                     self._add_services(db, services_str, new_business_uid, business_user_id, request.files)
                 
+                # Handle additional business users if provided
+                additional_business_user = payload.pop('additional_business_user', None)
+                additional_business_role = payload.pop('additional_business_role', None)
+                if additional_business_user and additional_business_role:
+                    self._handle_additional_business_users(db, new_business_uid, additional_business_user, additional_business_role, exclude_user_id=business_user_id)
 
                 
                 # print(insert_response["code"])
@@ -315,6 +355,14 @@ class BusinessInfo(Resource):
                         service_user_id = fallback_query['result'][0].get('bu_user_id')
                     else:
                         service_user_id = None
+                
+                # Handle additional business users if provided
+                additional_business_user = payload.pop('additional_business_user', None)
+                additional_business_role = payload.pop('additional_business_role', None)
+                if additional_business_user and additional_business_role:
+                    # Exclude the primary business_user_id from deletion
+                    exclude_id = business_user_id if business_user_id else service_user_id
+                    self._handle_additional_business_users(db, business_uid, additional_business_user, additional_business_role, exclude_user_id=exclude_id)
                 
                 categories_uid_str = None
                 social_links_str = None
@@ -615,6 +663,105 @@ class BusinessInfo(Resource):
             raise
     
     # New method to add services
+    def _handle_additional_business_users(self, db, business_uid, additional_business_user, additional_business_role, exclude_user_id=None):
+        """
+        Handle additional business users from email arrays.
+        - Find user_id for each email
+        - Update existing records if role changed
+        - Insert new records if they don't exist
+        - Delete records that exist in DB but not in the new arrays (excluding exclude_user_id)
+        
+        Args:
+            db: Database connection
+            business_uid: Business UID
+            additional_business_user: List of email addresses
+            additional_business_role: List of roles (must match length of additional_business_user)
+            exclude_user_id: User ID to exclude from deletion (typically the primary business_user_id)
+        """
+        try:
+            # Parse the arrays if they're strings
+            if isinstance(additional_business_user, str):
+                additional_business_user = ast.literal_eval(additional_business_user)
+            if isinstance(additional_business_role, str):
+                additional_business_role = ast.literal_eval(additional_business_role)
+            
+            # Validate arrays have same length
+            if len(additional_business_user) != len(additional_business_role):
+                print(f"Error: additional_business_user and additional_business_role arrays must have same length")
+                return
+            
+            # Get all existing business_user records for this business
+            existing_records_query = db.select('every_circle.business_user', 
+                                              where={'bu_business_id': business_uid})
+            existing_records = {}
+            if existing_records_query['result']:
+                for record in existing_records_query['result']:
+                    existing_records[record['bu_user_id']] = record
+            
+            # Track which user_ids we're processing (to identify deletions later)
+            processed_user_ids = set()
+            
+            # Process each email/role pair
+            for email, role in zip(additional_business_user, additional_business_role):
+                # Find user_id from email
+                user_query = db.select('every_circle.users', where={'user_email_id': email})
+                if not user_query['result']:
+                    print(f"Warning: User with email '{email}' not found, skipping")
+                    continue
+                
+                user_id = user_query['result'][0]['user_uid']
+                processed_user_ids.add(user_id)
+                
+                # Check if record exists for this user_id and business_id
+                business_user_query = db.select('every_circle.business_user',
+                                               where={'bu_business_id': business_uid, 'bu_user_id': user_id})
+                
+                if business_user_query['result']:
+                    # Record exists - check if role changed
+                    existing_record = business_user_query['result'][0]
+                    existing_role = existing_record.get('bu_role')
+                    
+                    if existing_role != role:
+                        # Role changed, update it
+                        bu_uid = existing_record['bu_uid']
+                        db.update('every_circle.business_user', {'bu_uid': bu_uid}, {'bu_role': role})
+                        print(f"Updated business_user role from '{existing_role}' to '{role}' for business {business_uid}, user {user_id} (email: {email})")
+                    else:
+                        print(f"Business_user role unchanged: '{role}' for business {business_uid}, user {user_id} (email: {email})")
+                else:
+                    # Record doesn't exist - insert new one
+                    try:
+                        bu_uid_response = db.call(procedure='new_bu_uid')
+                        if 'result' not in bu_uid_response or not bu_uid_response['result']:
+                            print(f"Error: Failed to generate bu_uid for email {email}")
+                            continue
+                        
+                        new_bu_uid = bu_uid_response['result'][0]['new_id']
+                        business_user_payload = {
+                            'bu_uid': new_bu_uid,
+                            'bu_business_id': business_uid,
+                            'bu_user_id': user_id,
+                            'bu_role': role
+                        }
+                        db.insert('every_circle.business_user', business_user_payload)
+                        print(f"Inserted new business_user record for business {business_uid}, user {user_id} (email: {email}), role {role}")
+                    except Exception as e:
+                        print(f"Exception creating new business_user record for email {email}: {str(e)}")
+                        traceback.print_exc()
+            
+            # Delete records that exist in DB but not in the new arrays (excluding exclude_user_id)
+            for existing_user_id, existing_record in existing_records.items():
+                if existing_user_id not in processed_user_ids and existing_user_id != exclude_user_id:
+                    # This record exists in DB but wasn't in the new arrays - delete it (unless it's the excluded user)
+                    bu_uid = existing_record['bu_uid']
+                    db.delete(f"""DELETE FROM every_circle.business_user WHERE bu_uid = "{bu_uid}";""")
+                    print(f"Deleted business_user record for business {business_uid}, user {existing_user_id} (not in new arrays)")
+                    
+        except Exception as e:
+            print(f"Error processing additional business users: {str(e)}")
+            traceback.print_exc()
+            raise
+    
     def _add_services(self, db, services_str, business_uid, user_uid, request_files=None):
         try:
             import json
