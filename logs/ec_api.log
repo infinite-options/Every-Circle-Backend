@@ -300,3 +300,83 @@
 2025-11-07 12:24:58,467 [INFO]  * Debugger PIN: 104-466-528
 2025-11-07 12:25:04,574 [INFO] 127.0.0.1 - - [07/Nov/2025 12:25:04] "GET /api/v1/businessinfo/100-000022 HTTP/1.1" 200 -
 2025-11-07 12:28:57,659 [INFO] 127.0.0.1 - - [07/Nov/2025 12:28:57] "GET /api/v1/businessinfo/100-000022 HTTP/1.1" 200 -
+2025-11-10 08:52:48,788 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 08:52:49,056 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-10 08:52:49,057 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-10 08:52:49,058 [INFO]  * Restarting with stat
+2025-11-10 08:52:49,996 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 08:52:50,049 [WARNING]  * Debugger is active!
+2025-11-10 08:52:50,060 [INFO]  * Debugger PIN: 104-466-528
+2025-11-10 08:53:02,489 [INFO] 127.0.0.1 - - [10/Nov/2025 08:53:02] "GET /api/v1/businessinfo/200-000053 HTTP/1.1" 200 -
+2025-11-10 10:17:04,098 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 10:17:04,183 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-10 10:17:04,183 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-10 10:17:04,184 [INFO]  * Restarting with stat
+2025-11-10 10:17:05,012 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 10:17:05,060 [WARNING]  * Debugger is active!
+2025-11-10 10:17:05,072 [INFO]  * Debugger PIN: 104-466-528
+2025-11-10 10:17:20,768 [INFO] 127.0.0.1 - - [10/Nov/2025 10:17:20] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-10 11:11:01,569 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-10 11:11:02,069 [INFO]  * Restarting with stat
+2025-11-10 11:48:30,709 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 11:48:30,786 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-10 11:48:30,786 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-10 11:48:30,788 [INFO]  * Restarting with stat
+2025-11-10 11:48:31,635 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 11:48:31,683 [WARNING]  * Debugger is active!
+2025-11-10 11:48:31,700 [INFO]  * Debugger PIN: 104-466-528
+2025-11-10 11:49:20,717 [INFO] 127.0.0.1 - - [10/Nov/2025 11:49:20] "[31m[1mPOST /api/v1/transactions HTTP/1.1[0m" 400 -
+2025-11-10 11:51:15,040 [INFO] 127.0.0.1 - - [10/Nov/2025 11:51:15] "[31m[1mPOST /api/v1/transactions HTTP/1.1[0m" 400 -
+2025-11-10 11:51:23,474 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-10 11:51:23,765 [INFO]  * Restarting with stat
+2025-11-10 11:51:25,298 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 11:51:25,355 [WARNING]  * Debugger is active!
+2025-11-10 11:51:25,367 [INFO]  * Debugger PIN: 104-466-528
+2025-11-10 11:51:29,853 [INFO] 127.0.0.1 - - [10/Nov/2025 11:51:29] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-10 11:55:29,260 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-10 11:55:29,569 [INFO]  * Restarting with stat
+2025-11-10 11:55:30,986 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-10 11:55:31,050 [WARNING]  * Debugger is active!
+2025-11-10 11:55:31,071 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 13:45:33,187 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 13:45:33,428 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-11 13:45:33,428 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-11 13:45:33,430 [INFO]  * Restarting with stat
+2025-11-11 13:45:34,345 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 13:45:34,397 [WARNING]  * Debugger is active!
+2025-11-11 13:45:34,411 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 13:45:43,663 [INFO] 127.0.0.1 - - [11/Nov/2025 13:45:43] "PUT /api/v1/businessinfo HTTP/1.1" 200 -
+2025-11-11 15:00:07,161 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/business_info.py', reloading
+2025-11-11 15:00:07,743 [INFO]  * Restarting with stat
+2025-11-11 15:00:09,381 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:00:09,437 [WARNING]  * Debugger is active!
+2025-11-11 15:00:09,453 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 15:00:11,519 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/business_info.py', reloading
+2025-11-11 15:00:11,772 [INFO]  * Restarting with stat
+2025-11-11 15:00:12,699 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:00:12,751 [WARNING]  * Debugger is active!
+2025-11-11 15:00:12,761 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 15:00:22,993 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/business_info.py', reloading
+2025-11-11 15:00:23,454 [INFO]  * Restarting with stat
+2025-11-11 15:00:24,875 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:00:24,934 [WARNING]  * Debugger is active!
+2025-11-11 15:00:24,943 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 15:12:23,912 [INFO] 127.0.0.1 - - [11/Nov/2025 15:12:23] "PUT /api/v1/businessinfo HTTP/1.1" 200 -
+2025-11-11 15:13:23,533 [INFO] 127.0.0.1 - - [11/Nov/2025 15:13:23] "PUT /api/v1/businessinfo HTTP/1.1" 200 -
+2025-11-11 15:13:40,994 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/business_info.py', reloading
+2025-11-11 15:13:41,257 [INFO]  * Restarting with stat
+2025-11-11 15:13:42,695 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:13:42,751 [WARNING]  * Debugger is active!
+2025-11-11 15:13:42,762 [INFO]  * Debugger PIN: 104-466-528

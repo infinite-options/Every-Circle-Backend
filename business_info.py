@@ -107,6 +107,7 @@ class BusinessInfo(Resource):
                 ratings_query = f"""
                     SELECT *
                     FROM every_circle.ratings
+                    LEFT JOIN every_circle.profile_personal ON profile_personal_uid = rating_profile_id
                     -- WHERE rating_business_id = "200-000056"
                     WHERE rating_business_id = "{business_uid}"
                 """
@@ -368,6 +369,40 @@ class BusinessInfo(Resource):
                 social_links_str = None
                 delete_services_str = None
                 services_str = None
+                custom_tags = None
+                
+                # Handle custom_tags field
+                if 'custom_tags' in payload:
+                    try:
+                        custom_tags_str = payload.pop('custom_tags')
+                        # Try to parse as JSON if it's a string
+                        if isinstance(custom_tags_str, str):
+                            custom_tags = json.loads(custom_tags_str)
+                        elif isinstance(custom_tags_str, list):
+                            custom_tags = custom_tags_str
+                        else:
+                            print(f"Warning: custom_tags is not a valid format: {type(custom_tags_str)}")
+                            custom_tags = None
+                        
+                        if custom_tags is not None:
+                            if not isinstance(custom_tags, list):
+                                print(f"Warning: custom_tags must be a list, got {type(custom_tags)}")
+                                custom_tags = None
+                            else:
+                                # Remove existing business_tags for this business
+                                delete_query = f"DELETE FROM every_circle.business_tags WHERE bt_business_id = '{business_uid}'"
+                                db.execute(delete_query)
+                                print(f"Deleted existing business_tags for business {business_uid}")
+                                
+                                # Process and add new tags
+                                stored_tags = self._process_tags(db, business_uid, custom_tags)
+                                response['updated_tags'] = stored_tags
+                                print(f"Processed {len(stored_tags)} tags for business {business_uid}")
+                    except json.JSONDecodeError as e:
+                        print(f"Error parsing custom_tags JSON: {str(e)}")
+                    except Exception as e:
+                        print(f"Error processing custom_tags: {str(e)}")
+                        traceback.print_exc()
                 
                 if 'business_categories_uid' in payload:
                     categories_uid_str = payload.pop('business_categories_uid')
@@ -762,6 +797,106 @@ class BusinessInfo(Resource):
             traceback.print_exc()
             raise
     
+    def _process_tags(self, db, business_uid: str, tags: list) -> list:
+        """
+        Process tags for a business:
+        - Check if tags exist in every_circle.tags table
+        - Create new tags if they don't exist
+        - Create business-tag associations in every_circle.business_tags table
+        
+        Args:
+            db: Database connection
+            business_uid: Business UID
+            tags: List of tag names (strings)
+            
+        Returns:
+            List of dictionaries with tag_name and tag_uid for successfully processed tags
+        """
+        print(f"Processing tags for business {business_uid}: {tags}")
+        stored_tags = []
+        
+        for tag in tags:
+            try:
+                if not tag or not isinstance(tag, str):
+                    print(f"Warning: Skipping invalid tag: {tag}")
+                    continue
+                    
+                tag_name = tag.strip().lower()
+                
+                if not tag_name:
+                    print(f"Warning: Skipping empty tag after processing")
+                    continue
+                
+                # Check if tag exists in every_circle.tags
+                tag_query = db.select('every_circle.tags', where={'tag_name': tag_name})
+                
+                if tag_query.get('result') and len(tag_query['result']) > 0:
+                    # Tag exists, get its UID
+                    tag_uid = tag_query['result'][0]['tag_uid']
+                    print(f"Found existing tag: {tag_name} with UID: {tag_uid}")
+                else:
+                    # Create new tag in every_circle.tags
+                    tag_uid_response = db.call(procedure='new_tag_uid')
+                    if not tag_uid_response.get('result') or len(tag_uid_response['result']) == 0:
+                        print(f"Warning: Failed to generate tag UID for tag: {tag_name}")
+                        continue
+                    
+                    tag_uid = tag_uid_response['result'][0]['new_id']
+                    
+                    tag_payload = {
+                        'tag_uid': tag_uid,
+                        'tag_name': tag_name
+                    }
+                    tag_insert = db.insert('every_circle.tags', tag_payload)
+                    print(f"Created new tag: {tag_name} with UID: {tag_uid}")
+                    
+                    if tag_insert.get('code') != 200:
+                        print(f"Failed to create tag {tag_name}: {tag_insert.get('message')}")
+                        continue
+                
+                # Check if business-tag association already exists
+                existing_bt_query = db.select('every_circle.business_tags', 
+                                             where={'bt_business_id': business_uid, 'bt_tag_id': tag_uid})
+                
+                if existing_bt_query.get('result') and len(existing_bt_query['result']) > 0:
+                    print(f"Business-tag association already exists for tag: {tag_name}")
+                    stored_tags.append({
+                        'tag_name': tag_name,
+                        'tag_uid': tag_uid
+                    })
+                    continue
+                
+                # Create business-tag association in every_circle.business_tags
+                bt_uid_response = db.call(procedure='new_bt_uid')
+                if not bt_uid_response.get('result') or len(bt_uid_response['result']) == 0:
+                    print(f"Warning: Failed to generate business_tag UID for tag: {tag_name}")
+                    continue
+                
+                bt_uid = bt_uid_response['result'][0]['new_id']
+                
+                bt_payload = {
+                    'bt_uid': bt_uid,
+                    'bt_tag_id': tag_uid,
+                    'bt_business_id': business_uid
+                }
+                bt_response = db.insert('every_circle.business_tags', bt_payload)
+                
+                if bt_response.get('code') == 200:
+                    stored_tags.append({
+                        'tag_name': tag_name,
+                        'tag_uid': tag_uid
+                    })
+                    print(f"Created business-tag association: {bt_uid} for tag {tag_name}")
+                else:
+                    print(f"Failed to create business-tag association: {bt_response.get('message')}")
+                
+            except Exception as e:
+                print(f"Error processing tag {tag}: {str(e)}")
+                traceback.print_exc()
+                continue
+        
+        return stored_tags
+
     def _add_services(self, db, services_str, business_uid, user_uid, request_files=None):
         try:
             import json
