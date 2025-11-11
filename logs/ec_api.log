@@ -380,3 +380,14 @@
 2025-11-11 15:13:42,695 [INFO] 🚀 ec_api.py has started successfully (with file logging).
 2025-11-11 15:13:42,751 [WARNING]  * Debugger is active!
 2025-11-11 15:13:42,762 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 15:28:20,658 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:28:20,738 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-11 15:28:20,738 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-11 15:28:20,740 [INFO]  * Restarting with stat
+2025-11-11 15:28:21,567 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-11 15:28:21,616 [WARNING]  * Debugger is active!
+2025-11-11 15:28:21,628 [INFO]  * Debugger PIN: 104-466-528
+2025-11-11 15:28:27,707 [INFO] 127.0.0.1 - - [11/Nov/2025 15:28:27] "GET /api/v1/businessinfo/200-000070 HTTP/1.1" 200 -

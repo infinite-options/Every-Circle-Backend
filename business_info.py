@@ -112,6 +112,28 @@ class BusinessInfo(Resource):
                     WHERE rating_business_id = "{business_uid}"
                 """
                 ratings_response = db.execute(ratings_query)
+
+                # Query for business tags
+                tags_query = f"""
+                    SELECT t.tag_uid, t.tag_name
+                    FROM every_circle.business_tags bt
+                    JOIN every_circle.tags t ON bt.bt_tag_id = t.tag_uid
+                    WHERE bt.bt_business_id = "{business_uid}"
+                    ORDER BY t.tag_name
+                """
+                print(f"Executing tags query for business_uid: {business_uid}")
+                print(f"Tags query: {tags_query}")
+                tags_response = db.execute(tags_query)
+                print(f"Tags response: {tags_response}")
+                
+                # Format tags as a simple list of tag names
+                tags = []
+                if tags_response.get('result'):
+                    print(f"Found {len(tags_response['result'])} tags")
+                    tags = [tag['tag_name'] for tag in tags_response['result']]
+                    print(f"Formatted tags list: {tags}")
+                else:
+                    print("No tags found in response or result is empty")
                 
                 response = {
                     'business': business_data,
@@ -120,6 +142,7 @@ class BusinessInfo(Resource):
                     'social_links': links_response['result'] if 'result' in links_response else [],
                     'services': services_response['result'] if 'result' in services_response else [],
                     'ratings': ratings_response['result'] if 'result' in ratings_response else [],
+                    'tags': tags,
                     'code': 200,
                     'message': 'Business data retrieved successfully'
                 }
@@ -178,6 +201,7 @@ class BusinessInfo(Resource):
                 categories_uid_str = None
                 social_links_str = None
                 services_str = None
+                custom_tags = None
                 
                 if 'business_categories_uid' in payload:
                     categories_uid_str = payload.pop('business_categories_uid')
@@ -188,6 +212,29 @@ class BusinessInfo(Resource):
                 # Extract services data
                 if 'business_services' in payload:
                     services_str = payload.pop('business_services')
+                
+                # Extract custom_tags if provided
+                if 'custom_tags' in payload:
+                    try:
+                        custom_tags_str = payload.pop('custom_tags')
+                        # Try to parse as JSON if it's a string
+                        if isinstance(custom_tags_str, str):
+                            custom_tags = json.loads(custom_tags_str)
+                        elif isinstance(custom_tags_str, list):
+                            custom_tags = custom_tags_str
+                        else:
+                            print(f"Warning: custom_tags is not a valid format: {type(custom_tags_str)}")
+                            custom_tags = None
+                        
+                        if custom_tags is not None and not isinstance(custom_tags, list):
+                            print(f"Warning: custom_tags must be a list, got {type(custom_tags)}")
+                            custom_tags = None
+                    except json.JSONDecodeError as e:
+                        print(f"Error parsing custom_tags JSON: {str(e)}")
+                        custom_tags = None
+                    except Exception as e:
+                        print(f"Error processing custom_tags: {str(e)}")
+                        custom_tags = None
                 
                 # Extract business_user fields from payload
                 business_user_id = payload.pop('business_user_id', user_uid)  # Default to user_uid if not provided
@@ -245,6 +292,12 @@ class BusinessInfo(Resource):
                 # Add services if provided
                 if services_str:
                     self._add_services(db, services_str, new_business_uid, business_user_id, request.files)
+                
+                # Process custom_tags if provided
+                if custom_tags:
+                    stored_tags = self._process_tags(db, new_business_uid, custom_tags)
+                    response['tags'] = stored_tags
+                    print(f"Processed {len(stored_tags)} tags for new business {new_business_uid}")
                 
                 # Handle additional business users if provided
                 additional_business_user = payload.pop('additional_business_user', None)
