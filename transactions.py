@@ -9,6 +9,55 @@ from user_path_connection import ConnectionsPath
 
 class Transactions(Resource):
 
+    def get(self, profile_id=None):
+        print(f"In Transactions GET with profile_id: {profile_id}")
+        response = {}
+        
+        try:
+            if not profile_id:
+                response['message'] = 'profile_id is required'
+                response['code'] = 400
+                return response, 400
+            
+            with connect() as db:
+                # Execute query with parameterized profile_id for security
+                query = """
+                    SELECT 
+                        transaction_uid, 
+                        transaction_datetime, 
+                        transaction_total, 
+                        transaction_business_id,
+                        business_name
+                    FROM every_circle.transactions
+                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id
+                    WHERE transaction_profile_id = %s
+                    ORDER BY transaction_datetime DESC
+                """
+                
+                print(f"Executing query for profile_id: {profile_id}")
+                result = db.execute(query, (profile_id,))
+                print(f"Query result: {result}")
+                
+                if result.get('code') == 200:
+                    response['message'] = 'Transactions retrieved successfully'
+                    response['code'] = 200
+                    response['data'] = result.get('result', [])
+                    response['count'] = len(result.get('result', []))
+                else:
+                    response['message'] = 'Query execution failed'
+                    response['code'] = result.get('code', 500)
+                    response['error'] = result.get('error', 'Unknown error')
+                    return response, response['code']
+                
+                return response, 200
+                
+        except Exception as e:
+            print(f"Error in Transactions GET: {str(e)}")
+            print(traceback.format_exc())
+            response['message'] = f'An error occurred: {str(e)}'
+            response['code'] = 500
+            return response, 500
+
     def post(self):
         print("In Transactions POST New")
         response = {}
