@@ -204,6 +204,17 @@ def sync_expertise(exp_map):
                profile_expertise_description, updated_at
         FROM profile_expertise
     """)
+    # cur.execute("""
+    #     SELECT profile_expertise.*
+    #         , user_email_id
+    #         , profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, profile_personal_phone_number, profile_personal_phone_number_is_public
+    #         , profile_personal_city, profile_personal_state, profile_personal_country, profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude
+    #         , profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, profile_personal_tag_line_is_public
+    #         , updated_at
+    #     FROM profile_expertise
+    #     LEFT JOIN every_circle.profile_personal ON profile_personal_uid = profile_expertise_profile_personal_id
+    #     LEFT JOIN every_circle.users ON user_uid = profile_personal_user_id
+    # """)
     rows = cur.fetchall()
     conn.close()
 
@@ -273,7 +284,53 @@ def search_expertise():
     query = request.args.get("q", "")
     vector = embed_text(query)
     results = qdrant.search("expertise", query_vector=vector, limit=99999)
-    return jsonify([{"score": r.score, **r.payload} for r in results])
+    
+    # Extract all profile_expertise_uid values from results
+    expertise_uids = [r.payload.get("profile_expertise_uid") for r in results if r.payload.get("profile_expertise_uid")]
+    
+    # Fetch additional information from database for all expertise UIDs
+    additional_info = {}
+    if expertise_uids:
+        conn = mysql_connect()
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Create placeholders for IN clause
+        placeholders = ",".join(["%s"] * len(expertise_uids))
+        query_sql = f"""
+            SELECT profile_expertise.*, -- updated_at
+                  user_email_id
+                , profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, profile_personal_phone_number, profile_personal_phone_number_is_public
+                , profile_personal_city, profile_personal_state, profile_personal_country, profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude
+                , profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, profile_personal_tag_line_is_public
+            FROM profile_expertise
+            LEFT JOIN every_circle.profile_personal ON profile_personal_uid = profile_expertise_profile_personal_id
+            LEFT JOIN every_circle.users ON user_uid = profile_personal_user_id
+            WHERE profile_expertise_uid IN ({placeholders})
+        """
+        cur.execute(query_sql, expertise_uids)
+        rows = cur.fetchall()
+        conn.close()
+        
+        # Create a mapping of profile_expertise_uid to additional info
+        for row in rows:
+            uid = row.get("profile_expertise_uid")
+            if uid:
+                additional_info[uid] = row
+    
+    # Merge Qdrant results with additional database information
+    response_data = []
+    for r in results:
+        expertise_uid = r.payload.get("profile_expertise_uid")
+        result_item = {"score": r.score, **r.payload}
+        
+        # Add additional information if available
+        if expertise_uid and expertise_uid in additional_info:
+            # Merge additional info, with Qdrant payload taking precedence for overlapping fields
+            result_item.update(additional_info[expertise_uid])
+        
+        response_data.append(result_item)
+    
+    return jsonify(response_data)
 
 # ---------------------------------------------------------
 # MAIN

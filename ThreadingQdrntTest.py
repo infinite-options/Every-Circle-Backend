@@ -101,6 +101,17 @@ def sync_expertise():
     conn = mysql_connect()
     cur = conn.cursor(pymysql.cursors.DictCursor)
     cur.execute("SELECT profile_expertise_uid, profile_expertise_title, profile_expertise_description, updated_at FROM profile_expertise")
+    # cur.execute("""
+    #     SELECT profile_expertise.*
+    #         , user_email_id
+    #         , profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, profile_personal_phone_number, profile_personal_phone_number_is_public
+    #         , profile_personal_city, profile_personal_state, profile_personal_country, profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude
+    #         , profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, profile_personal_tag_line_is_public
+    #         , updated_at
+    #     FROM profile_expertise
+    #     LEFT JOIN every_circle.profile_personal ON profile_personal_uid = profile_expertise_profile_personal_id
+    #     LEFT JOIN every_circle.users ON user_uid = profile_personal_user_id
+    # """)
     rows = cur.fetchall()
     conn.close()
 
@@ -194,6 +205,18 @@ def upsert_expertise(uid):
     conn = mysql_connect()
     cur = conn.cursor(pymysql.cursors.DictCursor)
     cur.execute("SELECT profile_expertise_uid, profile_expertise_title, profile_expertise_description, updated_at FROM profile_expertise WHERE profile_expertise_uid=%s", (uid,))
+    # cur.execute("""
+    #     SELECT profile_expertise.*
+    #         , user_email_id
+    #         , profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, profile_personal_phone_number, profile_personal_phone_number_is_public
+    #         , profile_personal_city, profile_personal_state, profile_personal_country, profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude
+    #         , profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, profile_personal_tag_line_is_public
+    #         , updated_at
+    #     FROM profile_expertise
+    #     LEFT JOIN every_circle.profile_personal ON profile_personal_uid = profile_expertise_profile_personal_id
+    #     LEFT JOIN every_circle.users ON user_uid = profile_personal_user_id
+    #     WHERE profile_expertise_uid = %s""", (uid,)
+    #     )
     row = cur.fetchone()
     conn.close()
 
