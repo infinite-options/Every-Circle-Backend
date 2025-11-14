@@ -275,7 +275,54 @@ def search_wishes():
     query = request.args.get("q", "")
     vector = embed_text(query)
     results = qdrant.search("wishes", query_vector=vector, limit=99999)
-    return jsonify([{"score": r.score, **r.payload} for r in results])
+    
+    # Extract all profile_wishes_uid values from results
+    wishes_uids = [r.payload.get("profile_wish_uid") for r in results if r.payload.get("profile_wish_uid")]
+    
+    # Fetch additional information from database for all wishes UIDs
+    additional_info = {}
+    if wishes_uids:
+        conn = mysql_connect()
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Create placeholders for IN clause
+        placeholders = ",".join(["%s"] * len(wishes_uids))
+        query_sql = f"""
+            SELECT profile_wish.*, -- updated_at
+                  user_email_id
+                , profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, profile_personal_phone_number, profile_personal_phone_number_is_public
+                , profile_personal_city, profile_personal_state, profile_personal_country, profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude
+                , profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, profile_personal_tag_line_is_public
+            FROM profile_wish
+            LEFT JOIN every_circle.profile_personal ON profile_personal_uid = profile_wish_profile_personal_id
+            LEFT JOIN every_circle.users ON user_uid = profile_personal_user_id
+            WHERE profile_wish_uid IN ({placeholders})
+        """
+        cur.execute(query_sql, wishes_uids)
+        rows = cur.fetchall()
+        conn.close()
+        
+        # Create a mapping of profile_wish_uid to additional info
+        for row in rows:
+            uid = row.get("profile_wish_uid")
+            if uid:
+                additional_info[uid] = row
+    
+    # Merge Qdrant results with additional database information
+    response_data = []
+    for r in results:
+        wish_uid = r.payload.get("profile_wish_uid")
+        result_item = {"score": r.score, **r.payload}
+        
+        # Add additional information if available
+        if wish_uid and wish_uid in additional_info:
+            # Merge additional info, with Qdrant payload taking precedence for overlapping fields
+            result_item.update(additional_info[wish_uid])
+        
+        response_data.append(result_item)
+    
+    return jsonify(response_data)
+
 
 @app.route("/search_expertise", methods=["GET"])
 def search_expertise():
