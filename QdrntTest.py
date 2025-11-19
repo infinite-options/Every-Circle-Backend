@@ -32,6 +32,29 @@ embedder = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 # ---------------------------------------------------------
+# LIMIT LOGIC
+# ---------------------------------------------------------
+def get_limit(param, max_results):
+    """
+    - If no parameter: return 5
+    - If numeric: return that number
+    - If ALL: return max_results
+    """
+    if param is None or param == "":
+        return 5
+
+    value = str(param).strip().upper()
+
+    if value == "ALL":
+        return max_results
+
+    if value.isdigit():
+        return int(value)
+
+    return 5
+
+
+# ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
 def embed_text(text: str):
@@ -183,7 +206,7 @@ def upsert_business(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH BUSINESS (ENRICHED)
+# SEARCH BUSINESS (UPDATED WITH LIMIT)
 # ---------------------------------------------------------
 @app.route("/search_business", methods=["GET"])
 def search_business():
@@ -191,11 +214,17 @@ def search_business():
     biz_map = sync_businesses(biz_map)
 
     query = request.args.get("q", "")
+    limit_param = request.args.get("limit")
+
+    max_results = 99999
+    final_limit = get_limit(limit_param, max_results)
+
     vector = embed_text(query)
 
-    results = qdrant.search("businesses", query_vector=vector, limit=99999)
+    results = qdrant.search("businesses", query_vector=vector, limit=max_results)
+    results = results[:final_limit]
 
-    business_uids = [r.payload.get("business_uid") for r in results if r.payload.get("business_uid")]
+    business_uids = [r.payload.get("business_uid") for r in results]
 
     additional_info = {}
 
@@ -206,29 +235,7 @@ def search_business():
         placeholders = ",".join(["%s"] * len(business_uids))
 
         cur.execute(f"""
-            SELECT
-                business_uid,
-                business_name,
-                business_short_bio,
-                business_tag_line,
-                business_city,
-                business_state,
-                business_country,
-                business_latitude,
-                business_longitude,
-                business_phone_number,
-                business_phone_number_is_public,
-                business_email_id,
-                business_email_id_is_public,
-                business_images_url,
-                business_images_is_public,
-                business_owner_fn,
-                business_owner_ln,
-                business_price_level,
-                business_google_rating,
-                business_reward_type,
-                business_reward_amount,
-                updated_at
+            SELECT *
             FROM business
             WHERE business_uid IN ({placeholders})
         """, business_uids)
@@ -242,7 +249,6 @@ def search_business():
     response_data = []
     for r in results:
         uid = r.payload.get("business_uid")
-
         merged = {"score": r.score, **r.payload}
 
         if uid in additional_info:
@@ -312,7 +318,7 @@ def upsert_wish(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH WISHES
+# SEARCH WISHES (UPDATED WITH LIMIT)
 # ---------------------------------------------------------
 @app.route("/search_wishes", methods=["GET"])
 def search_wishes():
@@ -320,11 +326,17 @@ def search_wishes():
     wish_map = sync_wishes(wish_map)
 
     query = request.args.get("q", "")
+    limit_param = request.args.get("limit")
+
+    max_results = 99999
+    final_limit = get_limit(limit_param, max_results)
+
     vector = embed_text(query)
 
-    results = qdrant.search("wishes", query_vector=vector, limit=99999)
+    results = qdrant.search("wishes", query_vector=vector, limit=max_results)
+    results = results[:final_limit]
 
-    wish_uids = [r.payload.get("profile_wish_uid") for r in results if r.payload.get("profile_wish_uid")]
+    wish_uids = [r.payload.get("profile_wish_uid") for r in results]
 
     additional_info = {}
 
@@ -425,7 +437,7 @@ def upsert_expertise(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH EXPERTISE
+# SEARCH EXPERTISE (UPDATED WITH LIMIT)
 # ---------------------------------------------------------
 @app.route("/search_expertise", methods=["GET"])
 def search_expertise():
@@ -433,11 +445,17 @@ def search_expertise():
     exp_map = sync_expertise(exp_map)
 
     query = request.args.get("q", "")
+    limit_param = request.args.get("limit")
+
+    max_results = 99999
+    final_limit = get_limit(limit_param, max_results)
+
     vector = embed_text(query)
 
-    results = qdrant.search("expertise", query_vector=vector, limit=99999)
+    results = qdrant.search("expertise", query_vector=vector, limit=max_results)
+    results = results[:final_limit]
 
-    exp_uids = [r.payload.get("profile_expertise_uid") for r in results if r.payload.get("profile_expertise_uid")]
+    exp_uids = [r.payload.get("profile_expertise_uid") for r in results]
 
     additional_info = {}
 
