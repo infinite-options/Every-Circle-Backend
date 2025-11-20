@@ -395,3 +395,90 @@
 2025-11-12 12:50:03,144 [WARNING]  * Debugger is active!
 2025-11-12 12:50:03,197 [INFO]  * Debugger PIN: 104-466-528
 2025-11-12 12:50:16,282 [INFO] 127.0.0.1 - - [12/Nov/2025 12:50:16] "GET /api/v1/transactions/110-000013 HTTP/1.1" 200 -
+2025-11-20 10:24:00,454 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:24:00,733 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-20 10:24:00,733 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-20 10:24:00,734 [INFO]  * Restarting with stat
+2025-11-20 10:24:01,586 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:24:01,637 [WARNING]  * Debugger is active!
+2025-11-20 10:24:01,649 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:24:27,207 [INFO] 127.0.0.1 - - [20/Nov/2025 10:24:27] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 10:29:40,903 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:29:41,275 [INFO]  * Restarting with stat
+2025-11-20 10:29:42,749 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:29:42,804 [WARNING]  * Debugger is active!
+2025-11-20 10:29:42,817 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:29:52,882 [INFO] 127.0.0.1 - - [20/Nov/2025 10:29:52] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 10:32:02,094 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:32:02,399 [INFO]  * Restarting with stat
+2025-11-20 10:32:03,870 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:32:03,924 [WARNING]  * Debugger is active!
+2025-11-20 10:32:03,934 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:32:19,633 [INFO] 127.0.0.1 - - [20/Nov/2025 10:32:19] "[33mPOST /api/v1/transactions HTTP/1.1[0m" 404 -
+2025-11-20 10:45:44,375 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:45:44,792 [INFO]  * Restarting with stat
+2025-11-20 10:45:46,312 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:45:46,369 [WARNING]  * Debugger is active!
+2025-11-20 10:45:46,382 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:50:59,501 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:50:59,824 [INFO]  * Restarting with stat
+2025-11-20 10:51:01,227 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:51:01,273 [WARNING]  * Debugger is active!
+2025-11-20 10:51:01,284 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:51:05,905 [INFO] 127.0.0.1 - - [20/Nov/2025 10:51:05] "[33mPOST /api/v1/transactions HTTP/1.1[0m" 404 -
+2025-11-20 10:57:04,303 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:57:04,644 [INFO]  * Restarting with stat
+2025-11-20 10:57:06,047 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:57:06,100 [WARNING]  * Debugger is active!
+2025-11-20 10:57:06,110 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:58:21,342 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 10:58:21,574 [INFO]  * Restarting with stat
+2025-11-20 10:58:22,951 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 10:58:23,005 [WARNING]  * Debugger is active!
+2025-11-20 10:58:23,016 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 10:58:29,168 [INFO] 127.0.0.1 - - [20/Nov/2025 10:58:29] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 11:25:52,509 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:25:52,967 [INFO]  * Restarting with stat
+2025-11-20 11:27:58,432 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:27:58,514 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-20 11:27:58,514 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-20 11:27:58,515 [INFO]  * Restarting with stat
+2025-11-20 11:27:59,378 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:27:59,428 [WARNING]  * Debugger is active!
+2025-11-20 11:27:59,439 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 11:28:08,401 [INFO] 127.0.0.1 - - [20/Nov/2025 11:28:08] "[35m[1mPOST /api/v1/transactions HTTP/1.1[0m" 500 -
+2025-11-20 11:32:23,182 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:32:23,525 [INFO]  * Restarting with stat
+2025-11-20 11:32:24,950 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:32:25,002 [WARNING]  * Debugger is active!
+2025-11-20 11:32:25,013 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 11:32:32,283 [INFO] 127.0.0.1 - - [20/Nov/2025 11:32:32] "[33mPOST /api/v1/transactions HTTP/1.1[0m" 404 -
+2025-11-20 11:37:32,239 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:37:32,574 [INFO]  * Restarting with stat
+2025-11-20 11:37:34,018 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:37:34,074 [WARNING]  * Debugger is active!
+2025-11-20 11:37:34,085 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 11:37:39,227 [INFO] 127.0.0.1 - - [20/Nov/2025 11:37:39] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 11:48:44,676 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:48:45,066 [INFO]  * Restarting with stat
+2025-11-20 11:48:46,902 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:48:47,011 [WARNING]  * Debugger is active!
+2025-11-20 11:48:47,047 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 11:48:55,276 [INFO] 127.0.0.1 - - [20/Nov/2025 11:48:55] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 11:51:42,028 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:51:42,383 [INFO]  * Restarting with stat
+2025-11-20 11:51:43,970 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:51:44,025 [WARNING]  * Debugger is active!
+2025-11-20 11:51:44,039 [INFO]  * Debugger PIN: 104-466-528
+2025-11-20 11:51:46,785 [INFO] 127.0.0.1 - - [20/Nov/2025 11:51:46] "POST /api/v1/transactions HTTP/1.1" 200 -
+2025-11-20 11:57:31,960 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/transactions.py', reloading
+2025-11-20 11:57:32,430 [INFO]  * Restarting with stat
+2025-11-20 11:57:33,888 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-20 11:57:33,953 [WARNING]  * Debugger is active!
+2025-11-20 11:57:33,963 [INFO]  * Debugger PIN: 104-466-528

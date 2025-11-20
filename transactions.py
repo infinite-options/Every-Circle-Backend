@@ -122,8 +122,8 @@ class Transactions(Resource):
                     # {'bs_uid': '250-000021', 'quantity': 9, 'recommender_profile_id': '110-000231'}
                     
                     # Validate required item fields
-                    if not item.get('bs_uid'):
-                        print(f"Warning: Skipping item missing bs_uid: {item}")
+                    if not item.get('bs_uid') and not item.get('expertise_uid'):
+                        print(f"Warning: Skipping item missing bs_uid or expertise_uid: {item}")
                         continue
                     
                     # Generate new transaction item UID
@@ -139,35 +139,122 @@ class Transactions(Resource):
                     tx_item = {
                         'ti_uid': new_transaction_item_uid,
                         'ti_transaction_id': new_transaction_uid,
-                        'ti_bs_id': item.get('bs_uid'),
+                        'ti_bs_id': item.get('bs_uid') or item.get('expertise_uid'),
                         'ti_bs_qty': item.get('quantity')
                     }
                     print("tx_item: ", tx_item)
+                    ti_bs_id = tx_item.get("ti_bs_id")
 
-                    # Get other item details from business services table using parameterized query
-                    bs_query = """
-                        SELECT *
-                        FROM every_circle.business_services
-                        WHERE bs_uid = %s
-                    """
-                    bs_response = db.execute(bs_query, (item.get('bs_uid'),))
-                    print("bs_response: ", bs_response)
+                    if ti_bs_id and str(ti_bs_id).startswith('250'):
+                        print("ti_bs_id is a business service")
+                        # Get other item details from business services table using parameterized query
+                        bs_query = """
+                            SELECT *
+                            FROM every_circle.business_services
+                            WHERE bs_uid = %s
+                        """
+                        bs_response = db.execute(bs_query,  ti_bs_id)
+                        print("bs_response: ", bs_response)
+                        
+                        # Check if business service exists
+                        if not bs_response.get('result') or len(bs_response['result']) == 0:
+                            response['message'] = f"Business service not found: {item.get('bs_uid')}"
+                            response['code'] = 404
+                            return response, 404
+
+                        bs_data = bs_response['result'][0]
+                        tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
+                        tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
+                        tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
+                        tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
+                        tx_item['ti_bs_tax_rate'] = bs_data.get('bs_tax_rate')
+                        tx_item['ti_bs_refund_policy'] = bs_data.get('bs_refund_policy')
+                        tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
+                        print("tx_item: ", tx_item)
+
+
+                    elif ti_bs_id and str(ti_bs_id).startswith('150'):
+                        print("ti_bs_id is an expertise")
+                        # Get other item details from expertise table using parameterized query
+                        expertise_query = """
+                            SELECT *
+                            FROM every_circle.profile_expertise
+                            WHERE profile_expertise_uid = %s
+                        """
+                        bs_response = db.execute(expertise_query,  ti_bs_id)
+                        print("expertise_response: ", bs_response)
+                        # Check if expertise exists
+                        if not bs_response.get('result') or len(bs_response['result']) == 0:
+                            response['message'] = f"Expertise not found: {item.get('expertise_uid')}"
+                            response['code'] = 404
+                            return response, 404
+                        
+                        bs_data = bs_response['result'][0]
+                        tx_item['ti_bs_cost'] = bs_data.get('profile_expertise_cost')
+                        tx_item['ti_bs_cost_currency'] = bs_data.get('profile_expertise_cost_currency')
+                        tx_item['ti_bs_sku'] = bs_data.get('profile_expertise_sku')  # Doesn't exist
+                        tx_item['ti_bs_is_taxable'] = bs_data.get('profile_expertise_is_taxable')
+                        tx_item['ti_bs_tax_rate'] = bs_data.get('profile_expertise_tax_rate')
+                        tx_item['ti_bs_refund_policy'] = bs_data.get('profile_expertise_refund_policy')
+                        tx_item['ti_bs_return_window_days'] = bs_data.get('profile_expertise_return_window_days')
+                        print("tx_item: ", tx_item)
+
+                        
+                    elif ti_bs_id and str(ti_bs_id).startswith('160'):
+                        print("ti_bs_id is a wish")
+                        # Get other item details from wish table using parameterized query
+                        wish_query = """
+                            SELECT *
+                            FROM every_circle.profile_wish
+                            WHERE wish_uid = %s
+                        """
+                        bs_response = db.execute(wish_query, (item.get('wish_uid'),))
+                        print("wish_response: ", bs_response)
+                        # Check if wish exists
+                        if not bs_response.get('result') or len(bs_response['result']) == 0:
+                            response['message'] = f"Wish not found: {item.get('wish_uid')}"
+                            response['code'] = 404
+                            return response, 404
+
+                        bs_data = bs_response['result'][0]
+                        tx_item['ti_bs_cost'] = bs_data.get('profile_wish_cost')
+                        tx_item['ti_bs_cost_currency'] = bs_data.get('profile_wish_cost_currency')
+                        tx_item['ti_bs_sku'] = bs_data.get('profile_wish_sku')  # Doesn't exist
+                        tx_item['ti_bs_is_taxable'] = bs_data.get('profile_wish_is_taxable')
+                        tx_item['ti_bs_tax_rate'] = bs_data.get('profile_wish_tax_rate')
+                        tx_item['ti_bs_refund_policy'] = bs_data.get('profile_wish_refund_policy')
+                        tx_item['ti_bs_return_window_days'] = bs_data.get('profile_wish_return_window_days')
+                        print("tx_item: ", tx_item)
+                        
+
+                    else:
+                        print("ti_bs_id is not a valid ID")
+                        continue
+    
+                    # # Get other item details from business services table using parameterized query
+                    # bs_query = """
+                    #     SELECT *
+                    #     FROM every_circle.business_services
+                    #     WHERE bs_uid = %s
+                    # """
+                    # bs_response = db.execute(bs_query, (item.get('bs_uid'),))
+                    # print("bs_response: ", bs_response)
                     
-                    # Check if business service exists
-                    if not bs_response.get('result') or len(bs_response['result']) == 0:
-                        response['message'] = f"Business service not found: {item.get('bs_uid')}"
-                        response['code'] = 404
-                        return response, 404
+                    # # Check if business service exists
+                    # if not bs_response.get('result') or len(bs_response['result']) == 0:
+                    #     response['message'] = f"Business service not found: {item.get('bs_uid')}"
+                    #     response['code'] = 404
+                    #     return response, 404
                     
-                    bs_data = bs_response['result'][0]
-                    tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
-                    tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
-                    tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
-                    tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
-                    tx_item['ti_bs_tax_rate'] = bs_data.get('bs_tax_rate')
-                    tx_item['ti_bs_refund_policy'] = bs_data.get('bs_refund_policy')
-                    tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
-                    print("tx_item: ", tx_item)
+                    # bs_data = bs_response['result'][0]
+                    # tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
+                    # tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
+                    # tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
+                    # tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
+                    # tx_item['ti_bs_tax_rate'] = bs_data.get('bs_tax_rate')
+                    # tx_item['ti_bs_refund_policy'] = bs_data.get('bs_refund_policy')
+                    # tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
+                    # print("tx_item: ", tx_item)
     
                     # Insert transaction item
                     transaction_item_response = db.insert('every_circle.transactions_items', tx_item)
@@ -186,8 +273,10 @@ class Transactions(Resource):
                         
                         recommender_profile_id = item.get('recommender_profile_id')
                         if not recommender_profile_id:
-                            print("Warning: No recommender_profile_id provided, skipping bounty processing")
-                            continue
+                            # print("Warning: No recommender_profile_id provided, skipping bounty processing")
+                            # continue
+                            print("Warning: No recommender_profile_id provided")
+                            recommender_profile_id = payload.get('profile_id')
                         
                         # Find connection path between buyer and recommender
                         try:
@@ -254,7 +343,7 @@ class Transactions(Resource):
                                     'tb_ti_id': new_transaction_item_uid,
                                     'tb_profile_id': participant,
                                     'tb_percentage': "0.2",
-                                    'tb_amount': 0.20 * float(bounty_amount)
+                                    'tb_amount': round(0.20 * float(bounty_amount), 4)
                                 }
                                 print("tx_bounty: ", tx_bounty)
                                 
@@ -291,7 +380,7 @@ class Transactions(Resource):
                                     'tb_ti_id': new_transaction_item_uid,
                                     'tb_profile_id': participant,
                                     'tb_percentage': str(network_percentage),
-                                    'tb_amount': network_percentage * float(bounty_amount)
+                                    'tb_amount': round(network_percentage * float(bounty_amount), 4)
                                 }
                                 print("tx_bounty: ", tx_bounty)
                                 
