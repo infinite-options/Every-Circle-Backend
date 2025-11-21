@@ -1,6 +1,7 @@
 import os
 import pymysql
 import uuid
+import math
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
@@ -22,7 +23,8 @@ MYSQL = dict(
     database=os.environ["RDS_DB"]
 )
 
-MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
+# Chose this model because it fits on ec2, might consider upgrading for better search
+MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2" 
 EMBED_DIM = 384
 QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
@@ -35,11 +37,6 @@ qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 # LIMIT LOGIC
 # ---------------------------------------------------------
 def get_limit(param, max_results):
-    """
-    - If no parameter: return 5
-    - If numeric: return that number
-    - If ALL: return max_results
-    """
     if param is None or param == "":
         return 5
 
@@ -53,6 +50,36 @@ def get_limit(param, max_results):
 
     return 5
 
+# ---------------------------------------------------------
+# Haversine Distance (Miles)
+# ---------------------------------------------------------
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """
+    Returns distance in miles.
+    Returns None if any coordinate is missing.
+    """
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return None
+
+    lat1 = float(lat1)
+    lon1 = float(lon1)
+    lat2 = float(lat2)
+    lon2 = float(lon2)
+
+    R = 3958.8  # Radius of Earth in miles
+
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    rlat1 = math.radians(lat1)
+    rlat2 = math.radians(lat2)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
 
 # ---------------------------------------------------------
 # Helpers
@@ -67,7 +94,7 @@ def mysql_connect():
     return pymysql.connect(**MYSQL)
 
 # ---------------------------------------------------------
-# Qdrant Insert Verification
+# Qdrant Insert Verification - (May not need this)
 # ---------------------------------------------------------
 def verify_qdrant_insert(collection, uid_key, uid_value):
     try:
@@ -179,7 +206,7 @@ def sync_businesses(biz_map):
     return biz_map
 
 # ---------------------------------------------------------
-# BUSINESS UPSERT
+# BUSINESS UPSERT - (Insert or Update)
 # ---------------------------------------------------------
 def upsert_business(row):
     uid = row["business_uid"]
@@ -206,7 +233,7 @@ def upsert_business(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH BUSINESS (UPDATED WITH LIMIT)
+# SEARCH BUSINESS (UPDATED WITH DISTANCE AND RATING FILTERS)
 # ---------------------------------------------------------
 @app.route("/search_business", methods=["GET"])
 def search_business():
@@ -216,14 +243,22 @@ def search_business():
     query = request.args.get("q", "")
     limit_param = request.args.get("limit")
 
+    # NEW FILTER PARAMS
+    user_lat = request.args.get("user_lat", type=float)
+    user_lon = request.args.get("user_lon", type=float)
+    max_distance = request.args.get("max_distance", type=float)
+    min_rating = request.args.get("min_rating", type=float)
+    max_rating = request.args.get("max_rating", type=float)
+
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
 
     vector = embed_text(query)
 
+    # Search ALL results first
     results = qdrant.search("businesses", query_vector=vector, limit=max_results)
-    results = results[:final_limit]
 
+    # Build list of UIDs for SQL fetch
     business_uids = [r.payload.get("business_uid") for r in results]
 
     additional_info = {}
@@ -246,20 +281,50 @@ def search_business():
         for row in rows:
             additional_info[row["business_uid"]] = row
 
-    response_data = []
+    # -----------------------------------------------------
+    # APPLY FILTERS + ADD DISTANCE
+    # -----------------------------------------------------
+    filtered = []
     for r in results:
         uid = r.payload.get("business_uid")
+
         merged = {"score": r.score, **r.payload}
 
         if uid in additional_info:
             merged.update(additional_info[uid])
 
-        merged["bs_tags"] = r.payload.get("bs_tags", [])
-        merged["tags"] = r.payload.get("tags", [])
+        # Calculate distance if user lat/lon provided
+        if user_lat is not None and user_lon is not None:
+            dist = haversine_miles(
+                user_lat,
+                user_lon,
+                merged.get("business_latitude"),
+                merged.get("business_longitude")
+            )
+            merged["distance_miles"] = dist
 
-        response_data.append(merged)
+            # max_distance filter
+            if max_distance is not None and dist is not None:
+                if dist > max_distance:
+                    continue
 
-    return jsonify(response_data)
+        # rating filters
+        rating = merged.get("business_google_rating")
+        if rating is not None:
+            rating = float(rating)
+
+            if min_rating is not None and rating < min_rating:
+                continue
+            if max_rating is not None and rating > max_rating:
+                continue
+
+        filtered.append(merged)
+
+        # stop when limit reached
+        if len(filtered) >= final_limit:
+            break
+
+    return jsonify(filtered)
 
 # ---------------------------------------------------------
 # WISHES SYNC
@@ -318,7 +383,7 @@ def upsert_wish(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH WISHES (UPDATED WITH LIMIT)
+# SEARCH WISHES (unchanged)
 # ---------------------------------------------------------
 @app.route("/search_wishes", methods=["GET"])
 def search_wishes():
@@ -379,6 +444,7 @@ def search_wishes():
 
     return jsonify(response)
 
+
 # ---------------------------------------------------------
 # EXPERTISE SYNC
 # ---------------------------------------------------------
@@ -437,7 +503,7 @@ def upsert_expertise(row):
     )
 
 # ---------------------------------------------------------
-# SEARCH EXPERTISE (UPDATED WITH LIMIT)
+# SEARCH EXPERTISE (UNCHANGED)
 # ---------------------------------------------------------
 @app.route("/search_expertise", methods=["GET"])
 def search_expertise():
@@ -498,6 +564,7 @@ def search_expertise():
 
     return jsonify(response)
 
+
 # ---------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------
@@ -508,12 +575,5 @@ if __name__ == "__main__":
     biz_map = {}
     wish_map = {}
     exp_map = {}
-
-    print("\n🚀 INITIAL SYNC STARTING NOW...")
-    biz_map = sync_businesses(biz_map)
-    wish_map = sync_wishes(wish_map)
-    exp_map = sync_expertise(exp_map)
-
-    print("\n🚀 Live sync enabled for: businesses, wishes, expertise\n")
 
     app.run(host="0.0.0.0", port=5001)
