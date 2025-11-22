@@ -68,10 +68,16 @@ class UserProfileInfo(Resource):
                                             where={'profile_education_profile_personal_id': profile_id})
                     response['education_info'] = education_info['result'] if education_info['result'] else []
 
-                    # Get wishes info - returning all wishes entries for this profile
-                    wishes_info = db.select('every_circle.profile_wish', 
-                                         where={'profile_wish_profile_personal_id': profile_id})
-                    response['wishes_info'] = wishes_info['result'] if wishes_info['result'] else []
+                    # Get wishes info - returning all wishes entries for this profile with response counts
+                    wishes_query = """
+                        SELECT *, COUNT(wr_profile_wish_id) AS wish_responses
+                        FROM every_circle.profile_wish
+                        LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+                        WHERE profile_wish_profile_personal_id = %s
+                        GROUP BY profile_wish_uid
+                    """
+                    wishes_info = db.execute(wishes_query, (profile_id,))
+                    response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
                     # Get ratings info - returning all ratings entries for this profile
                     ratings_info = db.select('every_circle.ratings', 
@@ -150,10 +156,16 @@ class UserProfileInfo(Resource):
                                             where={'profile_education_profile_personal_id': profile_id})
                     response['education_info'] = education_info['result'] if education_info['result'] else []
 
-                    # Get wishes info - returning all wishes entries for this profile
-                    wishes_info = db.select('every_circle.profile_wish', 
-                                         where={'profile_wish_profile_personal_id': profile_id})
-                    response['wishes_info'] = wishes_info['result'] if wishes_info['result'] else []
+                    # Get wishes info - returning all wishes entries for this profile with response counts
+                    wishes_query = """
+                        SELECT *, COUNT(wr_profile_wish_id) AS wish_responses
+                        FROM every_circle.profile_wish
+                        LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+                        WHERE profile_wish_profile_personal_id = %s
+                        GROUP BY profile_wish_uid
+                    """
+                    wishes_info = db.execute(wishes_query, (profile_id,))
+                    response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
                     # Get ratings info - returning all ratings entries for this profile
                     ratings_info = db.select('every_circle.ratings', 
