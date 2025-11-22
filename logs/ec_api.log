@@ -493,3 +493,60 @@
 2025-11-21 20:34:43,475 [WARNING]  * Debugger is active!
 2025-11-21 20:34:43,498 [INFO]  * Debugger PIN: 317-871-169
 2025-11-21 20:35:27,019 [INFO] 127.0.0.1 - - [21/Nov/2025 20:35:27] "GET /api/v1/userprofileinfo/110-000016 HTTP/1.1" 200 -
+2025-11-22 04:54:40,698 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 04:54:40,774 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-22 04:54:40,774 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-22 04:54:40,776 [INFO]  * Restarting with stat
+2025-11-22 04:54:41,654 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 04:54:41,713 [WARNING]  * Debugger is active!
+2025-11-22 04:54:41,725 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 04:54:55,577 [INFO] 127.0.0.1 - - [22/Nov/2025 04:54:55] "GET /api/v1/userprofileinfo/110-000016 HTTP/1.1" 200 -
+2025-11-22 04:56:13,187 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/user_profile_info.py', reloading
+2025-11-22 04:56:13,529 [INFO]  * Restarting with stat
+2025-11-22 04:56:14,995 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 04:56:15,042 [WARNING]  * Debugger is active!
+2025-11-22 04:56:15,053 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 04:56:22,164 [INFO] 127.0.0.1 - - [22/Nov/2025 04:56:22] "GET /api/v1/userprofileinfo/110-000016 HTTP/1.1" 200 -
+2025-11-22 04:57:20,070 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/user_profile_info.py', reloading
+2025-11-22 04:57:20,366 [INFO]  * Restarting with stat
+2025-11-22 04:57:21,761 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 04:57:21,818 [WARNING]  * Debugger is active!
+2025-11-22 04:57:21,829 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 04:57:28,257 [INFO] 127.0.0.1 - - [22/Nov/2025 04:57:28] "GET /api/v1/userprofileinfo/110-000016 HTTP/1.1" 200 -
+2025-11-22 05:01:30,445 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/user_profile_info.py', reloading
+2025-11-22 05:01:30,767 [INFO]  * Restarting with stat
+2025-11-22 05:01:32,200 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:01:32,254 [WARNING]  * Debugger is active!
+2025-11-22 05:01:32,265 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 05:01:35,019 [INFO] 127.0.0.1 - - [22/Nov/2025 05:01:35] "GET /api/v1/userprofileinfo/110-000016 HTTP/1.1" 200 -
+2025-11-22 05:02:06,890 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/user_profile_info.py', reloading
+2025-11-22 05:02:07,136 [INFO]  * Restarting with stat
+2025-11-22 05:02:08,407 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:02:08,463 [WARNING]  * Debugger is active!
+2025-11-22 05:02:08,601 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 05:41:16,171 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:41:16,257 [INFO] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:4090
+ * Running on http://192.168.86.23:4090
+2025-11-22 05:41:16,257 [INFO] [33mPress CTRL+C to quit[0m
+2025-11-22 05:41:16,259 [INFO]  * Restarting with stat
+2025-11-22 05:41:17,107 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:41:17,159 [WARNING]  * Debugger is active!
+2025-11-22 05:41:17,169 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 05:41:21,247 [INFO] 127.0.0.1 - - [22/Nov/2025 05:41:21] "[33mGET /api/profilewishinfo/110-000016 HTTP/1.1[0m" 404 -
+2025-11-22 05:42:12,042 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/profile_wish.py', reloading
+2025-11-22 05:42:12,296 [INFO]  * Restarting with stat
+2025-11-22 05:42:13,602 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:42:13,655 [WARNING]  * Debugger is active!
+2025-11-22 05:42:13,665 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 05:42:56,064 [INFO] 127.0.0.1 - - [22/Nov/2025 05:42:56] "[33mGET /api/profilewishinfo/responses110-000016 HTTP/1.1[0m" 404 -
+2025-11-22 05:43:54,316 [INFO]  * Detected change in '/Users/pmarathay/code/Every-Circle-Backend/ec_api.py', reloading
+2025-11-22 05:43:54,531 [INFO]  * Restarting with stat
+2025-11-22 05:43:56,062 [INFO] 🚀 ec_api.py has started successfully (with file logging).
+2025-11-22 05:43:56,116 [WARNING]  * Debugger is active!
+2025-11-22 05:43:56,128 [INFO]  * Debugger PIN: 317-871-169
+2025-11-22 05:44:04,925 [INFO] 127.0.0.1 - - [22/Nov/2025 05:44:04] "GET /api/profilewishinfo/110-000016 HTTP/1.1" 200 -

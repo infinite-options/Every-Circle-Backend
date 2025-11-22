@@ -543,7 +543,7 @@ api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<str
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
-api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:query>")
+api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_id>")
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 

@@ -70,12 +70,13 @@ class UserProfileInfo(Resource):
 
                     # Get wishes info - returning all wishes entries for this profile with response counts
                     wishes_query = """
-                        SELECT *, COUNT(wr_profile_wish_id) AS wish_responses
+                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
                         FROM every_circle.profile_wish
                         LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
                         WHERE profile_wish_profile_personal_id = %s
                         GROUP BY profile_wish_uid
                     """
+                    # print("wishes_query", wishes_query)
                     wishes_info = db.execute(wishes_query, (profile_id,))
                     response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
@@ -158,7 +159,7 @@ class UserProfileInfo(Resource):
 
                     # Get wishes info - returning all wishes entries for this profile with response counts
                     wishes_query = """
-                        SELECT *, COUNT(wr_profile_wish_id) AS wish_responses
+                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
                         FROM every_circle.profile_wish
                         LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
                         WHERE profile_wish_profile_personal_id = %s
