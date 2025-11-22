@@ -36,15 +36,15 @@ class ProfileWishInfo(Resource):
         
         # return store, 200
 
-    def get(self, profile_id):
+    def get(self, profile_wish_id):
         # Determine which endpoint was called based on available parameters
         
-        print(f"In ProfileWishInfo GET - Wish Responses for profile: {profile_id}")
+        print(f"In ProfileWishInfo GET - Wish Responses for profile: {profile_wish_id}")
         response = {}
         
         try:
-            if not profile_id:
-                response['message'] = 'profile_id is required'
+            if not profile_wish_id:
+                response['message'] = 'profile_wish_id is required'
                 response['code'] = 400
                 return response, 400
             
@@ -68,11 +68,11 @@ class ProfileWishInfo(Resource):
                     FROM every_circle.profile_wish
                     LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
                     LEFT JOIN every_circle.profile_personal ON wr_responder_id = profile_personal_uid
-                    WHERE profile_wish_profile_personal_id = %s
+                    WHERE wr_profile_wish_id = %s
                 """
                 
-                print(f"Executing query for profile_wish_profile_personal_id: {profile_id}")
-                query_response = db.execute(wishes_responses_query, (profile_id,))
+                print(f"Executing query for profile_wish_id: {profile_wish_id}")
+                query_response = db.execute(wishes_responses_query, (profile_wish_id,))
                 print(f"Query response: {query_response}")
                 
                 if query_response.get('code') == 200:
