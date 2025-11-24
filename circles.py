@@ -16,17 +16,35 @@ class Circles(Resource):
                 response['code'] = 400
                 return response, 400
             
+            # Get optional circle_related_person_id from query parameters
+            circle_related_person_id = request.args.get('circle_related_person_id')
+            print(f"circle_related_person_id from query params: {circle_related_person_id}")
+            
             with connect() as db:
-                # Query to get all circles for a profile
-                circles_query = """
-                    SELECT * 
-                    FROM every_circle.circles
-                    WHERE circle_profile_id = %s
-                    ORDER BY circle_date DESC, circle_uid DESC
-                """
+                # Build query based on whether circle_related_person_id is provided
+                if circle_related_person_id:
+                    # Query to get circles for a profile filtered by related person
+                    circles_query = """
+                        SELECT * 
+                        FROM every_circle.circles
+                        WHERE circle_profile_id = %s
+                        AND circle_related_person_id = %s
+                        ORDER BY circle_date DESC, circle_uid DESC
+                    """
+                    query_params = (circle_profile_id, circle_related_person_id)
+                    print(f"Executing GET query for circle_profile_id: {circle_profile_id} AND circle_related_person_id: {circle_related_person_id}")
+                else:
+                    # Query to get all circles for a profile
+                    circles_query = """
+                        SELECT * 
+                        FROM every_circle.circles
+                        WHERE circle_profile_id = %s
+                        ORDER BY circle_date DESC, circle_uid DESC
+                    """
+                    query_params = (circle_profile_id,)
+                    print(f"Executing GET query for circle_profile_id: {circle_profile_id}")
                 
-                print(f"Executing GET query for circle_profile_id: {circle_profile_id}")
-                query_response = db.execute(circles_query, (circle_profile_id,))
+                query_response = db.execute(circles_query, query_params)
                 print(f"GET query response: {query_response}")
                 
                 if query_response.get('code') == 200:
