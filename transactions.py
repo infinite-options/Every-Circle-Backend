@@ -122,8 +122,8 @@ class Transactions(Resource):
                     # {'bs_uid': '250-000021', 'quantity': 9, 'recommender_profile_id': '110-000231'}
                     
                     # Validate required item fields
-                    if not item.get('bs_uid') and not item.get('expertise_uid'):
-                        print(f"Warning: Skipping item missing bs_uid or expertise_uid: {item}")
+                    if not item.get('bs_uid') and not item.get('expertise_uid') and not item.get('wish_response_uid'):
+                        print(f"Warning: Skipping item missing bs_uid or expertise_uid or wish_response_uid: {item}")
                         continue
                     
                     # Generate new transaction item UID
@@ -139,7 +139,7 @@ class Transactions(Resource):
                     tx_item = {
                         'ti_uid': new_transaction_item_uid,
                         'ti_transaction_id': new_transaction_uid,
-                        'ti_bs_id': item.get('bs_uid') or item.get('expertise_uid'),
+                        'ti_bs_id': item.get('bs_uid') or item.get('expertise_uid') or item.get('wish_response_uid'),
                         'ti_bs_qty': item.get('quantity')
                     }
                     print("tx_item: ", tx_item)
@@ -200,19 +200,20 @@ class Transactions(Resource):
                         print("tx_item: ", tx_item)
 
                         
-                    elif ti_bs_id and str(ti_bs_id).startswith('160'):
+                    elif ti_bs_id and str(ti_bs_id).startswith('165'):
                         print("ti_bs_id is a wish")
                         # Get other item details from wish table using parameterized query
                         wish_query = """
-                            SELECT *
+                            SELECT wish_response.wish_response_uid, profile_wish.*
                             FROM every_circle.profile_wish
-                            WHERE wish_uid = %s
+                            LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+                            WHERE wish_response_uid = %s
                         """
-                        bs_response = db.execute(wish_query, (item.get('wish_uid'),))
+                        bs_response = db.execute(wish_query, (item.get('wish_response_uid'),))
                         print("wish_response: ", bs_response)
                         # Check if wish exists
                         if not bs_response.get('result') or len(bs_response['result']) == 0:
-                            response['message'] = f"Wish not found: {item.get('wish_uid')}"
+                            response['message'] = f"Wish not found: {item.get('wish_response_uid')}"
                             response['code'] = 404
                             return response, 404
 
