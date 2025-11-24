@@ -45,6 +45,7 @@ from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
 from bounty_results import BountyResults
 from transaction_cost import TransactionCost
+from circles import Circles
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -546,6 +547,7 @@ api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
+api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
 
 class GooglePlacesInfo(Resource):
     def post(self):
