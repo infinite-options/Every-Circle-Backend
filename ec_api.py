@@ -88,6 +88,10 @@ import json
 import base64
 import googlemaps
 
+import awsgi
+def lambda_handler(event, context):
+   return awsgi.response(app, event, context, base64_content_types={"image/png"})
+
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
 # == Using Cryptography library for AES encryption ==

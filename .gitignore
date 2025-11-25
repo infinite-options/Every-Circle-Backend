@@ -36,3 +36,10 @@ sample.py
 __pycache__/
 test.py
 
+# build folder
+build/
+lambda_build/
+
+# zip files
+*.zip
+
