@@ -23,8 +23,7 @@ MYSQL = dict(
     database=os.environ["RDS_DB"]
 )
 
-# Chose this model because it fits on ec2, might consider upgrading for better search
-MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2" 
+MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
 EMBED_DIM = 384
 QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
@@ -32,6 +31,49 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 app = Flask(__name__)
 embedder = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+# ---------------------------------------------------------
+# SAFE CONVERSION HELPERS (bulletproof)
+# ---------------------------------------------------------
+def safe_float(value):
+    """
+    Safely convert value to float.
+    Returns None for invalid, empty, or malformed numeric input.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip()
+    if s == "":
+        return None
+
+    try:
+        return float(s)
+    except:
+        return None
+
+
+def safe_int(value):
+    """
+    Safely convert value to int.
+    Returns None for invalid or empty input.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+
+    s = str(value).strip()
+    if s == "":
+        return None
+
+    try:
+        return int(s)
+    except:
+        return None
+
 
 # ---------------------------------------------------------
 # LIMIT LOGIC
@@ -50,23 +92,25 @@ def get_limit(param, max_results):
 
     return 5
 
+
 # ---------------------------------------------------------
-# Haversine Distance (Miles)
+# Haversine Distance (safe)
 # ---------------------------------------------------------
 def haversine_miles(lat1, lon1, lat2, lon2):
     """
     Returns distance in miles.
-    Returns None if any coordinate is missing.
+    Returns None if coordinates are missing or invalid.
     """
-    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+
+    lat1 = safe_float(lat1)
+    lon1 = safe_float(lon1)
+    lat2 = safe_float(lat2)
+    lon2 = safe_float(lon2)
+
+    if None in (lat1, lon1, lat2, lon2):
         return None
 
-    lat1 = float(lat1)
-    lon1 = float(lon1)
-    lat2 = float(lat2)
-    lon2 = float(lon2)
-
-    R = 3958.8  # Radius of Earth in miles
+    R = 3958.8  # Earth radius (miles)
 
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -81,8 +125,9 @@ def haversine_miles(lat1, lon1, lat2, lon2):
 
     return R * c
 
+
 # ---------------------------------------------------------
-# Helpers
+# EMBEDDING + MYSQL HELPERS
 # ---------------------------------------------------------
 def embed_text(text: str):
     return embedder.encode(text).tolist()
@@ -94,7 +139,7 @@ def mysql_connect():
     return pymysql.connect(**MYSQL)
 
 # ---------------------------------------------------------
-# Qdrant Insert Verification - (May not need this)
+# VERIFY QDRANT INSERT (optional, kept safe)
 # ---------------------------------------------------------
 def verify_qdrant_insert(collection, uid_key, uid_value):
     try:
@@ -107,8 +152,9 @@ def verify_qdrant_insert(collection, uid_key, uid_value):
     except:
         return False
 
+
 # ---------------------------------------------------------
-# Collection Creation
+# ENSURE COLLECTIONS
 # ---------------------------------------------------------
 def ensure_collections():
     for col in ["businesses", "wishes", "expertise"]:
@@ -120,8 +166,9 @@ def ensure_collections():
             )
         print(f"✅ Collection '{col}' ready.")
 
+
 # ---------------------------------------------------------
-# BUSINESS SYNC (Insert / Update / Delete)
+# BUSINESS SYNC
 # ---------------------------------------------------------
 def sync_businesses(biz_map):
     print("\n==============================")
@@ -163,20 +210,22 @@ def sync_businesses(biz_map):
     service_rows = cur.fetchall()
     conn.close()
 
-    # Map business → service tags
+    # Map business_uid → list of service tags
     service_map = {}
     for s in service_rows:
         bid = s["bs_business_id"]
         if bid not in service_map:
             service_map[bid] = []
-        if s["bs_tags"]:
+
+        tags_raw = s["bs_tags"]
+        if tags_raw:
             service_map[bid].extend(
-                [t.strip().lower() for t in s["bs_tags"].split(",") if t.strip()]
+                [t.strip().lower() for t in tags_raw.split(",") if t.strip()]
             )
 
     current_state = {r["business_uid"]: str(r["updated_at"]) for r in rows}
 
-    # INSERT or UPDATE
+    # INSERT or UPDATE operations
     for row in rows:
         uid = row["business_uid"]
         row["bs_tags"] = service_map.get(uid, [])
@@ -196,7 +245,7 @@ def sync_businesses(biz_map):
 
         biz_map[uid] = current_state[uid]
 
-    # DELETE removed businesses
+    # Handle deleted businesses
     for old_uid in list(biz_map.keys()):
         if old_uid not in current_state:
             print(f"🗑 Removing business: {old_uid}")
@@ -205,35 +254,56 @@ def sync_businesses(biz_map):
 
     return biz_map
 
+
 # ---------------------------------------------------------
-# BUSINESS UPSERT - (Insert or Update)
+# UPSERT BUSINESS
 # ---------------------------------------------------------
 def upsert_business(row):
     uid = row["business_uid"]
 
+    # create searchable text
     text = (
         f"{row['business_name']} "
         f"{row.get('business_short_bio') or ''} "
         f"{row.get('business_tag_line') or ''}"
     )
 
-    tags = []
+    # parse tagline tags
+    tagline_tags = []
     if row.get("business_tag_line"):
-        tags = [t.strip().lower() for t in row["business_tag_line"].split(",") if t.strip()]
+        tagline_tags = [
+            t.strip().lower()
+            for t in row["business_tag_line"].split(",")
+            if t.strip()
+        ]
+
+    # sanitize numeric values
+    row["business_latitude"] = safe_float(row.get("business_latitude"))
+    row["business_longitude"] = safe_float(row.get("business_longitude"))
+    row["business_price_level"] = safe_int(row.get("business_price_level"))
+    row["business_google_rating"] = safe_float(row.get("business_google_rating"))
+    row["business_reward_amount"] = safe_float(row.get("business_reward_amount"))
 
     payload = {
         **row,
-        "tags": tags,
+        "tags": tagline_tags,
         "bs_tags": row.get("bs_tags", [])
     }
 
     qdrant.upsert(
         collection_name="businesses",
-        points=[PointStruct(id=make_uuid(uid), vector=embed_text(text), payload=payload)]
+        points=[
+            PointStruct(
+                id=make_uuid(uid),
+                vector=embed_text(text),
+                payload=payload
+            )
+        ]
     )
 
+
 # ---------------------------------------------------------
-# SEARCH BUSINESS (UPDATED WITH DISTANCE AND RATING FILTERS)
+# SEARCH BUSINESS (FULLY FIXED)
 # ---------------------------------------------------------
 @app.route("/search_business", methods=["GET"])
 def search_business():
@@ -243,30 +313,28 @@ def search_business():
     query = request.args.get("q", "")
     limit_param = request.args.get("limit")
 
-    # NEW FILTER PARAMS
-    user_lat = request.args.get("user_lat", type=float)
-    user_lon = request.args.get("user_lon", type=float)
-    max_distance = request.args.get("max_distance", type=float)
-    min_rating = request.args.get("min_rating", type=float)
-    max_rating = request.args.get("max_rating", type=float)
+    # FILTER PARAMETERS (safe)
+    user_lat = safe_float(request.args.get("user_lat"))
+    user_lon = safe_float(request.args.get("user_lon"))
+    max_distance = safe_float(request.args.get("max_distance"))
+    min_rating = safe_float(request.args.get("min_rating"))
+    max_rating = safe_float(request.args.get("max_rating"))
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
 
     vector = embed_text(query)
 
-    # Search ALL results first
+    # search qdrant
     results = qdrant.search("businesses", query_vector=vector, limit=max_results)
 
-    # Build list of UIDs for SQL fetch
     business_uids = [r.payload.get("business_uid") for r in results]
-
     additional_info = {}
 
+    # fetch SQL details
     if business_uids:
         conn = mysql_connect()
         cur = conn.cursor(pymysql.cursors.DictCursor)
-
         placeholders = ",".join(["%s"] * len(business_uids))
 
         cur.execute(f"""
@@ -279,10 +347,17 @@ def search_business():
         conn.close()
 
         for row in rows:
+            # sanitize numeric fields here too
+            row["business_latitude"] = safe_float(row.get("business_latitude"))
+            row["business_longitude"] = safe_float(row.get("business_longitude"))
+            row["business_google_rating"] = safe_float(row.get("business_google_rating"))
+            row["business_reward_amount"] = safe_float(row.get("business_reward_amount"))
+            row["business_price_level"] = safe_int(row.get("business_price_level"))
+
             additional_info[row["business_uid"]] = row
 
     # -----------------------------------------------------
-    # APPLY FILTERS + ADD DISTANCE
+    # APPLY FILTERS + ADD DISTANCE (SAFE)
     # -----------------------------------------------------
     filtered = []
     for r in results:
@@ -293,7 +368,7 @@ def search_business():
         if uid in additional_info:
             merged.update(additional_info[uid])
 
-        # Calculate distance if user lat/lon provided
+        # Compute distance safely
         if user_lat is not None and user_lon is not None:
             dist = haversine_miles(
                 user_lat,
@@ -303,16 +378,13 @@ def search_business():
             )
             merged["distance_miles"] = dist
 
-            # max_distance filter
             if max_distance is not None and dist is not None:
                 if dist > max_distance:
                     continue
 
-        # rating filters
-        rating = merged.get("business_google_rating")
+        # Safely filter by rating
+        rating = safe_float(merged.get("business_google_rating"))
         if rating is not None:
-            rating = float(rating)
-
             if min_rating is not None and rating < min_rating:
                 continue
             if max_rating is not None and rating > max_rating:
@@ -320,7 +392,6 @@ def search_business():
 
         filtered.append(merged)
 
-        # stop when limit reached
         if len(filtered) >= final_limit:
             break
 
@@ -362,6 +433,7 @@ def sync_wishes(wish_map):
 
         wish_map[uid] = current_state[uid]
 
+    # Remove deleted wishes
     for old_uid in list(wish_map.keys()):
         if old_uid not in current_state:
             print(f"🗑 Removing wish: {old_uid}")
@@ -370,8 +442,9 @@ def sync_wishes(wish_map):
 
     return wish_map
 
+
 # ---------------------------------------------------------
-# UPSERT WISH
+# UPSERT WISH (no numeric conversions required)
 # ---------------------------------------------------------
 def upsert_wish(row):
     uid = row["profile_wish_uid"]
@@ -379,11 +452,18 @@ def upsert_wish(row):
 
     qdrant.upsert(
         collection_name="wishes",
-        points=[PointStruct(id=make_uuid(uid), vector=embed_text(text), payload=row)]
+        points=[
+            PointStruct(
+                id=make_uuid(uid),
+                vector=embed_text(text),
+                payload=row
+            )
+        ]
     )
 
+
 # ---------------------------------------------------------
-# SEARCH WISHES (unchanged)
+# SEARCH WISHES (safe, but no numeric conversions needed)
 # ---------------------------------------------------------
 @app.route("/search_wishes", methods=["GET"])
 def search_wishes():
@@ -417,7 +497,8 @@ def search_wishes():
                    profile_personal_email_is_public, profile_personal_phone_number,
                    profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude,
+                   profile_personal_location_is_public,
+                   profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
                    profile_personal_tag_line, profile_personal_tag_line_is_public
             FROM profile_wish
@@ -432,15 +513,21 @@ def search_wishes():
         conn.close()
 
         for row in rows:
+            # sanitize location numeric fields
+            row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
+            row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+
             additional_info[row["profile_wish_uid"]] = row
 
     response = []
     for r in results:
         uid = r.payload.get("profile_wish_uid")
-        item = {"score": r.score, **r.payload}
+        obj = {"score": r.score, **r.payload}
+
         if uid in additional_info:
-            item.update(additional_info[uid])
-        response.append(item)
+            obj.update(additional_info[uid])
+
+        response.append(obj)
 
     return jsonify(response)
 
@@ -482,6 +569,7 @@ def sync_expertise(exp_map):
 
         exp_map[uid] = current_state[uid]
 
+    # remove deleted
     for old_uid in list(exp_map.keys()):
         if old_uid not in current_state:
             print(f"🗑 Removing expertise: {old_uid}")
@@ -489,6 +577,7 @@ def sync_expertise(exp_map):
             exp_map.pop(old_uid, None)
 
     return exp_map
+
 
 # ---------------------------------------------------------
 # UPSERT EXPERTISE
@@ -499,11 +588,18 @@ def upsert_expertise(row):
 
     qdrant.upsert(
         collection_name="expertise",
-        points=[PointStruct(id=make_uuid(uid), vector=embed_text(text), payload=row)]
+        points=[
+            PointStruct(
+                id=make_uuid(uid),
+                vector=embed_text(text),
+                payload=row
+            )
+        ]
     )
 
+
 # ---------------------------------------------------------
-# SEARCH EXPERTISE (UNCHANGED)
+# SEARCH EXPERTISE
 # ---------------------------------------------------------
 @app.route("/search_expertise", methods=["GET"])
 def search_expertise():
@@ -522,7 +618,6 @@ def search_expertise():
     results = results[:final_limit]
 
     exp_uids = [r.payload.get("profile_expertise_uid") for r in results]
-
     additional_info = {}
 
     if exp_uids:
@@ -537,7 +632,8 @@ def search_expertise():
                    profile_personal_email_is_public, profile_personal_phone_number,
                    profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude,
+                   profile_personal_location_is_public,
+                   profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
                    profile_personal_tag_line, profile_personal_tag_line_is_public
             FROM profile_expertise
@@ -552,15 +648,21 @@ def search_expertise():
         conn.close()
 
         for row in rows:
+            # sanitize numeric fields
+            row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
+            row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+
             additional_info[row["profile_expertise_uid"]] = row
 
     response = []
     for r in results:
         uid = r.payload.get("profile_expertise_uid")
-        item = {"score": r.score, **r.payload}
+        obj = {"score": r.score, **r.payload}
+
         if uid in additional_info:
-            item.update(additional_info[uid])
-        response.append(item)
+            obj.update(additional_info[uid])
+
+        response.append(obj)
 
     return jsonify(response)
 
