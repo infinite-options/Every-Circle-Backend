@@ -40,6 +40,9 @@ test.py
 build/
 lambda_build/
 
+# logs folder
+logs/
+
 # zip files
 *.zip
 

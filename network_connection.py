@@ -31,11 +31,22 @@ class NetworkPath(Resource):
             #                     FROM profile_personal
             #                     WHERE profile_personal_referred_by in ({placeholders});
             #                 '''
+            # down_query = f'''
+            #                 SELECT profile_personal_uid, circles.*
+            #                 FROM profile_personal
+            #                 LEFT JOIN circles ON circle_related_person_id = profile_personal_uid
+            #                 WHERE profile_personal_referred_by in ({placeholders});
+            #                 '''
             down_query = f'''
-                            SELECT profile_personal_uid, circles.*
-                            FROM profile_personal
-                            LEFT JOIN circles ON circle_related_person_id = profile_personal_uid
-                            WHERE profile_personal_referred_by in ({placeholders});
+                            SELECT 
+                                pp.profile_personal_uid,
+                                pp.profile_personal_referred_by,
+                                c.*
+                            FROM profile_personal AS pp
+                            LEFT JOIN every_circle.circles AS c
+                                ON c.circle_related_person_id = pp.profile_personal_uid
+                                AND c.circle_profile_id = '{target_uid}'
+                            WHERE pp.profile_personal_referred_by in ({placeholders});
                             '''
             print('down_query', down_query)
 
@@ -82,11 +93,16 @@ class NetworkPath(Resource):
             #     WHERE profile_personal_uid in ({placeholders});
             # '''
             up_query = f'''
-                SELECT profile_personal_referred_by, circles.*
-                FROM profile_personal
-                LEFT JOIN circles ON circle_related_person_id = profile_personal_uid
-                WHERE profile_personal_referred_by in ({placeholders});
-            '''
+                            SELECT  
+                                pp.profile_personal_uid,
+                                pp.profile_personal_referred_by, 
+                                c.*
+                            FROM profile_personal AS pp
+                            LEFT JOIN every_circle.circles AS c
+                                ON c.circle_related_person_id = pp.profile_personal_uid
+                                AND c.circle_profile_id = '{target_uid}'
+                            WHERE pp.profile_personal_referred_by in ({placeholders});
+                        '''
             print('up_query', up_query)
         
             with connect() as db:
