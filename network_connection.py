@@ -27,11 +27,17 @@ class NetworkPath(Resource):
             
             placeholders = ",".join(f"'{u}'" for u in uids)
 
-            down_query = f''' SELECT profile_personal_uid
-                                FROM profile_personal
-                                WHERE profile_personal_referred_by in ({placeholders});
+            # down_query = f'''   SELECT profile_personal_uid
+            #                     FROM profile_personal
+            #                     WHERE profile_personal_referred_by in ({placeholders});
+            #                 '''
+            down_query = f'''
+                            SELECT profile_personal_uid, circles.*
+                            FROM profile_personal
+                            LEFT JOIN circles ON circle_related_person_id = profile_personal_uid
+                            WHERE profile_personal_referred_by in ({placeholders});
                             '''
-            #print('down_query', down_query)
+            print('down_query', down_query)
 
 
             with connect() as db:
@@ -49,7 +55,14 @@ class NetworkPath(Resource):
             down_query_details = response['result']
             #print('down_query_details: ', down_query_details)
 
-            down_list = [item['profile_personal_uid'] for item in down_query_details]
+            down_list = [{
+                'uid': item['profile_personal_uid'],
+                'circle_relationship': item.get('circle_relationship'),
+                'circle_date': item.get('circle_date'),
+                'circle_event': item.get('circle_event'),
+                'circle_note': item.get('circle_note'),
+                'circle_geotag': item.get('circle_geotag')
+            } for item in down_query_details]
             
             #print('down_list:', down_list)
 
@@ -63,12 +76,18 @@ class NetworkPath(Resource):
                 return []
             
             placeholders = ",".join(f"'{u}'" for u in uids)
+            # up_query = f'''
+            #     SELECT profile_personal_referred_by
+            #     FROM profile_personal
+            #     WHERE profile_personal_uid in ({placeholders});
+            # '''
             up_query = f'''
-                SELECT profile_personal_referred_by
+                SELECT profile_personal_referred_by, circles.*
                 FROM profile_personal
-                WHERE profile_personal_uid in ({placeholders});
-        '''
-            #print('up_query', up_query)
+                LEFT JOIN circles ON circle_related_person_id = profile_personal_uid
+                WHERE profile_personal_referred_by in ({placeholders});
+            '''
+            print('up_query', up_query)
         
             with connect() as db:
                 response = db.execute(up_query)
@@ -83,7 +102,14 @@ class NetworkPath(Resource):
             up_query_details = response['result']
             #print('up_query_details: ', up_query_details)
 
-            up_list = [item['profile_personal_referred_by'] for item in up_query_details]
+            up_list = [{
+                'uid': item['profile_personal_referred_by'],
+                'circle_relationship': item.get('circle_relationship'),
+                'circle_date': item.get('circle_date'),
+                'circle_event': item.get('circle_event'),
+                'circle_note': item.get('circle_note'),
+                'circle_geotag': item.get('circle_geotag')
+            } for item in up_query_details]
 
             #print('up_list:', up_list)
 
@@ -100,11 +126,11 @@ class NetworkPath(Resource):
             new_down = fetch_descendants(current_down)
 
             #print('new_down', new_down)
-            new_down = [u for u in new_down if u not in seen]
+            new_down = [u for u in new_down if u['uid'] not in seen]
             store['descendants'][deg] = new_down
             down_nodes.extend(new_down)
-            seen.update(new_down)
-            current_down = new_down
+            seen.update([u['uid'] for u in new_down])
+            current_down = [u['uid'] for u in new_down]
             # degree = deg
             #print('down_nodes', down_nodes)
             
@@ -117,11 +143,11 @@ class NetworkPath(Resource):
             #print('new_up', new_up)
 
 
-            new_up = [u for u in new_up if u not in seen]
+            new_up = [u for u in new_up if u['uid'] not in seen]
             store['ancestors'][deg] = new_up
             up_nodes.extend(new_up)
-            seen.update(new_up)
-            current_up = new_up
+            seen.update([u['uid'] for u in new_up])
+            current_up = [u['uid'] for u in new_up]
             #print('up_nodes', up_nodes)
 
         total_count = sum(len(v) for v in store['ancestors'].values()) + sum(len(v) for v in store['descendants'].values())
@@ -145,10 +171,12 @@ class NetworkPath(Resource):
             if total_count >= max_nodes:
                 break
 
-            result = fetch_descendants(val)
-            result = [u for u in result if u not in seen]
+            # Extract UIDs from val (which is a list of dicts) to pass to fetch_descendants
+            val_uids = [v['uid'] if isinstance(v, dict) else v for v in val]
+            result = fetch_descendants(val_uids)
+            result = [u for u in result if u['uid'] not in seen]
             store['ancestors_down'][id] = result
-            seen.update(result)
+            seen.update([u['uid'] for u in result])
                 
 
 
@@ -165,15 +193,35 @@ class NetworkPath(Resource):
         final_rows = []
 
         def add_to_rows(source_dict, base_degree=0):
-            for level, uids in source_dict.items():
+            for level, items in source_dict.items():
                 curr_degree = int(level) + base_degree
                 if curr_degree > degree:
                     break
                 else:
-                    for uid in uids:
+                    for item in items:
+                        # Handle both dict format and legacy string format
+                        if isinstance(item, dict):
+                            uid = item['uid']
+                            circle_relationship = item.get('circle_relationship')
+                            circle_date = item.get('circle_date')
+                            circle_event = item.get('circle_event')
+                            circle_note = item.get('circle_note')
+                            circle_geotag = item.get('circle_geotag')
+                        else:
+                            uid = item
+                            circle_relationship = None
+                            circle_date = None
+                            circle_event = None
+                            circle_note = None
+                            circle_geotag = None
                         final_rows.append({
                             "target_uid": target_uid,
                             "network_profile_personal_uid": uid,
+                            "circle_relationship": circle_relationship,
+                            "circle_date": circle_date,
+                            "circle_event": circle_event,
+                            "circle_note": circle_note,
+                            "circle_geotag": circle_geotag,
                             "degree": curr_degree
                         })
 
