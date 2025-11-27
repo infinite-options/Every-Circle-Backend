@@ -64,10 +64,11 @@ class NetworkPath(Resource):
 
 
             down_query_details = response['result']
-            #print('down_query_details: ', down_query_details)
+            # print('down_query_details: ', down_query_details)
 
             down_list = [{
                 'uid': item['profile_personal_uid'],
+                'profile_personal_referred_by': item.get('profile_personal_referred_by'),
                 'circle_relationship': item.get('circle_relationship'),
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
@@ -75,7 +76,7 @@ class NetworkPath(Resource):
                 'circle_geotag': item.get('circle_geotag')
             } for item in down_query_details]
             
-            #print('down_list:', down_list)
+            print('down_list with profile_personal_referred_by:', down_list)
 
             return down_list
 
@@ -95,13 +96,13 @@ class NetworkPath(Resource):
             up_query = f'''
                             SELECT  
                                 pp.profile_personal_uid,
-                                pp.profile_personal_referred_by, 
+                                pp.profile_personal_referred_by,
                                 c.*
                             FROM profile_personal AS pp
                             LEFT JOIN every_circle.circles AS c
                                 ON c.circle_related_person_id = pp.profile_personal_uid
                                 AND c.circle_profile_id = '{target_uid}'
-                            WHERE pp.profile_personal_referred_by in ({placeholders});
+                            WHERE pp.profile_personal_uid in ({placeholders});
                         '''
             print('up_query', up_query)
         
@@ -116,10 +117,11 @@ class NetworkPath(Resource):
 
         
             up_query_details = response['result']
-            #print('up_query_details: ', up_query_details)
+            print('up_query_details: ', up_query_details)
 
             up_list = [{
-                'uid': item['profile_personal_referred_by'],
+                'uid': item['profile_personal_referred_by'],  # The ancestor node
+                'profile_personal_referred_by': item.get('profile_personal_uid'),  # The child this ancestor connects TO (for graph connection)
                 'circle_relationship': item.get('circle_relationship'),
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
@@ -127,7 +129,7 @@ class NetworkPath(Resource):
                 'circle_geotag': item.get('circle_geotag')
             } for item in up_query_details]
 
-            #print('up_list:', up_list)
+            print('up_list with profile_personal_referred_by:', up_list)
 
             return up_list
         
@@ -218,6 +220,7 @@ class NetworkPath(Resource):
                         # Handle both dict format and legacy string format
                         if isinstance(item, dict):
                             uid = item['uid']
+                            profile_personal_referred_by = item.get('profile_personal_referred_by')
                             circle_relationship = item.get('circle_relationship')
                             circle_date = item.get('circle_date')
                             circle_event = item.get('circle_event')
@@ -225,6 +228,7 @@ class NetworkPath(Resource):
                             circle_geotag = item.get('circle_geotag')
                         else:
                             uid = item
+                            profile_personal_referred_by = None
                             circle_relationship = None
                             circle_date = None
                             circle_event = None
@@ -233,6 +237,7 @@ class NetworkPath(Resource):
                         final_rows.append({
                             "target_uid": target_uid,
                             "network_profile_personal_uid": uid,
+                            "profile_personal_referred_by": profile_personal_referred_by,
                             "circle_relationship": circle_relationship,
                             "circle_date": circle_date,
                             "circle_event": circle_event,
@@ -247,6 +252,18 @@ class NetworkPath(Resource):
 
         # sort by degree
         final_rows.sort(key=lambda x: x['degree'])
+
+        # Debug: Log all relationships for graph construction
+        print('\n=== GRAPH RELATIONSHIPS DEBUG ===')
+        print(f'Total nodes: {len(final_rows)}')
+        for row in final_rows:
+            node_uid = row['network_profile_personal_uid']
+            referred_by = row.get('profile_personal_referred_by')
+            degree = row['degree']
+            print(f'  Node {node_uid} (degree {degree}):')
+            if referred_by:
+                print(f'    -> profile_personal_referred_by (connects TO): {referred_by}')
+        print('=== END GRAPH RELATIONSHIPS ===\n')
 
         # Return as JSON
         # return jsonify(final_rows)
