@@ -41,6 +41,15 @@ class NetworkPath(Resource):
                             SELECT 
                                 pp.profile_personal_uid,
                                 pp.profile_personal_referred_by,
+                                pp.profile_personal_first_name,
+                                pp.profile_personal_last_name,
+                                pp.profile_personal_tag_line,
+                                pp.profile_personal_phone_number,
+                                pp.profile_personal_image,
+                                pp.profile_personal_email_is_public,
+                                pp.profile_personal_phone_number_is_public,
+                                pp.profile_personal_tag_line_is_public,
+                                pp.profile_personal_image_is_public,
                                 c.*
                             FROM profile_personal AS pp
                             LEFT JOIN every_circle.circles AS c
@@ -69,6 +78,15 @@ class NetworkPath(Resource):
             down_list = [{
                 'uid': item['profile_personal_uid'],
                 'profile_personal_referred_by': item.get('profile_personal_referred_by'),
+                'profile_personal_first_name': item.get('profile_personal_first_name'),
+                'profile_personal_last_name': item.get('profile_personal_last_name'),
+                'profile_personal_tag_line': item.get('profile_personal_tag_line'),
+                'profile_personal_phone_number': item.get('profile_personal_phone_number'),
+                'profile_personal_image': item.get('profile_personal_image'),
+                'profile_personal_email_is_public': item.get('profile_personal_email_is_public'),
+                'profile_personal_phone_number_is_public': item.get('profile_personal_phone_number_is_public'),
+                'profile_personal_tag_line_is_public': item.get('profile_personal_tag_line_is_public'),
+                'profile_personal_image_is_public': item.get('profile_personal_image_is_public'),
                 'circle_relationship': item.get('circle_relationship'),
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
@@ -97,8 +115,19 @@ class NetworkPath(Resource):
                             SELECT  
                                 pp.profile_personal_uid,
                                 pp.profile_personal_referred_by,
+                                pp_parent.profile_personal_first_name,
+                                pp_parent.profile_personal_last_name,
+                                pp_parent.profile_personal_tag_line,
+                                pp_parent.profile_personal_phone_number,
+                                pp_parent.profile_personal_image,
+                                pp_parent.profile_personal_email_is_public,
+                                pp_parent.profile_personal_phone_number_is_public,
+                                pp_parent.profile_personal_tag_line_is_public,
+                                pp_parent.profile_personal_image_is_public,
                                 c.*
                             FROM profile_personal AS pp
+                            LEFT JOIN profile_personal AS pp_parent
+                                ON pp_parent.profile_personal_uid = pp.profile_personal_referred_by
                             LEFT JOIN every_circle.circles AS c
                                 ON c.circle_related_person_id = pp.profile_personal_uid
                                 AND c.circle_profile_id = '{target_uid}'
@@ -122,6 +151,16 @@ class NetworkPath(Resource):
             up_list = [{
                 'uid': item['profile_personal_referred_by'],  # The ancestor node
                 'profile_personal_referred_by': item.get('profile_personal_uid'),  # The child this ancestor connects TO (for graph connection)
+                'profile_personal_referred_by': item.get('profile_personal_uid'),
+                'profile_personal_first_name': item.get('profile_personal_first_name'),
+                'profile_personal_last_name': item.get('profile_personal_last_name'),
+                'profile_personal_tag_line': item.get('profile_personal_tag_line'),
+                'profile_personal_phone_number': item.get('profile_personal_phone_number'),
+                'profile_personal_image': item.get('profile_personal_image'),
+                'profile_personal_email_is_public': item.get('profile_personal_email_is_public'),
+                'profile_personal_phone_number_is_public': item.get('profile_personal_phone_number_is_public'),
+                'profile_personal_tag_line_is_public': item.get('profile_personal_tag_line_is_public'),
+                'profile_personal_image_is_public': item.get('profile_personal_image_is_public'),
                 'circle_relationship': item.get('circle_relationship'),
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
@@ -211,41 +250,47 @@ class NetworkPath(Resource):
         final_rows = []
 
         def add_to_rows(source_dict, base_degree=0):
-            for level, items in source_dict.items():
-                curr_degree = int(level) + base_degree
-                if curr_degree > degree:
-                    break
-                else:
-                    for item in items:
-                        # Handle both dict format and legacy string format
-                        if isinstance(item, dict):
-                            uid = item['uid']
-                            profile_personal_referred_by = item.get('profile_personal_referred_by')
-                            circle_relationship = item.get('circle_relationship')
-                            circle_date = item.get('circle_date')
-                            circle_event = item.get('circle_event')
-                            circle_note = item.get('circle_note')
-                            circle_geotag = item.get('circle_geotag')
+            for level, items in source_dict.items(): #iterating through source_dict items(level, items)
+                curr_degree = int(level) + base_degree #calculating current degree(level + base_degree)
+                if curr_degree > degree:  #checking if current degree is greater than input degree
+                    break #if true then breaking the loop
+                else: #if false then iterating through items
+                    for item in items: #iterating through items
+                        # Handle both dict format and legacy string format(uid only), whichever format info is passed through item
+                        if isinstance(item, dict):  #using isinstance to check if item is dict
+                            final_rows.append({  #above if statement is true then appending all values to final_rows
+                                "target_uid": target_uid, #using terget_uid instead of item['uid'] to ensure all connections point back to the original target_uid
+                                "network_profile_personal_uid": item['uid'], #using item['uid'] to get the uid of the connection
+                                "profile_personal_referred_by": item.get('profile_personal_referred_by'),
+                                "profile_personal_first_name": item.get('profile_personal_first_name'),
+                                "profile_personal_last_name": item.get('profile_personal_last_name'),
+                                "profile_personal_tag_line": item.get('profile_personal_tag_line'),
+                                "profile_personal_phone_number": item.get('profile_personal_phone_number'),
+                                "profile_personal_image": item.get('profile_personal_image'),
+                                "profile_personal_email_is_public": item.get('profile_personal_email_is_public'),
+                                "profile_personal_phone_number_is_public": item.get('profile_personal_phone_number_is_public'),
+                                "profile_personal_tag_line_is_public": item.get('profile_personal_tag_line_is_public'),
+                                "profile_personal_image_is_public": item.get('profile_personal_image_is_public'),
+                                "circle_relationship": item.get('circle_relationship'),
+                                "circle_date": item.get('circle_date'),
+                                "circle_event": item.get('circle_event'),
+                                "circle_note": item.get('circle_note'),
+                                "circle_geotag": item.get('circle_geotag'),
+                                "degree": curr_degree
+                            })
                         else:
-                            uid = item
-                            profile_personal_referred_by = None
-                            circle_relationship = None
-                            circle_date = None
-                            circle_event = None
-                            circle_note = None
-                            circle_geotag = None
-                        final_rows.append({
-                            "target_uid": target_uid,
-                            "network_profile_personal_uid": uid,
-                            "profile_personal_referred_by": profile_personal_referred_by,
-                            "circle_relationship": circle_relationship,
-                            "circle_date": circle_date,
-                            "circle_event": circle_event,
-                            "circle_note": circle_note,
-                            "circle_geotag": circle_geotag,
-                            "degree": curr_degree
-                        })
-
+                            #above if statement is false then appending only uid and everything else get the value None
+                            final_rows.append({
+                                "target_uid": target_uid,
+                                "network_profile_personal_uid": item,
+                                "profile_personal_referred_by": None,
+                                "circle_relationship": None,
+                                "circle_date": None,
+                                "circle_event": None,
+                                "circle_note": None,
+                                "circle_geotag": None,
+                                "degree": curr_degree
+                            })
         add_to_rows(store['descendants'])            # Degree: as is
         add_to_rows(store['ancestors'])              # Degree: as is
         add_to_rows(store['ancestors_down'], 1)      # Degree: ancestor level + 1
