@@ -25,8 +25,13 @@ class Feedback(Resource):
             
             # Validate required fields
             required_fields = [
-                'user_uid', 'page_name', 'feedback_text',
-                'question_1', 'question_2',
+                'user_uid', 
+                'page_name',
+                'first_name',
+                'last_name',
+                'feedback_text',
+                'question_1', 
+                'question_2',
                 'question_3'
             ]
             
@@ -37,102 +42,61 @@ class Feedback(Resource):
                         'code': 400
                     }, 400
             
-            # Validate ratings are between 1-5
-            ratings = [
-                data['question_1'],
-                data['question_2'],
-                data['question_3']
-            ]
-            
-            for rating in ratings:
-                if not isinstance(rating, int) or rating < 1 or rating > 5:
-                    return {
-                        'message': 'Ratings must be integers between 1 and 5',
-                        'code': 400
-                    }, 400
-            
-            # Call stored procedure
-            query = """
-                CALL every_circle.create_feedback(
-                    %s, %s, %s, %s, %s, %s, %s, %s
-                )
-            """
-            
-            params = [
-                data['user_uid'],
-                data.get('first_name', ''),
-                data.get('last_name', ''),
-                data['page_name'],
-                data['feedback_text'],
-                data['question_1'],
-                data['question_2'],
-                data['question_3']
-            ]
-            
-            print('Calling stored procedure with params:', params)
             
             with connect() as db:
-                response = db.execute(query, params)
-            
-            print('Stored procedure response:', response)
-            
-            return {
-                'message': 'Feedback submitted successfully',
-                'code': 200
-            }, 200
+                # 1️⃣ GET NEW FEEDBACK UID
+                uid_result = db.execute("CALL every_circle.new_feedback_uid()")
+                print("UID RESULT:", uid_result)
+
+                if not uid_result or 'result' not in uid_result or not uid_result['result']:
+                    return {
+                        'message': 'Failed to generate feedback UID',
+                        'code': 500
+                    }, 500
+
+                new_feedback_uid = uid_result["result"][0]["new_id"]
+                print("New feedback UID:", new_feedback_uid)
+
+                # 2️⃣ INSERT THE FEEDBACK ROW
+                insert_query = """
+                    INSERT INTO every_circle.feedback (
+                        feedback_uid, 
+                        feedback_user_uid,
+                        feedback_first_name,
+                        feedback_last_name,
+                        feedback_page_name,
+                        feedback_text,
+                        feedback_question_1,
+                        feedback_question_2,
+                        feedback_question_3
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                insert_params = [
+                    new_feedback_uid,
+                    data['user_uid'],
+                    data.get('first_name', ''),
+                    data.get('last_name', ''),
+                    data['page_name'],
+                    data['feedback_text'],
+                    data['question_1'],
+                    data['question_2'],
+                    data['question_3']
+                ]
+                
+                print('Inserting feedback with query:', insert_query)
+                print('Insert params:', insert_params)
+                
+                db.execute(insert_query, insert_params, 'post')
+                
+                
                 
         except Exception as e:
             print(f"Error submitting feedback: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {
                 'message': f'Error submitting feedback: {str(e)}',
                 'code': 500
             }, 500
     
-    def get(self):
-        """
-        Get feedback data (admin/analytics endpoint)
-        Optional query params:
-        - user_uid: Filter by user
-        - page_name: Filter by page
-        - limit: Number of results (default 100)
-        """
-        try:
-            user_uid = request.args.get('user_uid')
-            page_name = request.args.get('page_name')
-            limit = request.args.get('limit', 100, type=int)
-            
-            query = "SELECT * FROM every_circle.feedback WHERE 1=1"
-            params = []
-            
-            if user_uid:
-                query += " AND feedback_user_uid = %s"
-                params.append(user_uid)
-            
-            if page_name:
-                query += " AND feedback_page_name = %s"
-                params.append(page_name)
-            
-            query += " ORDER BY feedback_created_at DESC LIMIT %s"
-            params.append(limit)
-            
-            with connect() as db:
-                response = db.execute(query, params)
-            
-            if response and 'result' in response:
-                return {
-                    'feedback': response['result'],
-                    'count': len(response['result']),
-                    'code': 200
-                }, 200
-            else:
-                return {
-                    'message': 'No feedback found',
-                    'code': 404
-                }, 404
-                
-        except Exception as e:
-            print(f"Error fetching feedback: {str(e)}")
-            return {
-                'message': f'Error fetching feedback: {str(e)}',
-                'code': 500
-            }, 500
