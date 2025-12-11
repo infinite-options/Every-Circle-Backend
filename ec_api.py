@@ -341,7 +341,8 @@ else:
 def sendEmail(recipient, subject, body):
     with app.app_context():
         print("In sendEmail: ", recipient, subject, body)
-        sender="support@manifestmy.space"
+        # Use the configured default sender from environment variables
+        sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
         print("sender: ", sender)
         msg = Message(
             sender=sender,
@@ -349,10 +350,8 @@ def sendEmail(recipient, subject, body):
             subject=subject,
             body=body
         )
-        print("sender: ", sender)
-        # print("Email message: ", msg)
         mail.send(msg)
-        # print("email sent")
+        print("Email successfully sent from {sender} to {recipient}")
 
 # app.sendEmail = sendEmail
 
@@ -364,8 +363,17 @@ class SendEmail(Resource):
 
         # Check if each field in the payload is not null
         if all(field is not None for field in payload.values()):
-            sendEmail(payload["receiver"], payload["email_subject"], payload["email_body"])
-            return "Email Sent"
+            try:
+                sendEmail(payload["receiver"], payload["email_subject"], payload["email_body"])
+                return {
+                    "message": "Email Sent",
+                    "subject": payload["email_subject"]
+                }, 200
+            except Exception as e:
+                return {
+                    "message": "Failed to send email",
+                    "error": str(e)
+                }, 500
         else:
             return "Some fields are missing in the payload", 400
 
@@ -552,6 +560,8 @@ api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
+
+api.add_resource(SendEmail, "/sendEmail")
 
 class GooglePlacesInfo(Resource):
     def post(self):
