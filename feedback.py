@@ -88,9 +88,12 @@ class Feedback(Resource):
                 print('Insert params:', insert_params)
                 
                 db.execute(insert_query, insert_params, 'post')
-                
-                
-                
+
+                return {
+                    'message': 'Feedback submitted successfully',
+                    'code': 200
+                }, 200
+          
         except Exception as e:
             print(f"Error submitting feedback: {str(e)}")
             import traceback
