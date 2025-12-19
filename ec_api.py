@@ -47,6 +47,7 @@ from bounty_results import BountyResults
 from transaction_cost import TransactionCost
 from circles import Circles
 from feedback import Feedback
+from search_referral import SearchReferral
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -554,6 +555,7 @@ api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<strin
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
 api.add_resource(Feedback, '/api/feedback')
+api.add_resource(SearchReferral, '/api/search_referral')
 
 class GooglePlacesInfo(Resource):
     def post(self):
