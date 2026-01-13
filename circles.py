@@ -94,7 +94,9 @@ class Circles(Resource):
                 'circle_relationship': payload.get('circle_relationship'),
                 'circle_date': payload.get('circle_date'),
                 'circle_event': payload.get('circle_event'),
-                'circle_note': payload.get('circle_note')
+                'circle_note': payload.get('circle_note'),
+                'circle_geotag': payload.get('circle_geotag'),
+                'circle_introduced_by': payload.get('circle_introduced_by')
             }
             
             print(f"Prepared circle_data: {circle_data}")
@@ -181,7 +183,9 @@ class Circles(Resource):
                     'circle_relationship',
                     'circle_date',
                     'circle_event',
-                    'circle_note'
+                    'circle_note',
+                    'circle_geotag',
+                    'circle_introduced_by'
                 ]
                 
                 for field in updatable_fields:
