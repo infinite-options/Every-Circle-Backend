@@ -112,6 +112,15 @@ class BusinessInfo(Resource):
                     WHERE rating_business_id = "{business_uid}"
                 """
                 ratings_response = db.execute(ratings_query)
+                # Extract unique reviewer profile IDs from ratings
+                reviewer_profile_ids = []
+
+                if ratings_response.get('result'):
+                    reviewer_profile_ids = list({
+                        rating.get('rating_profile_id')
+                        for rating in ratings_response['result']
+                        if rating.get('rating_profile_id')
+                    })
 
                 # Query for business tags
                 tags_query = f"""
@@ -142,6 +151,7 @@ class BusinessInfo(Resource):
                     'social_links': links_response['result'] if 'result' in links_response else [],
                     'services': services_response['result'] if 'result' in services_response else [],
                     'ratings': ratings_response['result'] if 'result' in ratings_response else [],
+                    'reviewer_profile_ids': reviewer_profile_ids,
                     'tags': tags,
                     'code': 200,
                     'message': 'Business data retrieved successfully'

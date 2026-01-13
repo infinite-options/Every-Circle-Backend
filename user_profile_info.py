@@ -89,15 +89,15 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                        -- SELECT pb.*, b.business_name AS profile_business_name
-                                        -- FROM every_circle.profile_has_business pb
-                                        -- LEFT JOIN every_circle.business b ON b.business_uid = pb.profile_business_business_id
-                                        -- WHERE pb.profile_business_profile_personal_id = '{profile_id}'
-
-                                        -- SELECT * FROM every_circle.business
-                                        -- WHERE business_user_id = '100-000425';
-                                        SELECT business_uid, business_name FROM every_circle.business
-                                        WHERE business_user_id = '{user_id}';
+                                        SELECT 
+                                            b.business_uid, 
+                                            b.business_name,
+                                            bu.bu_uid,
+                                            bu.bu_role,
+                                            bu.bu_individual_business_is_public
+                                        FROM every_circle.business b
+                                        LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
+                                        WHERE bu.bu_user_id = '{user_id}';
                                     """
                     # print("business_info", business_info)
                     business_result = db.execute(business_info)
@@ -110,7 +110,7 @@ class UserProfileInfo(Resource):
                     return response, 200
                     
                 elif uid[:3] == "110":
-                    print("Profile UID Passed")
+                    print("Profile UID Passed", uid)
                     # This is a profile UID (profile_personal)
                     personal_info = db.select('every_circle.profile_personal', where={'profile_personal_uid': uid})
                     
@@ -177,10 +177,15 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                    SELECT *
-                                    FROM every_circle.business
-                                    LEFT JOIN every_circle.business_user ON business.business_uid = business_user.bu_business_id
-                                    WHERE business_user.bu_user_id = '{user_id}';
+                                    SELECT 
+                                        b.business_uid,
+                                        b.business_name,
+                                        bu.bu_uid,
+                                        bu.bu_role,
+                                        bu.bu_individual_business_is_public
+                                    FROM every_circle.business b
+                                    LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
+                                    WHERE bu.bu_user_id = '{user_id}';
                                     """
                     print("business_info", business_info)
                     business_result = db.execute(business_info)
@@ -304,7 +309,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
-                    'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public'
+                    'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public'
                 ]
                 
                 for field in personal_info_fields:
@@ -813,7 +818,8 @@ class UserProfileInfo(Resource):
                     'profile_personal_experience_is_public', 
                     'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 
-                    'profile_personal_wishes_is_public'
+                    'profile_personal_wishes_is_public',
+                    'profile_personal_business_is_public'
                 ]
                 
                 for field in personal_info_fields:
@@ -1281,87 +1287,111 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         businesses_data = json.loads(payload.pop('business_info'))
+                        print(f"Parsed businesses_data: {businesses_data}")
                         businesses_uids = []
+                        
+                        # Get user_id from profile
+                        profile_query = db.select('every_circle.profile_personal', 
+                                                where={'profile_personal_uid': profile_uid})
+                        user_id = profile_query['result'][0]['profile_personal_user_id'] if profile_query['result'] else None
+                        print(f"user_id from profile: {user_id}")
+                        
+                        if not user_id:
+                            print("Error: Could not find user_id for profile")
+                            raise Exception("User ID not found for profile")
                         
                         # Process each business entry
                         for business_data in businesses_data:
-                            print("business_data", business_data)
-                            business_info = {}
+                            print(f"=== Processing business_data: {business_data}")
                             
-                            # Check if this is an existing business (has UID)
+                            # The profile_business_uid in the payload is actually the business_uid (200-xxx)
+                            # We need to look it up in business_user table
                             if 'profile_business_uid' in business_data and business_data['profile_business_uid']:
-
-                                print("In existing business entry", business_data['profile_business_uid'])
-                                # Get the existing business UID
-                                business_uid = business_data.pop('profile_business_uid')
+                                business_uid = business_data['profile_business_uid']  # This is actually business_uid
+                                print(f"Found profile_business_uid (actually business_uid): {business_uid}")
                                 
-                                # Check if business exists                                      
-                                business_exists_query = db.select('every_circle.profile_has_business', 
-                                                                 where={'profile_business_uid': business_uid})
+                                # Check if business_user entry exists for this user and business
+                                print(f"Looking up in business_user: bu_user_id={user_id}, bu_business_id={business_uid}")
+                                bu_check = db.select('every_circle.business_user',
+                                                    where={'bu_user_id': user_id, 'bu_business_id': business_uid})
                                 
-                                print("here 0", business_exists_query)
-                                if not business_exists_query['result']:
-                                    # Skip this one if it doesn't exist
-                                    print(f"Warning: Business with UID {business_uid} not found")                           
+                                print(f"bu_check result: {bu_check}")
+                                
+                                if not bu_check['result']:
+                                    print(f"WARNING: No business_user entry found for user {user_id} and business {business_uid}")
+                                    print("Skipping this business...")
                                     continue
                                 
-                                # Map fields from the business data
-                                print("here 1")
-                                if 'role' in business_data:
-                                    business_info['profile_business_role'] = business_data['role']
-                                print("here 2")
-                                if 'isPublic' in business_data:
-                                    business_info['profile_business_is_visible'] = business_data['isPublic']
-                                print("here 3")
-                                if 'isApproved' in business_data and business_data['isApproved'] == "1":
-                                    business_info['profile_business_approved'] = business_data['isApproved']
-                                    business_info['profile_business_approver_id'] = business_data['approverId']
-                                print("here 4")
-                                # Update the existing business
-                                if business_info:
-                                    db.update('every_circle.business', 
-                                             {'business_uid': business_uid}, business_info)
+                                # Get the bu_uid
+                                bu_uid = bu_check['result'][0]['bu_uid']
+                                print(f"Found bu_uid: {bu_uid}")
                                 
-                                businesses_uids.append(business_uid)
+                                # Prepare update data for business_user table
+                                business_user_info = {}
+                                
+                                if 'profile_business_role' in business_data:
+                                    print(f"Found profile_business_role: {business_data['profile_business_role']}")
+                                    business_user_info['bu_role'] = business_data['profile_business_role']
+                                elif 'role' in business_data:
+                                    print(f"Found role: {business_data['role']}")
+                                    business_user_info['bu_role'] = business_data['role']
+                                
+                                if 'individualIsPublic' in business_data:
+                                    print(f"Found individualIsPublic: {business_data['individualIsPublic']} (type: {type(business_data['individualIsPublic'])})")
+                                    business_user_info['bu_individual_business_is_public'] = business_data['individualIsPublic']
+                                else:
+                                    print("WARNING: individualIsPublic NOT found in business_data")
+                                
+                                # Update the business_user entry
+                                if business_user_info:
+                                    print(f"Updating business_user {bu_uid} with data: {business_user_info}")
+                                    update_result = db.update('every_circle.business_user',
+                                                            {'bu_uid': bu_uid},
+                                                            business_user_info)
+                                    print(f"Update result: {update_result}")
+                                else:
+                                    print("WARNING: No data to update for business_user")
+                                
+                                businesses_uids.append(bu_uid)
+                                print(f"Added bu_uid {bu_uid} to businesses_uids list")
                             else:
-                                # This is a new business entry
-
-                                # Create New Business
-                                new_business_info = {}
-                                new_business_info['business_uid'] = db.call(procedure='new_business_uid')['result'][0]['new_id']
-                                if 'name' in business_data:
-                                    new_business_info['business_name'] = business_data['name']
-                                db.insert('every_circle.business', new_business_info)
-
-
-                                # Add Business to Profile
-                                new_business_uid = db.call(procedure='new_profile_business_uid')['result'][0]['new_id']
-                                print("new_business_uid", new_business_uid)
-                                business_info['profile_business_uid'] = new_business_uid
-                                business_info['profile_business_profile_personal_id'] = profile_uid
-
-                                                                
-                                # Map fields from the business data
-                                business_info['profile_business_business_id'] = new_business_info['business_uid']
-                                if 'role' in business_data:
-                                    business_info['profile_business_role'] = business_data['role']
-                                print("here 2")
-                                if 'isPublic' in business_data:
-                                    business_info['profile_business_is_visible'] = business_data['isPublic']
-                                print("here 3")
-                                if 'isApproved' in business_data and business_data['isApproved'] == "1":
-                                    business_info['profile_business_approved'] = business_data['isApproved']
-                                    business_info['profile_business_approver_id'] = business_data['approverId']
+                                print("WARNING: profile_business_uid not found or empty in business_data")
+                                # This is a new business entry - create business_user relationship
+                                print("Attempting to create new business_user entry")
                                 
-                                # Insert the business record
-                                print("Inserting business record", business_info)
-                                db.insert('every_circle.profile_has_business', business_info)
-                                businesses_uids.append(new_business_uid)
+                                if 'business_uid' not in business_data or not business_data['business_uid']:
+                                    print("ERROR: No business_uid provided for new entry, skipping...")
+                                    continue
+                                
+                                actual_business_uid = business_data['business_uid']
+                                print(f"Creating new entry for business_uid: {actual_business_uid}")
+                                
+                                # Create business_user entry
+                                new_bu_uid = db.call(procedure='new_business_user_uid')['result'][0]['new_id']
+                                bu_info = {
+                                    'bu_uid': new_bu_uid,
+                                    'bu_user_id': user_id,
+                                    'bu_business_id': actual_business_uid,
+                                    'bu_individual_business_is_public': business_data.get('individualIsPublic', False)
+                                }
+                                
+                                if 'profile_business_role' in business_data:
+                                    bu_info['bu_role'] = business_data['profile_business_role']
+                                elif 'role' in business_data:
+                                    bu_info['bu_role'] = business_data['role']
+                                
+                                print(f"Inserting new business_user: {bu_info}")
+                                insert_result = db.insert('every_circle.business_user', bu_info)
+                                print(f"Insert result: {insert_result}")
+                                businesses_uids.append(new_bu_uid)
                         
-                        updated_uids['business_uids'] = businesses_uids
+                        print(f"Final businesses_uids list: {businesses_uids}")
+                        updated_uids['business_user_uids'] = businesses_uids
                     except Exception as e:
-                        print(f"Error processing businesses JSON in PUT: {str(e)}")
-                
+                        print(f"ERROR processing businesses JSON in PUT: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+
                 # Prepare the response with both updated and deleted UIDs
             response['updated_uids'] = updated_uids
             if deleted_uids:

@@ -64,7 +64,8 @@ class ProfileWishInfo(Resource):
                         profile_personal_short_bio_is_public, profile_personal_resume_is_public, 
                         profile_personal_banner_ads_bounty, profile_personal_allow_banner_ads, 
                         profile_personal_notification_preference, profile_personal_location_preference, 
-                        profile_personal_last_updated_at, profile_personal_resume, profile_personal_path
+                        profile_personal_last_updated_at, profile_personal_resume, profile_personal_path,
+                        profile_personal_business_is_public
                     FROM every_circle.profile_wish
                     LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
                     LEFT JOIN every_circle.profile_personal ON wr_responder_id = profile_personal_uid
