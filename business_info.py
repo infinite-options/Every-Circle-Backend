@@ -76,7 +76,8 @@ class BusinessInfo(Resource):
                             'profile_id': bu_record.get('profile_id'),
                             'first_name': bu_record.get('first_name'),
                             'last_name': bu_record.get('last_name'),
-                            'profile_photo': bu_record.get('profile_photo')
+                            'profile_photo': bu_record.get('profile_photo'),
+                            'bu_individual_business_is_public': bu_record.get('bu_individual_business_is_public', 0)
                         })
                 
                 category_query = f"""
