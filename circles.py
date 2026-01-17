@@ -96,6 +96,8 @@ class Circles(Resource):
                 'circle_event': payload.get('circle_event'),
                 'circle_note': payload.get('circle_note'),
                 'circle_geotag': payload.get('circle_geotag'),
+                'circle_city': payload.get('circle_city'),
+                'circle_state': payload.get('circle_state'),
                 'circle_introduced_by': payload.get('circle_introduced_by')
             }
             
