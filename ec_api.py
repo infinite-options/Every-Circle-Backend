@@ -38,7 +38,7 @@ from tag_generator_api import TagGeneratorAPI
 from sambanovasearch import AIDirectBusinessSearch
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
-from transactions import Transactions
+from transactions import Transactions, SellerTransactions
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -546,6 +546,7 @@ api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:profile_id>')
+api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
