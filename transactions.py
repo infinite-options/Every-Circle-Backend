@@ -408,5 +408,58 @@ class Transactions(Resource):
             response['message'] = f'An error occurred: {str(e)}'
             response['code'] = 500
             return response, 500
-
+        
+class SellerTransactions(Resource):
     
+    def get(self, profile_id=None):
+        print(f"In SellerTransactions GET with profile_id: {profile_id}")
+        response = {}
+        
+        try:
+            if not profile_id:
+                response['message'] = 'profile_id is required'
+                response['code'] = 400
+                return response, 400
+            
+            with connect() as db:
+                # Execute query to get transactions
+                query = """
+                    SELECT 
+                        t.transaction_uid, 
+                        t.transaction_datetime, 
+                        t.transaction_total, 
+                        t.transaction_business_id,
+                        t.transaction_profile_id,
+                        ti.ti_uid,
+                        ti.ti_bs_id,
+                        ti.ti_bs_qty,
+                        ti.ti_bs_cost
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti ON ti.ti_transaction_id = t.transaction_uid 
+                    WHERE t.transaction_business_id = %s
+                    ORDER BY t.transaction_datetime DESC
+                """
+                
+                print(f"Executing seller query for profile_id: {profile_id}")
+                result = db.execute(query, (profile_id,))
+                print(f"Seller query result: {result}")
+                
+                if result.get('code') == 200:
+                    response['message'] = 'Seller transactions retrieved successfully'
+                    response['code'] = 200
+                    response['data'] = result.get('result', [])
+                    response['count'] = len(result.get('result', []))
+                else:
+                    response['message'] = 'Query execution failed'
+                    response['code'] = result.get('code', 500)
+                    response['error'] = result.get('error', 'Unknown error')
+                    return response, response['code']
+                
+                return response, 200
+                
+        except Exception as e:
+            print(f"Error in SellerTransactions GET: {str(e)}")
+            print(traceback.format_exc())
+            response['message'] = f'An error occurred: {str(e)}'
+            response['code'] = 500
+            return response, 500
