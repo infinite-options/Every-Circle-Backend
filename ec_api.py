@@ -43,7 +43,7 @@ from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
-from bounty_results import BountyResults
+from bounty_results import BountyResults, BusinessBountyResults
 from transaction_cost import TransactionCost
 from circles import Circles
 from feedback import Feedback
@@ -554,6 +554,7 @@ api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
 api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
+api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')

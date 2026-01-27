@@ -56,3 +56,54 @@ class BountyResults(Resource):
             response['code'] = 500
             response['message'] = f'An error occurred: {str(e)}'
             return response, 500 
+        
+class BusinessBountyResults(Resource):
+    def get(self, business_id):
+        print(f"In BusinessBountyResults GET for business_id: {business_id}")
+        response = {}
+        
+        try:
+            with connect() as db:
+                # Query to get bounty results for transactions where this business was the seller
+                bounty_query = """
+                    SELECT 
+                        transaction_uid,
+                        transaction_datetime,
+                        SUM(tb_amount) AS bounty_earned,
+                        transaction_profile_id,
+                        transaction_business_id
+                    FROM (
+                        SELECT *
+                        FROM every_circle.transactions_bounty
+                        LEFT JOIN every_circle.transactions_items ON tb_ti_id = ti_uid
+                        LEFT JOIN every_circle.transactions ON ti_transaction_id = transaction_uid
+                        WHERE transaction_business_id = %s
+                    ) AS t
+                    GROUP BY t.transaction_uid, t.transaction_datetime, t.transaction_profile_id, t.transaction_business_id
+                    ORDER BY t.transaction_datetime DESC
+                """
+                
+                bounty_response = db.execute(bounty_query, (business_id,))
+                
+                if bounty_response['code'] == 200:
+                    response['code'] = 200
+                    response['message'] = 'Business bounty results retrieved successfully'
+                    response['data'] = bounty_response['result']
+                    response['total_bounties'] = len(bounty_response['result'])
+                    
+                    # Calculate total bounty paid out by business
+                    total_bounty = sum(float(bounty['bounty_earned']) for bounty in bounty_response['result'])
+                    response['total_bounty_earned'] = total_bounty
+                    
+                    return response, 200
+                else:
+                    response['code'] = 500
+                    response['message'] = 'Error retrieving business bounty results'
+                    return response, 500
+                    
+        except Exception as e:
+            print(f"Error in BusinessBountyResults GET: {str(e)}")
+            print(traceback.format_exc())
+            response['code'] = 500
+            response['message'] = f'An error occurred: {str(e)}'
+            return response, 500
