@@ -65,24 +65,43 @@ class BusinessBountyResults(Resource):
         try:
             with connect() as db:
                 # Query to get bounty results for transactions where this business was the seller
+                
                 bounty_query = """
                     SELECT 
-                        transaction_uid,
-                        transaction_datetime,
-                        SUM(tb_amount) AS bounty_earned,
-                        transaction_profile_id,
-                        transaction_business_id
+                        t.transaction_uid,
+                        t.transaction_datetime,
+                        t.transaction_taxes,
+                        t.transaction_profile_id,
+                        t.transaction_business_id,
+                        t.bs_uid,
+                        t.bs_service_name,
+                        t.bs_cost,
+                        t.bs_bounty,
+                        t.ti_bs_qty,
+                        SUM(t.tb_amount) AS bounty_earned,
+                        (t.bs_bounty * t.ti_bs_qty) AS bounty_paid
                     FROM (
                         SELECT *
                         FROM every_circle.transactions_bounty
                         LEFT JOIN every_circle.transactions_items ON tb_ti_id = ti_uid
                         LEFT JOIN every_circle.transactions ON ti_transaction_id = transaction_uid
+                        LEFT JOIN every_circle.business_services ON ti_bs_id = bs_uid
                         WHERE transaction_business_id = %s
                     ) AS t
-                    GROUP BY t.transaction_uid, t.transaction_datetime, t.transaction_profile_id, t.transaction_business_id
+                    GROUP BY 
+                        t.transaction_uid, 
+                        t.transaction_datetime, 
+                        t.transaction_taxes,
+                        t.transaction_profile_id, 
+                        t.transaction_business_id,
+                        t.bs_uid,
+                        t.bs_service_name,
+                        t.bs_cost,
+                        t.bs_bounty,
+                        t.ti_bs_qty
                     ORDER BY t.transaction_datetime DESC
                 """
-                
+
                 bounty_response = db.execute(bounty_query, (business_id,))
                 
                 if bounty_response['code'] == 200:

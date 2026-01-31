@@ -428,6 +428,7 @@ class SellerTransactions(Resource):
                         t.transaction_uid, 
                         t.transaction_datetime, 
                         t.transaction_total, 
+                        t.transaction_taxes,
                         t.transaction_business_id,
                         t.transaction_profile_id,
                         ti.ti_uid,
