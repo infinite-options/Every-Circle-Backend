@@ -488,6 +488,8 @@ class UserProfileInfo(Resource):
                                 wish_info['profile_wish_description'] = wish_data['description']
                             if 'bounty' in wish_data:
                                 wish_info['profile_wish_bounty'] = wish_data['bounty']
+                            if 'cost' in wish_data:  
+                                wish_info['profile_wish_cost'] = wish_data['cost']
                             
                             # Insert the wish record
                             db.insert('every_circle.profile_wish', wish_info)
@@ -1247,8 +1249,11 @@ class UserProfileInfo(Resource):
                                     wish_info['profile_wish_description'] = wish_data['details']
                                 if 'amount' in wish_data:
                                     wish_info['profile_wish_bounty'] = wish_data['amount']
+                                if 'cost' in wish_data: 
+                                    wish_info['profile_wish_cost'] = wish_data['cost']
                                 if 'isPublic' in exp_data:
                                     wish_info['profile_wish_is_public'] = wish_data['isPublic']
+                                
                                 
                                 # Update the existing wish
                                 if wish_info:
@@ -1270,6 +1275,8 @@ class UserProfileInfo(Resource):
                                     wish_info['profile_wish_description'] = wish_data['details']
                                 if 'amount' in wish_data:
                                     wish_info['profile_wish_bounty'] = wish_data['amount']
+                                if 'cost' in wish_data:  
+                                    wish_info['profile_wish_cost'] = wish_data['cost']
                                 if 'isPublic' in exp_data:
                                     wish_info['profile_wish_is_public'] = wish_data['isPublic']
                                 
