@@ -1251,7 +1251,7 @@ class UserProfileInfo(Resource):
                                     wish_info['profile_wish_bounty'] = wish_data['amount']
                                 if 'cost' in wish_data: 
                                     wish_info['profile_wish_cost'] = wish_data['cost']
-                                if 'isPublic' in exp_data:
+                                if 'isPublic' in wish_data:
                                     wish_info['profile_wish_is_public'] = wish_data['isPublic']
                                 
                                 
