@@ -81,9 +81,15 @@ class UserProfileInfo(Resource):
                     response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
                     # Get ratings info - returning all ratings entries for this profile
-                    ratings_info = db.select('every_circle.ratings', 
-                                         where={'rating_profile_id': profile_id})
-                    response['ratings_info'] = ratings_info['result'] if ratings_info['result'] else []
+                    # Get ratings info with business name
+                    ratings_query = f"""
+                        SELECT r.*, b.business_name
+                        FROM every_circle.ratings r
+                        LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
+                        WHERE r.rating_profile_id = '{profile_id}'
+                    """
+                    ratings_result = db.execute(ratings_query)
+                    response['ratings_info'] = ratings_result['result'] if ratings_result['result'] else []
 
                     # Get business info - returning all business entries for this profile
                     # business_info = db.select('every_circle.profile_has_business',
@@ -92,6 +98,11 @@ class UserProfileInfo(Resource):
                                         SELECT 
                                             b.business_uid, 
                                             b.business_name,
+                                            b.phone_number,
+                                            b.business_city,
+                                            b.business_state,
+                                            b.business_country,
+                                            b.business_zip_code,
                                             bu.bu_uid,
                                             bu.bu_role,
                                             bu.bu_individual_business_is_public
@@ -169,9 +180,15 @@ class UserProfileInfo(Resource):
                     response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
                     # Get ratings info - returning all ratings entries for this profile
-                    ratings_info = db.select('every_circle.ratings', 
-                                         where={'rating_profile_id': profile_id})
-                    response['ratings_info'] = ratings_info['result'] if ratings_info['result'] else []
+                    # Get ratings info with business name
+                    ratings_query = f"""
+                        SELECT r.*, b.business_name
+                        FROM every_circle.ratings r
+                        LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
+                        WHERE r.rating_profile_id = '{profile_id}'
+                    """
+                    ratings_result = db.execute(ratings_query)
+                    response['ratings_info'] = ratings_result['result'] if ratings_result['result'] else []
 
                     # Get business info - returning all business entries for this profile
                     # business_info = db.select('every_circle.profile_has_business',
