@@ -83,7 +83,7 @@ class UserProfileInfo(Resource):
                     # Get ratings info - returning all ratings entries for this profile
                     # Get ratings info with business name
                     ratings_query = f"""
-                        SELECT r.*, b.business_name
+                        SELECT r.*, b.business_name, b.business_phone_number, b.business_city, b.business_state
                         FROM every_circle.ratings r
                         LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
                         WHERE r.rating_profile_id = '{profile_id}'
@@ -95,23 +95,26 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                        SELECT 
-                                            b.business_uid, 
-                                            b.business_name,
-                                            b.phone_number,
-                                            b.business_city,
-                                            b.business_state,
-                                            b.business_country,
-                                            b.business_zip_code,
-                                            bu.bu_uid,
-                                            bu.bu_role,
-                                            bu.bu_individual_business_is_public
-                                        FROM every_circle.business b
-                                        LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                                        WHERE bu.bu_user_id = '{user_id}';
-                                    """
-                    # print("business_info", business_info)
+                        SELECT 
+                            b.business_uid,
+                            b.business_name,
+                            b.business_phone_number,
+                            b.business_phone_number_is_public,
+                            b.business_address_line_1,
+                            b.business_city,
+                            b.business_state,
+                            b.business_country,
+                            b.business_zip_code,
+                            bu.bu_uid,
+                            bu.bu_role,
+                            bu.bu_individual_business_is_public
+                        FROM every_circle.business b
+                        LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
+                        WHERE bu.bu_user_id = '{user_id}';
+                    """
+                    print("business_info query:", business_info)
                     business_result = db.execute(business_info)
+                    print("business_result:", business_result)
                     response['business_info'] = business_result['result'] if business_result['result'] else []
                     
                     # Add user_role from users table
@@ -182,7 +185,7 @@ class UserProfileInfo(Resource):
                     # Get ratings info - returning all ratings entries for this profile
                     # Get ratings info with business name
                     ratings_query = f"""
-                        SELECT r.*, b.business_name
+                        SELECT r.*, b.business_name, b.business_phone_number, b.business_city, b.business_state
                         FROM every_circle.ratings r
                         LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
                         WHERE r.rating_profile_id = '{profile_id}'
@@ -194,18 +197,26 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                                    SELECT 
-                                        b.business_uid,
-                                        b.business_name,
-                                        bu.bu_uid,
-                                        bu.bu_role,
-                                        bu.bu_individual_business_is_public
-                                    FROM every_circle.business b
-                                    LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                                    WHERE bu.bu_user_id = '{user_id}';
-                                    """
-                    print("business_info", business_info)
+                            SELECT 
+                                b.business_uid,
+                                b.business_name,
+                                b.business_phone_number,
+                                b.business_address_line_1,
+                                b.business_phone_number_is_public,
+                                b.business_city,
+                                b.business_state,
+                                b.business_country,
+                                b.business_zip_code,
+                                bu.bu_uid,
+                                bu.bu_role,
+                                bu.bu_individual_business_is_public
+                            FROM every_circle.business b
+                            LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
+                            WHERE bu.bu_user_id = '{user_id}';
+                        """
+                    print("business_info query:", business_info)
                     business_result = db.execute(business_info)
+                    print("business_result:", business_result)
                     response['business_info'] = business_result['result'] if business_result['result'] else []
 
                     print("4")
