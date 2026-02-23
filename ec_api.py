@@ -20,22 +20,16 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from user_profile import Profile
 from business import Business, Business_v2, Businesses
 from business_v3 import Business_v3
-from ratings import Ratings, Ratings_v2
-from ratings_v3 import Ratings_v3
-from search import Search, Search_v2
+from ratings import Ratings
 from lists import Lists
 from charges import Charges
 from business_budget import Business_Budget
 from business_revenue import BusinessRevenue
-from feed import Feed
 from category_list import CategoryList
 from chatbot import ChatbotAPI
-from user_connections import Connections
 from tag_generator_api import TagGeneratorAPI
-from sambanovasearch import AIDirectBusinessSearch
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
 from transactions import Transactions, SellerTransactions
@@ -461,7 +455,7 @@ class Refer(Resource):
         
         try:
             with connect() as db:
-                profile_exists_query = db.select('every_circle.profile', where={'profile_uid': payload['profile_uid']})
+                profile_exists_query = db.select('every_circle.profile_personal', where={'profile_personal_uid': payload['profile_uid']})
                 if not profile_exists_query['result']:
                     response['message'] = 'User does not exist'
                     response['code'] = 404
@@ -522,27 +516,19 @@ class Refer(Resource):
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
-api.add_resource(Profile, "/profile", "/profile/<string:uid>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
 api.add_resource(Business_v2, "/api/v2/business", "/api/v2/business/<string:uid>")
 api.add_resource(Businesses, "/businesses")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
-api.add_resource(Ratings_v2, "/api/v2/ratings", "/api/v2/ratings/<string:uid>")
-api.add_resource(Search, "/search/<string:profile_id>")
-api.add_resource(Search_v2, "/api/v2/search/<string:profile_id>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
 api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
-api.add_resource(Feed, "/feed/<string:profile_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
-api.add_resource(Connections, '/api/v1/connections/<string:profile_id>')
 api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
 api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
-api.add_resource(Ratings_v3, '/api/v3/ratings_v3', '/api/v3/ratings_v3/<string:uid>')
-api.add_resource(AIDirectBusinessSearch, '/api/v1/aidirectbusinesssearch/<string:profile_id>')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:profile_id>')

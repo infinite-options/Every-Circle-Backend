@@ -270,11 +270,13 @@ def processImage(key, payload):
             
             if 'delete_business_images' in payload and payload['delete_business_images'] not in {None, '', 'null'}:
                 for image in json.loads(payload.pop('delete_business_images')):
-                    delete_key = image.split(f'{bucket}/', 1)[1]
-                    # print("Delete key", delete_key)
-                    deleteImage(delete_key)
+                    # Only delete from S3 if this is an S3 URL; otherwise just remove from list (e.g. Google Place photo URLs)
+                    if f'{bucket}/' in image:
+                        delete_key = image.split(f'{bucket}/', 1)[1]
+                        deleteImage(delete_key)
+                    if image in business_images:
+                        business_images.remove(image)
                     print("\nimage", image, type(image))
-                    business_images.remove(image)
                     print(business_images)
             
             i = 0
