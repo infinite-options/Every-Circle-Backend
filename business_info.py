@@ -1,6 +1,7 @@
 from flask_restful import Resource
 from flask import request
 from datetime import datetime
+from urllib.parse import urlparse
 import ast
 import traceback
 import json
@@ -692,13 +693,32 @@ class BusinessInfo(Resource):
         }
         db.insert('every_circle.business_category', category_payload)
     
+    def _s3_key_from_url(self, url, bucket):
+        """Extract S3 object key from URL. Supports path-style and virtual-hosted-style URLs."""
+        if not url or not isinstance(url, str) or '[' in url or '.jpg"]' in url or url.strip().startswith('['):
+            return None
+        try:
+            parsed = urlparse(url)
+            path = (parsed.path or '').strip().lstrip('/')
+            if not path:
+                return None
+            # Path-style: https://s3-us-west-1.amazonaws.com/bucket/key/path -> path is "bucket/key/path"
+            if path.startswith(bucket + '/'):
+                return path[len(bucket) + 1:]
+            # Virtual-hosted: https://bucket.s3.region.amazonaws.com/key/path -> path is "key/path"
+            return path
+        except Exception:
+            return None
+
     def _process_business_profile_image(self, db, business_uid, payload, is_create=False):
         """Handle single business profile image: delete current from S3 if replaced/removed, upload new if provided.
-        Sets payload['business_profile_img'] and leaves payload['business_profile_img_is_public'] as-is (0/1)."""
+        Sets payload['business_profile_img'] to the full S3 URL (or None). Never stores a filename or JSON array."""
         bucket = os.getenv('BUCKET_NAME')
         if not bucket:
             return
-        has_new_file = 'business_profile_img' in request.files
+        # Accept profile image from business_profile_img (preferred) or business_img_0 (fallback)
+        file = request.files.get('business_profile_img') or request.files.get('business_img_0')
+        has_new_file = file is not None and getattr(file, 'filename', None)
         has_delete = 'delete_business_profile_img' in payload and payload.get('delete_business_profile_img') not in (None, '', 'null')
         if not has_new_file and not has_delete:
             return
@@ -709,31 +729,28 @@ class BusinessInfo(Resource):
             if row.get('result') and row['result'][0].get('business_profile_img'):
                 current_url = row['result'][0]['business_profile_img']
 
-        if has_delete:
-            to_remove = payload.pop('delete_business_profile_img')
-            if to_remove and f'{bucket}/' in to_remove:
+        def delete_s3_if_valid(url):
+            key = self._s3_key_from_url(url, bucket)
+            if key:
                 try:
-                    delete_key = to_remove.split(f'{bucket}/', 1)[1]
-                    deleteImage(delete_key)
+                    deleteImage(key)
                 except Exception as e:
                     print(f"Error deleting business_profile_img from S3: {e}")
+
+        if has_delete:
+            to_remove = payload.pop('delete_business_profile_img')
+            delete_s3_if_valid(to_remove)
             payload['business_profile_img'] = None
-        elif has_new_file and current_url and f'{bucket}/' in current_url:
-            try:
-                delete_key = current_url.split(f'{bucket}/', 1)[1]
-                deleteImage(delete_key)
-            except Exception as e:
-                print(f"Error deleting previous business_profile_img from S3: {e}")
+        elif has_new_file and current_url:
+            delete_s3_if_valid(current_url)
             payload['business_profile_img'] = None
 
-        if has_new_file:
-            file = request.files.get('business_profile_img')
-            if file and file.filename:
-                ts = datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
-                image_key = f'business_profile/{business_uid}/business_profile_img_{ts}'
-                url = uploadImage(file, image_key, '')
-                if url:
-                    payload['business_profile_img'] = url
+        if has_new_file and file and getattr(file, 'filename', None):
+            ts = datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+            image_key = f'business_profile/{business_uid}/business_profile_img_{ts}'
+            url = uploadImage(file, image_key, '')
+            if url:
+                payload['business_profile_img'] = url
 
     def _add_social_links(self, db, social_links_str, business_uid):
         try:
