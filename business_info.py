@@ -260,6 +260,8 @@ class BusinessInfo(Resource):
                     images = processImage(key, payload)
                     payload['business_images_url'] = json.dumps(images)
 
+                # Profile image: only set from uploaded file (S3 URL), never from form string
+                payload.pop('business_profile_img', None)
                 self._process_business_profile_image(db, new_business_uid, payload, is_create=True)
 
                 # print("Insert Payload: ", payload)
@@ -581,6 +583,8 @@ class BusinessInfo(Resource):
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
 
+                # Profile image: only set from uploaded file (S3 URL) or explicit delete, never from form string
+                payload.pop('business_profile_img', None)
                 self._process_business_profile_image(db, business_uid, payload, is_create=False)
                 
                 # List of valid business table columns
