@@ -260,6 +260,8 @@ class BusinessInfo(Resource):
                     images = processImage(key, payload)
                     payload['business_images_url'] = json.dumps(images)
 
+                self._process_business_profile_image(db, new_business_uid, payload, is_create=True)
+
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert('every_circle.business', payload)
                 # print("insert_response: ", insert_response)
@@ -578,6 +580,8 @@ class BusinessInfo(Resource):
                     images = processImage(key_personal, payload)
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
+
+                self._process_business_profile_image(db, business_uid, payload, is_create=False)
                 
                 # List of valid business table columns
                 valid_columns = [
@@ -585,7 +589,8 @@ class BusinessInfo(Resource):
                     'business_city', 'business_state', 'business_country', 'business_zip_code',
                     'business_phone_number', 'business_email_id', 'business_category_id',
                     'business_short_bio', 'business_tag_line', 'business_ein_number',
-                    'business_website', 'business_images_url', 'business_email_id_is_public',
+                    'business_website', 'business_images_url', 'business_profile_img',
+                    'business_profile_img_is_public', 'business_email_id_is_public',
                     'business_phone_number_is_public', 'business_tag_line_is_public',
                     'business_short_bio_is_public', 'business_google_id', 'business_latitude',
                     'business_longitude', 'business_price_level', 'business_google_rating',
@@ -683,6 +688,49 @@ class BusinessInfo(Resource):
         }
         db.insert('every_circle.business_category', category_payload)
     
+    def _process_business_profile_image(self, db, business_uid, payload, is_create=False):
+        """Handle single business profile image: delete current from S3 if replaced/removed, upload new if provided.
+        Sets payload['business_profile_img'] and leaves payload['business_profile_img_is_public'] as-is (0/1)."""
+        bucket = os.getenv('BUCKET_NAME')
+        if not bucket:
+            return
+        has_new_file = 'business_profile_img' in request.files
+        has_delete = 'delete_business_profile_img' in payload and payload.get('delete_business_profile_img') not in (None, '', 'null')
+        if not has_new_file and not has_delete:
+            return
+
+        current_url = None
+        if not is_create:
+            row = db.select('every_circle.business', where={'business_uid': business_uid})
+            if row.get('result') and row['result'][0].get('business_profile_img'):
+                current_url = row['result'][0]['business_profile_img']
+
+        if has_delete:
+            to_remove = payload.pop('delete_business_profile_img')
+            if to_remove and f'{bucket}/' in to_remove:
+                try:
+                    delete_key = to_remove.split(f'{bucket}/', 1)[1]
+                    deleteImage(delete_key)
+                except Exception as e:
+                    print(f"Error deleting business_profile_img from S3: {e}")
+            payload['business_profile_img'] = None
+        elif has_new_file and current_url and f'{bucket}/' in current_url:
+            try:
+                delete_key = current_url.split(f'{bucket}/', 1)[1]
+                deleteImage(delete_key)
+            except Exception as e:
+                print(f"Error deleting previous business_profile_img from S3: {e}")
+            payload['business_profile_img'] = None
+
+        if has_new_file:
+            file = request.files.get('business_profile_img')
+            if file and file.filename:
+                ts = datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+                image_key = f'business_profile/{business_uid}/business_profile_img_{ts}'
+                url = uploadImage(file, image_key, '')
+                if url:
+                    payload['business_profile_img'] = url
+
     def _add_social_links(self, db, social_links_str, business_uid):
         try:
             social_links = ast.literal_eval(social_links_str)
