@@ -350,8 +350,10 @@ class UserProfileInfo(Resource):
                     payload_images['profile_image'] = request.files['profile_image']
                     if 'delete_profile_image' in request.files:
                         payload_images['delete_profile_image'] = request.files['delete_profile_image']
+                    print("[PERSONAL PROFILE IMAGE] POST - request.files keys=%s, sending to processImage" % (list(request.files.keys()) if request.files else []))
                     key = {'profile_personal_uid': new_profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
+                    print("[PERSONAL PROFILE IMAGE] POST - result (profile_personal_image)=%s" % (personal_info.get('profile_personal_image')))
                 
                 # Set last updated timestamp
                 personal_info['profile_personal_last_updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -874,8 +876,10 @@ class UserProfileInfo(Resource):
                         payload_images['profile_image'] = request.files['profile_image']
                     if 'delete_profile_image' in payload:
                         payload_images['delete_profile_image'] = payload['delete_profile_image']
+                    print("[PERSONAL PROFILE IMAGE] PUT - sending to processImage: payload_images keys=%s" % (list(payload_images.keys())))
                     # key = {'profile_personal_uid': profile_uid}
                     personal_info['profile_personal_image'] = processImage(key, payload_images)
+                    print("[PERSONAL PROFILE IMAGE] PUT - result from processImage (stored in profile_personal_image)=%s" % (personal_info.get('profile_personal_image')))
 
 
 

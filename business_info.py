@@ -1,14 +1,13 @@
 from flask_restful import Resource
 from flask import request
 from datetime import datetime
-from urllib.parse import urlparse
 import ast
 import traceback
 import json
 import googlemaps
 import os
 
-from data_ec import connect, processImage, uploadImage, deleteImage
+from data_ec import connect, processImage, uploadImage, deleteImage, processSingleImageUpload
 
 
 class BusinessInfo(Resource):
@@ -261,9 +260,22 @@ class BusinessInfo(Resource):
                     images = processImage(key, payload)
                     payload['business_images_url'] = json.dumps(images)
 
-                # Profile image: only set from uploaded file (S3 URL), never from form string
-                payload.pop('business_profile_img', None)
-                self._process_business_profile_image(db, new_business_uid, payload, is_create=True)
+                # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
+                if 'business_profile_img' in request.files or 'delete_business_profile_img' in payload:
+                    print("[BUSINESS PROFILE IMAGE] POST - request.files keys=%s" % (list(request.files.keys()) if request.files else []))
+                    print("[BUSINESS PROFILE IMAGE] POST - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s" % (
+                        'business_profile_img' in (request.files or {}), 'delete_business_profile_img' in payload
+                    ))
+                    if payload.get('delete_business_profile_img'):
+                        print("[BUSINESS PROFILE IMAGE] POST - delete_business_profile_img value=%s" % ((payload['delete_business_profile_img'] or '')[:80] + ('...' if len(payload.get('delete_business_profile_img') or '') > 80 else '')))
+                    payload.pop('business_profile_img', None)
+                    result = processSingleImageUpload(
+                        db, new_business_uid, 'every_circle.business', 'business_uid', 'business_profile_img',
+                        'business_profile_img', 'delete_business_profile_img', 'business_profile',
+                        payload, is_create=True
+                    )
+                    payload['business_profile_img'] = result
+                    print("[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s" % (result))
 
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert('every_circle.business', payload)
@@ -365,7 +377,10 @@ class BusinessInfo(Resource):
                     response['message'] = 'Business does not exist'
                     response['code'] = 404
                     return response, 404
-                
+
+                # Keep profile image URL so we can re-apply before update (ensures it is never dropped)
+                business_profile_img_url = None
+
                 # Extract business_user fields from payload if provided
                 business_user_id = payload.pop('business_user_id', None)
                 business_role = payload.pop('business_role', None)
@@ -544,9 +559,9 @@ class BusinessInfo(Resource):
                                                     print(f"Error deleting image: {str(e)}")
                                     
                                     # Add new images
-                                    for key in request.files:
-                                        if key.startswith(f"{image_key}_img_"):
-                                            file = request.files[key]
+                                    for file_key in request.files:
+                                        if file_key.startswith(f"{image_key}_img_"):
+                                            file = request.files[file_key]
                                             if file and file.filename:
                                                 unique_filename = f"service_{business_uid}_{service_uid}_{file.filename}"
                                                 image_key = f'services/{business_uid}/{unique_filename}'
@@ -584,10 +599,24 @@ class BusinessInfo(Resource):
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
 
-                # Profile image: only set from uploaded file (S3 URL) or explicit delete, never from form string
-                payload.pop('business_profile_img', None)
-                self._process_business_profile_image(db, business_uid, payload, is_create=False)
-                
+                # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
+                if 'business_profile_img' in request.files or 'delete_business_profile_img' in payload:
+                    print("[BUSINESS PROFILE IMAGE] PUT - request.files keys=%s" % (list(request.files.keys()) if request.files else []))
+                    print("[BUSINESS PROFILE IMAGE] PUT - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s" % (
+                        'business_profile_img' in (request.files or {}), 'delete_business_profile_img' in payload
+                    ))
+                    if payload.get('delete_business_profile_img'):
+                        print("[BUSINESS PROFILE IMAGE] PUT - delete_business_profile_img value=%s" % ((payload['delete_business_profile_img'] or '')[:80] + ('...' if len(payload.get('delete_business_profile_img') or '') > 80 else '')))
+                    payload.pop('business_profile_img', None)
+                    result = processSingleImageUpload(
+                        db, business_uid, 'every_circle.business', 'business_uid', 'business_profile_img',
+                        'business_profile_img', 'delete_business_profile_img', 'business_profile',
+                        payload, is_create=False
+                    )
+                    business_profile_img_url = result
+                    payload['business_profile_img'] = result
+                    print("[BUSINESS PROFILE IMAGE] PUT - URL stored in DB (business_profile_img)=%s" % (result))
+
                 # List of valid business table columns
                 valid_columns = [
                     'business_name', 'business_address_line_1', 'business_address_line_2',
@@ -607,8 +636,19 @@ class BusinessInfo(Resource):
                 for field in invalid_fields:
                     print(f"Removing invalid field: {field}")
                     payload.pop(field)
-                
+
+                # Re-apply business profile image URL so it is never dropped (e.g. by invalid_fields or ordering)
+                if business_profile_img_url is not None:
+                    payload['business_profile_img'] = business_profile_img_url
+                    print("[BUSINESS PROFILE IMAGE] PUT - Re-applied URL before update (len=%s)" % (len(business_profile_img_url)))
+
                 print("Final payload:", payload)
+                print("[BUSINESS PROFILE IMAGE] PUT - business_profile_img in payload=%s" % ('business_profile_img' in payload))
+                # Just before DB write: confirm URL and is_public we are sending
+                _url = payload.get('business_profile_img')
+                _is_public = payload.get('business_profile_img_is_public')
+                print("[DB WRITE] About to PUT to database - business_profile_img=%s" % (_url if _url else "(none)"))
+                print("[DB WRITE] About to PUT to database - business_profile_img_is_public=%s" % (_is_public if _is_public is not None and _is_public != '' else "(none/empty)"))
                 if payload:
                     update_response = db.update('every_circle.business', key, payload)
                     print(update_response)
@@ -693,65 +733,6 @@ class BusinessInfo(Resource):
         }
         db.insert('every_circle.business_category', category_payload)
     
-    def _s3_key_from_url(self, url, bucket):
-        """Extract S3 object key from URL. Supports path-style and virtual-hosted-style URLs."""
-        if not url or not isinstance(url, str) or '[' in url or '.jpg"]' in url or url.strip().startswith('['):
-            return None
-        try:
-            parsed = urlparse(url)
-            path = (parsed.path or '').strip().lstrip('/')
-            if not path:
-                return None
-            # Path-style: https://s3-us-west-1.amazonaws.com/bucket/key/path -> path is "bucket/key/path"
-            if path.startswith(bucket + '/'):
-                return path[len(bucket) + 1:]
-            # Virtual-hosted: https://bucket.s3.region.amazonaws.com/key/path -> path is "key/path"
-            return path
-        except Exception:
-            return None
-
-    def _process_business_profile_image(self, db, business_uid, payload, is_create=False):
-        """Handle single business profile image: delete current from S3 if replaced/removed, upload new if provided.
-        Sets payload['business_profile_img'] to the full S3 URL (or None). Never stores a filename or JSON array."""
-        bucket = os.getenv('BUCKET_NAME')
-        if not bucket:
-            return
-        # Accept profile image from business_profile_img (preferred) or business_img_0 (fallback)
-        file = request.files.get('business_profile_img') or request.files.get('business_img_0')
-        has_new_file = file is not None and getattr(file, 'filename', None)
-        has_delete = 'delete_business_profile_img' in payload and payload.get('delete_business_profile_img') not in (None, '', 'null')
-        if not has_new_file and not has_delete:
-            return
-
-        current_url = None
-        if not is_create:
-            row = db.select('every_circle.business', where={'business_uid': business_uid})
-            if row.get('result') and row['result'][0].get('business_profile_img'):
-                current_url = row['result'][0]['business_profile_img']
-
-        def delete_s3_if_valid(url):
-            key = self._s3_key_from_url(url, bucket)
-            if key:
-                try:
-                    deleteImage(key)
-                except Exception as e:
-                    print(f"Error deleting business_profile_img from S3: {e}")
-
-        if has_delete:
-            to_remove = payload.pop('delete_business_profile_img')
-            delete_s3_if_valid(to_remove)
-            payload['business_profile_img'] = None
-        elif has_new_file and current_url:
-            delete_s3_if_valid(current_url)
-            payload['business_profile_img'] = None
-
-        if has_new_file and file and getattr(file, 'filename', None):
-            ts = datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
-            image_key = f'business_profile/{business_uid}/business_profile_img_{ts}'
-            url = uploadImage(file, image_key, '')
-            if url:
-                payload['business_profile_img'] = url
-
     def _add_social_links(self, db, social_links_str, business_uid):
         try:
             social_links = ast.literal_eval(social_links_str)
