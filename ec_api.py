@@ -21,7 +21,7 @@ load_dotenv()
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
 from user_profile import Profile
-from business import Business, Business_v2, Businesses
+from business import Business, Business_v2, BusinessAvgRatings, Businesses
 from business_v3 import Business_v3
 from ratings import Ratings, Ratings_v2
 from ratings_v3 import Ratings_v3
@@ -558,6 +558,7 @@ api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:bus
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
+api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
 
 class GooglePlacesInfo(Resource):
     def post(self):

@@ -394,3 +394,38 @@ class Businesses(Resource):
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
+        
+
+class BusinessAvgRatings(Resource):
+    def get(self):
+        business_uids = request.args.get('uids', '').strip()
+        if not business_uids:
+            return {'message': 'uids required', 'code': 400}, 400
+        
+        uid_list = [uid.strip() for uid in business_uids.split(',')]
+        placeholders = ','.join([f"'{uid}'" for uid in uid_list])
+        
+        response = {}
+        try:
+            with connect() as db:
+                query = f"""
+                    SELECT 
+                        rating_business_id,
+                        ROUND(AVG(rating_star), 1) AS avg_rating,
+                        COUNT(rating_uid) AS rating_count
+                    FROM every_circle.ratings
+                    WHERE rating_business_id IN ({placeholders})
+                    GROUP BY rating_business_id
+                """
+                result = db.execute(query)
+                ratings_map = {}
+                if result['result']:
+                    for row in result['result']:
+                        ratings_map[row['rating_business_id']] = {
+                            'avg_rating': row['avg_rating'],
+                            'rating_count': row['rating_count']
+                        }
+                response['result'] = ratings_map
+                return response, 200
+        except Exception as e:
+            return {'message': 'Internal Server Error', 'code': 500}, 500
