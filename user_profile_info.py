@@ -95,24 +95,28 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                        SELECT 
+                        SELECT -- * 
                             b.business_uid,
                             b.business_name,
                             b.business_phone_number,
-                            b.business_phone_number_is_public,
                             b.business_address_line_1,
+                            b.business_phone_number_is_public,
                             b.business_city,
                             b.business_state,
                             b.business_country,
                             b.business_zip_code,
+                            b.business_profile_img,
+                            b.business_profile_img_is_public,
                             bu.bu_uid,
                             bu.bu_role,
                             bu.bu_individual_business_is_public
                         FROM every_circle.business b
                         LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                        WHERE bu.bu_user_id = '{user_id}';
+                        LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
+                        -- WHERE p.profile_personal_user_id = '100-000015'
+                        WHERE p.profile_personal_uid = '{user_id}';
                     """
-                    print("business_info query:", business_info)
+                    print("business_info query 100:", business_info)
                     business_result = db.execute(business_info)
                     print("business_result:", business_result)
                     response['business_info'] = business_result['result'] if business_result['result'] else []
@@ -197,7 +201,7 @@ class UserProfileInfo(Resource):
                     # business_info = db.select('every_circle.profile_has_business',
                     #                          where={'profile_business_profile_personal_id': profile_id})
                     business_info = f"""
-                            SELECT 
+                            SELECT -- * 
                                 b.business_uid,
                                 b.business_name,
                                 b.business_phone_number,
@@ -207,14 +211,18 @@ class UserProfileInfo(Resource):
                                 b.business_state,
                                 b.business_country,
                                 b.business_zip_code,
+                                b.business_profile_img,
+                                b.business_profile_img_is_public,
                                 bu.bu_uid,
                                 bu.bu_role,
                                 bu.bu_individual_business_is_public
                             FROM every_circle.business b
                             LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                            WHERE bu.bu_user_id = '{user_id}';
+                            LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
+                            -- WHERE p.profile_personal_uid = '100-000015'
+                            WHERE p.profile_personal_uid = '{profile_id}';
                         """
-                    print("business_info query:", business_info)
+                    print("business_info query 110:", business_info)
                     business_result = db.execute(business_info)
                     print("business_result:", business_result)
                     response['business_info'] = business_result['result'] if business_result['result'] else []

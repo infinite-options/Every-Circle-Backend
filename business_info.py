@@ -52,14 +52,23 @@ class BusinessInfo(Resource):
                 # Get all business_user records for this business with user email and profile information
                 business_users_query = f"""
                     SELECT bu.*, 
-                           u.user_email_id,
-                           pp.profile_personal_uid as profile_id,
-                           pp.profile_personal_first_name as first_name,
-                           pp.profile_personal_last_name as last_name,
-                           pp.profile_personal_image as profile_photo
+                        u.user_email_id,
+                        pp.profile_personal_email_is_public as email_public,
+                        pp.profile_personal_uid as profile_id,
+                        pp.profile_personal_first_name as first_name,
+                        pp.profile_personal_last_name as last_name,
+                        pp.profile_personal_phone_number as phone,
+                        pp.profile_personal_phone_number_is_public as phone_public,
+                        pp.profile_personal_city as city,
+                        pp.profile_personal_state as state,
+                        pp.profile_personal_country as country,
+                        pp.profile_personal_location_is_public as location_public,
+                        pp.profile_personal_image as profile_photo,
+                        pp.profile_personal_image_is_public as profile_photo_is_public
                     FROM every_circle.business_user bu
                     LEFT JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
                     LEFT JOIN every_circle.profile_personal pp ON bu.bu_user_id = pp.profile_personal_user_id
+                    -- WHERE bu.bu_business_id = "200-000071"
                     WHERE bu.bu_business_id = "{business_uid}"
                 """
                 business_users_response = db.execute(business_users_query)
@@ -73,10 +82,18 @@ class BusinessInfo(Resource):
                             'business_role': bu_record.get('bu_role'),
                             'business_uid': bu_record.get('bu_uid'),
                             'user_email': bu_record.get('user_email_id'),
+                            'user_email_is_public': bu_record.get('email_public'),
                             'profile_id': bu_record.get('profile_id'),
                             'first_name': bu_record.get('first_name'),
                             'last_name': bu_record.get('last_name'),
+                            'phone': bu_record.get('phone'),
+                            'phone_is_public': bu_record.get('phone_public'),
+                            'city': bu_record.get('city'),
+                            'state': bu_record.get('state'),
+                            'country': bu_record.get('country'),
+                            'location_is_public': bu_record.get('location_public'),
                             'profile_photo': bu_record.get('profile_photo'),
+                            'profile_photo_is_public': bu_record.get('profile_photo_is_public'),
                             'bu_individual_business_is_public': bu_record.get('bu_individual_business_is_public', 0)
                         })
                 
@@ -448,7 +465,35 @@ class BusinessInfo(Resource):
                     # Exclude the primary business_user_id from deletion
                     exclude_id = business_user_id if business_user_id else service_user_id
                     self._handle_additional_business_users(db, business_uid, additional_business_user, additional_business_role, exclude_user_id=exclude_id)
-                
+
+                # Handle business_users_individual_public: update bu_individual_business_is_public per user
+                business_users_individual_public = payload.pop('business_users_individual_public', None)
+                if business_users_individual_public:
+                    try:
+                        if isinstance(business_users_individual_public, str):
+                            public_list = json.loads(business_users_individual_public)
+                        elif isinstance(business_users_individual_public, list):
+                            public_list = business_users_individual_public
+                        else:
+                            public_list = None
+                        if public_list:
+                            for item in public_list:
+                                bu_user_id = item.get('business_user_id')
+                                is_public = item.get('bu_individual_business_is_public')
+                                if bu_user_id is None:
+                                    continue
+                                if is_public is None:
+                                    is_public = 0
+                                bu_row = db.select('every_circle.business_user',
+                                                  where={'bu_business_id': business_uid, 'bu_user_id': bu_user_id})
+                                if bu_row.get('result'):
+                                    bu_uid = bu_row['result'][0]['bu_uid']
+                                    db.update('every_circle.business_user', {'bu_uid': bu_uid},
+                                              {'bu_individual_business_is_public': 1 if is_public else 0})
+                                    print(f"Updated bu_individual_business_is_public={1 if is_public else 0} for business {business_uid}, user {bu_user_id}")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"Error parsing business_users_individual_public: {e}")
+
                 categories_uid_str = None
                 social_links_str = None
                 delete_services_str = None
