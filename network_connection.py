@@ -91,7 +91,9 @@ class NetworkPath(Resource):
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
                 'circle_note': item.get('circle_note'),
-                'circle_geotag': item.get('circle_geotag')
+                'circle_geotag': item.get('circle_geotag'),
+                'circle_city': item.get('circle_city'),
+                'circle_state': item.get('circle_state')
             } for item in down_query_details]
             
             print('down_list with profile_personal_referred_by:', down_list)
@@ -165,7 +167,9 @@ class NetworkPath(Resource):
                 'circle_date': item.get('circle_date'),
                 'circle_event': item.get('circle_event'),
                 'circle_note': item.get('circle_note'),
-                'circle_geotag': item.get('circle_geotag')
+                'circle_geotag': item.get('circle_geotag'),
+                'circle_city': item.get('circle_city'),
+                'circle_state': item.get('circle_state')
             } for item in up_query_details]
 
             print('up_list with profile_personal_referred_by:', up_list)
@@ -276,6 +280,8 @@ class NetworkPath(Resource):
                                 "circle_event": item.get('circle_event'),
                                 "circle_note": item.get('circle_note'),
                                 "circle_geotag": item.get('circle_geotag'),
+                                "circle_city": item.get('circle_city'),
+                                "circle_state": item.get('circle_state'),
                                 "degree": curr_degree
                             })
                         else:
