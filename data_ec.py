@@ -8,6 +8,7 @@ import boto3
 from botocore.response import StreamingBody
 import calendar
 from decimal import Decimal
+from urllib.parse import urlparse
 # from datetime import date, datetime, timedelta
 from werkzeug.datastructures import FileStorage
 import mimetypes
@@ -133,6 +134,97 @@ def uploadImage(file, key, content):
     
     return None
 
+
+def _s3_key_from_url(url, bucket):
+    """Extract S3 object key from URL. Supports path-style and virtual-hosted-style URLs.
+    Returns None if url is not a valid S3 URL (e.g. old DB value like a filename or JSON)."""
+    if not url or not isinstance(url, str):
+        return None
+    if '[' in url or '.jpg"]' in url or url.strip().startswith('['):
+        return None
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or '').strip().lstrip('/')
+        if not path:
+            return None
+        # Path-style: https://s3-us-west-1.amazonaws.com/bucket/key/path -> path is "bucket/key/path"
+        if path.startswith(bucket + '/'):
+            return path[len(bucket) + 1:]
+        # Virtual-hosted: https://bucket.s3.region.amazonaws.com/key/path -> path is "key/path"
+        return path
+    except Exception:
+        return None
+
+
+def processSingleImageUpload(db, entity_uid, table_name, uid_column_name, image_column_name,
+                             file_request_key, delete_payload_key, s3_key_prefix, payload, is_create=False):
+    """
+    Reusable flow for a single profile/entity image: load current from DB, delete from S3 if
+    replacing or explicitly deleting, upload new file to S3, return the new URL or None.
+    Same logic as profile_personal_image (processImage profile_personal_uid branch).
+
+    Caller must: (1) pass payload and will have delete_payload_key popped if present,
+    (2) assign return value to the image column (e.g. payload['business_profile_img'] = result).
+    Returns: full S3 URL string, or None (meaning clear the column / no new upload).
+    """
+    bucket = os.getenv('BUCKET_NAME')
+    if not bucket:
+        return None
+    file = request.files.get(file_request_key) if request.files else None
+    has_file = file and getattr(file, 'filename', None)
+    delete_val = payload.get(delete_payload_key)
+    has_delete = delete_payload_key in payload and delete_val not in (None, '', 'null')
+
+    # Console log what we received (for comparing personal vs business profile image requests)
+    print("[processSingleImageUpload] file_request_key=%s, request.files keys=%s, has_file=%s, filename=%s" % (
+        file_request_key,
+        list(request.files.keys()) if request.files else [],
+        has_file,
+        getattr(file, 'filename', None) if file else None,
+    ))
+    print("[processSingleImageUpload] delete_payload_key=%s, has_delete=%s, delete_val=%s" % (
+        delete_payload_key, has_delete, (delete_val[:80] + '...' if delete_val and len(delete_val) > 80 else delete_val)
+    ))
+
+    if not has_file and not has_delete:
+        return None
+
+    current_url = None
+    if not is_create:
+        row = db.select(table_name, where={uid_column_name: entity_uid})
+        if row.get('result') and row['result'][0].get(image_column_name):
+            current_url = row['result'][0][image_column_name]
+
+    def delete_if_s3_url(url):
+        key = _s3_key_from_url(url, bucket)
+        if key:
+            try:
+                deleteImage(key)
+            except Exception as e:
+                print(f"Error deleting image from S3: {e}")
+
+    if has_delete:
+        payload.pop(delete_payload_key, None)
+        delete_if_s3_url(delete_val)
+        # Only return here if we're not also uploading a new file (replace = delete old + upload new)
+        if not has_file:
+            return None
+
+    if has_file and current_url:
+        delete_if_s3_url(current_url)
+
+    if has_file and file:
+        ts = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+        unique_filename = file_request_key + '_' + ts
+        image_key = f'{s3_key_prefix}/{entity_uid}/{unique_filename}'
+        url = uploadImage(file, image_key, '')
+        print("[processSingleImageUpload] upload image_key=%s, returning url=%s" % (image_key, url))
+        if url:
+            print("[processSingleImageUpload] Backend received HTTP link from AWS: %s" % url)
+            return url
+    return None
+
+
 # --------------- PROCESS IMAGES ------------------
 
 def processImage(key, payload):
@@ -215,6 +307,16 @@ def processImage(key, payload):
             profilePersonalImage = None
             profile_image = None
 
+            # Console log what we received for PERSONAL profile image (compare with business)
+            print("[PERSONAL PROFILE IMAGE] request.files keys=%s" % (list(request.files.keys()) if request.files else []))
+            print("[PERSONAL PROFILE IMAGE] payload keys (image-related)=%s" % ([k for k in (payload or {}).keys() if 'image' in k.lower() or 'delete' in k.lower()]))
+            print("[PERSONAL PROFILE IMAGE] profile_image in request.files=%s, delete_profile_image in payload=%s" % (
+                'profile_image' in (request.files or {}),
+                'delete_profile_image' in (payload or {}),
+            ))
+            if payload and payload.get('delete_profile_image'):
+                print("[PERSONAL PROFILE IMAGE] delete_profile_image value=%s" % (payload['delete_profile_image'][:80] + '...' if len(payload.get('delete_profile_image', '') or '') > 80 else payload.get('delete_profile_image')))
+
             profile_personal_data = db.execute(""" SELECT profile_personal_image, profile_personal_resume FROM every_circle.profile_personal WHERE profile_personal_uid = \'""" + key_uid + """\'; """)
             if profile_personal_data['result']:
                 print("Profile Data: ", profile_personal_data['result'])
@@ -239,7 +341,7 @@ def processImage(key, payload):
                 unique_filename = 'profile_image_' + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
                 image_key = f'{key_type}/{key_uid}/{unique_filename}'
                 profilePersonalImage = uploadImage(profileImageFile, image_key, '')
-                print("Image after upload: ", profilePersonalImage)
+                print("[PERSONAL PROFILE IMAGE] image_key=%s, URL stored in DB (profile_personal_image)=%s" % (image_key, profilePersonalImage))
                 
                 # images.append(receiptImage)
                 # print("Image after upload: ", images)
@@ -270,11 +372,13 @@ def processImage(key, payload):
             
             if 'delete_business_images' in payload and payload['delete_business_images'] not in {None, '', 'null'}:
                 for image in json.loads(payload.pop('delete_business_images')):
-                    delete_key = image.split(f'{bucket}/', 1)[1]
-                    # print("Delete key", delete_key)
-                    deleteImage(delete_key)
+                    # Only delete from S3 if this is an S3 URL; otherwise just remove from list (e.g. Google Place photo URLs)
+                    if f'{bucket}/' in image:
+                        delete_key = image.split(f'{bucket}/', 1)[1]
+                        deleteImage(delete_key)
+                    if image in business_images:
+                        business_images.remove(image)
                     print("\nimage", image, type(image))
-                    business_images.remove(image)
                     print(business_images)
             
             i = 0

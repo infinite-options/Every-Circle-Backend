@@ -7,7 +7,7 @@ import json
 import googlemaps
 import os
 
-from data_ec import connect, processImage, uploadImage, deleteImage
+from data_ec import connect, processImage, uploadImage, deleteImage, processSingleImageUpload
 
 
 class BusinessInfo(Resource):
@@ -52,14 +52,23 @@ class BusinessInfo(Resource):
                 # Get all business_user records for this business with user email and profile information
                 business_users_query = f"""
                     SELECT bu.*, 
-                           u.user_email_id,
-                           pp.profile_personal_uid as profile_id,
-                           pp.profile_personal_first_name as first_name,
-                           pp.profile_personal_last_name as last_name,
-                           pp.profile_personal_image as profile_photo
+                        u.user_email_id,
+                        pp.profile_personal_email_is_public as email_public,
+                        pp.profile_personal_uid as profile_id,
+                        pp.profile_personal_first_name as first_name,
+                        pp.profile_personal_last_name as last_name,
+                        pp.profile_personal_phone_number as phone,
+                        pp.profile_personal_phone_number_is_public as phone_public,
+                        pp.profile_personal_city as city,
+                        pp.profile_personal_state as state,
+                        pp.profile_personal_country as country,
+                        pp.profile_personal_location_is_public as location_public,
+                        pp.profile_personal_image as profile_photo,
+                        pp.profile_personal_image_is_public as profile_photo_is_public
                     FROM every_circle.business_user bu
                     LEFT JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
                     LEFT JOIN every_circle.profile_personal pp ON bu.bu_user_id = pp.profile_personal_user_id
+                    -- WHERE bu.bu_business_id = "200-000071"
                     WHERE bu.bu_business_id = "{business_uid}"
                 """
                 business_users_response = db.execute(business_users_query)
@@ -73,10 +82,18 @@ class BusinessInfo(Resource):
                             'business_role': bu_record.get('bu_role'),
                             'business_uid': bu_record.get('bu_uid'),
                             'user_email': bu_record.get('user_email_id'),
+                            'user_email_is_public': bu_record.get('email_public'),
                             'profile_id': bu_record.get('profile_id'),
                             'first_name': bu_record.get('first_name'),
                             'last_name': bu_record.get('last_name'),
+                            'phone': bu_record.get('phone'),
+                            'phone_is_public': bu_record.get('phone_public'),
+                            'city': bu_record.get('city'),
+                            'state': bu_record.get('state'),
+                            'country': bu_record.get('country'),
+                            'location_is_public': bu_record.get('location_public'),
                             'profile_photo': bu_record.get('profile_photo'),
+                            'profile_photo_is_public': bu_record.get('profile_photo_is_public'),
                             'bu_individual_business_is_public': bu_record.get('bu_individual_business_is_public', 0)
                         })
                 
@@ -260,6 +277,23 @@ class BusinessInfo(Resource):
                     images = processImage(key, payload)
                     payload['business_images_url'] = json.dumps(images)
 
+                # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
+                if 'business_profile_img' in request.files or 'delete_business_profile_img' in payload:
+                    print("[BUSINESS PROFILE IMAGE] POST - request.files keys=%s" % (list(request.files.keys()) if request.files else []))
+                    print("[BUSINESS PROFILE IMAGE] POST - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s" % (
+                        'business_profile_img' in (request.files or {}), 'delete_business_profile_img' in payload
+                    ))
+                    if payload.get('delete_business_profile_img'):
+                        print("[BUSINESS PROFILE IMAGE] POST - delete_business_profile_img value=%s" % ((payload['delete_business_profile_img'] or '')[:80] + ('...' if len(payload.get('delete_business_profile_img') or '') > 80 else '')))
+                    payload.pop('business_profile_img', None)
+                    result = processSingleImageUpload(
+                        db, new_business_uid, 'every_circle.business', 'business_uid', 'business_profile_img',
+                        'business_profile_img', 'delete_business_profile_img', 'business_profile',
+                        payload, is_create=True
+                    )
+                    payload['business_profile_img'] = result
+                    print("[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s" % (result))
+
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert('every_circle.business', payload)
                 # print("insert_response: ", insert_response)
@@ -360,7 +394,10 @@ class BusinessInfo(Resource):
                     response['message'] = 'Business does not exist'
                     response['code'] = 404
                     return response, 404
-                
+
+                # Keep profile image URL so we can re-apply before update (ensures it is never dropped)
+                business_profile_img_url = None
+
                 # Extract business_user fields from payload if provided
                 business_user_id = payload.pop('business_user_id', None)
                 business_role = payload.pop('business_role', None)
@@ -428,7 +465,35 @@ class BusinessInfo(Resource):
                     # Exclude the primary business_user_id from deletion
                     exclude_id = business_user_id if business_user_id else service_user_id
                     self._handle_additional_business_users(db, business_uid, additional_business_user, additional_business_role, exclude_user_id=exclude_id)
-                
+
+                # Handle business_users_individual_public: update bu_individual_business_is_public per user
+                business_users_individual_public = payload.pop('business_users_individual_public', None)
+                if business_users_individual_public:
+                    try:
+                        if isinstance(business_users_individual_public, str):
+                            public_list = json.loads(business_users_individual_public)
+                        elif isinstance(business_users_individual_public, list):
+                            public_list = business_users_individual_public
+                        else:
+                            public_list = None
+                        if public_list:
+                            for item in public_list:
+                                bu_user_id = item.get('business_user_id')
+                                is_public = item.get('bu_individual_business_is_public')
+                                if bu_user_id is None:
+                                    continue
+                                if is_public is None:
+                                    is_public = 0
+                                bu_row = db.select('every_circle.business_user',
+                                                  where={'bu_business_id': business_uid, 'bu_user_id': bu_user_id})
+                                if bu_row.get('result'):
+                                    bu_uid = bu_row['result'][0]['bu_uid']
+                                    db.update('every_circle.business_user', {'bu_uid': bu_uid},
+                                              {'bu_individual_business_is_public': 1 if is_public else 0})
+                                    print(f"Updated bu_individual_business_is_public={1 if is_public else 0} for business {business_uid}, user {bu_user_id}")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"Error parsing business_users_individual_public: {e}")
+
                 categories_uid_str = None
                 social_links_str = None
                 delete_services_str = None
@@ -539,9 +604,9 @@ class BusinessInfo(Resource):
                                                     print(f"Error deleting image: {str(e)}")
                                     
                                     # Add new images
-                                    for key in request.files:
-                                        if key.startswith(f"{image_key}_img_"):
-                                            file = request.files[key]
+                                    for file_key in request.files:
+                                        if file_key.startswith(f"{image_key}_img_"):
+                                            file = request.files[file_key]
                                             if file and file.filename:
                                                 unique_filename = f"service_{business_uid}_{service_uid}_{file.filename}"
                                                 image_key = f'services/{business_uid}/{unique_filename}'
@@ -578,14 +643,33 @@ class BusinessInfo(Resource):
                     images = processImage(key_personal, payload)
                     print("OUTSIDE IMAGEs", images)
                     payload['business_images_url'] = (json.dumps(images) if images else None)
-                
+
+                # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
+                if 'business_profile_img' in request.files or 'delete_business_profile_img' in payload:
+                    print("[BUSINESS PROFILE IMAGE] PUT - request.files keys=%s" % (list(request.files.keys()) if request.files else []))
+                    print("[BUSINESS PROFILE IMAGE] PUT - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s" % (
+                        'business_profile_img' in (request.files or {}), 'delete_business_profile_img' in payload
+                    ))
+                    if payload.get('delete_business_profile_img'):
+                        print("[BUSINESS PROFILE IMAGE] PUT - delete_business_profile_img value=%s" % ((payload['delete_business_profile_img'] or '')[:80] + ('...' if len(payload.get('delete_business_profile_img') or '') > 80 else '')))
+                    payload.pop('business_profile_img', None)
+                    result = processSingleImageUpload(
+                        db, business_uid, 'every_circle.business', 'business_uid', 'business_profile_img',
+                        'business_profile_img', 'delete_business_profile_img', 'business_profile',
+                        payload, is_create=False
+                    )
+                    business_profile_img_url = result
+                    payload['business_profile_img'] = result
+                    print("[BUSINESS PROFILE IMAGE] PUT - URL stored in DB (business_profile_img)=%s" % (result))
+
                 # List of valid business table columns
                 valid_columns = [
                     'business_name', 'business_address_line_1', 'business_address_line_2',
                     'business_city', 'business_state', 'business_country', 'business_zip_code',
                     'business_phone_number', 'business_email_id', 'business_category_id',
                     'business_short_bio', 'business_tag_line', 'business_ein_number',
-                    'business_website', 'business_images_url', 'business_email_id_is_public',
+                    'business_website', 'business_images_url', 'business_profile_img',
+                    'business_profile_img_is_public', 'business_email_id_is_public',
                     'business_phone_number_is_public', 'business_tag_line_is_public',
                     'business_short_bio_is_public', 'business_google_id', 'business_latitude',
                     'business_longitude', 'business_price_level', 'business_google_rating',
@@ -597,8 +681,19 @@ class BusinessInfo(Resource):
                 for field in invalid_fields:
                     print(f"Removing invalid field: {field}")
                     payload.pop(field)
-                
+
+                # Re-apply business profile image URL so it is never dropped (e.g. by invalid_fields or ordering)
+                if business_profile_img_url is not None:
+                    payload['business_profile_img'] = business_profile_img_url
+                    print("[BUSINESS PROFILE IMAGE] PUT - Re-applied URL before update (len=%s)" % (len(business_profile_img_url)))
+
                 print("Final payload:", payload)
+                print("[BUSINESS PROFILE IMAGE] PUT - business_profile_img in payload=%s" % ('business_profile_img' in payload))
+                # Just before DB write: confirm URL and is_public we are sending
+                _url = payload.get('business_profile_img')
+                _is_public = payload.get('business_profile_img_is_public')
+                print("[DB WRITE] About to PUT to database - business_profile_img=%s" % (_url if _url else "(none)"))
+                print("[DB WRITE] About to PUT to database - business_profile_img_is_public=%s" % (_is_public if _is_public is not None and _is_public != '' else "(none/empty)"))
                 if payload:
                     update_response = db.update('every_circle.business', key, payload)
                     print(update_response)
