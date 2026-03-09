@@ -663,7 +663,7 @@ class BusinessInfo(Resource):
 
                 # List of valid business table columns
                 valid_columns = [
-                    'business_name', 'business_address_line_1', 'business_address_line_2',
+                    'business_name', 'business_location_is_public','business_address_line_1', 'business_address_line_2',
                     'business_city', 'business_state', 'business_country', 'business_zip_code',
                     'business_phone_number', 'business_email_id', 'business_category_id',
                     'business_short_bio', 'business_tag_line', 'business_ein_number',
