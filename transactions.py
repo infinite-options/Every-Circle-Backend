@@ -22,14 +22,17 @@ class Transactions(Resource):
             with connect() as db:
                 # Execute query with parameterized profile_id for security
                 query = """
-                    SELECT 
+                    SELECT -- *,
                         transaction_uid, 
                         transaction_datetime, 
                         transaction_total, 
                         transaction_business_id,
-                        business_name
+                        if (ISNULL(business_name), profile_expertise_title, business_name) AS business_name
                     FROM every_circle.transactions
+                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id
+                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid
                     LEFT JOIN every_circle.business ON business_uid = transaction_business_id
+                    -- WHERE transaction_profile_id = '110-000018'
                     WHERE transaction_profile_id = %s
                     ORDER BY transaction_datetime DESC
                 """
