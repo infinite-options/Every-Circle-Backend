@@ -106,10 +106,9 @@ class BusinessInfo(Resource):
                 category_response = db.execute(category_query)
                 
                 links_query = f"""
-                    SELECT sl.social_link_name, bl.business_link_url
-                    FROM every_circle.business_link bl
-                    JOIN every_circle.social_link sl ON bl.business_link_social_link_id = sl.social_link_uid
-                    WHERE bl.business_link_business_id = "{business_uid}"
+                    SELECT bl_social_link_id as social_link_name, bl_url as business_link_url
+                    FROM every_circle.business_link
+                    WHERE bl_business_id = "{business_uid}"
                 """
                 links_response = db.execute(links_query)
                 
@@ -664,7 +663,7 @@ class BusinessInfo(Resource):
 
                 # List of valid business table columns
                 valid_columns = [
-                    'business_name', 'business_address_line_1', 'business_address_line_2',
+                    'business_name', 'business_location_is_public','business_address_line_1', 'business_address_line_2',
                     'business_city', 'business_state', 'business_country', 'business_zip_code',
                     'business_phone_number', 'business_email_id', 'business_category_id',
                     'business_short_bio', 'business_tag_line', 'business_ein_number',
@@ -790,7 +789,7 @@ class BusinessInfo(Resource):
                 
                 social_link_uid = social_link_query['result'][0]['social_link_uid']
                 
-                bl_uid_response = db.call(procedure='new_business_link_uid')
+                bl_uid_response = db.call(procedure='new_bl_uid')
                 bl_uid = bl_uid_response['result'][0]['new_id']
                 
                 link_payload = {
@@ -804,58 +803,72 @@ class BusinessInfo(Resource):
             print(f"Error processing social links: {str(e)}")
             raise
             
+   
+            print(f"Error updating social links: {str(e)}")
+            traceback.print_exc()
+            raise
+    
     def _update_social_links(self, db, social_links_str, business_uid):
         try:
-            social_links = ast.literal_eval(social_links_str)
-            
+            try:
+                social_links = json.loads(social_links_str)
+            except Exception:
+                social_links = ast.literal_eval(social_links_str)
+
+            print(f"Parsed social_links: {social_links}")
+
+            # Get existing links for this business from business_link table
             existing_links_query = f"""
-                SELECT sl.social_link_name, bl.business_link_url, bl.business_link_uid
-                FROM every_circle.business_link bl
-                JOIN every_circle.social_link sl ON bl.business_link_social_link_id = sl.social_link_uid
-                WHERE bl.business_link_business_id = "{business_uid}";
+                SELECT bl_uid, bl_social_link_id, bl_url
+                FROM every_circle.business_link
+                WHERE bl_business_id = "{business_uid}";
             """
             existing_links_response = db.execute(existing_links_query)
-            
+
             existing_links = {}
             if 'result' in existing_links_response and existing_links_response['result']:
                 for link in existing_links_response['result']:
-                    existing_links[link['social_link_name']] = {
-                        'url': link['business_link_url'],
-                        'uid': link['business_link_uid']
+                    existing_links[link['bl_social_link_id']] = {
+                        'url': link['bl_url'],
+                        'uid': link['bl_uid']
                     }
-            
+
+            print(f"Existing links in DB: {existing_links}")
+
             for social_platform, url in social_links.items():
-                social_link_query = db.select('every_circle.social_link', 
-                                             where={'social_link_name': social_platform})
-                
-                if not social_link_query['result']:
+                # Skip empty URLs
+                if not url or str(url).strip() == "":
+                    print(f"Skipping empty URL for platform: {social_platform}")
                     continue
-                
-                social_link_uid = social_link_query['result'][0]['social_link_uid']
-                
+
+                print(f"Processing {social_platform}: url={url}")
+
                 if social_platform in existing_links:
-                    update_link_uid = existing_links[social_platform]['uid']
-                    update_link_key = {'business_link_uid': update_link_uid}
-                    update_link_data = {'business_link_url': url}
-                    
-                    db.update('every_circle.business_link', update_link_key, update_link_data)
-                    existing_links.pop(social_platform)
+                    # Update existing record
+                    bl_uid = existing_links[social_platform]['uid']
+                    db.update('every_circle.business_link',
+                            {'bl_uid': bl_uid},
+                            {'bl_url': url})
+                    print(f"Updated {social_platform} link to {url}")
                 else:
-                    bl_uid_response = db.call(procedure='new_business_link_uid')
+                    # Insert new record
+                    bl_uid_response = db.call(procedure='new_bl_uid')
                     bl_uid = bl_uid_response['result'][0]['new_id']
-                    
+
                     link_payload = {
-                        'business_link_uid': bl_uid,
-                        'business_link_business_id': business_uid,
-                        'business_link_social_link_id': social_link_uid,
-                        'business_link_url': url
+                        'bl_uid': bl_uid,
+                        'bl_business_id': business_uid,
+                        'bl_social_link_id': social_platform,
+                        'bl_url': url
                     }
-                    
                     db.insert('every_circle.business_link', link_payload)
+                    print(f"Inserted new {social_platform} link: {url}")
+
         except Exception as e:
             print(f"Error updating social links: {str(e)}")
+            traceback.print_exc()
             raise
-    
+
     # New method to add services
     def _handle_additional_business_users(self, db, business_uid, additional_business_user, additional_business_role, exclude_user_id=None):
         """
@@ -1058,7 +1071,7 @@ class BusinessInfo(Resource):
 
     def _add_services(self, db, services_str, business_uid, user_uid, request_files=None):
         try:
-            import json
+            # import json
             services = json.loads(services_str)
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
