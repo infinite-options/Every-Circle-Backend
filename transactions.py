@@ -34,6 +34,7 @@ class Transactions(Resource):
                     LEFT JOIN every_circle.business ON business_uid = transaction_business_id
                     -- WHERE transaction_profile_id = '110-000018'
                     WHERE transaction_profile_id = %s
+                    GROUP BY transaction_datetime
                     ORDER BY transaction_datetime DESC
                 """
                 
