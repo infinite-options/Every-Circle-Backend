@@ -293,6 +293,17 @@ class BusinessInfo(Resource):
                     payload['business_profile_img'] = result
                     print("[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s" % (result))
 
+                # Normalize business_category_id to a single text field (comma-separated if multiple)
+                if 'business_category_id' in payload:
+                    print("In business_category_id", payload['business_category_id'])
+                    val = payload['business_category_id']
+                    if isinstance(val, list):
+                        payload['business_category_id'] = ','.join(str(v).strip() for v in val)
+                    elif val is not None and not isinstance(val, str):
+                        payload['business_category_id'] = str(val)
+                    elif isinstance(val, str):
+                        payload['business_category_id'] = val.strip()
+
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert('every_circle.business', payload)
                 # print("insert_response: ", insert_response)
@@ -661,9 +672,20 @@ class BusinessInfo(Resource):
                     payload['business_profile_img'] = result
                     print("[BUSINESS PROFILE IMAGE] PUT - URL stored in DB (business_profile_img)=%s" % (result))
 
+                # Normalize business_category_id to a single text field (comma-separated if multiple)
+                if 'business_category_id' in payload:
+                    print("In business_category_id", payload['business_category_id'])
+                    val = payload['business_category_id']
+                    if isinstance(val, list):
+                        payload['business_category_id'] = ','.join(str(v).strip() for v in val)
+                    elif val is not None and not isinstance(val, str):
+                        payload['business_category_id'] = str(val)
+                    elif isinstance(val, str):
+                        payload['business_category_id'] = val.strip()
+
                 # List of valid business table columns
                 valid_columns = [
-                    'business_name', 'business_location_is_public','business_address_line_1', 'business_address_line_2',
+                    'business_name', 'business_location', 'business_location_is_public','business_address_line_1', 'business_address_line_2',
                     'business_city', 'business_state', 'business_country', 'business_zip_code',
                     'business_phone_number', 'business_email_id', 'business_category_id',
                     'business_short_bio', 'business_tag_line', 'business_ein_number',
