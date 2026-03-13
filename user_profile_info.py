@@ -109,6 +109,8 @@ class UserProfileInfo(Resource):
                             b.business_state,
                             b.business_country,
                             b.business_zip_code,
+                            b.business_tag_line,
+                            b.business_tag_line_is_public,
                             b.business_profile_img,
                             b.business_profile_img_is_public,
                             bu.bu_uid,
@@ -219,6 +221,8 @@ class UserProfileInfo(Resource):
                                 b.business_state,
                                 b.business_country,
                                 b.business_zip_code,
+                                b.business_tag_line,
+                                b.business_tag_line_is_public,
                                 b.business_profile_img,
                                 b.business_profile_img_is_public,
                                 bu.bu_uid,
@@ -227,7 +231,7 @@ class UserProfileInfo(Resource):
                             FROM every_circle.business b
                             LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
                             LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
-                            -- WHERE p.profile_personal_uid = '100-000015'
+                            -- WHERE p.profile_personal_uid = '110-000015'
                             WHERE p.profile_personal_uid = '{profile_id}';
                         """
                     print("business_info query 110:", business_info)
@@ -536,6 +540,14 @@ class UserProfileInfo(Resource):
                                 wish_info['profile_wish_bounty'] = wish_data['bounty']
                             if 'cost' in wish_data:  
                                 wish_info['profile_wish_cost'] = wish_data['cost']
+                            if 'profile_wish_start' in wish_data:
+                                wish_info['profile_wish_start'] = wish_data['profile_wish_start']
+                            if 'profile_wish_end' in wish_data:
+                                wish_info['profile_wish_end'] = wish_data['profile_wish_end']
+                            if 'profile_wish_location' in wish_data:
+                                wish_info['profile_wish_location'] = wish_data['profile_wish_location']
+                            if 'profile_wish_mode' in wish_data:
+                                wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
                             
                             # Insert the wish record
                             db.insert('every_circle.profile_wish', wish_info)
@@ -1301,6 +1313,14 @@ class UserProfileInfo(Resource):
                                     wish_info['profile_wish_cost'] = wish_data['cost']
                                 if 'isPublic' in wish_data:
                                     wish_info['profile_wish_is_public'] = wish_data['isPublic']
+                                if 'profile_wish_start' in wish_data:
+                                    wish_info['profile_wish_start'] = wish_data['profile_wish_start']
+                                if 'profile_wish_end' in wish_data:
+                                    wish_info['profile_wish_end'] = wish_data['profile_wish_end']
+                                if 'profile_wish_location' in wish_data:
+                                    wish_info['profile_wish_location'] = wish_data['profile_wish_location']
+                                if 'profile_wish_mode' in wish_data:
+                                    wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
                                 
                                 
                                 # Update the existing wish
@@ -1325,8 +1345,16 @@ class UserProfileInfo(Resource):
                                     wish_info['profile_wish_bounty'] = wish_data['amount']
                                 if 'cost' in wish_data:  
                                     wish_info['profile_wish_cost'] = wish_data['cost']
-                                if 'isPublic' in exp_data:
+                                if 'isPublic' in wish_data:
                                     wish_info['profile_wish_is_public'] = wish_data['isPublic']
+                                if 'profile_wish_start' in wish_data:
+                                    wish_info['profile_wish_start'] = wish_data['profile_wish_start']
+                                if 'profile_wish_end' in wish_data:
+                                    wish_info['profile_wish_end'] = wish_data['profile_wish_end']
+                                if 'profile_wish_location' in wish_data:
+                                    wish_info['profile_wish_location'] = wish_data['profile_wish_location']
+                                if 'profile_wish_mode' in wish_data:
+                                    wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
                                 
                                 # Insert the wish record
                                 db.insert('every_circle.profile_wish', wish_info)
