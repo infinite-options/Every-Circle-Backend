@@ -27,12 +27,29 @@ class Transactions(Resource):
                         transaction_datetime, 
                         transaction_total, 
                         transaction_business_id,
-                        if (ISNULL(business_name), profile_expertise_title, business_name) AS business_name
+                        CASE
+                            WHEN business_name IS NOT NULL THEN business_name
+                            ELSE CONCAT(profile_personal_first_name," ", profile_personal_last_name)
+                        END AS business_name,
+                        CASE
+                            WHEN business_name IS NOT NULL THEN "Business"
+                            WHEN profile_expertise_title IS NOT NULL THEN "Offering"
+                            WHEN profile_wish_title IS NOT NULL THEN "Seeking"
+                        END AS purchase_type,
+                        CASE
+                            WHEN business_name IS NOT NULL THEN "See Receipt"
+                            WHEN profile_expertise_title IS NOT NULL THEN profile_expertise_title
+                            WHEN profile_wish_title IS NOT NULL THEN profile_wish_title
+                            ELSE "Item Not Found"
+                        END AS purchased_item
                     FROM every_circle.transactions
-                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id
-                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid
-                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id
-                    -- WHERE transaction_profile_id = '110-000018'
+                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id -- Find Transaction Items
+                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid -- Find Expertise
+                    LEFT JOIN every_circle.wish_response ON ti_bs_id = wish_response_uid -- Find Wish Response
+                    LEFT JOIN every_circle.profile_wish ON wr_profile_wish_id = profile_wish_uid -- Find Actual Wish
+                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id -- Find Business
+                    LEFT JOIN every_circle.profile_personal ON transaction_business_id = profile_personal_uid -- Find Person
+                    -- WHERE transaction_profile_id = '110-000010'
                     WHERE transaction_profile_id = %s
                     GROUP BY transaction_datetime
                     ORDER BY transaction_datetime DESC
