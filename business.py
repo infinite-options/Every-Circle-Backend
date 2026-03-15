@@ -429,3 +429,58 @@ class BusinessAvgRatings(Resource):
                 return response, 200
         except Exception as e:
             return {'message': 'Internal Server Error', 'code': 500}, 500
+
+
+class BusinessTagSearch(Resource):
+    def get(self):
+        query = request.args.get('q', '').strip().lower()
+        if not query:
+            return {'message': 'q parameter required', 'code': 400}, 400
+        
+        response = {}
+        try:
+            with connect() as db:
+                tag_query = f"""
+                    SELECT DISTINCT
+                        b.business_uid,
+                        b.business_name,
+                        b.business_short_bio,
+                        b.business_tag_line,
+                        b.business_profile_img,
+                        b.business_city,
+                        b.business_state,
+                        b.business_phone_number,
+                        b.business_email_id,
+                        b.business_website,
+                        b.business_email_id_is_public,
+                        b.business_phone_number_is_public,
+                        b.business_tag_line_is_public,
+                        b.business_short_bio_is_public,
+                        b.business_profile_img_is_public
+                    FROM every_circle.business b
+                    JOIN every_circle.business_tags bt ON bt.bt_business_id = b.business_uid
+                    JOIN every_circle.tags t ON t.tag_uid = bt.bt_tag_id
+                    WHERE LOWER(t.tag_name) LIKE '%{query}%'
+                    AND b.business_is_active = 1
+                """
+                result = db.execute(tag_query)
+                businesses = result['result'] if result['result'] else []
+
+                # For each business, fetch all its tags
+                for business in businesses:
+                    uid = business['business_uid']
+                    tags_query = f"""
+                        SELECT t.tag_name
+                        FROM every_circle.business_tags bt
+                        JOIN every_circle.tags t ON t.tag_uid = bt.bt_tag_id
+                        WHERE bt.bt_business_id = '{uid}'
+                    """
+                    tags_result = db.execute(tags_query)
+                    business['tags'] = [row['tag_name'] for row in tags_result['result']] if tags_result['result'] else []
+
+                response['result'] = businesses
+                response['code'] = 200
+                return response, 200
+        except Exception as e:
+            print(f"Error in BusinessTagSearch GET: {str(e)}")
+            return {'message': 'Internal Server Error', 'code': 500}, 500
