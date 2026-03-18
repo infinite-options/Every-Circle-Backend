@@ -135,8 +135,13 @@ class ProfileWishInfo(Resource):
                     'wish_response_uid': new_wish_response_uid,
                     'wr_profile_wish_id': profile_wish_id,
                     'wr_responder_id': responder_id,
-                    'wr_responder_note': responder_note
+                    'wr_responder_note': responder_note,
+                    'wr_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
+                if payload.get('referral_profile_uid'):
+                    wish_response_data['wr_recommended_id'] = payload.get('referral_profile_uid')
+                if payload.get('help_type'):
+                    wish_response_data['wr_type'] = payload.get('help_type')
                 
                 print(f"Inserting wish response data: {wish_response_data}")
                 
