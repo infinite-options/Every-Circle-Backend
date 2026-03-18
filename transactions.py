@@ -22,36 +22,38 @@ class Transactions(Resource):
             with connect() as db:
                 # Execute query with parameterized profile_id for security
                 query = """
-                    SELECT -- *,
+                    SELECT
                         transaction_uid, 
                         transaction_datetime, 
                         transaction_total, 
                         transaction_business_id,
                         CASE
-                            WHEN business_name IS NOT NULL THEN business_name
-                            ELSE CONCAT(profile_personal_first_name," ", profile_personal_last_name)
+                            WHEN MAX(business_name) IS NOT NULL THEN MAX(business_name)
+                            ELSE MAX(CONCAT(profile_personal_first_name, " ", profile_personal_last_name))
                         END AS business_name,
                         CASE
-                            WHEN business_name IS NOT NULL THEN "Business"
-                            WHEN profile_expertise_title IS NOT NULL THEN "Offering"
-                            WHEN profile_wish_title IS NOT NULL THEN "Seeking"
+                            WHEN MAX(business_name) IS NOT NULL THEN "Business"
+                            WHEN MAX(profile_expertise_title) IS NOT NULL THEN "Offering"
+                            WHEN MAX(profile_wish_title) IS NOT NULL THEN "Seeking"
+                            ELSE "Unknown"
                         END AS purchase_type,
                         CASE
-                            WHEN business_name IS NOT NULL THEN "See Receipt"
-                            WHEN profile_expertise_title IS NOT NULL THEN profile_expertise_title
-                            WHEN profile_wish_title IS NOT NULL THEN profile_wish_title
-                            ELSE "Item Not Found"
+                            WHEN MAX(business_name) IS NOT NULL THEN "See Receipt"
+                            ELSE GROUP_CONCAT(
+                                COALESCE(profile_expertise_title, profile_wish_title)
+                                ORDER BY ti_uid
+                                SEPARATOR ", "
+                            )
                         END AS purchased_item
                     FROM every_circle.transactions
-                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id -- Find Transaction Items
-                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid -- Find Expertise
-                    LEFT JOIN every_circle.wish_response ON ti_bs_id = wish_response_uid -- Find Wish Response
-                    LEFT JOIN every_circle.profile_wish ON wr_profile_wish_id = profile_wish_uid -- Find Actual Wish
-                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id -- Find Business
-                    LEFT JOIN every_circle.profile_personal ON transaction_business_id = profile_personal_uid -- Find Person
-                    -- WHERE transaction_profile_id = '110-000010'
+                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id
+                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid
+                    LEFT JOIN every_circle.wish_response ON ti_bs_id = wish_response_uid
+                    LEFT JOIN every_circle.profile_wish ON wr_profile_wish_id = profile_wish_uid
+                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id
+                    LEFT JOIN every_circle.profile_personal ON transaction_business_id = profile_personal_uid
                     WHERE transaction_profile_id = %s
-                    GROUP BY transaction_datetime
+                    GROUP BY transaction_uid, transaction_datetime, transaction_total, transaction_business_id
                     ORDER BY transaction_datetime DESC
                 """
                 
