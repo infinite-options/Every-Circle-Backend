@@ -51,24 +51,16 @@ class ProfileWishInfo(Resource):
             with connect() as db:
                 # Query to get wish responses with responder profile information
                 wishes_responses_query = """
-                    SELECT every_circle.wish_response.*,
-                        profile_personal_uid, profile_personal_user_id, profile_personal_referred_by, 
-                        profile_personal_first_name, profile_personal_last_name, profile_personal_email_is_public, 
-                        profile_personal_phone_number, profile_personal_phone_number_is_public, 
-                        profile_personal_city, profile_personal_state, profile_personal_country, 
-                        profile_personal_location_is_public, profile_personal_latitude, profile_personal_longitude, 
-                        profile_personal_experience_is_public, profile_personal_education_is_public, 
-                        profile_personal_expertise_is_public, profile_personal_wishes_is_public, 
-                        profile_personal_image, profile_personal_image_is_public, profile_personal_tag_line, 
-                        profile_personal_tag_line_is_public, profile_personal_short_bio, 
-                        profile_personal_short_bio_is_public, profile_personal_resume_is_public, 
-                        profile_personal_banner_ads_bounty, profile_personal_allow_banner_ads, 
-                        profile_personal_notification_preference, profile_personal_location_preference, 
-                        profile_personal_last_updated_at, profile_personal_resume, profile_personal_path,
-                        profile_personal_business_is_public
-                    FROM every_circle.profile_wish
-                    LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
-                    LEFT JOIN every_circle.profile_personal ON wr_responder_id = profile_personal_uid
+                    SELECT pw.*, wr.*,
+                        responder.profile_personal_first_name, responder.profile_personal_last_name,
+                        recommended.*,
+                        if (recommended.profile_personal_email_is_public = 1, u.user_email_id, null) AS user_email
+                    FROM every_circle.profile_wish pw
+                    LEFT JOIN every_circle.wish_response wr ON wr_profile_wish_id = profile_wish_uid
+                    LEFT JOIN every_circle.profile_personal AS responder ON wr_responder_id = profile_personal_uid
+                    LEFT JOIN every_circle.profile_personal AS recommended ON (wr_type = 'refer' AND wr_recommended_id = recommended.profile_personal_uid) OR ((wr_type = 'help' OR ISNULL(wr_type)) AND wr_responder_id = recommended.profile_personal_uid)
+                    LEFT JOIN every_circle.users u ON user_uid = recommended.profile_personal_user_id
+                    -- WHERE wr_profile_wish_id = "160-000014"
                     WHERE wr_profile_wish_id = %s
                 """
                 
