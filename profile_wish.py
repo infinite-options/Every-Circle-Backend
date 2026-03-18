@@ -52,9 +52,9 @@ class ProfileWishInfo(Resource):
                 # Query to get wish responses with responder profile information
                 wishes_responses_query = """
                     SELECT pw.*, wr.*,
-                        responder.profile_personal_first_name, responder.profile_personal_last_name,
+                        responder.profile_personal_first_name AS responder_first_name, responder.profile_personal_last_name AS responder_last_name,
                         recommended.*,
-                        if (recommended.profile_personal_email_is_public = 1, u.user_email_id, null) AS user_email
+                        if (recommended.profile_personal_email_is_public = 1, u.user_email_id, null) AS profile_personal_email
                     FROM every_circle.profile_wish pw
                     LEFT JOIN every_circle.wish_response wr ON wr_profile_wish_id = profile_wish_uid
                     LEFT JOIN every_circle.profile_personal AS responder ON wr_responder_id = profile_personal_uid
