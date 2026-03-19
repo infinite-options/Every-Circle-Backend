@@ -108,7 +108,8 @@ class Transactions(Resource):
                 'transaction_stripe_pi': payload.get('stripe_payment_intent'),
                 'transaction_total': payload.get('total_amount_paid'),
                 'transaction_amount': payload.get('total_costs'),
-                'transaction_taxes': payload.get('total_taxes')
+                'transaction_taxes': payload.get('total_taxes'),
+                'transaction_in_escrow': 1 if payload.get('transaction_in_escrow') else 0
             }
 
             with connect() as db:
