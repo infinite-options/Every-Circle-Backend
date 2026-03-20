@@ -26,7 +26,10 @@ class Transactions(Resource):
                         transaction_uid, 
                         transaction_datetime, 
                         transaction_total, 
+                        ti_bs_qty,
+                        ti_bs_cost,
                         transaction_business_id,
+                        transaction_in_escrow,
                         CASE
                             WHEN MAX(business_name) IS NOT NULL THEN MAX(business_name)
                             ELSE MAX(CONCAT(profile_personal_first_name, " ", profile_personal_last_name))
@@ -52,6 +55,7 @@ class Transactions(Resource):
                     LEFT JOIN every_circle.profile_wish ON wr_profile_wish_id = profile_wish_uid
                     LEFT JOIN every_circle.business ON business_uid = transaction_business_id
                     LEFT JOIN every_circle.profile_personal ON transaction_business_id = profile_personal_uid
+                    -- WHERE transaction_profile_id = '110-000014'
                     WHERE transaction_profile_id = %s
                     GROUP BY transaction_uid, transaction_datetime, transaction_total, transaction_business_id
                     ORDER BY transaction_datetime DESC
@@ -432,7 +436,56 @@ class Transactions(Resource):
             response['message'] = f'An error occurred: {str(e)}'
             response['code'] = 500
             return response, 500
-        
+
+    def put(self):
+        print("In Transactions PUT")
+        response = {}
+
+        try:
+            payload = request.get_json()
+            if not payload:
+                response['message'] = 'Request body is required'
+                response['code'] = 400
+                return response, 400
+
+            if not payload.get('transaction_uid'):
+                response['message'] = 'transaction_uid is required'
+                response['code'] = 400
+                return response, 400
+
+            if 'transaction_in_escrow' not in payload:
+                response['message'] = 'transaction_in_escrow is required'
+                response['code'] = 400
+                return response, 400
+
+            transaction_uid = payload.get('transaction_uid')
+            transaction_in_escrow = 1 if payload.get('transaction_in_escrow') else 0
+
+            with connect() as db:
+                update_response = db.update(
+                    'every_circle.transactions',
+                    {'transaction_uid': transaction_uid},
+                    {'transaction_in_escrow': transaction_in_escrow}
+                )
+
+                if update_response.get('code') != 200:
+                    response['message'] = update_response.get('message', 'Failed to update transaction')
+                    response['code'] = update_response.get('code', 500)
+                    return response, response['code']
+
+                response['message'] = 'Transaction updated successfully'
+                response['code'] = 200
+                response['transaction_uid'] = transaction_uid
+                response['transaction_in_escrow'] = transaction_in_escrow
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in Transactions PUT: {str(e)}")
+            print(traceback.format_exc())
+            response['message'] = f'An error occurred: {str(e)}'
+            response['code'] = 500
+            return response, 500
+
 class SellerTransactions(Resource):
     
     def get(self, profile_id=None):
@@ -455,12 +508,14 @@ class SellerTransactions(Resource):
                         t.transaction_taxes,
                         t.transaction_business_id,
                         t.transaction_profile_id,
+                        t.transaction_in_escrow,
                         ti.ti_uid,
                         ti.ti_bs_id,
                         ti.ti_bs_qty,
                         ti.ti_bs_cost
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti ON ti.ti_transaction_id = t.transaction_uid 
+                    -- WHERE t.transaction_profile_id = '110-000014'
                     WHERE t.transaction_business_id = %s
                     ORDER BY t.transaction_datetime DESC
                 """

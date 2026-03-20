@@ -531,7 +531,7 @@ api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<strin
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
-api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:profile_id>')
+api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
