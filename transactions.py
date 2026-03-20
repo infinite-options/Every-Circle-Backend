@@ -7,6 +7,16 @@ import json
 from data_ec import connect, processImage
 from user_path_connection import ConnectionsPath
 
+
+def _strip_currency(value):
+    """Remove $ and commas from currency values before storing."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.replace('$', '').replace(',', '').strip()
+    return value
+
+
 class Transactions(Resource):
 
     def get(self, profile_id=None):
@@ -191,7 +201,7 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
+                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('bs_cost'))
                         tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
                         tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
@@ -218,7 +228,7 @@ class Transactions(Resource):
                             return response, 404
                         
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = bs_data.get('profile_expertise_cost')
+                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('profile_expertise_cost'))
                         tx_item['ti_bs_cost_currency'] = bs_data.get('profile_expertise_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('profile_expertise_sku')  # Doesn't exist
                         tx_item['ti_bs_is_taxable'] = bs_data.get('profile_expertise_is_taxable')
@@ -246,7 +256,7 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = bs_data.get('profile_wish_cost')
+                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('profile_wish_cost'))
                         tx_item['ti_bs_cost_currency'] = bs_data.get('profile_wish_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('profile_wish_sku')  # Doesn't exist
                         tx_item['ti_bs_is_taxable'] = bs_data.get('profile_wish_is_taxable')
