@@ -7,16 +7,6 @@ import json
 from data_ec import connect, processImage
 from user_path_connection import ConnectionsPath
 
-
-def _strip_currency(value):
-    """Remove $ and commas from currency values before storing."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value.replace('$', '').replace(',', '').strip()
-    return value
-
-
 class Transactions(Resource):
 
     def get(self, profile_id=None):
@@ -30,50 +20,66 @@ class Transactions(Resource):
                 return response, 400
             
             with connect() as db:
-                # Execute query with parameterized profile_id for security
                 query = """
                     SELECT
-                        transaction_uid, 
-                        transaction_datetime, 
-                        transaction_total, 
-                        ti_bs_qty,
-                        ti_bs_cost,
-                        transaction_business_id,
-                        transaction_in_escrow,
+                        t.transaction_uid,
+                        t.transaction_datetime,
+                        t.transaction_total,
+                        t.transaction_taxes,
+                        t.transaction_profile_id,
+                        t.transaction_in_escrow,
+                        ti.ti_uid,
+                        ti.ti_bs_id,
+                        ti.ti_bs_qty,
+                        ti.ti_bs_cost,
                         CASE
-                            WHEN MAX(business_name) IS NOT NULL THEN MAX(business_name)
-                            ELSE MAX(CONCAT(profile_personal_first_name, " ", profile_personal_last_name))
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                                CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                            ELSE NULL
                         END AS business_name,
                         CASE
-                            WHEN MAX(business_name) IS NOT NULL THEN "Business"
-                            WHEN MAX(profile_expertise_title) IS NOT NULL THEN "Offering"
-                            WHEN MAX(profile_wish_title) IS NOT NULL THEN "Seeking"
-                            ELSE "Unknown"
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                            ELSE 'Unknown'
                         END AS purchase_type,
                         CASE
-                            WHEN MAX(business_name) IS NOT NULL THEN "See Receipt"
-                            ELSE GROUP_CONCAT(
-                                COALESCE(profile_expertise_title, profile_wish_title)
-                                ORDER BY ti_uid
-                                SEPARATOR ", "
-                            )
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                            ELSE 'See Receipt'
                         END AS purchased_item
-                    FROM every_circle.transactions
-                    LEFT JOIN every_circle.transactions_items ON transaction_uid = ti_transaction_id
-                    LEFT JOIN every_circle.profile_expertise ON ti_bs_id = profile_expertise_uid
-                    LEFT JOIN every_circle.wish_response ON ti_bs_id = wish_response_uid
-                    LEFT JOIN every_circle.profile_wish ON wr_profile_wish_id = profile_wish_uid
-                    LEFT JOIN every_circle.business ON business_uid = transaction_business_id
-                    LEFT JOIN every_circle.profile_personal ON transaction_business_id = profile_personal_uid
-                    -- WHERE transaction_profile_id = '110-000014'
-                    WHERE transaction_profile_id = %s
-                    GROUP BY transaction_uid, transaction_datetime, transaction_total, transaction_business_id
-                    ORDER BY transaction_datetime DESC
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                        ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                        ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                        ON bs.bs_business_id = biz.business_uid
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                        ON biz.`business_user_id-DNU` = seller_pp.profile_personal_user_id
+                    LEFT JOIN every_circle.profile_expertise pe
+                        ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                        ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                        ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                        ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    WHERE t.transaction_profile_id = %s
+                    ORDER BY t.transaction_datetime DESC, ti.ti_uid ASC
                 """
+                # Temporary debug - test with a simple query
+                test_result = db.execute("SELECT * FROM every_circle.transactions WHERE transaction_profile_id = %s", (profile_id,))
+                print(f"SIMPLE TEST - code: {test_result.get('code')}, count: {len(test_result.get('result', []))}, error: {test_result.get('error')}")
                 
                 print(f"Executing query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
-                print(f"Query result: {result}")
+                print(f"Query result code: {result.get('code')}")
+                print(f"Query result count: {len(result.get('result', []))}")
+                print(f"Query error: {result.get('error')}")
+                print(f"First row if any: {result.get('result', [None])[0] if result.get('result') else 'EMPTY'}")
                 
                 if result.get('code') == 200:
                     response['message'] = 'Transactions retrieved successfully'
@@ -122,8 +128,7 @@ class Transactions(Resource):
                 'transaction_stripe_pi': payload.get('stripe_payment_intent'),
                 'transaction_total': payload.get('total_amount_paid'),
                 'transaction_amount': payload.get('total_costs'),
-                'transaction_taxes': payload.get('total_taxes'),
-                'transaction_in_escrow': 1 if payload.get('transaction_in_escrow') else 0
+                'transaction_taxes': payload.get('total_taxes')
             }
 
             with connect() as db:
@@ -201,7 +206,7 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('bs_cost'))
+                        tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
                         tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
                         tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
@@ -228,7 +233,7 @@ class Transactions(Resource):
                             return response, 404
                         
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('profile_expertise_cost'))
+                        tx_item['ti_bs_cost'] = bs_data.get('profile_expertise_cost')
                         tx_item['ti_bs_cost_currency'] = bs_data.get('profile_expertise_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('profile_expertise_sku')  # Doesn't exist
                         tx_item['ti_bs_is_taxable'] = bs_data.get('profile_expertise_is_taxable')
@@ -256,7 +261,7 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response['result'][0]
-                        tx_item['ti_bs_cost'] = _strip_currency(bs_data.get('profile_wish_cost'))
+                        tx_item['ti_bs_cost'] = bs_data.get('profile_wish_cost')
                         tx_item['ti_bs_cost_currency'] = bs_data.get('profile_wish_cost_currency')
                         tx_item['ti_bs_sku'] = bs_data.get('profile_wish_sku')  # Doesn't exist
                         tx_item['ti_bs_is_taxable'] = bs_data.get('profile_wish_is_taxable')
@@ -446,56 +451,7 @@ class Transactions(Resource):
             response['message'] = f'An error occurred: {str(e)}'
             response['code'] = 500
             return response, 500
-
-    def put(self):
-        print("In Transactions PUT")
-        response = {}
-
-        try:
-            payload = request.get_json()
-            if not payload:
-                response['message'] = 'Request body is required'
-                response['code'] = 400
-                return response, 400
-
-            if not payload.get('transaction_uid'):
-                response['message'] = 'transaction_uid is required'
-                response['code'] = 400
-                return response, 400
-
-            if 'transaction_in_escrow' not in payload:
-                response['message'] = 'transaction_in_escrow is required'
-                response['code'] = 400
-                return response, 400
-
-            transaction_uid = payload.get('transaction_uid')
-            transaction_in_escrow = 1 if payload.get('transaction_in_escrow') else 0
-
-            with connect() as db:
-                update_response = db.update(
-                    'every_circle.transactions',
-                    {'transaction_uid': transaction_uid},
-                    {'transaction_in_escrow': transaction_in_escrow}
-                )
-
-                if update_response.get('code') != 200:
-                    response['message'] = update_response.get('message', 'Failed to update transaction')
-                    response['code'] = update_response.get('code', 500)
-                    return response, response['code']
-
-                response['message'] = 'Transaction updated successfully'
-                response['code'] = 200
-                response['transaction_uid'] = transaction_uid
-                response['transaction_in_escrow'] = transaction_in_escrow
-                return response, 200
-
-        except Exception as e:
-            print(f"Error in Transactions PUT: {str(e)}")
-            print(traceback.format_exc())
-            response['message'] = f'An error occurred: {str(e)}'
-            response['code'] = 500
-            return response, 500
-
+        
 class SellerTransactions(Resource):
     
     def get(self, profile_id=None):
@@ -518,14 +474,12 @@ class SellerTransactions(Resource):
                         t.transaction_taxes,
                         t.transaction_business_id,
                         t.transaction_profile_id,
-                        t.transaction_in_escrow,
                         ti.ti_uid,
                         ti.ti_bs_id,
                         ti.ti_bs_qty,
                         ti.ti_bs_cost
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti ON ti.ti_transaction_id = t.transaction_uid 
-                    -- WHERE t.transaction_profile_id = '110-000014'
                     WHERE t.transaction_business_id = %s
                     ORDER BY t.transaction_datetime DESC
                 """
