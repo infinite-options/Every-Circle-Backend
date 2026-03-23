@@ -39,10 +39,11 @@ class Transactions(Resource):
                         t.transaction_taxes,
                         t.transaction_profile_id,
                         t.transaction_in_escrow,
-                        ti.ti_uid,
-                        ti.ti_bs_id,
-                        ti.ti_bs_qty,
-                        ti.ti_bs_cost,
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_uid
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN expertise_pp.profile_personal_uid
+                            ELSE NULL
+                        END AS seller_id,
                         CASE
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN
@@ -55,12 +56,18 @@ class Transactions(Resource):
                             WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
                             ELSE 'Unknown'
                         END AS purchase_type,
-                        CASE
-                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
-                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
-                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
-                            ELSE 'See Receipt'
-                        END AS purchased_item
+                        GROUP_CONCAT(
+                            CASE
+                                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                                WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                                ELSE 'See Receipt'
+                            END
+                            ORDER BY ti.ti_uid
+                            SEPARATOR ', '
+                        ) AS purchased_item,
+                        SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                        MIN(ti.ti_uid) AS ti_uid
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                         ON t.transaction_uid = ti.ti_transaction_id
@@ -79,7 +86,15 @@ class Transactions(Resource):
                     LEFT JOIN every_circle.profile_wish pw
                         ON wr.wr_profile_wish_id = pw.profile_wish_uid
                     WHERE t.transaction_profile_id = %s
-                    ORDER BY t.transaction_datetime DESC, ti.ti_uid ASC
+                    GROUP BY
+                        t.transaction_uid,
+                        t.transaction_datetime,
+                        t.transaction_total,
+                        t.transaction_profile_id,
+                        seller_id,
+                        business_name,
+                        purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
                 """
                 
                 print(f"Executing query for profile_id: {profile_id}")
