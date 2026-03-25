@@ -34,6 +34,17 @@ class Ratings(Resource):
                 response['message'] = f'No ratings found for {key}'
                 response['code'] = 404
                 return response, 404
+            
+            # Add is_verified for each rating
+            for rating in response['result']:
+                profile_id = rating.get('rating_profile_id')
+                business_id = rating.get('rating_business_id')
+                with connect() as db2:
+                    transaction_check = db2.select('transactions', where={
+                        'transaction_profile_id': profile_id,
+                        'transaction_business_id': business_id
+                    })
+                rating['is_verified'] = bool(transaction_check.get('result'))
 
             return response, 200
 

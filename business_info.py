@@ -10,6 +10,15 @@ import os
 from data_ec import connect, processImage, uploadImage, deleteImage, processSingleImageUpload
 
 
+def _strip_currency(value):
+    """Remove $ and commas from currency values before storing."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.replace('$', '').replace(',', '').strip()
+    return value
+
+
 class BusinessInfo(Resource):
     def get(self, uid):
         print(f"In Business GET with uid: {uid}")
@@ -630,6 +639,11 @@ class BusinessInfo(Resource):
                                     else:
                                         service_data['bs_image_url'] = None
                                 
+                                # Strip $ from currency fields before storing
+                                if 'bs_bounty' in service_data:
+                                    service_data['bs_bounty'] = _strip_currency(service_data['bs_bounty'])
+                                if 'bs_cost' in service_data:
+                                    service_data['bs_cost'] = _strip_currency(service_data['bs_cost'])
                                 print(f"Updating service with data: {service_data}")
                                 if service_data:
                                     update_response = db.update('every_circle.business_services', 
@@ -1128,7 +1142,7 @@ class BusinessInfo(Resource):
                     'bs_service_desc': service.get('bs_service_desc'),
                     'bs_notes': service.get('bs_notes'),
                     'bs_sku': service.get('bs_sku'),
-                    'bs_bounty': service.get('bs_bounty'),
+                    'bs_bounty': _strip_currency(service.get('bs_bounty')),
                     'bs_bounty_currency': service.get('bs_bounty_currency'),
                     'bs_is_taxable': service.get('bs_is_taxable', 0),
                     'bs_tax_rate': service.get('bs_tax_rate'),
@@ -1143,7 +1157,7 @@ class BusinessInfo(Resource):
                     'bs_created_by': user_uid,
                     'bs_updated_by': user_uid,
                     'bs_duration_minutes': service.get('bs_duration_minutes'),
-                    'bs_cost': service.get('bs_cost'),
+                    'bs_cost': _strip_currency(service.get('bs_cost')),
                     'bs_cost_currency': service.get('bs_cost_currency')
                 }
                 

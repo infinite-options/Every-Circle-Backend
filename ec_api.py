@@ -20,7 +20,7 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessAvgRatings, Businesses
+from business import Business, Business_v2, BusinessAvgRatings, Businesses, BusinessTagSearch
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -38,7 +38,7 @@ from network_connection import NetworkPath
 from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
 from bounty_results import BountyResults, BusinessBountyResults
-from transaction_cost import TransactionCost
+from transaction_receipt import TransactionReceipt
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from feedback import Feedback
@@ -532,14 +532,14 @@ api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<strin
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
-api.add_resource(Transactions, '/api/v1/transactions','/api/v1/transactions/<string:profile_id>')
+api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
-api.add_resource(TransactionCost, '/api/transactioncost/<string:user_uid>/<string:ts_uid>')
+api.add_resource(TransactionReceipt, '/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
@@ -548,6 +548,7 @@ api.add_resource(NearbyUsers,    '/api/v1/nearby/<string:profile_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
+api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 
 class GooglePlacesInfo(Resource):
     def post(self):

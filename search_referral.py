@@ -26,6 +26,14 @@ class SearchReferral(Resource):
                     profile_personal_user_id,
                     profile_personal_first_name,
                     profile_personal_last_name,
+                    CASE WHEN profile_personal_email_is_public = 1 
+                        THEN u.user_email_id
+                        ELSE NULL 
+                    END as profile_email_id,
+                    CASE WHEN profile_personal_phone_number_is_public = 1 
+                        THEN profile_personal_phone_number 
+                        ELSE NULL 
+                    END as profile_personal_phone_number,
                     CASE WHEN profile_personal_location_is_public = 1 
                         THEN profile_personal_city 
                         ELSE NULL 
@@ -39,6 +47,7 @@ class SearchReferral(Resource):
                         ELSE NULL 
                     END as profile_personal_image
                 FROM every_circle.profile_personal
+                LEFT JOIN every_circle.users u ON profile_personal_user_id = user_uid
                 WHERE 
                     LOWER(COALESCE(profile_personal_first_name, '')) LIKE LOWER(%s) OR
                     LOWER(COALESCE(profile_personal_last_name, '')) LIKE LOWER(%s) OR
@@ -50,12 +59,12 @@ class SearchReferral(Resource):
             search_term = f"%{query}%"
             params = [search_term, search_term, search_term, search_term]
             
-            print(f"Searching for: '{query}' with pattern: '{search_term}'")  # DEBUG
+            # print(f"Searching for: '{query}' with pattern: '{search_term}'")  # DEBUG
             
             with connect() as db:
                 response = db.execute(search_query, params)
             
-            print(f"Search response: {response}")  # DEBUG
+            # print(f"Search response: {response}")  # DEBUG
             
             if response and 'result' in response:
                 results = response['result']
