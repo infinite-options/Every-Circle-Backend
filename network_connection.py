@@ -57,7 +57,7 @@ class NetworkPath(Resource):
                                 AND c.circle_profile_id = '{target_uid}'
                             WHERE pp.profile_personal_referred_by in ({placeholders});
                             '''
-            print('down_query', down_query)
+            # print('down_query', down_query)
 
 
             with connect() as db:
@@ -96,7 +96,7 @@ class NetworkPath(Resource):
                 'circle_state': item.get('circle_state')
             } for item in down_query_details]
             
-            print('down_list with profile_personal_referred_by:', down_list)
+            # print('down_list with profile_personal_referred_by:', down_list)
 
             return down_list
 
@@ -135,7 +135,7 @@ class NetworkPath(Resource):
                                 AND c.circle_profile_id = '{target_uid}'
                             WHERE pp.profile_personal_uid in ({placeholders});
                         '''
-            print('up_query', up_query)
+            # print('up_query', up_query)
         
             with connect() as db:
                 response = db.execute(up_query)
@@ -323,9 +323,9 @@ class NetworkPath(Resource):
             node_uid = row['network_profile_personal_uid']
             referred_by = row.get('profile_personal_referred_by')
             degree = row['degree']
-            print(f'  Node {node_uid} (degree {degree}):')
-            if referred_by:
-                print(f'    -> profile_personal_referred_by (connects TO): {referred_by}')
+            # print(f'  Node {node_uid} (degree {degree}):')
+            # if referred_by:
+            #     print(f'    -> profile_personal_referred_by (connects TO): {referred_by}')
         print('=== END GRAPH RELATIONSHIPS ===\n')
 
         # Return as JSON
