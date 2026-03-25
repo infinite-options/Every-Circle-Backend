@@ -143,6 +143,44 @@ class Circles(Resource):
             response['code'] = 500
             return response, 500
 
+    def delete(self, circle_id):
+        circle_uid = circle_id
+        print(f"In Circles DELETE - Removing circle with circle_uid: {circle_uid}")
+        response = {}
+
+        try:
+            if not circle_uid:
+                response['message'] = 'circle_uid is required'
+                response['code'] = 400
+                return response, 400
+
+            with connect() as db:
+                existing = db.select('every_circle.circles', where={'circle_uid': circle_uid})
+                if not existing.get('result') or len(existing['result']) == 0:
+                    response['message'] = f'Circle with UID {circle_uid} not found'
+                    response['code'] = 404
+                    return response, 404
+
+                delete_response = db.delete(f"DELETE FROM every_circle.circles WHERE circle_uid = '{circle_uid}'")
+                print(f"Delete response: {delete_response}")
+
+                if delete_response.get('code') != 200:
+                    response['message'] = delete_response.get('message', 'Failed to delete circle')
+                    response['code'] = delete_response.get('code', 500)
+                    return response, response['code']
+
+                response['message'] = 'Connection removed successfully'
+                response['code'] = 200
+                response['circle_uid'] = circle_uid
+                print(f"DELETE successful: Circle {circle_uid} removed")
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in Circles DELETE: {str(e)}")
+            response['message'] = f'An error occurred: {str(e)}'
+            response['code'] = 500
+            return response, 500
+
     def put(self, circle_id):
         circle_uid = circle_id
         print(f"In Circles PUT - Update circle with circle_uid: {circle_uid}")

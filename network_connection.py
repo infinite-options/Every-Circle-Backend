@@ -13,7 +13,7 @@ class NetworkPath(Resource):
         seen = set([target_uid])
         down_nodes =[]
         up_nodes = []
-        max_nodes  = 30
+        max_nodes  = 200
         #degree = 3
         store = {'descendants': defaultdict(list), 'ancestors': defaultdict(list), 'ancestors_down':defaultdict(list)}
 
@@ -211,33 +211,45 @@ class NetworkPath(Resource):
             current_up = [u['uid'] for u in new_up]
             #print('up_nodes', up_nodes)
 
-        total_count = sum(len(v) for v in store['ancestors'].values()) + sum(len(v) for v in store['descendants'].values())
-        #print('total_count before the anscestors_down', total_count)
-
-
+        # Phase 3a: for each ancestor group, fetch one level of descendants
+        all_ancestors_down_nodes = []
         for id, val in store['ancestors'].items():
 
-            #print('id, val inside the anscestors_down', id, val)
-            
-            total_count += sum(len(v) for v in store['ancestors_down'].values())
-
-            #print('total_count inside the anscestors_down', total_count)
-
-            #if not val or '110-000001' in val:
             if not val:
-                 continue
+                continue
 
-            #print('total_count', total_count)   
-
-            if total_count >= max_nodes:
+            if len(seen) >= max_nodes:
                 break
 
-            # Extract UIDs from val (which is a list of dicts) to pass to fetch_descendants
-            val_uids = [v['uid'] if isinstance(v, dict) else v for v in val]
+            val_uids = [v['uid'] for v in val if isinstance(v, dict) and v.get('uid') is not None]
+            if not val_uids:
+                continue
+
             result = fetch_descendants(val_uids)
             result = [u for u in result if u['uid'] not in seen]
             store['ancestors_down'][id] = result
             seen.update([u['uid'] for u in result])
+            all_ancestors_down_nodes.extend(result)
+
+        # Phase 3b: continue BFS downward from ancestors_down nodes so that cousins,
+        # second-cousins, etc. are found.  Each extra hop increments the level key by 1;
+        # add_to_rows uses base_degree=1, so degree = level + 1 stays correct.
+        max_anc_level = max(store['ancestors_down'].keys()) if store['ancestors_down'] else 0
+        current_down_frontier = all_ancestors_down_nodes
+        next_level = max_anc_level + 1
+
+        while current_down_frontier and len(seen) < max_nodes and (next_level + 1) <= degree:
+            frontier_uids = [u['uid'] for u in current_down_frontier if u.get('uid') is not None]
+            if not frontier_uids:
+                break
+            result = fetch_descendants(frontier_uids)
+            result = [u for u in result if u['uid'] not in seen]
+            if not result:
+                break
+            store['ancestors_down'][next_level] = result
+            seen.update([u['uid'] for u in result])
+            current_down_frontier = result
+            next_level += 1
                 
 
 
