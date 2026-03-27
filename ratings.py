@@ -218,6 +218,60 @@ class Ratings(Resource):
             rating_uid = payload.pop('rating_uid')
             key = {'rating_uid': rating_uid}
 
+            # rating response handling
+            if 'ratings_response' in payload:
+                responding_profile_uid = payload.pop('responding_profile_uid', None)
+                if not responding_profile_uid:
+                    response['message'] = 'responding_profile_uid is required to post a response'
+                    response['code'] = 400
+                    return response, 400
+
+                with connect() as db:
+                    # Get the business_id from the rating
+                    rating_row = db.select('every_circle.ratings', where=key)
+                    if not rating_row['result']:
+                        response['message'] = 'Rating does not exist'
+                        response['code'] = 404
+                        return response, 404
+
+                    business_uid = rating_row['result'][0].get('rating_business_id')
+
+                    # Step 1: Get all bu_user_ids for this business
+                    ownership_check = db.select(
+                        'every_circle.business_user',
+                        where={'bu_business_id': business_uid}
+                    )
+                    if not ownership_check['result']:
+                        response['message'] = 'No owners found for this business'
+                        response['code'] = 403
+                        return response, 403
+
+                    bu_user_ids = [
+                        bu.get('bu_user_id')
+                        for bu in ownership_check['result']
+                        if bu.get('bu_user_id')
+                    ]
+                    print("DEBUG bu_user_ids:", bu_user_ids)
+
+                    # Step 2: For each bu_user_id look up the profile_personal_uid
+                    is_authorized = False
+                    for bu_user_id in bu_user_ids:
+                        profile_check = db.select(
+                            'every_circle.profile_personal',
+                            where={'profile_personal_user_id': bu_user_id}
+                        )
+                        if profile_check.get('result'):
+                            profile_uid = profile_check['result'][0].get('profile_personal_uid')
+                            print("DEBUG profile_uid found:", profile_uid)
+                            if str(profile_uid) == str(responding_profile_uid):
+                                is_authorized = True
+                                break
+
+                    if not is_authorized:
+                        response['message'] = 'You are not authorized to respond to reviews for this business'
+                        response['code'] = 403
+                        return response, 403
+
             with connect() as db:
 
                 # Check if the rating exists
@@ -227,7 +281,7 @@ class Ratings(Resource):
                     response['message'] = 'ratings does not exist'
                     response['code'] = 404
                     return response, 404
-                
+                payload.pop('responding_profile_uid', None)
                 processImage(key, payload)
                 
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -236,7 +290,9 @@ class Ratings(Resource):
             
             return response, 200
         
-        except:
+       
+        except Exception as e:
+            print(f"Error in Ratings PUT: {e}")
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
