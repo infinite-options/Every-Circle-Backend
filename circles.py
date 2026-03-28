@@ -73,11 +73,9 @@ class Circles(Resource):
         response = {}
         
         try:
-            # Get JSON payload from request
             payload = request.get_json()
             print(f"POST payload received: {payload}")
             
-            # Validate required fields
             required_fields = ['circle_profile_id']
             missing_fields = [field for field in required_fields if not payload.get(field)]
             
@@ -87,7 +85,6 @@ class Circles(Resource):
                 print(f"POST validation failed: {response['message']}")
                 return response, 400
             
-            # Extract fields
             circle_data = {
                 'circle_profile_id': payload.get('circle_profile_id'),
                 'circle_related_person_id': payload.get('circle_related_person_id'),
@@ -98,13 +95,13 @@ class Circles(Resource):
                 'circle_geotag': payload.get('circle_geotag'),
                 'circle_city': payload.get('circle_city'),
                 'circle_state': payload.get('circle_state'),
-                'circle_introduced_by': payload.get('circle_introduced_by')
+                'circle_introduced_by': payload.get('circle_introduced_by'),
+                'circle_num_nodes': payload.get('circle_num_nodes')
             }
             
             print(f"Prepared circle_data: {circle_data}")
             
             with connect() as db:
-                # Generate new circle UID
                 print("Calling stored procedure: new_circle_uid")
                 circle_uid_response = db.call(procedure='new_circle_uid')
                 print(f"Stored procedure response: {circle_uid_response}")
@@ -119,7 +116,6 @@ class Circles(Resource):
                 circle_data['circle_uid'] = new_circle_uid
                 print(f"Generated new circle_uid: {new_circle_uid}")
                 
-                # Insert into circles table
                 print(f"Inserting circle data into database: {circle_data}")
                 insert_response = db.insert('every_circle.circles', circle_data)
                 print(f"Insert response: {insert_response}")
