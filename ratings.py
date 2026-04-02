@@ -6,6 +6,7 @@ import ast
 import json
 
 from data_ec import connect, uploadImage, s3, processImage
+from user_path_connection import ConnectionsPath
 
 
 class Ratings(Resource):
@@ -14,19 +15,20 @@ class Ratings(Resource):
         response = {}
         try:
             print(uid, type(uid))
+            viewer_uid = request.args.get('viewer_uid')
+            print("🔍 viewer_uid received:", viewer_uid)
+
             with connect() as db:
                 key = {}
                 if uid[:3] == "110":
                     key['rating_profile_id'] = uid
-                
                 elif uid[:3] == "200":
                     key['rating_business_id'] = uid
-
                 else:
                     response['message'] = 'Invalid UID'
                     response['code'] = 400
                     return response, 400
-            
+
                 response = db.select('every_circle.ratings', where=key)
 
             if not response['result']:
@@ -34,21 +36,79 @@ class Ratings(Resource):
                 response['message'] = f'No ratings found for {key}'
                 response['code'] = 404
                 return response, 404
-            
-            # Add is_verified for each rating
+
+            # Add is_verified and circle_num_nodes for each rating
             for rating in response['result']:
                 profile_id = rating.get('rating_profile_id')
                 business_id = rating.get('rating_business_id')
+
                 with connect() as db2:
+                    # is_verified check
                     transaction_check = db2.select('transactions', where={
                         'transaction_profile_id': profile_id,
                         'transaction_business_id': business_id
                     })
-                rating['is_verified'] = bool(transaction_check.get('result'))
+                    rating['is_verified'] = bool(transaction_check.get('result'))
 
+                    # circle_num_nodes lookup - use same connection
+                    rating['circle_num_nodes'] = None
+                    print(f"🔍 viewer_uid={viewer_uid}, profile_id={profile_id}")
+                    if viewer_uid and profile_id and viewer_uid != profile_id:
+                        print(f"🔍 Looking up circle for viewer={viewer_uid} -> reviewer={profile_id}")
+                        circle_check = db2.select(
+                            'every_circle.circles',
+                            where={
+                                'circle_profile_id': viewer_uid,
+                                'circle_related_person_id': profile_id
+                            }
+                        )
+                        if not circle_check.get('result'):
+                            circle_check = db2.select(
+                                'every_circle.circles',
+                                where={
+                                    'circle_profile_id': profile_id,
+                                    'circle_related_person_id': viewer_uid
+                                }
+                            )
+
+                        stored_nodes = None
+                        if circle_check.get('result'):
+                            stored_nodes = circle_check['result'][0].get('circle_num_nodes')
+                            print(f"🔍 Found circle record, stored_nodes={stored_nodes}")
+                        else:
+                            print(f"🔍 No circle record found in either direction")
+
+                        if stored_nodes is not None:
+                            rating['circle_num_nodes'] = int(stored_nodes)
+                        else:
+                            try:
+                                connections_path = ConnectionsPath()
+                                path_response, path_status = connections_path.get(viewer_uid, profile_id)
+                                print(f"🔍 path_status: {path_status}")
+                                print(f"🔍 path_response: {path_response}")
+                                if path_status == 200 and path_response.get('combined_path'):
+                                    nodes = path_response['combined_path'].split(',')
+                                    rating['circle_num_nodes'] = int(len(nodes) - 1)
+                                    print(f"🔍 Calculated circle_num_nodes for {viewer_uid} -> {profile_id}: {rating['circle_num_nodes']}")
+                                else:
+                                    print(f"🔍 ConnectionsPath returned no combined_path for {viewer_uid} -> {profile_id}")
+                            except Exception as e:
+                                print(f"Could not calculate circle_num_nodes: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+            # Sort by circle_num_nodes: lowest first, None (not in network) at the end
+            if uid[:3] == "200" and viewer_uid:
+                response['result'].sort(
+                    key=lambda r: (
+                        r['circle_num_nodes'] is None,
+                        int(r['circle_num_nodes']) if r['circle_num_nodes'] is not None else 0
+                    )
+                )
             return response, 200
 
-        except:
+        except Exception as e:
+            print(f"Error in Ratings GET: {e}")
             response['message'] = 'Internal Server Error'
             response['code'] = 500
             return response, 500
