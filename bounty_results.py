@@ -35,31 +35,30 @@ class BountyResults(Resource):
                 # """
                 bounty_query = f""" 
                 SELECT *,
-                    SUM(tb_amount) AS bounty_earned
-                FROM (
-                    SELECT 
-                        tb.*,
-                        ti.*,
-                        t.transaction_datetime, t.transaction_profile_id, t.transaction_business_id, 
-                        IF (t.transaction_in_escrow = 1,1,0) AS in_escrow,
-                        CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS purchaser_name,
-                        IF(
-                            t.transaction_business_id LIKE '110%%',
-                            CONCAT(pp.profile_personal_first_name, ' ', pp.profile_personal_last_name),
-                            b.business_name
-                        ) AS display_name
+                        SUM(tb_amount) AS bounty_earned
+                    FROM (
+                        SELECT 
+                            tb.*,
+                            ti.*,
+                            t.transaction_datetime, t.transaction_profile_id, t.transaction_business_id, 
+                            IF (t.transaction_in_escrow = 1,1,0) AS in_escrow,
+                            CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS purchaser_name,
+                            IF(
+                                t.transaction_business_id LIKE '110%%',
+                                CONCAT(pp.profile_personal_first_name, ' ', pp.profile_personal_last_name),
+                                b.business_name
+                            ) AS display_name
 
-                    FROM every_circle.transactions_bounty tb
-                    LEFT JOIN every_circle.transactions_items ti ON tb_ti_id = ti_uid
-                    LEFT JOIN every_circle.transactions t ON ti.ti_transaction_id = t.transaction_uid
-                    LEFT JOIN every_circle.business b ON t.transaction_business_id = b.business_uid
-                    LEFT JOIN every_circle.profile_personal pp ON t.transaction_business_id = pp.profile_personal_uid
-                    LEFT JOIN every_circle.profile_personal p ON t.transaction_profile_id = p.profile_personal_uid
-                    -- WHERE tb_profile_id = '110-000014'
-                    WHERE tb_profile_id = %s
-                ) AS bounty_results
-                GROUP BY bounty_results.tb_ti_id
-                ORDER BY bounty_results.transaction_datetime DESC
+                        FROM every_circle.transactions_bounty tb
+                        LEFT JOIN every_circle.transactions_items ti ON tb_ti_id = ti_uid
+                        LEFT JOIN every_circle.transactions t ON ti.ti_transaction_id = t.transaction_uid
+                        LEFT JOIN every_circle.business b ON t.transaction_business_id = b.business_uid
+                        LEFT JOIN every_circle.profile_personal pp ON t.transaction_business_id = pp.profile_personal_uid
+                        LEFT JOIN every_circle.profile_personal p ON t.transaction_profile_id = p.profile_personal_uid
+                        WHERE tb_profile_id = %s
+                    ) AS bounty_results
+                    GROUP BY bounty_results.ti_transaction_id, bounty_results.transaction_business_id
+                    ORDER BY bounty_results.transaction_datetime DESC
                 """
                 
                 bounty_response = db.execute(bounty_query, (profile_id,))
