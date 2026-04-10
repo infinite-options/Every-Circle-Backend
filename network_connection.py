@@ -131,7 +131,7 @@ class NetworkPath(Resource):
                             LEFT JOIN profile_personal AS pp_parent
                                 ON pp_parent.profile_personal_uid = pp.profile_personal_referred_by
                             LEFT JOIN every_circle.circles AS c
-                                ON c.circle_related_person_id = pp.profile_personal_uid
+                                ON c.circle_related_person_id = pp_parent.profile_personal_uid
                                 AND c.circle_profile_id = '{target_uid}'
                             WHERE pp.profile_personal_uid in ({placeholders});
                         '''
