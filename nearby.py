@@ -57,7 +57,9 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
                 pp.profile_personal_last_name,
                 pp.profile_personal_image,
                 rc.circle_relationship            AS recipient_relationship,
-                (rc.circle_profile_id IS NOT NULL) AS recipient_in_circles,
+                (rc.circle_profile_id IS NOT NULL
+                 AND rc.circle_relationship IS NOT NULL
+                 AND rc.circle_relationship != '') AS recipient_in_circles,
                 {dist_col}
             FROM every_circle.profile_personal pp
             LEFT JOIN every_circle.circles rc
@@ -72,7 +74,8 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
         return query, args
 
     # all_circles or specific: only people the sender has in their circles
-    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+    # For all_circles, exclude connections with no relationship assigned (NULL or empty string).
+    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else "AND c.circle_relationship IS NOT NULL AND c.circle_relationship != ''"
     query = f"""
         SELECT
             pp.profile_personal_uid           AS recipient_uid,
@@ -80,7 +83,9 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
             pp.profile_personal_last_name,
             pp.profile_personal_image,
             rc.circle_relationship            AS recipient_relationship,
-            (rc.circle_profile_id IS NOT NULL) AS recipient_in_circles,
+            (rc.circle_profile_id IS NOT NULL
+             AND rc.circle_relationship IS NOT NULL
+             AND rc.circle_relationship != '') AS recipient_in_circles,
             {dist_col}
         FROM every_circle.circles c
         JOIN every_circle.profile_personal pp
@@ -133,7 +138,8 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
         return query, args
 
     # all_circles or specific
-    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+    # For all_circles, exclude connections with no relationship assigned (NULL or empty string).
+    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else "AND c.circle_relationship IS NOT NULL AND c.circle_relationship != ''"
     query = f"""
         SELECT
             pp.profile_personal_uid       AS nearby_uid,
@@ -216,19 +222,23 @@ def _publish_nearby_alerts(
         async def _publish_all():
             async with ably_lib.AblyRest(api_key) as client:
 
-                # 2a. Tell each recipient that the updater is nearby
+                # 2a. Tell each recipient that the updater is nearby.
+                #     source='share' means the sender explicitly chose to share with this
+                #     person — the frontend should always show these, never filter them out.
                 for r in recipients:
                     recipient_uid   = r.get('recipient_uid')
                     distance_meters = float(r.get('distance_meters') or 0)
                     distance_miles  = round(distance_meters / 1609.34, 2)
                     payload = {
                         'type':                  'nearby-alert',
+                        'source':                'share',
                         'sender_uid':            profile_uid,
                         'sender_name':           sender_name,
                         'sender_image':          sender.get('profile_personal_image'),
                         'distance_meters':       round(distance_meters, 1),
                         'distance_miles':        distance_miles,
                         # Forwarded so the recipient's frontend can apply receiveFrom filter
+                        # (only relevant when share_with='everyone' — see frontend handler)
                         'recipient_relationship': r.get('recipient_relationship'),
                         'recipient_in_circles':   bool(r.get('recipient_in_circles')),
                     }
@@ -236,7 +246,8 @@ def _publish_nearby_alerts(
                     await channel.publish('nearby-alert', payload)
                     print(f'Notified {recipient_uid}: {sender_name} is {distance_miles} mi away')
 
-                # 2b. Tell the updater about each nearby person they want to hear from
+                # 2b. Tell the updater about each nearby person they want to hear from.
+                #     source='receive' — the updater's receiveFrom preference governs these.
                 for p in nearby_for_me:
                     nearby_uid      = p.get('nearby_uid')
                     distance_meters = float(p.get('distance_meters') or 0)
@@ -247,6 +258,7 @@ def _publish_nearby_alerts(
                     ).strip() or 'Someone'
                     payload = {
                         'type':            'nearby-alert',
+                        'source':          'receive',
                         'sender_uid':      nearby_uid,
                         'sender_name':     nearby_name,
                         'sender_image':    p.get('profile_personal_image'),
@@ -401,7 +413,8 @@ class NearbyUsers(Resource):
         # Build query based on mode
         db_types     = _norm_types(types_list) if mode == 'specific' else []
         placeholders = ', '.join(['%s'] * len(db_types)) if db_types else ''
-        rel_filter   = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+        # For all_circles, exclude connections with no relationship assigned (NULL or empty string).
+        rel_filter   = f"AND c.circle_relationship IN ({placeholders})" if db_types else "AND c.circle_relationship IS NOT NULL AND c.circle_relationship != ''"
 
         dist_col = f"""ST_Distance_Sphere(
                     POINT(pp.profile_personal_nearby_lng, pp.profile_personal_nearby_lat),
