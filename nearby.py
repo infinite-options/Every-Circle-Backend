@@ -2,23 +2,316 @@ from flask_restful import Resource
 from flask import request
 from data_ec import connect
 import datetime
+import os
+from dotenv import load_dotenv
 
-# --- Configurable constants (change these to test different behaviour) ---
+load_dotenv()
+
+# --- Configurable constants (mirror these in the frontend) ---
 LOCATION_EXPIRY_HOURS = 1     # how long a stored location stays "fresh"
 NEARBY_RADIUS_METERS  = 1609  # 1 mile
+
+# Normalise frontend plural labels (friends / colleagues / family) to DB values
+RELATIONSHIP_MAP = {
+    'friends':    'friend',
+    'colleagues': 'colleague',
+    'family':     'family',
+}
+
+
+def _norm_types(types_list):
+    """Map frontend plural labels to DB relationship values."""
+    return [RELATIONSHIP_MAP.get(t, t) for t in (types_list or [])]
+
+
+def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
+    """
+    Build a query that finds people to NOTIFY about the updater's location.
+    Returns (sql_string, args_tuple).
+
+    For each recipient the query also fetches:
+      • recipient_relationship  — how THEY have labelled the sender in their circles
+      • recipient_in_circles    — 1 if they have the sender in their circles, 0 otherwise
+    These fields are forwarded in the Ably payload so each recipient's frontend can
+    apply its own receiveFrom filter (Option A — frontend drops unwanted messages).
+
+    TODO: For share_with='everyone' this scans all users with a fresh location, which
+          may be expensive at scale.  Consider moving the fan-out to a dedicated
+          notification service / pre-computed index and storing preferences in the DB.
+    """
+    db_types    = _norm_types(share_with_types) if share_with == 'specific' else []
+    placeholders = ', '.join(['%s'] * len(db_types)) if db_types else ''
+
+    dist_col = f"""ST_Distance_Sphere(
+                    POINT(pp.profile_personal_nearby_lng, pp.profile_personal_nearby_lat),
+                    POINT(%s, %s)
+                ) AS distance_meters"""
+
+    if share_with == 'everyone':
+        # Notify ALL nearby users regardless of circle membership.
+        # Left-join so we still know how each recipient has labelled the sender.
+        query = f"""
+            SELECT
+                pp.profile_personal_uid           AS recipient_uid,
+                pp.profile_personal_first_name,
+                pp.profile_personal_last_name,
+                pp.profile_personal_image,
+                rc.circle_relationship            AS recipient_relationship,
+                (rc.circle_profile_id IS NOT NULL) AS recipient_in_circles,
+                {dist_col}
+            FROM every_circle.profile_personal pp
+            LEFT JOIN every_circle.circles rc
+                ON  rc.circle_profile_id        = pp.profile_personal_uid
+                AND rc.circle_related_person_id = %s
+            WHERE pp.profile_personal_uid != %s
+              AND pp.profile_personal_nearby_lat IS NOT NULL
+              AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+            HAVING distance_meters < {NEARBY_RADIUS_METERS}
+        """
+        args = (lng, lat, profile_uid, profile_uid)
+        return query, args
+
+    # all_circles or specific: only people the sender has in their circles
+    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+    query = f"""
+        SELECT
+            pp.profile_personal_uid           AS recipient_uid,
+            pp.profile_personal_first_name,
+            pp.profile_personal_last_name,
+            pp.profile_personal_image,
+            rc.circle_relationship            AS recipient_relationship,
+            (rc.circle_profile_id IS NOT NULL) AS recipient_in_circles,
+            {dist_col}
+        FROM every_circle.circles c
+        JOIN every_circle.profile_personal pp
+            ON pp.profile_personal_uid = c.circle_related_person_id
+        LEFT JOIN every_circle.circles rc
+            ON  rc.circle_profile_id        = pp.profile_personal_uid
+            AND rc.circle_related_person_id = %s
+        WHERE c.circle_profile_id = %s
+          AND pp.profile_personal_nearby_lat IS NOT NULL
+          AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+          {rel_filter}
+        HAVING distance_meters < {NEARBY_RADIUS_METERS}
+    """
+    args = (lng, lat, profile_uid, profile_uid) + tuple(db_types)
+    return query, args
+
+
+def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng):
+    """
+    Build a query that finds nearby users to send AS notifications TO the updater.
+    Returns (sql_string, args_tuple).
+    """
+    db_types     = _norm_types(receive_from_types) if receive_from == 'specific' else []
+    placeholders = ', '.join(['%s'] * len(db_types)) if db_types else ''
+
+    dist_col = f"""ST_Distance_Sphere(
+                    POINT(pp.profile_personal_nearby_lng, pp.profile_personal_nearby_lat),
+                    POINT(%s, %s)
+                ) AS distance_meters"""
+
+    if receive_from == 'everyone':
+        query = f"""
+            SELECT
+                pp.profile_personal_uid       AS nearby_uid,
+                pp.profile_personal_first_name,
+                pp.profile_personal_last_name,
+                pp.profile_personal_image,
+                mc.circle_relationship        AS my_relationship,
+                {dist_col}
+            FROM every_circle.profile_personal pp
+            LEFT JOIN every_circle.circles mc
+                ON  mc.circle_profile_id        = %s
+                AND mc.circle_related_person_id = pp.profile_personal_uid
+            WHERE pp.profile_personal_uid != %s
+              AND pp.profile_personal_nearby_lat IS NOT NULL
+              AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+            HAVING distance_meters < {NEARBY_RADIUS_METERS}
+        """
+        args = (lng, lat, profile_uid, profile_uid)
+        return query, args
+
+    # all_circles or specific
+    rel_filter = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+    query = f"""
+        SELECT
+            pp.profile_personal_uid       AS nearby_uid,
+            pp.profile_personal_first_name,
+            pp.profile_personal_last_name,
+            pp.profile_personal_image,
+            c.circle_relationship         AS my_relationship,
+            {dist_col}
+        FROM every_circle.circles c
+        JOIN every_circle.profile_personal pp
+            ON pp.profile_personal_uid = c.circle_related_person_id
+        WHERE c.circle_profile_id = %s
+          AND pp.profile_personal_nearby_lat IS NOT NULL
+          AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+          {rel_filter}
+        HAVING distance_meters < {NEARBY_RADIUS_METERS}
+    """
+    args = (lng, lat, profile_uid) + tuple(db_types)
+    return query, args
+
+
+def _publish_nearby_alerts(
+    profile_uid, lat, lng,
+    share_with='all_circles', share_with_types=None,
+    receive_from='all_circles', receive_from_types=None,
+):
+    """
+    Publish nearby-alert Ably messages based on the user's sharing preferences.
+
+    share_with / share_with_types  — who gets told the updater is nearby
+    receive_from / receive_from_types — who the updater hears about
+
+    Each payload includes `recipient_relationship` and `recipient_in_circles` so
+    the recipient's frontend can apply its own receiveFrom filter (Option A).
+    """
+    try:
+        import ably as ably_lib
+
+        # 1. Get the updater's profile info
+        with connect() as db:
+            sender_resp = db.execute(
+                """
+                SELECT profile_personal_first_name,
+                       profile_personal_last_name,
+                       profile_personal_image
+                FROM every_circle.profile_personal
+                WHERE profile_personal_uid = %s
+                """,
+                args=(profile_uid,)
+            )
+        sender = (sender_resp.get('result') or [{}])[0]
+        sender_name = (
+            f"{sender.get('profile_personal_first_name') or ''} "
+            f"{sender.get('profile_personal_last_name') or ''}"
+        ).strip() or 'Someone'
+
+        # 2. Build + run both queries
+        share_query,   share_args   = _build_share_query(
+            share_with,   share_with_types   or [], profile_uid, lat, lng)
+        receive_query, receive_args = _build_receive_query(
+            receive_from, receive_from_types or [], profile_uid, lat, lng)
+
+        with connect() as db:
+            share_resp   = db.execute(share_query,   args=share_args)
+            receive_resp = db.execute(receive_query, args=receive_args)
+
+        recipients    = share_resp.get('result')   or []
+        nearby_for_me = receive_resp.get('result') or []
+
+        if not recipients and not nearby_for_me:
+            return
+
+        api_key = os.getenv('ABLY_API_KEY', '')
+        if not api_key:
+            print('ABLY_API_KEY not set — skipping nearby alerts')
+            return
+
+        import asyncio
+
+        async def _publish_all():
+            async with ably_lib.AblyRest(api_key) as client:
+
+                # 2a. Tell each recipient that the updater is nearby
+                for r in recipients:
+                    recipient_uid   = r.get('recipient_uid')
+                    distance_meters = float(r.get('distance_meters') or 0)
+                    distance_miles  = round(distance_meters / 1609.34, 2)
+                    payload = {
+                        'type':                  'nearby-alert',
+                        'sender_uid':            profile_uid,
+                        'sender_name':           sender_name,
+                        'sender_image':          sender.get('profile_personal_image'),
+                        'distance_meters':       round(distance_meters, 1),
+                        'distance_miles':        distance_miles,
+                        # Forwarded so the recipient's frontend can apply receiveFrom filter
+                        'recipient_relationship': r.get('recipient_relationship'),
+                        'recipient_in_circles':   bool(r.get('recipient_in_circles')),
+                    }
+                    channel = client.channels.get(f'/{recipient_uid}')
+                    await channel.publish('nearby-alert', payload)
+                    print(f'Notified {recipient_uid}: {sender_name} is {distance_miles} mi away')
+
+                # 2b. Tell the updater about each nearby person they want to hear from
+                for p in nearby_for_me:
+                    nearby_uid      = p.get('nearby_uid')
+                    distance_meters = float(p.get('distance_meters') or 0)
+                    distance_miles  = round(distance_meters / 1609.34, 2)
+                    nearby_name     = (
+                        f"{p.get('profile_personal_first_name') or ''} "
+                        f"{p.get('profile_personal_last_name') or ''}"
+                    ).strip() or 'Someone'
+                    payload = {
+                        'type':            'nearby-alert',
+                        'sender_uid':      nearby_uid,
+                        'sender_name':     nearby_name,
+                        'sender_image':    p.get('profile_personal_image'),
+                        'distance_meters': round(distance_meters, 1),
+                        'distance_miles':  distance_miles,
+                        # How the updater has labelled this nearby person (their own circles)
+                        'recipient_relationship': p.get('my_relationship'),
+                        'recipient_in_circles':   True,
+                    }
+                    channel = client.channels.get(f'/{profile_uid}')
+                    await channel.publish('nearby-alert', payload)
+                    print(f'Notified updater {profile_uid}: {nearby_name} is {distance_miles} mi away')
+
+                # [DISABLED] Old approach: queried users who had the updater in THEIR circles.
+                # Now only people the updater has added (their own circle) are considered,
+                # and the share_with / receive_from settings give fine-grained control.
+                # notify_others_query = f"""
+                #     SELECT
+                #         c.circle_profile_id  AS recipient_uid,
+                #         pp.profile_personal_first_name,
+                #         pp.profile_personal_last_name,
+                #         pp.profile_personal_image,
+                #         ST_Distance_Sphere(
+                #             POINT(pp.profile_personal_nearby_lng, pp.profile_personal_nearby_lat),
+                #             POINT(%s, %s)
+                #         ) AS distance_meters
+                #     FROM every_circle.circles c
+                #     JOIN every_circle.profile_personal pp
+                #         ON pp.profile_personal_uid = c.circle_profile_id
+                #     WHERE c.circle_related_person_id = %s
+                #       AND pp.profile_personal_nearby_lat IS NOT NULL
+                #       AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+                #     HAVING distance_meters < {NEARBY_RADIUS_METERS}
+                # """
+
+        asyncio.run(_publish_all())
+
+    except Exception as e:
+        print(f'Error in _publish_nearby_alerts: {e}')
 
 
 class NearbyLocation(Resource):
     """PATCH /api/v1/nearby/location
     Updates the ephemeral nearby-location fields for a user.
-    Body (JSON): { profile_uid, lat, lng }
+    Body (JSON): {
+        profile_uid, lat, lng,
+        live_sharing?,       -- triggers Ably notifications when true
+        share_with?,         -- 'everyone' | 'all_circles' | 'specific'
+        share_with_types?,   -- list of types when share_with='specific'
+        receive_from?,       -- 'everyone' | 'all_circles' | 'specific'
+        receive_from_types?, -- list of types when receive_from='specific'
+    }
     """
 
     def patch(self):
         data = request.get_json(silent=True) or {}
-        profile_uid = data.get('profile_uid')
-        lat         = data.get('lat')
-        lng         = data.get('lng')
+        profile_uid  = data.get('profile_uid')
+        lat          = data.get('lat')
+        lng          = data.get('lng')
+        live_sharing = data.get('live_sharing', False)
+
+        share_with         = data.get('share_with',         'all_circles')
+        share_with_types   = data.get('share_with_types',   [])
+        receive_from       = data.get('receive_from',       'all_circles')
+        receive_from_types = data.get('receive_from_types', [])
 
         if not profile_uid or lat is None or lng is None:
             return {'message': 'profile_uid, lat, and lng are required', 'code': 400}, 400
@@ -39,18 +332,33 @@ class NearbyLocation(Resource):
         if result.get('code') not in (200, 201):
             return {'message': 'Failed to update location', 'code': 500}, 500
 
+        if live_sharing:
+            _publish_nearby_alerts(
+                profile_uid, lat, lng,
+                share_with=share_with,
+                share_with_types=share_with_types,
+                receive_from=receive_from,
+                receive_from_types=receive_from_types,
+            )
+
         return {'message': 'Location updated', 'code': 200, 'updated_at': updated_at}, 200
 
 
 class NearbyUsers(Resource):
     """GET /api/v1/nearby/<profile_uid>
-    Returns circle members within NEARBY_RADIUS_METERS whose location is
-    fresher than LOCATION_EXPIRY_HOURS.
+    Returns nearby users based on the caller's visibility preferences.
+    Query params:
+        mode  — 'everyone' | 'all_circles' | 'specific'  (default: 'all_circles')
+        types — comma-separated relationship types when mode='specific'
+                e.g. types=friends,colleagues
     """
 
     def get(self, profile_uid):
+        mode       = request.args.get('mode', 'all_circles')
+        types_raw  = request.args.get('types', '')
+        types_list = [t.strip() for t in types_raw.split(',') if t.strip()] if types_raw else []
+
         with connect() as db:
-            # 1. Fetch the requesting user's current nearby location
             user_resp = db.execute(
                 """
                 SELECT profile_personal_nearby_lat,
@@ -74,7 +382,7 @@ class NearbyUsers(Resource):
                 'result': []
             }, 200
 
-        # 2. Check freshness of the user's own location
+        # Freshness check
         updated_at = user['profile_personal_nearby_updated_at']
         if isinstance(updated_at, str):
             updated_at = datetime.datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
@@ -90,44 +398,71 @@ class NearbyUsers(Resource):
         user_lat = float(user['profile_personal_nearby_lat'])
         user_lng = float(user['profile_personal_nearby_lng'])
 
-        # 3. Find circle members within radius with a fresh location
-        # Constants are f-stringed (safe — they are hardcoded Python values, not user input).
-        # User-supplied coordinates are parameterised via %s.
-        nearby_query = f"""
-            SELECT
-                pp.profile_personal_uid,
-                pp.profile_personal_first_name,
-                pp.profile_personal_last_name,
-                pp.profile_personal_image,
-                pp.profile_personal_nearby_updated_at,
-                ST_Distance_Sphere(
+        # Build query based on mode
+        db_types     = _norm_types(types_list) if mode == 'specific' else []
+        placeholders = ', '.join(['%s'] * len(db_types)) if db_types else ''
+        rel_filter   = f"AND c.circle_relationship IN ({placeholders})" if db_types else ""
+
+        dist_col = f"""ST_Distance_Sphere(
                     POINT(pp.profile_personal_nearby_lng, pp.profile_personal_nearby_lat),
                     POINT(%s, %s)
-                ) AS distance_meters
-            FROM every_circle.profile_personal pp
-            JOIN every_circle.circles c
-                ON c.circle_related_person_id = pp.profile_personal_uid
-            WHERE c.circle_profile_id = %s
-              AND pp.profile_personal_nearby_lat IS NOT NULL
-              AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
-            HAVING distance_meters < {NEARBY_RADIUS_METERS}
-            ORDER BY distance_meters ASC
-        """
+                ) AS distance_meters"""
+
+        if mode == 'everyone':
+            nearby_query = f"""
+                SELECT
+                    pp.profile_personal_uid,
+                    pp.profile_personal_first_name,
+                    pp.profile_personal_last_name,
+                    pp.profile_personal_image,
+                    pp.profile_personal_nearby_updated_at,
+                    mc.circle_relationship,
+                    {dist_col}
+                FROM every_circle.profile_personal pp
+                LEFT JOIN every_circle.circles mc
+                    ON  mc.circle_profile_id        = %s
+                    AND mc.circle_related_person_id = pp.profile_personal_uid
+                WHERE pp.profile_personal_uid != %s
+                  AND pp.profile_personal_nearby_lat IS NOT NULL
+                  AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+                HAVING distance_meters < {NEARBY_RADIUS_METERS}
+                ORDER BY distance_meters ASC
+            """
+            args = (user_lng, user_lat, profile_uid, profile_uid)
+        else:
+            nearby_query = f"""
+                SELECT
+                    pp.profile_personal_uid,
+                    pp.profile_personal_first_name,
+                    pp.profile_personal_last_name,
+                    pp.profile_personal_image,
+                    pp.profile_personal_nearby_updated_at,
+                    c.circle_relationship,
+                    {dist_col}
+                FROM every_circle.profile_personal pp
+                JOIN every_circle.circles c
+                    ON c.circle_related_person_id = pp.profile_personal_uid
+                WHERE c.circle_profile_id = %s
+                  AND pp.profile_personal_nearby_lat IS NOT NULL
+                  AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+                  {rel_filter}
+                HAVING distance_meters < {NEARBY_RADIUS_METERS}
+                ORDER BY distance_meters ASC
+            """
+            args = (user_lng, user_lat, profile_uid) + tuple(db_types)
 
         with connect() as db:
-            nearby_resp = db.execute(nearby_query, args=(user_lng, user_lat, profile_uid))
+            nearby_resp = db.execute(nearby_query, args=args)
 
         nearby = nearby_resp.get('result', [])
-
-        # Convert distance to float for clean JSON serialisation
         for row in nearby:
             if row.get('distance_meters') is not None:
                 row['distance_meters'] = float(row['distance_meters'])
 
         return {
-            'message': 'Success',
-            'code': 200,
-            'result': nearby,
-            'expiry_hours': LOCATION_EXPIRY_HOURS,
+            'message':       'Success',
+            'code':          200,
+            'result':        nearby,
+            'expiry_hours':  LOCATION_EXPIRY_HOURS,
             'radius_meters': NEARBY_RADIUS_METERS,
         }, 200
