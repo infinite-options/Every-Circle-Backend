@@ -44,8 +44,12 @@ def _get_or_create_conversation(uid_a, uid_b):
     return conv_uid, True
 
 
-def _publish_message(conversation_uid, message_uid, sender_uid, body, sent_at):
-    """Publish a new-message event to the chat Ably channel (best-effort)."""
+def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, body, sent_at):
+    """
+    Publish a new-message event to:
+      1. chat::<conversation_uid>  — for the ChatScreen real-time feed
+      2. /<recipient_uid>          — for the unread-dot / notification banner
+    """
     try:
         import ably
         import asyncio
@@ -55,19 +59,55 @@ def _publish_message(conversation_uid, message_uid, sender_uid, body, sent_at):
             print("ABLY_API_KEY not set — skipping chat publish")
             return
 
+        # Find the recipient (the participant who is NOT the sender)
+        recipient_uid = None
+        try:
+            with connect() as db:
+                conv_resp = db.execute(
+                    """
+                    SELECT participant_a_uid, participant_b_uid
+                    FROM every_circle.conversations
+                    WHERE conversation_uid = %s
+                    """,
+                    args=(conversation_uid,),
+                )
+            conv = (conv_resp.get("result") or [{}])[0]
+            if conv.get("participant_a_uid") == sender_uid:
+                recipient_uid = conv.get("participant_b_uid")
+            else:
+                recipient_uid = conv.get("participant_a_uid")
+        except Exception as e:
+            print(f"Could not find recipient for notification: {e}")
+
         async def _pub():
             async with ably.AblyRest(api_key) as client:
-                channel = client.channels.get(f"chat::{conversation_uid}")
-                await channel.publish(
+                # 1. Conversation channel — ChatScreen listens here
+                conv_channel = client.channels.get(f"chat::{conversation_uid}")
+                await conv_channel.publish(
                     "new-message",
                     {
-                        "message_uid": message_uid,
+                        "message_uid":      message_uid,
                         "conversation_uid": conversation_uid,
-                        "sender_uid": sender_uid,
-                        "body": body,
-                        "sent_at": sent_at,
+                        "sender_uid":       sender_uid,
+                        "body":             body,
+                        "sent_at":          sent_at,
                     },
                 )
+
+                # 2. Recipient's personal channel — UnreadContext listens here
+                if recipient_uid:
+                    personal_channel = client.channels.get(f"/{recipient_uid}")
+                    await personal_channel.publish(
+                        "new-message",
+                        {
+                            "message_uid":      message_uid,
+                            "conversation_uid": conversation_uid,
+                            "sender_uid":       sender_uid,
+                            "sender_name":      sender_name,
+                            "body":             body[:120],  # preview only
+                            "sent_at":          sent_at,
+                        },
+                    )
 
         asyncio.run(_pub())
     except Exception as e:
@@ -244,7 +284,27 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        _publish_message(conv_uid, msg_uid, sender_uid, body, now)
+        # Look up sender's name for the notification preview
+        sender_name = "Someone"
+        try:
+            with connect() as db:
+                sn = db.execute(
+                    """
+                    SELECT profile_personal_first_name, profile_personal_last_name
+                    FROM every_circle.profile_personal
+                    WHERE profile_personal_uid = %s
+                    """,
+                    args=(sender_uid,),
+                )
+            sp = (sn.get("result") or [{}])[0]
+            sender_name = (
+                f"{sp.get('profile_personal_first_name') or ''} "
+                f"{sp.get('profile_personal_last_name') or ''}"
+            ).strip() or "Someone"
+        except Exception:
+            pass
+
+        _publish_message(conv_uid, msg_uid, sender_uid, sender_name, body, now)
 
         return {
             "message": "Message sent",
