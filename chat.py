@@ -11,6 +11,44 @@ load_dotenv()
 
 # --------------- helpers ---------------
 
+def _get_participant_info(uid):
+    """
+    Return { first_name, last_name, image } for any UID type:
+      110-...  →  every_circle.profile_personal
+      200-...  →  every_circle.business  (business_name used as first_name)
+    """
+    if not uid:
+        return {}
+    try:
+        with connect() as db:
+            if uid[:3] == "200":
+                rows = db.execute(
+                    "SELECT business_name, business_profile_img FROM every_circle.business WHERE business_uid = %s",
+                    args=(uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return {
+                    "first_name": row.get("business_name") or "Business",
+                    "last_name":  "",
+                    "image":      row.get("business_profile_img"),
+                }
+            else:
+                rows = db.execute(
+                    """SELECT profile_personal_first_name, profile_personal_last_name, profile_personal_image
+                       FROM every_circle.profile_personal WHERE profile_personal_uid = %s""",
+                    args=(uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return {
+                    "first_name": row.get("profile_personal_first_name") or "",
+                    "last_name":  row.get("profile_personal_last_name") or "",
+                    "image":      row.get("profile_personal_image"),
+                }
+    except Exception as e:
+        print(f"_get_participant_info error for {uid}: {e}")
+        return {}
+
+
 def _get_or_create_conversation(uid_a, uid_b):
     """Return (conversation_uid, created) for the pair. Order is normalised."""
     p1, p2 = sorted([uid_a, uid_b])
@@ -180,25 +218,12 @@ class Conversations(Resource):
         result = []
         for conv in conversations:
             other_uid = conv.get("other_uid")
-            other_info = {}
-            if other_uid:
-                with connect() as db:
-                    p = db.execute(
-                        """
-                        SELECT profile_personal_first_name,
-                               profile_personal_last_name,
-                               profile_personal_image
-                        FROM every_circle.profile_personal
-                        WHERE profile_personal_uid = %s
-                        """,
-                        args=(other_uid,),
-                    )
-                pr = (p.get("result") or [{}])[0]
-                other_info = {
-                    "first_name": pr.get("profile_personal_first_name"),
-                    "last_name": pr.get("profile_personal_last_name"),
-                    "image": pr.get("profile_personal_image"),
-                }
+            info = _get_participant_info(other_uid) if other_uid else {}
+            other_info = {
+                "first_name": info.get("first_name"),
+                "last_name":  info.get("last_name"),
+                "image":      info.get("image"),
+            }
 
             result.append(
                 {
@@ -207,6 +232,7 @@ class Conversations(Resource):
                     "last_message": conv.get("last_message"),
                     "last_sent_at": str(conv.get("last_sent_at") or ""),
                     "other_uid": other_uid,
+                    "my_uid": profile_uid,  # lets the client know which side it is
                     **other_info,
                 }
             )
@@ -284,22 +310,12 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        # Look up sender's name for the notification preview
+        # Look up sender's name for the notification preview (works for both 110- and 200- UIDs)
         sender_name = "Someone"
         try:
-            with connect() as db:
-                sn = db.execute(
-                    """
-                    SELECT profile_personal_first_name, profile_personal_last_name
-                    FROM every_circle.profile_personal
-                    WHERE profile_personal_uid = %s
-                    """,
-                    args=(sender_uid,),
-                )
-            sp = (sn.get("result") or [{}])[0]
+            info = _get_participant_info(sender_uid)
             sender_name = (
-                f"{sp.get('profile_personal_first_name') or ''} "
-                f"{sp.get('profile_personal_last_name') or ''}"
+                f"{info.get('first_name') or ''} {info.get('last_name') or ''}"
             ).strip() or "Someone"
         except Exception:
             pass
