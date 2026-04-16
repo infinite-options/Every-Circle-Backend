@@ -11,6 +11,44 @@ load_dotenv()
 
 # --------------- helpers ---------------
 
+def _get_participant_info(uid):
+    """
+    Return { first_name, last_name, image } for any UID type:
+      110-...  →  every_circle.profile_personal
+      200-...  →  every_circle.business  (business_name used as first_name)
+    """
+    if not uid:
+        return {}
+    try:
+        with connect() as db:
+            if uid[:3] == "200":
+                rows = db.execute(
+                    "SELECT business_name, business_profile_img FROM every_circle.business WHERE business_uid = %s",
+                    args=(uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return {
+                    "first_name": row.get("business_name") or "Business",
+                    "last_name":  "",
+                    "image":      row.get("business_profile_img"),
+                }
+            else:
+                rows = db.execute(
+                    """SELECT profile_personal_first_name, profile_personal_last_name, profile_personal_image
+                       FROM every_circle.profile_personal WHERE profile_personal_uid = %s""",
+                    args=(uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return {
+                    "first_name": row.get("profile_personal_first_name") or "",
+                    "last_name":  row.get("profile_personal_last_name") or "",
+                    "image":      row.get("profile_personal_image"),
+                }
+    except Exception as e:
+        print(f"_get_participant_info error for {uid}: {e}")
+        return {}
+
+
 def _get_or_create_conversation(uid_a, uid_b):
     """Return (conversation_uid, created) for the pair. Order is normalised."""
     p1, p2 = sorted([uid_a, uid_b])
@@ -44,8 +82,12 @@ def _get_or_create_conversation(uid_a, uid_b):
     return conv_uid, True
 
 
-def _publish_message(conversation_uid, message_uid, sender_uid, body, sent_at):
-    """Publish a new-message event to the chat Ably channel (best-effort)."""
+def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, body, sent_at):
+    """
+    Publish a new-message event to:
+      1. chat::<conversation_uid>  — for the ChatScreen real-time feed
+      2. /<recipient_uid>          — for the unread-dot / notification banner
+    """
     try:
         import ably
         import asyncio
@@ -55,19 +97,55 @@ def _publish_message(conversation_uid, message_uid, sender_uid, body, sent_at):
             print("ABLY_API_KEY not set — skipping chat publish")
             return
 
+        # Find the recipient (the participant who is NOT the sender)
+        recipient_uid = None
+        try:
+            with connect() as db:
+                conv_resp = db.execute(
+                    """
+                    SELECT participant_a_uid, participant_b_uid
+                    FROM every_circle.conversations
+                    WHERE conversation_uid = %s
+                    """,
+                    args=(conversation_uid,),
+                )
+            conv = (conv_resp.get("result") or [{}])[0]
+            if conv.get("participant_a_uid") == sender_uid:
+                recipient_uid = conv.get("participant_b_uid")
+            else:
+                recipient_uid = conv.get("participant_a_uid")
+        except Exception as e:
+            print(f"Could not find recipient for notification: {e}")
+
         async def _pub():
             async with ably.AblyRest(api_key) as client:
-                channel = client.channels.get(f"chat::{conversation_uid}")
-                await channel.publish(
+                # 1. Conversation channel — ChatScreen listens here
+                conv_channel = client.channels.get(f"chat::{conversation_uid}")
+                await conv_channel.publish(
                     "new-message",
                     {
-                        "message_uid": message_uid,
+                        "message_uid":      message_uid,
                         "conversation_uid": conversation_uid,
-                        "sender_uid": sender_uid,
-                        "body": body,
-                        "sent_at": sent_at,
+                        "sender_uid":       sender_uid,
+                        "body":             body,
+                        "sent_at":          sent_at,
                     },
                 )
+
+                # 2. Recipient's personal channel — UnreadContext listens here
+                if recipient_uid:
+                    personal_channel = client.channels.get(f"/{recipient_uid}")
+                    await personal_channel.publish(
+                        "new-message",
+                        {
+                            "message_uid":      message_uid,
+                            "conversation_uid": conversation_uid,
+                            "sender_uid":       sender_uid,
+                            "sender_name":      sender_name,
+                            "body":             body[:120],  # preview only
+                            "sent_at":          sent_at,
+                        },
+                    )
 
         asyncio.run(_pub())
     except Exception as e:
@@ -140,25 +218,12 @@ class Conversations(Resource):
         result = []
         for conv in conversations:
             other_uid = conv.get("other_uid")
-            other_info = {}
-            if other_uid:
-                with connect() as db:
-                    p = db.execute(
-                        """
-                        SELECT profile_personal_first_name,
-                               profile_personal_last_name,
-                               profile_personal_image
-                        FROM every_circle.profile_personal
-                        WHERE profile_personal_uid = %s
-                        """,
-                        args=(other_uid,),
-                    )
-                pr = (p.get("result") or [{}])[0]
-                other_info = {
-                    "first_name": pr.get("profile_personal_first_name"),
-                    "last_name": pr.get("profile_personal_last_name"),
-                    "image": pr.get("profile_personal_image"),
-                }
+            info = _get_participant_info(other_uid) if other_uid else {}
+            other_info = {
+                "first_name": info.get("first_name"),
+                "last_name":  info.get("last_name"),
+                "image":      info.get("image"),
+            }
 
             result.append(
                 {
@@ -167,6 +232,7 @@ class Conversations(Resource):
                     "last_message": conv.get("last_message"),
                     "last_sent_at": str(conv.get("last_sent_at") or ""),
                     "other_uid": other_uid,
+                    "my_uid": profile_uid,  # lets the client know which side it is
                     **other_info,
                 }
             )
@@ -244,7 +310,17 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        _publish_message(conv_uid, msg_uid, sender_uid, body, now)
+        # Look up sender's name for the notification preview (works for both 110- and 200- UIDs)
+        sender_name = "Someone"
+        try:
+            info = _get_participant_info(sender_uid)
+            sender_name = (
+                f"{info.get('first_name') or ''} {info.get('last_name') or ''}"
+            ).strip() or "Someone"
+        except Exception:
+            pass
+
+        _publish_message(conv_uid, msg_uid, sender_uid, sender_name, body, now)
 
         return {
             "message": "Message sent",

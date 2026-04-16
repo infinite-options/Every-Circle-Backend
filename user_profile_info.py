@@ -119,8 +119,7 @@ class UserProfileInfo(Resource):
                         FROM every_circle.business b
                         LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
                         LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
-                        -- WHERE p.profile_personal_user_id = '100-000015'
-                        WHERE p.profile_personal_uid = '{user_id}';
+                        WHERE p.profile_personal_user_id = '{user_id}';
                     """
                     print("business_info query 100:", business_info)
                     business_result = db.execute(business_info)
