@@ -15,12 +15,20 @@ import os
 
 # Load environment variables first, before any imports
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessAvgRatings, Businesses, BusinessTagSearch
+from business import (
+    Business,
+    Business_v2,
+    BusinessAvgRatings,
+    BusinessMaxBounty,
+    Businesses,
+    BusinessTagSearch,
+)
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -43,6 +51,8 @@ from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from feedback import Feedback
 from search_referral import SearchReferral
+from profile_views import ProfileViews
+
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -60,12 +70,19 @@ from flask import Flask, request, render_template, url_for, redirect, jsonify, a
 from flask_restful import Resource, Api
 from flask_cors import CORS
 from flask_mail import Mail, Message  # used for email
-from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt_identity, jwt_required, create_access_token 
+from flask_jwt_extended import (
+    JWTManager,
+    verify_jwt_in_request,
+    get_jwt_identity,
+    jwt_required,
+    create_access_token,
+)
 from pytz import timezone as ptz  # Not sure what the difference is
 from decimal import Decimal
 from hashlib import sha512
 from twilio.rest import Client
 from oauth2client import GOOGLE_REVOKE_URI, GOOGLE_TOKEN_URI, client
+
 # from google_auth_oauthlib.flow import InstalledAppFlow
 from urllib.parse import urlparse
 from io import BytesIO
@@ -89,7 +106,9 @@ import googlemaps
 # def lambda_handler(event, context):
 #    return awsgi.response(app, event, context, base64_content_types={"image/png"})
 
-print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
+print(
+    f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------"
+)
 
 # == Using Cryptography library for AES encryption ==
 
@@ -162,7 +181,6 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 #         return None
 
 
-
 # NEED to figure out where the NotFound or InternalServerError is displayed
 # from werkzeug.exceptions import BadRequest, InternalServerError
 
@@ -177,32 +195,30 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 # from env_keys import BING_API_KEY, RDS_PW
 
 
-
-
 app = Flask(__name__)
 api = Api(app)
 
 CORS(app)
 
 # Set this to false when deploying to live application
-app.config['DEBUG'] = True
+app.config["DEBUG"] = True
 
 # Setup the Flask-JWT-Extended extension
-app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
-app.config['JWT_TOKEN_LOCATION'] = ['headers'] 
-app.config['JWT_HEADER_NAME'] = 'Authorization' 
-app.config['JWT_HEADER_TYPE'] = 'Bearer'
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+app.config["JWT_TOKEN_LOCATION"] = ["headers"]
+app.config["JWT_HEADER_NAME"] = "Authorization"
+app.config["JWT_HEADER_TYPE"] = "Bearer"
 
 jwtManager = JWTManager(app)
 
 
 # --------------- Google Scopes and Credentials------------------
 # SCOPES = "https://www.googleapis.com/auth/calendar"
-SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 # CLIENT_SECRET_FILE = "credentials.json"
 # APPLICATION_NAME = "nitya-ayurveda"
-ALLOWED_EXTENSIONS = set(['png', 'jpg', 'jpeg'])
-s = URLSafeTimedSerializer('thisisaverysecretkey')
+ALLOWED_EXTENSIONS = set(["png", "jpg", "jpeg"])
+s = URLSafeTimedSerializer("thisisaverysecretkey")
 
 
 # --------------- Stripe Variables ------------------
@@ -217,16 +233,15 @@ stripe_secret_live_key = os.getenv("stripe_secret_live_key")
 # --------------- Twilio Setting ------------------
 # Twilio's settings
 # from twilio.rest import Client
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 
 # --------------- Mail Variables ------------------
 # Mail username and password loaded in .env file
-app.config['MAIL_USERNAME'] = os.getenv('SUPPORT_EMAIL')
-app.config['MAIL_PASSWORD'] = os.getenv('SUPPORT_PASSWORD')
-app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
+app.config["MAIL_USERNAME"] = os.getenv("SUPPORT_EMAIL")
+app.config["MAIL_PASSWORD"] = os.getenv("SUPPORT_PASSWORD")
+app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER")
 # print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
 
 
@@ -250,8 +265,6 @@ app.config["DEBUG"] = True
 mail = Mail(app)
 
 
-
-
 # --------------- Time Variables ------------------
 # convert to UTC time zone when testing in local time zone
 utc = pytz.utc
@@ -260,9 +273,11 @@ utc = pytz.utc
 # def getToday(): return datetime.strftime(datetime.now(utc), "%Y-%m-%d")
 # def getNow(): return datetime.strftime(datetime.now(utc), "%Y-%m-%d %H:%M:%S")
 
+
 # # These statment return Day and Time in Local Time - Not sure about PST vs PDT
 def getToday():
     return datetime.strftime(datetime.now(), "%Y-%m-%d")
+
 
 def getNow():
     return datetime.strftime(datetime.now(), "%Y-%m-%d %H:%M:%S")
@@ -284,15 +299,15 @@ import logging
 import os
 
 # Check if we're running in AWS Lambda (read-only file system)
-is_lambda = os.environ.get('AWS_LAMBDA_FUNCTION_NAME') is not None
+is_lambda = os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
 
 if not is_lambda:
     # Only set up file logging when not running in Lambda
     try:
         from logging.handlers import RotatingFileHandler
-        
+
         LOG_FILE = "logs/ec_api.log"
-        
+
         # Only create directory if path includes one
         log_dir = os.path.dirname(LOG_FILE)
         if log_dir:
@@ -303,57 +318,44 @@ if not is_lambda:
             LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3
         )
         log_handler.setLevel(logging.INFO)
-        log_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s"
-        ))
+        log_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
 
         logging.basicConfig(
-            level=logging.INFO,
-            handlers=[
-                log_handler,
-                logging.StreamHandler()
-            ]
+            level=logging.INFO, handlers=[log_handler, logging.StreamHandler()]
         )
-        
+
         logging.info("🚀 ec_api.py has started successfully (with file logging).")
     except Exception as e:
         # Fallback to console-only logging if file logging fails
-        logging.basicConfig(
-            level=logging.INFO,
-            handlers=[logging.StreamHandler()]
-        )
+        logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
         logging.info("🚀 ec_api.py has started successfully (console logging only).")
         logging.warning(f"File logging setup failed: {e}")
 else:
     # Lambda environment - use console logging only
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[logging.StreamHandler()]
-    )
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
     logging.info("🚀 ec_api.py has started successfully in Lambda environment.")
 
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
+
 def sendEmail(recipient, subject, body):
     with app.app_context():
         print("In sendEmail: ", recipient, subject, body)
-        sender="support@manifestmy.space"
+        sender = "support@manifestmy.space"
         print("sender: ", sender)
-        msg = Message(
-            sender=sender,
-            recipients=[recipient],
-            subject=subject,
-            body=body
-        )
+        msg = Message(sender=sender, recipients=[recipient], subject=subject, body=body)
         print("sender: ", sender)
         # print("Email message: ", msg)
         mail.send(msg)
         # print("email sent")
 
+
 # app.sendEmail = sendEmail
 
-    
+
 class SendEmail(Resource):
     def post(self):
         payload = request.get_json()
@@ -361,7 +363,9 @@ class SendEmail(Resource):
 
         # Check if each field in the payload is not null
         if all(field is not None for field in payload.values()):
-            sendEmail(payload["receiver"], payload["email_subject"], payload["email_body"])
+            sendEmail(
+                payload["receiver"], payload["email_subject"], payload["email_body"]
+            )
             return "Email Sent"
         else:
             return "Some fields are missing in the payload", 400
@@ -388,22 +392,22 @@ class SendEmail_CLASS(Resource):
 
 
 def SendEmail_CRON(self):
-        print("In Send EMail CRON get")
-        try:
-            conn = connect()
+    print("In Send EMail CRON get")
+    try:
+        conn = connect()
 
-            recipient = "pmarathay@gmail.com"
-            subject = "MySpace CRON Jobs Completed"
-            body = "The Following CRON Jobs Ran:"
-            # mail.send(msg)
-            sendEmail(recipient, subject, body)
+        recipient = "pmarathay@gmail.com"
+        subject = "MySpace CRON Jobs Completed"
+        body = "The Following CRON Jobs Ran:"
+        # mail.send(msg)
+        sendEmail(recipient, subject, body)
 
-            return "Email Sent", 200
+        return "Email Sent", 200
 
-        except:
-            raise BadRequest("Request failed, please try again later.")
-        finally:
-            print("exit SendEmail")
+    except:
+        raise BadRequest("Request failed, please try again later.")
+    finally:
+        print("exit SendEmail")
 
 
 def Send_Twilio_SMS(message, phone_number):
@@ -411,22 +415,18 @@ def Send_Twilio_SMS(message, phone_number):
     items = {}
     numbers = phone_number
     message = message
-    numbers = list(set(numbers.split(',')))
+    numbers = list(set(numbers.split(",")))
     # print("TWILIO_ACCOUNT_SID: ", TWILIO_ACCOUNT_SID)
     # print("TWILIO_AUTH_TOKEN: ", TWILIO_AUTH_TOKEN)
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     # print("Client Info: ", client)
     for destination in numbers:
         message = client.messages.create(
-            body=message,
-            from_='+19254815757',
-            to="+1" + destination
+            body=message, from_="+19254815757", to="+1" + destination
         )
-    items['code'] = 200
-    items['Message'] = 'SMS sent successfully to the recipient'
+    items["code"] = 200
+    items["Message"] = "SMS sent successfully to the recipient"
     return items
-
-
 
 
 class stripe_key(Resource):
@@ -437,6 +437,7 @@ class stripe_key(Resource):
         else:
             return {"publicKey": stripe_public_live_key}
 
+
 class Refer(Resource):
     def post(self):
         print("In Refer POST")
@@ -444,73 +445,83 @@ class Refer(Resource):
         payload = request.get_json()
         response = {}
 
-        if 'profile_uid' not in payload:
-            response['message'] = 'profile_uid is required to refer a friend'
-            response['code'] = 400
+        if "profile_uid" not in payload:
+            response["message"] = "profile_uid is required to refer a friend"
+            response["code"] = 400
             return response, 400
-        
-        if  'user_referred_email' not in payload and 'user_referred_number' not in payload:
-            response['message'] = 'Either user_referred_email or user_referred_number is required'
-            response['code'] = 400
+
+        if (
+            "user_referred_email" not in payload
+            and "user_referred_number" not in payload
+        ):
+            response["message"] = (
+                "Either user_referred_email or user_referred_number is required"
+            )
+            response["code"] = 400
             return response, 400
-        
+
         try:
             with connect() as db:
-                profile_exists_query = db.select('every_circle.profile_personal', where={'profile_personal_uid': payload['profile_uid']})
-                if not profile_exists_query['result']:
-                    response['message'] = 'User does not exist'
-                    response['code'] = 404
+                profile_exists_query = db.select(
+                    "every_circle.profile_personal",
+                    where={"profile_personal_uid": payload["profile_uid"]},
+                )
+                if not profile_exists_query["result"]:
+                    response["message"] = "User does not exist"
+                    response["code"] = 404
                     return response, 404
-                
+
                 print(profile_exists_query)
-                user_profile_details = profile_exists_query['result'][0]
+                user_profile_details = profile_exists_query["result"][0]
 
                 # user_profile_query = db.select('every_circle.profile', where={'profile_user_id': payload['user_uid']})
                 # if not user_profile_query['result']:
                 #     response['message'] = 'User exists in User table but does not exists in the profile table'
                 #     response['code'] = 404
                 #     return response, 404
-                
+
                 # print(user_profile_query)
                 # user_profile_details = user_profile_query['result'][0]
-            
-            if 'message' in payload:
-                message = payload['message']
-                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['profile_uid']}"
+
+            if "message" in payload:
+                message = payload["message"]
+                message = (
+                    message
+                    + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['profile_uid']}"
+                )
             else:
                 message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
-            
-            if 'user_referred_email' in payload and payload['user_referred_email']:
+
+            if "user_referred_email" in payload and payload["user_referred_email"]:
                 # send email
                 # print(payload['user_referred_email'], type(payload['user_referred_email']))
-                recipient = payload['user_referred_email']
+                recipient = payload["user_referred_email"]
                 subject = "Every-Circle referreal from a friend"
                 body = message
 
                 try:
                     print("Now about to send email")
                     sendEmail(recipient, subject, body)
-                    response['Email Status'] = 'Sent'
+                    response["Email Status"] = "Sent"
                 except:
-                    response['Email Status'] = 'Failed'
+                    response["Email Status"] = "Failed"
 
-            if 'user_referred_number' in payload and payload['user_referred_number']:
+            if "user_referred_number" in payload and payload["user_referred_number"]:
                 # send SMS
                 # message = message
-                phone_number = payload['user_referred_number']
+                phone_number = payload["user_referred_number"]
 
                 try:
                     Send_Twilio_SMS(message, phone_number)
-                    response['SMS Status'] = 'Sent'
+                    response["SMS Status"] = "Sent"
                 except:
-                    response['SMS Status'] = "Failed"
-            
-            return response, 200
-        
-        except:
-            response['message'] = 'Internal Server Error'
-            return response, 500
+                    response["SMS Status"] = "Failed"
 
+            return response, 200
+
+        except:
+            response["message"] = "Internal Server Error"
+            return response, 500
 
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
@@ -527,54 +538,76 @@ api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
-api.add_resource(BusinessRevenue, '/api/v1/businessrevenue/<string:business_id>')
-api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<string:uid>')
-api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
-api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
-api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
-api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
-api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
+api.add_resource(BusinessRevenue, "/api/v1/businessrevenue/<string:business_id>")
+api.add_resource(Business_v3, "/api/v3/business_v3", "/api/v3/business_v3/<string:uid>")
+api.add_resource(TagGeneratorAPI, "/api/v1/taggenerator")
+api.add_resource(
+    UserProfileInfo, "/api/v1/userprofileinfo", "/api/v1/userprofileinfo/<string:uid>"
+)
+api.add_resource(
+    BusinessInfo, "/api/v1/businessinfo", "/api/v1/businessinfo/<string:uid>"
+)
+api.add_resource(
+    Transactions, "/api/v1/transactions", "/api/v1/transactions/<string:profile_id>"
+)
+api.add_resource(SellerTransactions, "/api/v1/transactions/seller/<string:profile_id>")
 
-api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
+api.add_resource(
+    ConnectionsPath, "/api/connections_path/<string:first_uid>/<string:second_uid>"
+)
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
-api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
-api.add_resource(TransactionReceipt, '/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>')
-api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
-api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')
-api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
-api.add_resource(NearbyLocation, '/api/v1/nearby/location')
-api.add_resource(NearbyUsers,    '/api/v1/nearby/<string:profile_uid>')
-api.add_resource(Feedback, '/api/feedback')
-api.add_resource(SearchReferral, '/api/search_referral')
-api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
-api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
+api.add_resource(
+    ProfileWishInfo,
+    "/api/profilewishinfo",
+    "/api/profilewishinfo/<string:profile_wish_id>",
+)
+api.add_resource(
+    TransactionReceipt,
+    "/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>",
+)
+api.add_resource(BountyResults, "/api/bountyresults/<string:profile_id>")
+api.add_resource(
+    BusinessBountyResults, "/api/business-bountyresults/<string:business_id>"
+)
+api.add_resource(Circles, "/api/v1/circles/<string:circle_id>", "/api/v1/circles")
+api.add_resource(
+    ProfileViews, "/api/v1/profile_views", "/api/v1/profile_views/<string:profile_uid>"
+)
+api.add_resource(NearbyLocation, "/api/v1/nearby/location")
+api.add_resource(NearbyUsers, "/api/v1/nearby/<string:profile_uid>")
+api.add_resource(Feedback, "/api/feedback")
+api.add_resource(SearchReferral, "/api/search_referral")
+api.add_resource(BusinessAvgRatings, "/api/v1/businessavgratings")
+api.add_resource(BusinessMaxBounty, "/api/v1/businessmaxbounty")
+api.add_resource(BusinessTagSearch, "/api/v1/businesstagsearch")
+
 
 class GooglePlacesInfo(Resource):
     def post(self):
         try:
             data = request.get_json()
-            place_id = data.get('place_id')
-            user_uid = data.get('user_uid')
-            
+            place_id = data.get("place_id")
+            user_uid = data.get("user_uid")
+
             if not place_id:
-                return {'error': 'place_id is required'}, 400
-                
+                return {"error": "place_id is required"}, 400
+
             if not user_uid:
-                return {'error': 'user_uid is required'}, 400
-            
+                return {"error": "user_uid is required"}, 400
+
             # Create instance of BusinessInfo and call the method
             business_info = BusinessInfo()
             return business_info.get_google_places_info(place_id, user_uid)
-            
+
         except Exception as e:
             print(f"Error in GooglePlacesInfo: {str(e)}")
-            return {'error': str(e)}, 500
+            return {"error": str(e)}, 500
+
 
 # Add the new endpoint to the API
-api.add_resource(GooglePlacesInfo, '/api/google-places')
+api.add_resource(GooglePlacesInfo, "/api/google-places")
 
 
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=4090)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=4090)
