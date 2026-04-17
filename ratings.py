@@ -32,10 +32,10 @@ class Ratings(Resource):
                 response = db.select('every_circle.ratings', where=key)
 
             if not response['result']:
-                response.pop('result')
+                response['result'] = []
                 response['message'] = f'No ratings found for {key}'
-                response['code'] = 404
-                return response, 404
+                response['code'] = 200
+                return response, 200
 
             # Add is_verified and circle_num_nodes for each rating
             for rating in response['result']:

@@ -20,7 +20,7 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessAvgRatings, Businesses, BusinessTagSearch
+from business import Business, Business_v2, BusinessAvgRatings, BusinessMaxBounty, Businesses, BusinessTagSearch
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -44,6 +44,7 @@ from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from feedback import Feedback
 from search_referral import SearchReferral
+from profile_views import ProfileViews
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -551,6 +552,8 @@ api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/message
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
+api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
+api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 
 class GooglePlacesInfo(Resource):

@@ -399,6 +399,7 @@ class Businesses(Resource):
 class BusinessAvgRatings(Resource):
     def get(self):
         business_uids = request.args.get('uids', '').strip()
+        viewer_uid = request.args.get('viewer_uid', '').strip()
         if not business_uids:
             return {'message': 'uids required', 'code': 400}, 400
         
@@ -408,6 +409,16 @@ class BusinessAvgRatings(Resource):
         response = {}
         try:
             with connect() as db:
+                # Initialize all requested businesses (even those with no ratings)
+                ratings_map = {
+                    uid: {
+                        'avg_rating': None,
+                        'rating_count': 0,
+                        'nearest_connection': None,
+                    }
+                    for uid in uid_list
+                }
+
                 query = f"""
                     SELECT 
                         rating_business_id,
@@ -418,16 +429,113 @@ class BusinessAvgRatings(Resource):
                     GROUP BY rating_business_id
                 """
                 result = db.execute(query)
-                ratings_map = {}
                 if result['result']:
                     for row in result['result']:
-                        ratings_map[row['rating_business_id']] = {
-                            'avg_rating': row['avg_rating'],
-                            'rating_count': row['rating_count']
-                        }
+                        bid = row['rating_business_id']
+                        ratings_map[bid]['avg_rating'] = row['avg_rating']
+                        ratings_map[bid]['rating_count'] = row['rating_count']
+
+                # If viewer_uid provided, BFS through referral tree to find
+                # degree from viewer to any reviewer of each business
+                if viewer_uid:
+                    # Get all reviewer UIDs for these businesses
+                    reviewer_query = f"""
+                        SELECT rating_business_id, rating_profile_id
+                        FROM every_circle.ratings
+                        WHERE rating_business_id IN ({placeholders})
+                    """
+                    reviewer_result = db.execute(reviewer_query)
+                    biz_reviewers = {}
+                    if reviewer_result.get('result'):
+                        for row in reviewer_result['result']:
+                            biz_reviewers.setdefault(
+                                row['rating_business_id'], []
+                            ).append(row['rating_profile_id'])
+
+                    all_reviewer_uids = set(
+                        uid for uids in biz_reviewers.values() for uid in uids
+                    )
+
+                    if all_reviewer_uids:
+                        # BFS: expand frontier in both directions (down=referred by me, up=who referred me)
+                        reviewer_degrees = {}
+                        seen = {viewer_uid}
+                        frontier = [viewer_uid]
+
+                        for degree in range(1, 6):
+                            if not frontier:
+                                break
+                            if not (all_reviewer_uids - set(reviewer_degrees.keys())):
+                                break
+                            ph = ','.join(f"'{u}'" for u in frontier)
+                            r_down = db.execute(
+                                f"SELECT profile_personal_uid FROM every_circle.profile_personal WHERE profile_personal_referred_by IN ({ph})"
+                            )
+                            r_up = db.execute(
+                                f"SELECT profile_personal_referred_by AS uid FROM every_circle.profile_personal WHERE profile_personal_uid IN ({ph}) AND profile_personal_referred_by IS NOT NULL"
+                            )
+                            next_frontier = []
+                            for row in (r_down.get('result') or []) + (r_up.get('result') or []):
+                                uid = row.get('profile_personal_uid') or row.get('uid')
+                                if uid and uid not in seen:
+                                    seen.add(uid)
+                                    next_frontier.append(uid)
+                                    if uid in all_reviewer_uids:
+                                        reviewer_degrees[uid] = degree
+                            frontier = next_frontier
+
+                        # For each business, pick the min degree among its reviewers
+                        for bid, reviewers in biz_reviewers.items():
+                            degrees = [
+                                reviewer_degrees[r]
+                                for r in reviewers
+                                if r in reviewer_degrees
+                            ]
+                            if degrees:
+                                ratings_map[bid]['nearest_connection'] = min(degrees)
+
                 response['result'] = ratings_map
                 return response, 200
         except Exception as e:
+            return {'message': 'Internal Server Error', 'code': 500}, 500
+
+
+class BusinessMaxBounty(Resource):
+    def get(self):
+        business_uids = request.args.get('uids', '').strip()
+        if not business_uids:
+            return {'message': 'uids required', 'code': 400}, 400
+
+        uid_list = [uid.strip() for uid in business_uids.split(',')]
+        placeholders = ','.join([f"'{uid}'" for uid in uid_list])
+
+        response = {}
+        try:
+            with connect() as db:
+                query = f"""
+                    SELECT
+                        bs_business_id,
+                        MAX(CASE WHEN bs_bounty_type = 'per_item' THEN bs_bounty END) AS max_per_item_bounty,
+                        MAX(CASE WHEN bs_bounty_type = 'total'    THEN bs_bounty END) AS max_total_bounty,
+                        MAX(bs_bounty) AS max_bounty
+                    FROM every_circle.business_services
+                    WHERE bs_business_id IN ({placeholders})
+                      AND bs_bounty IS NOT NULL AND bs_bounty > 0
+                    GROUP BY bs_business_id
+                """
+                result = db.execute(query)
+                bounty_map = {}
+                if result['result']:
+                    for row in result['result']:
+                        bounty_map[row['bs_business_id']] = {
+                            'max_bounty': row['max_bounty'],
+                            'max_per_item_bounty': row['max_per_item_bounty'],
+                            'max_total_bounty': row['max_total_bounty'],
+                        }
+                response['result'] = bounty_map
+                return response, 200
+        except Exception as e:
+            print(f"Error in BusinessMaxBounty GET: {str(e)}")
             return {'message': 'Internal Server Error', 'code': 500}, 500
 
 
@@ -456,10 +564,13 @@ class BusinessTagSearch(Resource):
                         b.business_phone_number_is_public,
                         b.business_tag_line_is_public,
                         b.business_short_bio_is_public,
-                        b.business_profile_img_is_public
+                        b.business_profile_img_is_public,
+                        pp.profile_personal_uid
                     FROM every_circle.business b
                     JOIN every_circle.business_tags bt ON bt.bt_business_id = b.business_uid
                     JOIN every_circle.tags t ON t.tag_uid = bt.bt_tag_id
+                    LEFT JOIN every_circle.business_user bu ON bu.bu_business_id = b.business_uid
+                    LEFT JOIN every_circle.profile_personal pp ON pp.profile_personal_user_id = bu.bu_user_id
                     WHERE LOWER(t.tag_name) LIKE '%{query}%'
                     AND b.business_is_active = 1
                 """
