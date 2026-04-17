@@ -82,7 +82,7 @@ def _get_or_create_conversation(uid_a, uid_b):
     return conv_uid, True
 
 
-def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, body, sent_at):
+def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sender_image, body, sent_at):
     """
     Publish a new-message event to:
       1. chat::<conversation_uid>  — for the ChatScreen real-time feed
@@ -142,6 +142,7 @@ def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, bod
                             "conversation_uid": conversation_uid,
                             "sender_uid":       sender_uid,
                             "sender_name":      sender_name,
+                            "sender_image":     sender_image,
                             "body":             body[:120],  # preview only
                             "sent_at":          sent_at,
                         },
@@ -310,17 +311,17 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        # Look up sender's name for the notification preview (works for both 110- and 200- UIDs)
-        sender_name = "Someone"
+        # Look up sender name + image for the notification preview (handles 110- and 200- UIDs)
+        sender_name  = "Someone"
+        sender_image = None
         try:
             info = _get_participant_info(sender_uid)
-            sender_name = (
-                f"{info.get('first_name') or ''} {info.get('last_name') or ''}"
-            ).strip() or "Someone"
+            sender_name  = (f"{info.get('first_name') or ''} {info.get('last_name') or ''}").strip() or "Someone"
+            sender_image = info.get("image")
         except Exception:
             pass
 
-        _publish_message(conv_uid, msg_uid, sender_uid, sender_name, body, now)
+        _publish_message(conv_uid, msg_uid, sender_uid, sender_name, sender_image, body, now)
 
         return {
             "message": "Message sent",

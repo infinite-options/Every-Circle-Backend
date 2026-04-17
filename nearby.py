@@ -24,6 +24,42 @@ def _norm_types(types_list):
     return [RELATIONSHIP_MAP.get(t, t) for t in (types_list or [])]
 
 
+def _consent_clause():
+    """
+    SQL AND-clause that enforces pp's stored share_with preference.
+    Must be appended to a query that already has pp aliased to profile_personal.
+    Consumes 2 consecutive %s args = (viewer_uid, viewer_uid).
+    """
+    return """
+        AND (
+            COALESCE(pp.profile_personal_nearby_share_with, 'all_circles') = 'everyone'
+            OR (
+                COALESCE(pp.profile_personal_nearby_share_with, 'all_circles') = 'all_circles'
+                AND EXISTS (
+                    SELECT 1 FROM every_circle.circles c_consent
+                    WHERE c_consent.circle_profile_id        = pp.profile_personal_uid
+                      AND c_consent.circle_related_person_id = %s
+                      AND c_consent.circle_relationship IS NOT NULL
+                      AND c_consent.circle_relationship != ''
+                )
+            )
+            OR (
+                pp.profile_personal_nearby_share_with = 'specific'
+                AND EXISTS (
+                    SELECT 1 FROM every_circle.circles c_consent
+                    WHERE c_consent.circle_profile_id        = pp.profile_personal_uid
+                      AND c_consent.circle_related_person_id = %s
+                      AND c_consent.circle_relationship IS NOT NULL
+                      AND FIND_IN_SET(
+                            c_consent.circle_relationship,
+                            COALESCE(pp.profile_personal_nearby_share_types, '')
+                          ) > 0
+                )
+            )
+        )
+    """
+
+
 def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
     """
     Build a query that finds people to NOTIFY about the updater's location.
@@ -37,7 +73,7 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
 
     TODO: For share_with='everyone' this scans all users with a fresh location, which
           may be expensive at scale.  Consider moving the fan-out to a dedicated
-          notification service / pre-computed index and storing preferences in the DB.
+          notification service / pre-computed index.
     """
     db_types    = _norm_types(share_with_types) if share_with == 'specific' else []
     placeholders = ', '.join(['%s'] * len(db_types)) if db_types else ''
@@ -116,6 +152,8 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
                     POINT(%s, %s)
                 ) AS distance_meters"""
 
+    consent = _consent_clause()
+
     if receive_from == 'everyone':
         query = f"""
             SELECT
@@ -132,9 +170,11 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
             WHERE pp.profile_personal_uid != %s
               AND pp.profile_personal_nearby_lat IS NOT NULL
               AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+              {consent}
             HAVING distance_meters < {NEARBY_RADIUS_METERS}
         """
-        args = (lng, lat, profile_uid, profile_uid)
+        # consent_clause needs profile_uid twice
+        args = (lng, lat, profile_uid, profile_uid, profile_uid, profile_uid)
         return query, args
 
     # all_circles or specific
@@ -155,9 +195,11 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
           AND pp.profile_personal_nearby_lat IS NOT NULL
           AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
           {rel_filter}
+          {consent}
         HAVING distance_meters < {NEARBY_RADIUS_METERS}
     """
-    args = (lng, lat, profile_uid) + tuple(db_types)
+    # args: dist_col(lng,lat), viewer circle join, rel_filter types, consent uid×2
+    args = (lng, lat, profile_uid) + tuple(db_types) + (profile_uid, profile_uid)
     return query, args
 
 
@@ -325,26 +367,39 @@ class NearbyLocation(Resource):
         receive_from       = data.get('receive_from',       'all_circles')
         receive_from_types = data.get('receive_from_types', [])
 
-        if not profile_uid or lat is None or lng is None:
-            return {'message': 'profile_uid, lat, and lng are required', 'code': 400}, 400
+        if not profile_uid:
+            return {'message': 'profile_uid is required', 'code': 400}, 400
 
-        updated_at = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        prefs_only = lat is None and lng is None
+        if not prefs_only and (lat is None or lng is None):
+            return {'message': 'Both lat and lng are required when updating location', 'code': 400}, 400
+
+        db_share_types = ','.join(_norm_types(share_with_types)) if share_with == 'specific' and share_with_types else None
+
+        fields = {
+            'profile_personal_nearby_share_with':  share_with,
+            'profile_personal_nearby_share_types': db_share_types,
+        }
+
+        if not prefs_only:
+            updated_at = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            fields.update({
+                'profile_personal_nearby_lat':        lat,
+                'profile_personal_nearby_lng':        lng,
+                'profile_personal_nearby_updated_at': updated_at,
+            })
 
         with connect() as db:
             result = db.update(
                 'every_circle.profile_personal',
                 {'profile_personal_uid': profile_uid},
-                {
-                    'profile_personal_nearby_lat':        lat,
-                    'profile_personal_nearby_lng':        lng,
-                    'profile_personal_nearby_updated_at': updated_at,
-                }
+                fields,
             )
 
         if result.get('code') not in (200, 201):
-            return {'message': 'Failed to update location', 'code': 500}, 500
+            return {'message': 'Failed to update', 'code': 500}, 500
 
-        if live_sharing:
+        if not prefs_only and live_sharing:
             _publish_nearby_alerts(
                 profile_uid, lat, lng,
                 share_with=share_with,
@@ -353,7 +408,11 @@ class NearbyLocation(Resource):
                 receive_from_types=receive_from_types,
             )
 
-        return {'message': 'Location updated', 'code': 200, 'updated_at': updated_at}, 200
+        return {
+            'message':    'Preferences updated' if prefs_only else 'Location updated',
+            'code':       200,
+            'updated_at': None if prefs_only else updated_at,
+        }, 200
 
 
 class NearbyUsers(Resource):
@@ -421,7 +480,12 @@ class NearbyUsers(Resource):
                     POINT(%s, %s)
                 ) AS distance_meters"""
 
+        # Server-side consent: reads pp's stored share_with preference.
+        # _consent_clause() needs viewer profile_uid passed twice as args.
+        consent_clause = _consent_clause()
+
         if mode == 'everyone':
+            # Viewer wants to see everyone, but we still respect each person's share_with.
             nearby_query = f"""
                 SELECT
                     pp.profile_personal_uid,
@@ -438,11 +502,15 @@ class NearbyUsers(Resource):
                 WHERE pp.profile_personal_uid != %s
                   AND pp.profile_personal_nearby_lat IS NOT NULL
                   AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
+                  {consent_clause}
                 HAVING distance_meters < {NEARBY_RADIUS_METERS}
                 ORDER BY distance_meters ASC
             """
-            args = (user_lng, user_lat, profile_uid, profile_uid)
+            # consent_clause needs profile_uid twice (for each EXISTS)
+            args = (user_lng, user_lat, profile_uid, profile_uid, profile_uid, profile_uid)
         else:
+            # all_circles / specific: viewer's receiveFrom filter (rel_filter on viewer's circles)
+            # combined with the nearby person's stored share_with consent check.
             nearby_query = f"""
                 SELECT
                     pp.profile_personal_uid,
@@ -454,15 +522,17 @@ class NearbyUsers(Resource):
                     {dist_col}
                 FROM every_circle.profile_personal pp
                 JOIN every_circle.circles c
-                    ON c.circle_related_person_id = pp.profile_personal_uid
-                WHERE c.circle_profile_id = %s
-                  AND pp.profile_personal_nearby_lat IS NOT NULL
+                    ON  c.circle_related_person_id = pp.profile_personal_uid
+                    AND c.circle_profile_id        = %s
+                WHERE pp.profile_personal_nearby_lat IS NOT NULL
                   AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
                   {rel_filter}
+                  {consent_clause}
                 HAVING distance_meters < {NEARBY_RADIUS_METERS}
                 ORDER BY distance_meters ASC
             """
-            args = (user_lng, user_lat, profile_uid) + tuple(db_types)
+            # args: dist_col(lng,lat), viewer JOIN, rel_filter types, consent_clause uid×2
+            args = (user_lng, user_lat, profile_uid) + tuple(db_types) + (profile_uid, profile_uid)
 
         with connect() as db:
             nearby_resp = db.execute(nearby_query, args=args)
