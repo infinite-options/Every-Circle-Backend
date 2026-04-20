@@ -675,19 +675,25 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
 
-            if "transaction_in_escrow" not in payload:
-                response["message"] = "transaction_in_escrow is required"
+            transaction_uid = payload.get("transaction_uid")
+            update_fields = {}
+
+            if "transaction_in_escrow" in payload:
+                update_fields["transaction_in_escrow"] = 1 if payload.get("transaction_in_escrow") else 0
+
+            if "transaction_return_requested" in payload:
+                update_fields["transaction_return_requested"] = 1 if payload.get("transaction_return_requested") else 0
+
+            if not update_fields:
+                response["message"] = "No valid fields to update"
                 response["code"] = 400
                 return response, 400
-
-            transaction_uid = payload.get("transaction_uid")
-            transaction_in_escrow = 1 if payload.get("transaction_in_escrow") else 0
 
             with connect() as db:
                 update_response = db.update(
                     "every_circle.transactions",
                     {"transaction_uid": transaction_uid},
-                    {"transaction_in_escrow": transaction_in_escrow},
+                    update_fields,
                 )
 
                 if update_response.get("code") != 200:
@@ -700,7 +706,7 @@ class Transactions(Resource):
                 response["message"] = "Transaction updated successfully"
                 response["code"] = 200
                 response["transaction_uid"] = transaction_uid
-                response["transaction_in_escrow"] = transaction_in_escrow
+                response.update(update_fields)
                 return response, 200
 
         except Exception as e:
@@ -734,6 +740,7 @@ class SellerTransactions(Resource):
                        t.transaction_business_id,
                        t.transaction_profile_id,
                        t.transaction_in_escrow,
+                       t.transaction_return_requested,
                        ti.ti_uid,
                        ti.ti_bs_id,
                        ti.ti_bs_qty,
