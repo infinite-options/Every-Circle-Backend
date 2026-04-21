@@ -1,3 +1,4 @@
+from aiohttp import payload
 from flask_restful import Resource
 from flask import request
 from datetime import datetime
@@ -40,6 +41,9 @@ class Transactions(Resource):
                        t.transaction_taxes,
                        t.transaction_profile_id,
                        t.transaction_in_escrow,
+                       t.transaction_return_requested,
+                       t.transaction_return_note,
+                       t.transaction_return_status,
                        CASE
                            WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_uid
                            WHEN ti.ti_bs_id LIKE '150-%%' THEN expertise_pp.profile_personal_uid
@@ -684,6 +688,12 @@ class Transactions(Resource):
             if "transaction_return_requested" in payload:
                 update_fields["transaction_return_requested"] = 1 if payload.get("transaction_return_requested") else 0
 
+            if "transaction_return_note" in payload:
+                update_fields["transaction_return_note"] = payload.get("transaction_return_note")
+
+            if "transaction_return_status" in payload:
+                update_fields["transaction_return_status"] = payload.get("transaction_return_status")    
+
             if not update_fields:
                 response["message"] = "No valid fields to update"
                 response["code"] = 400
@@ -741,6 +751,8 @@ class SellerTransactions(Resource):
                        t.transaction_profile_id,
                        t.transaction_in_escrow,
                        t.transaction_return_requested,
+                       t.transaction_return_note,
+                       ti.ti_uid,
                        ti.ti_uid,
                        ti.ti_bs_id,
                        ti.ti_bs_qty,
