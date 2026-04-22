@@ -5,6 +5,8 @@ import datetime
 import uuid
 import os
 from dotenv import load_dotenv
+import ably
+import asyncio
 
 load_dotenv()
 
@@ -88,9 +90,13 @@ def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sen
       1. chat::<conversation_uid>  — for the ChatScreen real-time feed
       2. /<recipient_uid>          — for the unread-dot / notification banner
     """
+
+    # import ably
+    # import asyncio
+
     try:
-        import ably
-        import asyncio
+        # import ably
+        # import asyncio
 
         api_key = os.getenv("ABLY_API_KEY", "")
         if not api_key:
