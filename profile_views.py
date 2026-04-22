@@ -1,3 +1,4 @@
+import json
 from flask import request
 from flask_restful import Resource
 from datetime import datetime
@@ -10,6 +11,7 @@ class ProfileViews(Resource):
         response = {}
         try:
             with connect() as db:
+                # Query views directly by the given UID (personal or business)
                 query = """
                     SELECT
                         pv.view_viewer_id,
@@ -64,6 +66,9 @@ class ProfileViews(Resource):
             payload = request.get_json(force=True, silent=True) or {}
             view_profile_id = (payload.get("profile_view_profile_id") or "").strip()
             view_viewer_id = (payload.get("profile_view_viewer_id") or "").strip()
+            print(
+                f"ProfileViews POST received - view_profile_id: {view_profile_id}, view_viewer_id: {view_viewer_id}"
+            )
 
             if not view_profile_id or not view_viewer_id:
                 response["message"] = (
@@ -81,94 +86,71 @@ class ProfileViews(Resource):
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
             with connect() as db:
-                # If a business UID (200-xxx) is passed, resolve to owner personal UIDs
-                if view_profile_id.startswith("200-"):
-                    owner_result = db.execute(
-                        """
-                        SELECT pp.profile_personal_uid AS owner_uid
-                        FROM every_circle.business_user bu
-                        LEFT JOIN every_circle.profile_personal pp
-                            ON bu.bu_user_id = pp.profile_personal_user_id
-                        WHERE bu.bu_business_id = %s
-                          AND pp.profile_personal_uid IS NOT NULL
-                        """,
-                        (view_profile_id,),
-                    )
-                    owner_rows = (
-                        (owner_result.get("result") or []) if owner_result else []
-                    )
-                    owner_uids = [
-                        r["owner_uid"] for r in owner_rows if r.get("owner_uid")
-                    ]
+                # Check if a record already exists for this viewer + profile (any time)
+                check = db.execute(
+                    """
+                    SELECT profile_view_uid, view_timestamp
+                    FROM every_circle.profile_views
+                    WHERE view_profile_id = %s
+                      AND view_viewer_id = %s
+                    LIMIT 1
+                    """,
+                    (view_profile_id, view_viewer_id),
+                )
+                existing = (check.get("result") or []) if check else []
+
+                if existing:
+                    existing_uid = existing[0]["profile_view_uid"]
+                    raw_ts = existing[0].get("view_timestamp")
+
+                    # Parse existing value — handle plain string, JSON string, or list
+                    if isinstance(raw_ts, list):
+                        timestamps = raw_ts
+                    else:
+                        try:
+                            parsed = json.loads(raw_ts) if raw_ts else []
+                            timestamps = (
+                                parsed if isinstance(parsed, list) else [str(raw_ts)]
+                            )
+                        except (TypeError, ValueError):
+                            timestamps = [str(raw_ts)] if raw_ts else []
+
+                    timestamps.append(now)
+                    updated_ts = json.dumps(timestamps)
+
                     print(
-                        f"Resolved business {view_profile_id} to owner UIDs: {owner_uids}"
+                        f"Appending timestamp to view {existing_uid} for {view_viewer_id} -> {view_profile_id}"
+                    )
+                    db.execute(
+                        """
+                        UPDATE every_circle.profile_views
+                        SET view_timestamp = %s
+                        WHERE profile_view_uid = %s
+                        """,
+                        (updated_ts, existing_uid),
                     )
                 else:
-                    owner_uids = [view_profile_id]
+                    uid_result = db.call("new_profile_view_uid")
+                    uid_rows = (uid_result.get("result") or []) if uid_result else []
+                    new_uid = uid_rows[0].get("new_id") if uid_rows else None
 
-                if not owner_uids:
-                    response["message"] = (
-                        "No owners found for given profile_view_profile_id"
+                    if not new_uid:
+                        response["message"] = "Failed to generate profile_view_uid"
+                        response["code"] = 500
+                        return response, 500
+
+                    print(
+                        f"Inserting view {new_uid}: {view_viewer_id} -> {view_profile_id}"
                     )
-                    response["code"] = 404
-                    return response, 404
-
-                for owner_uid in owner_uids:
-                    # Skip self-views per owner
-                    if owner_uid == view_viewer_id:
-                        continue
-
-                    # Check if this viewer already has a view within the last 2 days
-                    check = db.execute(
-                        """
-                        SELECT profile_view_uid
-                        FROM every_circle.profile_views
-                        WHERE view_profile_id = %s
-                          AND view_viewer_id = %s
-                          AND view_timestamp >= DATE_SUB(NOW(), INTERVAL 2 DAY)
-                        LIMIT 1
-                        """,
-                        (owner_uid, view_viewer_id),
+                    db.insert(
+                        "every_circle.profile_views",
+                        {
+                            "profile_view_uid": new_uid,
+                            "view_profile_id": view_profile_id,
+                            "view_viewer_id": view_viewer_id,
+                            "view_timestamp": json.dumps([now]),
+                        },
                     )
-                    existing = (check.get("result") or []) if check else []
-
-                    if existing:
-                        existing_uid = existing[0]["profile_view_uid"]
-                        print(
-                            f"Updating existing view {existing_uid} for {view_viewer_id} -> {owner_uid}"
-                        )
-                        db.execute(
-                            """
-                            UPDATE every_circle.profile_views
-                            SET view_timestamp = %s
-                            WHERE profile_view_uid = %s
-                            """,
-                            (now, existing_uid),
-                        )
-                    else:
-                        uid_result = db.call("new_profile_view_uid")
-                        uid_rows = (
-                            (uid_result.get("result") or []) if uid_result else []
-                        )
-                        new_uid = uid_rows[0].get("new_id") if uid_rows else None
-
-                        if not new_uid:
-                            response["message"] = "Failed to generate profile_view_uid"
-                            response["code"] = 500
-                            return response, 500
-
-                        print(
-                            f"Inserting view {new_uid}: {view_viewer_id} -> {owner_uid}"
-                        )
-                        db.insert(
-                            "every_circle.profile_views",
-                            {
-                                "profile_view_uid": new_uid,
-                                "view_profile_id": owner_uid,
-                                "view_viewer_id": view_viewer_id,
-                                "view_timestamp": now,
-                            },
-                        )
 
                 response["message"] = "View recorded"
                 response["code"] = 200
