@@ -43,6 +43,7 @@ from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from feedback import Feedback
+from ably_auth import AblyToken
 from search_referral import SearchReferral
 from profile_views import ProfileViews
 # from jwtToken import JwtToken
@@ -549,6 +550,7 @@ api.add_resource(NearbyLocation,  '/api/v1/nearby/location')
 api.add_resource(NearbyUsers,     '/api/v1/nearby/<string:profile_uid>')
 api.add_resource(Conversations,   '/api/v1/chat/conversations', '/api/v1/chat/conversations/<string:profile_uid>')
 api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/messages/<string:conversation_uid>')
+api.add_resource(AblyToken,       '/api/v1/ably/token')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
