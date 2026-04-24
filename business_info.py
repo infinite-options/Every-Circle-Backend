@@ -274,7 +274,9 @@ class BusinessInfo(Resource):
                     )
 
                 if business_look_up_query and business_look_up_query["result"]:
+                    existing = business_look_up_query["result"][0]
                     response["message"] = "BusinessInfo: Business already exists"
+                    response["business_uid"] = existing.get("business_uid")
                     response["code"] = 409
                     return response, 409
 
@@ -414,8 +416,36 @@ class BusinessInfo(Resource):
                     elif isinstance(val, str):
                         payload["business_category_id"] = val.strip()
 
-                # print("Insert Payload: ", payload)
+                # Alias business_address → business_address_line_1 (sent by Google Places flow)
+                if "business_address" in payload and "business_address_line_1" not in payload:
+                    payload["business_address_line_1"] = payload.pop("business_address")
+                elif "business_address" in payload:
+                    payload.pop("business_address")
+
+                # Strip any fields that don't exist in the business table
+                valid_columns = [
+                    "business_uid", "business_name", "business_location",
+                    "business_location_is_public", "business_address_line_1",
+                    "business_address_line_2", "business_city", "business_state",
+                    "business_country", "business_zip_code", "business_phone_number",
+                    "business_email_id", "business_category_id", "business_short_bio",
+                    "business_tag_line", "business_ein_number", "business_website",
+                    "business_images_url", "business_profile_img",
+                    "business_profile_img_is_public", "business_email_id_is_public",
+                    "business_phone_number_is_public", "business_tag_line_is_public",
+                    "business_short_bio_is_public", "business_google_id",
+                    "business_latitude", "business_longitude", "business_price_level",
+                    "business_google_rating", "business_joined_timestamp",
+                    "business_is_active",
+                ]
+                invalid_fields = [f for f in list(payload.keys()) if f not in valid_columns]
+                for field in invalid_fields:
+                    print(f"[POST] Removing invalid field: {field}")
+                    payload.pop(field)
+
+                print("[POST] Insert payload:", list(payload.keys()))
                 insert_response = db.insert("every_circle.business", payload)
+                print("[POST] insert_response:", insert_response)
                 # print("insert_response: ", insert_response)
 
                 # Insert into business_user table
@@ -489,21 +519,22 @@ class BusinessInfo(Resource):
                         exclude_user_id=business_user_id,
                     )
 
-                # print(insert_response["code"])
                 if insert_response["code"] == 200:
                     response = {
                         "business_uid": new_business_uid,
                         "message": "Business created successfully",
-                        "code": insert_response["code"],
+                        "code": 200,
                     }
+                    return response, 200
                 else:
                     response = {
-                        "Error": f"{new_business_uid} - Not Created",
-                        "message": insert_response["message"],
-                        "code": insert_response["code"],
+                        "business_uid": None,
+                        "error": f"{new_business_uid} - Not Created",
+                        "message": insert_response.get("message", "DB insert failed"),
+                        "code": 500,
                     }
-
-                return response, 200
+                    print(f"[POST] Business insert FAILED: {insert_response}")
+                    return response, 500
 
         except Exception as e:
             print(f"Error in BusinessInfo POST: {str(e)}")
