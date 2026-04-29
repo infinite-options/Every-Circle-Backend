@@ -289,7 +289,7 @@ class Business_v3(Resource):
             return response, 500
 
     def post(self):
-        print("In Business v3 POST")
+        print("In Business_v3 POST")
         response = {}
 
         try:
@@ -389,7 +389,7 @@ class Business_v3(Resource):
             return response, 500
 
     def put(self):
-        print("In Business PUT")
+        print("In Business_v3 PUT")
         response = {}
 
         try:

@@ -7,94 +7,137 @@ from data_ec import connect, processImage, processDocument
 
 class UserProfileInfo(Resource):
     def get(self, uid):
-        print("In UserProfileInfo GET")
+        print("In UserProfileInfo GET", uid, type(uid))
         response = {}
-        try:
-            print(uid, type(uid))
-            with connect() as db:
-                if uid[:3] == "100":
-                    print("User UID Passed - Consider Changing")
-                    # This is a user UID
-                    user_response = db.select('every_circle.users', where={'user_uid': uid})
-                    if not user_response['result']:
-                        response['message'] = f'No user found for {uid}'
+        with connect() as db:
+            try:
+
+                if uid[:3] == "110":
+                    print("Profile UID Passed")
+                    # Check if the profile exists
+                    profile_response = db.select('every_circle.profile_personal', where={'profile_personal_uid': uid})
+                    if not profile_response['result']:
+                        response['message'] = f'No profile found for {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    # print("profile_response: ", profile_response)
+                    profile_id = uid
+                    user_uid = profile_response['result'][0]['profile_personal_user_id']
+                    print("User UID: ", user_uid)
+
+                    # Get Email ID
+                    user_response = db.select('every_circle.users', where={'user_uid': user_uid})
+                    if not user_response['result']:
+                        response['message'] = f'No user found for {user_uid}'
+                        response['code'] = 404
+                        return response, 404
+
+                    # print("user_response: ", user_response)
+                    email_id = user_response['result'][0]['user_email_id']
+                    print("Email ID: ", email_id)
                     
-                    user_data = user_response['result'][0]
-                    
-                    # Get personal info
-                    personal_info = db.select('every_circle.profile_personal', where={'profile_personal_user_id': uid})
-                    
-                    if not personal_info['result']:
+
+                else:
+            
+                    if uid[:3] == "100":
+                        print("User UID Passed")
+
+                        # Check if the user exists
+                        user_response = db.select('every_circle.users', where={'user_uid': uid})
+                        if not user_response['result']:
+                            response['message'] = f'No user found for {uid}'
+                            response['code'] = 404
+                            return response, 404
+
+                        email_id = user_response['result'][0]['user_email_id']
+                        user_uid = uid
+                        print("User UID Passed", user_uid)
+                            
+
+                    elif "@" in uid:
+                        print("Email UID Passed")
+
+                        # Check if the user exists
+                        user_response = db.select('every_circle.users', where={'user_email_id': uid})
+                        # print("user_response: ", user_response)
+                        if not user_response['result']:
+                            response['message'] = f'No user found for {uid}'
+                            response['code'] = 404
+                            return response, 404
+
+                        email_id = uid
+                        user_uid = user_response['result'][0]['user_uid']
+                        print("User UID: ", user_uid)
+
+                    # Get profile info
+                    profile_response = db.select('every_circle.profile_personal', where={'profile_personal_user_id': user_uid})
+                    if not profile_response['result']:
                         response['message'] = 'Profile not found for this user'
                         response['code'] = 404
                         return response, 404
-                    
-                    # Get user info
-                    user_id = uid
-                    
-                    profile_id = personal_info['result'][0]['profile_personal_uid']
-                    
-                    # Get all associated profile data
-                    response['personal_info'] = personal_info['result'][0]
-                    
-                    # Get social media links
-                    social_links_query = f"""
+
+                    # print("profile_response: ", profile_response)
+                    profile_id = profile_response['result'][0]['profile_personal_uid']
+                    print("Profile UID: ", profile_id)
+
+                response['personal_info'] = profile_response['result'][0]
+                response['user_email'] = email_id
+                # print("Get 1")
+                # return profile_response['result'][0], 200
+
+                social_links_query = f"""
                         SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
                         FROM every_circle.profile_link pl
                         JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
                         WHERE pl.profile_link_profile_personal_id = '{profile_id}'
                     """
-                    social_links_response = db.execute(social_links_query)
-                    response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
-                    
-                    
-                    
-                    
-                    
+                social_links_response = db.execute(social_links_query)
+                response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
+                # print("Get 2")
                     # Get experience info - returning all experiences for this profile
-                    experience_info = db.select('every_circle.profile_experience', 
-                                             where={'profile_experience_profile_personal_id': profile_id})
-                    response['experience_info'] = experience_info['result'] if experience_info['result'] else []
-                    
-                    # Get expertise info - returning all expertise entries for this profile
-                    expertise_info = db.select('every_circle.profile_expertise', 
-                                            where={'profile_expertise_profile_personal_id': profile_id})
-                    response['expertise_info'] = expertise_info['result'] if expertise_info['result'] else []
+                experience_info = db.select('every_circle.profile_experience', 
+                                            where={'profile_experience_profile_personal_id': profile_id})
+                response['experience_info'] = experience_info['result'] if experience_info['result'] else []
+                
+                # Get expertise info - returning all expertise entries for this profile
+                expertise_info = db.select('every_circle.profile_expertise', 
+                                        where={'profile_expertise_profile_personal_id': profile_id})
+                response['expertise_info'] = expertise_info['result'] if expertise_info['result'] else []
 
-                    # Get education info - returning all education entries for this profile
-                    education_info = db.select('every_circle.profile_education', 
-                                            where={'profile_education_profile_personal_id': profile_id})
-                    response['education_info'] = education_info['result'] if education_info['result'] else []
+                # Get education info - returning all education entries for this profile
+                education_info = db.select('every_circle.profile_education', 
+                                        where={'profile_education_profile_personal_id': profile_id})
+                response['education_info'] = education_info['result'] if education_info['result'] else []
 
-                    # Get wishes info - returning all wishes entries for this profile with response counts
-                    wishes_query = """
-                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
-                        FROM every_circle.profile_wish
-                        LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
-                        WHERE profile_wish_profile_personal_id = %s
-                        GROUP BY profile_wish_uid
-                    """
-                    # print("wishes_query", wishes_query)
-                    wishes_info = db.execute(wishes_query, (profile_id,))
-                    response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
+                # Get wishes info - returning all wishes entries for this profile with response counts
+                wishes_query = """
+                    SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
+                    FROM every_circle.profile_wish
+                    LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+                    WHERE profile_wish_profile_personal_id = %s
+                    GROUP BY profile_wish_uid
+                """
+                wishes_info = db.execute(wishes_query, (profile_id,))
+                response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
 
-                    # Get ratings info - returning all ratings entries for this profile
-                    # Get ratings info with business name
-                    ratings_query = f"""
-                        SELECT r.*, b.business_name, b.business_phone_number, b.business_city, b.business_state
-                        FROM every_circle.ratings r
-                        LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
-                        WHERE r.rating_profile_id = '{profile_id}'
-                    """
-                    ratings_result = db.execute(ratings_query)
-                    response['ratings_info'] = ratings_result['result'] if ratings_result['result'] else []
+                # print("Get 3")
 
-                    # Get business info - returning all business entries for this profile
-                    # business_info = db.select('every_circle.profile_has_business',
-                    #                          where={'profile_business_profile_personal_id': profile_id})
-                    business_info = f"""
+                # Get ratings info - returning all ratings entries for this profile
+                # Get ratings info with business name
+                ratings_query = f"""
+                    SELECT r.*, b.business_name, b.business_phone_number, b.business_city, b.business_state
+                    FROM every_circle.ratings r
+                    LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
+                    WHERE r.rating_profile_id = '{profile_id}'
+                """
+                ratings_result = db.execute(ratings_query)
+                response['ratings_info'] = ratings_result['result'] if ratings_result['result'] else []
+
+                # Get business info - returning all business entries for this profile
+                # business_info = db.select('every_circle.profile_has_business',
+                #                          where={'profile_business_profile_personal_id': profile_id})
+                business_info = f"""
                         SELECT -- * 
                             b.business_uid,
                             b.business_name,
@@ -119,147 +162,28 @@ class UserProfileInfo(Resource):
                         FROM every_circle.business b
                         LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
                         LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
-                        WHERE p.profile_personal_user_id = '{user_id}';
+                        -- WHERE p.profile_personal_uid = '110-000015'
+                        WHERE p.profile_personal_uid = '{profile_id}';
                     """
-                    print("business_info query 100:", business_info)
-                    business_result = db.execute(business_info)
-                    print("business_result:", business_result)
-                    response['business_info'] = business_result['result'] if business_result['result'] else []
-                    
-                    # Add user_role from users table
-                    response['user_role'] = user_data['user_role']
-                    response['user_email'] = user_data['user_email_id']
-                    
-                    return response, 200
-                    
-                elif uid[:3] == "110":
-                    print("Profile UID Passed", uid)
-                    # This is a profile UID (profile_personal)
-                    personal_info = db.select('every_circle.profile_personal', where={'profile_personal_uid': uid})
-                    
-                    if not personal_info['result']:
-                        response['message'] = f'No profile found for {uid}'
-                        response['code'] = 404
-                        return response, 404
-                    
-                    print("1")
-                    profile_id = uid
-                    
-                    # Get all associated profile data
-                    response['personal_info'] = personal_info['result'][0]
-                    
-                    # Get user info
-                    user_id = personal_info['result'][0]['profile_personal_user_id']
-                    user_info = db.select('every_circle.users', where={'user_uid': user_id})
-                    response['user_role'] = user_info['result'][0]['user_role'] if user_info['result'] else "unknown"
-                    response['user_email'] = user_info['result'][0]['user_email_id']
-                    print("2")
-                    # Get social media links
-                    social_links_query = f"""
-                        SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
-                        FROM every_circle.profile_link pl
-                        JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
-                        WHERE pl.profile_link_profile_personal_id = '{profile_id}'
-                    """
-                    social_links_response = db.execute(social_links_query)
-                    response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
-                    print("3")
-                    
-                     # Get experience info - returning all experiences for this profile
-                    experience_info = db.select('every_circle.profile_experience', 
-                                             where={'profile_experience_profile_personal_id': profile_id})
-                    response['experience_info'] = experience_info['result'] if experience_info['result'] else []
-                    
-                    # Get expertise info - returning all expertise entries for this profile
-                    expertise_info = db.select('every_circle.profile_expertise', 
-                                            where={'profile_expertise_profile_personal_id': profile_id})
-                    response['expertise_info'] = expertise_info['result'] if expertise_info['result'] else []
+                # print("business_info query:", business_info)
+                business_result = db.execute(business_info)
+                # print("business_result:", business_result)
+                response['business_info'] = business_result['result'] if business_result['result'] else []
 
-                    # Get education info - returning all education entries for this profile
-                    education_info = db.select('every_circle.profile_education', 
-                                            where={'profile_education_profile_personal_id': profile_id})
-                    response['education_info'] = education_info['result'] if education_info['result'] else []
-
-                    # Get wishes info - returning all wishes entries for this profile with response counts
-                    wishes_query = """
-                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
-                        FROM every_circle.profile_wish
-                        LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
-                        WHERE profile_wish_profile_personal_id = %s
-                        GROUP BY profile_wish_uid
-                    """
-                    wishes_info = db.execute(wishes_query, (profile_id,))
-                    response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
-
-                    # Get ratings info - returning all ratings entries for this profile
-                    # Get ratings info with business name
-                    ratings_query = f"""
-                        SELECT r.*, b.business_name, b.business_phone_number, b.business_city, b.business_state
-                        FROM every_circle.ratings r
-                        LEFT JOIN every_circle.business b ON r.rating_business_id = b.business_uid
-                        WHERE r.rating_profile_id = '{profile_id}'
-                    """
-                    ratings_result = db.execute(ratings_query)
-                    response['ratings_info'] = ratings_result['result'] if ratings_result['result'] else []
-
-                    # Get business info - returning all business entries for this profile
-                    # business_info = db.select('every_circle.profile_has_business',
-                    #                          where={'profile_business_profile_personal_id': profile_id})
-                    business_info = f"""
-                            SELECT -- * 
-                                b.business_uid,
-                                b.business_name,
-                                b.business_phone_number,
-                                b.business_phone_number_is_public,
-                                b.business_email_id,
-                                b.business_email_id_is_public,
-                                b.business_location,
-                                b.business_address_line_1,
-                                b.business_address_line_2,
-                                b.business_city,
-                                b.business_state,
-                                b.business_country,
-                                b.business_zip_code,
-                                b.business_tag_line,
-                                b.business_tag_line_is_public,
-                                b.business_profile_img,
-                                b.business_profile_img_is_public,
-                                bu.bu_uid,
-                                bu.bu_role,
-                                bu.bu_individual_business_is_public
-                            FROM every_circle.business b
-                            LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                            LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
-                            -- WHERE p.profile_personal_uid = '110-000015'
-                            WHERE p.profile_personal_uid = '{profile_id}';
-                        """
-                    print("business_info query 110:", business_info)
-                    business_result = db.execute(business_info)
-                    print("business_result:", business_result)
-                    response['business_info'] = business_result['result'] if business_result['result'] else []
-
-                    print("4")
-                    
-                    return response, 200
+                # print("Get 4")
                 
-                elif "@" in uid:
-                    print("Email UID Passed")
-                    # This is an email UID
-                    user_info = db.select('every_circle.users', where={'user_email_id': uid})
-                    response['user_uid'] = user_info['result'][0]['user_uid'] if user_info['result'] else "unknown"
-                    return response, 200
-                
-                else:
-                    response['message'] = 'Invalid UID'
-                    response['code'] = 400
-                    return response, 400
+                return response, 200
 
-        except Exception as e:
-            print(f"Error in UserProfileInfo GET: {str(e)}")
-            response['message'] = 'Internal Server Error'
-            response['code'] = 500
-            return response, 500
-        
+
+            except Exception as e:
+                print(f"Error in UserProfileInfo GET: {str(e)}")
+                response['message'] = 'Improper Credentials'
+                response['code'] = 500
+                return response, 500
+
+                
+
+
     def post(self):
         print("In UserProfileInfo POST")
         response = {}

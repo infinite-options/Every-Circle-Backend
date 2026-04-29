@@ -11,7 +11,9 @@ class AblyToken(Resource):
     """
 
     def get(self):
+        print("AblyToken GET request received")
         api_key = os.getenv("ABLY_API_KEY", "")
+        print("api_key: ", api_key[:5])
         if not api_key:
             return {"message": "ABLY_API_KEY not configured on server", "code": 500}, 500
 
