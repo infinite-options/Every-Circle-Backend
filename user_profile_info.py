@@ -155,14 +155,14 @@ class UserProfileInfo(Resource):
                     response['user_email'] = user_info['result'][0]['user_email_id']
                     print("2")
                     # Get social media links
-                    social_links_query = f"""
-                        SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
-                        FROM every_circle.profile_link pl
-                        JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
-                        WHERE pl.profile_link_profile_personal_id = '{profile_id}'
-                    """
-                    social_links_response = db.execute(social_links_query)
-                    response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
+                    # social_links_query = f"""
+                    #     SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
+                    #     FROM every_circle.profile_link pl
+                    #     JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
+                    #     WHERE pl.profile_link_profile_personal_id = '{profile_id}'
+                    # """
+                    # social_links_response = db.execute(social_links_query)
+                    # response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
                     print("3")
                     
                      # Get experience info - returning all experiences for this profile
@@ -970,76 +970,76 @@ class UserProfileInfo(Resource):
                 
                 # Update social media links if provided
                 # First, get all social media platforms from the social_link table
-                social_links_query = db.select('every_circle.social_link')
-                social_links = {}
+                # social_links_query = db.select('every_circle.social_link')
+                # social_links = {}
                 
-                if social_links_query['result']:
-                    for link in social_links_query['result']:
-                        social_links[link['social_link_name'].lower()] = link['social_link_uid']
+                # if social_links_query['result']:
+                #     for link in social_links_query['result']:
+                #         social_links[link['social_link_name'].lower()] = link['social_link_uid']
                 
-                # Check for social media links in the payload
-                if 'social_links' in payload:
-                    print("In social_links")
-                    try:
-                        import json
-                        social_media_links = json.loads(payload.pop('social_links'))
-                        updated_link_uids = []
+                # # Check for social media links in the payload
+                # if 'social_links' in payload:
+                #     print("In social_links")
+                #     try:
+                #         import json
+                #         social_media_links = json.loads(payload.pop('social_links'))
+                #         updated_link_uids = []
                         
-                        # Get existing links for this profile
-                        existing_links_query = f"""
-                            SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
-                            FROM every_circle.profile_link pl
-                            JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
-                            WHERE pl.profile_link_profile_personal_id = '{profile_uid}'
-                        """
-                        existing_links_response = db.execute(existing_links_query)
+                #         # Get existing links for this profile
+                #         existing_links_query = f"""
+                #             SELECT pl.profile_link_uid, sl.social_link_name, pl.profile_link_url
+                #             FROM every_circle.profile_link pl
+                #             JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
+                #             WHERE pl.profile_link_profile_personal_id = '{profile_uid}'
+                #         """
+                #         existing_links_response = db.execute(existing_links_query)
                         
-                        # Create a map of platform name to existing link data
-                        existing_links = {}
-                        if existing_links_response['result']:
-                            for link in existing_links_response['result']:
-                                existing_links[link['social_link_name'].lower()] = {
-                                    'uid': link['profile_link_uid'],
-                                    'url': link['profile_link_url']
-                                }
+                #         # Create a map of platform name to existing link data
+                #         existing_links = {}
+                #         if existing_links_response['result']:
+                #             for link in existing_links_response['result']:
+                #                 existing_links[link['social_link_name'].lower()] = {
+                #                     'uid': link['profile_link_uid'],
+                #                     'url': link['profile_link_url']
+                #                 }
                         
-                        # Process each social media link
-                        for platform, url in social_media_links.items():
-                            platform_lower = platform.lower()
+                #         # Process each social media link
+                #         for platform, url in social_media_links.items():
+                #             platform_lower = platform.lower()
                             
-                            if platform_lower in social_links:
-                                if platform_lower in existing_links:
-                                    # Update existing link
-                                    link_uid = existing_links[platform_lower]['uid']
+                #             if platform_lower in social_links:
+                #                 if platform_lower in existing_links:
+                #                     # Update existing link
+                #                     link_uid = existing_links[platform_lower]['uid']
                                     
-                                    # Only update if URL is different
-                                    if url != existing_links[platform_lower]['url']:
-                                        db.update('every_circle.profile_link', 
-                                                 {'profile_link_uid': link_uid}, 
-                                                 {'profile_link_url': url})
+                #                     # Only update if URL is different
+                #                     if url != existing_links[platform_lower]['url']:
+                #                         db.update('every_circle.profile_link', 
+                #                                  {'profile_link_uid': link_uid}, 
+                #                                  {'profile_link_url': url})
                                     
-                                    updated_link_uids.append(link_uid)
-                                else:
-                                    # Create new link
-                                    if url:  # Only create if URL is provided
-                                        link_stored_procedure_response = db.call(procedure='new_profile_link_uid')
-                                        new_link_uid = link_stored_procedure_response['result'][0]['new_id']
+                #                     updated_link_uids.append(link_uid)
+                #                 else:
+                #                     # Create new link
+                #                     if url:  # Only create if URL is provided
+                #                         link_stored_procedure_response = db.call(procedure='new_profile_link_uid')
+                #                         new_link_uid = link_stored_procedure_response['result'][0]['new_id']
                                         
-                                        link_info = {
-                                            'profile_link_uid': new_link_uid,
-                                            'profile_link_profile_personal_id': profile_uid,
-                                            'profile_link_social_link_id': social_links[platform_lower],
-                                            'profile_link_url': url
-                                        }
+                #                         link_info = {
+                #                             'profile_link_uid': new_link_uid,
+                #                             'profile_link_profile_personal_id': profile_uid,
+                #                             'profile_link_social_link_id': social_links[platform_lower],
+                #                             'profile_link_url': url
+                #                         }
                                         
-                                        db.insert('every_circle.profile_link', link_info)
-                                        updated_link_uids.append(new_link_uid)
+                #                         db.insert('every_circle.profile_link', link_info)
+                #                         updated_link_uids.append(new_link_uid)
                         
-                        # Add updated link UIDs to response
-                        if updated_link_uids:
-                            updated_uids['profile_link_uids'] = updated_link_uids
-                    except Exception as e:
-                        print(f"Error processing social_links JSON: {str(e)}")
+                #         # Add updated link UIDs to response
+                #         if updated_link_uids:
+                #             updated_uids['profile_link_uids'] = updated_link_uids
+                #     except Exception as e:
+                #         print(f"Error processing social_links JSON: {str(e)}")
                 
                 # Handle multiple education entries
                 if 'education_info' in payload:

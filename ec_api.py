@@ -32,7 +32,7 @@ from chatbot import ChatbotAPI
 from tag_generator_api import TagGeneratorAPI
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
-from transactions import Transactions, SellerTransactions
+from transactions import Transactions, SellerTransactions, DeclinedReturns
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -46,6 +46,7 @@ from feedback import Feedback
 from ably_auth import AblyToken
 from search_referral import SearchReferral
 from profile_views import ProfileViews
+
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -557,6 +558,7 @@ api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
 api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
+api.add_resource(DeclinedReturns, "/api/v1/transactions/returns/declined")
 
 class GooglePlacesInfo(Resource):
     def post(self):
