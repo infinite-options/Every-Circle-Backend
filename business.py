@@ -225,7 +225,7 @@ class Business_v2(Resource):
             return response, 500
 
     def post(self):
-        print("In Business POST")
+        print("In Business_v2 POST")
         response = {}
 
         def check_category(category_uid, business_uid):
@@ -308,7 +308,7 @@ class Business_v2(Resource):
             return response, 500
 
     def put(self):
-        print("In Business PUT")
+        print("In Business_v2 PUT")
         response = {}
 
         def check_category(category_uid, business_uid):

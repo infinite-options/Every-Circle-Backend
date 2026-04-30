@@ -25,6 +25,20 @@ def _strip_currency(value):
     return value
 
 
+def _parse_public_flag(value):
+    """Normalize form/API public flags to 0 or 1 for tinyint columns."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return 1
+    if s in ("0", "false", "no", "off", ""):
+        return 0
+    return 1 if s else 0
+
+
 class BusinessInfo(Resource):
     def get(self, uid):
         print(f"In Business GET with uid: {uid}")
@@ -244,6 +258,7 @@ class BusinessInfo(Resource):
             user_uid = payload.pop("user_uid")
 
             with connect() as db:
+                # What do we do with the user info?
                 user_exists_query = db.select(
                     "every_circle.users", where={"user_uid": user_uid}
                 )
@@ -414,6 +429,12 @@ class BusinessInfo(Resource):
                     elif isinstance(val, str):
                         payload["business_category_id"] = val.strip()
 
+                # First service image (multipart): not columns on business table
+                print("Popping service_image_0_is_public - POST")
+                service_image_0_is_public = payload.pop(
+                    "bs_service_image_0_is_public", None
+                )
+
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert("every_circle.business", payload)
                 # print("insert_response: ", insert_response)
@@ -467,6 +488,7 @@ class BusinessInfo(Resource):
                         new_business_uid,
                         business_user_id,
                         request.files,
+                        service_image_0_is_public=service_image_0_is_public,
                     )
 
                 # Process custom_tags if provided
@@ -525,6 +547,15 @@ class BusinessInfo(Resource):
                 return response, 400
 
             business_uid = payload.pop("business_uid")
+            # Service image (first service only): not business table columns
+            print("Popping service_image_0_is_public - PUT")
+            service_image_0_is_public = payload.pop(
+                "bs_service_image_0_is_public", None
+            )
+            delete_bs_service_image_0 = payload.pop(
+                "delete_bs_service_image_0", None
+            )
+
             key = {"business_uid": business_uid}
 
             with connect() as db:
@@ -761,7 +792,7 @@ class BusinessInfo(Resource):
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                         # Process each service entry
-                        for service_data in services_data:
+                        for idx, service_data in enumerate(services_data):
                             print("Processing service data:", service_data)
 
                             # Check if this is an existing service (has UID)
@@ -785,13 +816,65 @@ class BusinessInfo(Resource):
                                     )
                                     continue
 
+                                has_f0 = (
+                                    idx == 0
+                                    and request.files
+                                    and request.files.get("bs_service_image_0")
+                                    and getattr(
+                                        request.files["bs_service_image_0"],
+                                        "filename",
+                                        None,
+                                    )
+                                )
+
                                 # Add updated timestamp and user
                                 service_data["bs_updated_at"] = current_time
                                 if service_user_id:
                                     service_data["bs_updated_by"] = service_user_id
 
-                                # Handle service images if present
-                                if "bs_image_key" in service_data:
+                                # First service: bs_service_image_0 -> S3, URL -> bs_image_url
+                                print("idx: ", idx)
+                                if idx == 0:
+                                    has_del = delete_bs_service_image_0 not in (
+                                        None,
+                                        "",
+                                        "null",
+                                        "false",
+                                        False,
+                                    )
+                                    if has_f0 or has_del:
+                                        img_payload = {}
+                                        if has_del:
+                                            img_payload["delete_bs_service_image_0"] = (
+                                                delete_bs_service_image_0
+                                            )
+                                        new_url = processSingleImageUpload(
+                                            db,
+                                            service_uid,
+                                            "every_circle.business_services",
+                                            "bs_uid",
+                                            "bs_image_url",
+                                            "bs_service_image_0",
+                                            "delete_bs_service_image_0",
+                                            "business_service",
+                                            img_payload,
+                                            is_create=False,
+                                        )
+                                        if new_url is not None:
+                                            service_data["bs_image_url"] = new_url
+                                        elif has_del and not has_f0:
+                                            service_data["bs_image_url"] = None
+                                    if service_image_0_is_public is not None:
+                                        service_data[
+                                            "bs_image_url_is_public"
+                                        ] = _parse_public_flag(
+                                            service_image_0_is_public
+                                        )
+
+                                # Handle service images if present (legacy bs_image_key)
+                                if "bs_image_key" in service_data and not (
+                                    idx == 0 and has_f0
+                                ):
                                     image_key = service_data.pop("bs_image_key")
                                     service_images = []
 
@@ -878,6 +961,12 @@ class BusinessInfo(Resource):
                                         business_uid,
                                         service_user_id,
                                         request.files,
+                                        service_image_0_is_public=(
+                                            service_image_0_is_public
+                                            if idx == 0
+                                            else None
+                                        ),
+                                        apply_service_image_0=(idx == 0),
                                     )
                                 else:
                                     print(
@@ -1475,21 +1564,49 @@ class BusinessInfo(Resource):
         return stored_tags
 
     def _add_services(
-        self, db, services_str, business_uid, user_uid, request_files=None
+        self,
+        db,
+        services_str,
+        business_uid,
+        user_uid,
+        request_files=None,
+        service_image_0_is_public=None,
+        apply_service_image_0=True,
     ):
         try:
             # import json
             services = json.loads(services_str)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            for service in services:
+            for idx, service in enumerate(services):
                 # Generate a new bs_uid
                 bs_uid_response = db.call(procedure="new_bs_uid")
                 bs_uid = bs_uid_response["result"][0]["new_id"]
 
-                # Handle service images if present
+                # Primary product image: bs_service_image_0 (first service only when allowed)
+                bs_image_url_value = None
+                if (
+                    apply_service_image_0
+                    and idx == 0
+                    and request_files
+                    and request_files.get("bs_service_image_0")
+                ):
+                    f0 = request_files["bs_service_image_0"]
+                    if f0 and getattr(f0, "filename", None):
+                        unique_filename = (
+                            f"service_{business_uid}_{bs_uid}_{f0.filename}"
+                        )
+                        s3_key = f"services/{business_uid}/{unique_filename}"
+                        bs_image_url_value = uploadImage(f0, s3_key, "")
+                        print("bs_image_url_value: ", bs_image_url_value)
+
+                # Legacy multi-image upload via bs_image_key
                 service_images = []
-                if request_files and "bs_image_key" in service:
+                if (
+                    bs_image_url_value is None
+                    and request_files
+                    and "bs_image_key" in service
+                ):
                     image_key = service.pop("bs_image_key")
                     # Look for images with the matching key prefix
                     for key in request_files:
@@ -1500,10 +1617,17 @@ class BusinessInfo(Resource):
                                 unique_filename = (
                                     f"service_{business_uid}_{bs_uid}_{file.filename}"
                                 )
-                                image_key = f"services/{business_uid}/{unique_filename}"
-                                image_url = uploadImage(file, image_key, "")
+                                image_key_s3 = (
+                                    f"services/{business_uid}/{unique_filename}"
+                                )
+                                image_url = uploadImage(file, image_key_s3, "")
                                 if image_url:
                                     service_images.append(image_url)
+
+                if bs_image_url_value is None and service_images:
+                    bs_image_url_value = json.dumps(service_images)
+                elif bs_image_url_value is None and not service_images:
+                    bs_image_url_value = None
 
                 # Set default values for required fields
                 service_data = {
@@ -1523,9 +1647,7 @@ class BusinessInfo(Resource):
                     "bs_discount_allowed": service.get("bs_discount_allowed", 0),
                     "bs_refund_policy": service.get("bs_refund_policy"),
                     "bs_return_window_days": service.get("bs_return_window_days"),
-                    "bs_image_url": (
-                        json.dumps(service_images) if service_images else None
-                    ),
+                    "bs_image_url": bs_image_url_value,
                     "bs_display_order": service.get("bs_display_order"),
                     "bs_tags": service.get("bs_tags"),
                     "bs_created_at": current_time,
@@ -1536,6 +1658,15 @@ class BusinessInfo(Resource):
                     "bs_cost": _strip_currency(service.get("bs_cost")),
                     "bs_cost_currency": service.get("bs_cost_currency"),
                 }
+
+                if (
+                    apply_service_image_0
+                    and idx == 0
+                    and service_image_0_is_public is not None
+                ):
+                    service_data["bs_image_url_is_public"] = _parse_public_flag(
+                        service_image_0_is_public
+                    )
 
                 # Remove None values to use database defaults
                 service_data = {k: v for k, v in service_data.items() if v is not None}
