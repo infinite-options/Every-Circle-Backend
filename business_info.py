@@ -4,6 +4,7 @@ from datetime import datetime
 import ast
 import traceback
 import json
+import logging
 import googlemaps
 import os
 
@@ -14,6 +15,7 @@ from data_ec import (
     deleteImage,
     processSingleImageUpload,
 )
+from user_path_connection import ConnectionsPath
 
 
 def _strip_currency(value):
@@ -391,10 +393,122 @@ class BusinessInfo(Resource):
                     "message": "Business data retrieved successfully",
                 }
 
-                return response, 200
+            # ── viewer_uid: enrich ratings + record view + fetch viewers ──
+            viewer_uid = (request.args.get("viewer_uid") or "").strip()
+            viewers = []
+
+            if viewer_uid:
+                for rating in response["ratings"]:
+                    rater_uid = rating.get("rating_profile_id")
+                    with connect() as db_r:
+                        tx = db_r.select("transactions", where={"transaction_profile_id": rater_uid, "transaction_business_id": business_uid})
+                        rating["is_verified"] = bool(tx.get("result"))
+                        rating["circle_num_nodes"] = None
+                        if rater_uid and viewer_uid != rater_uid:
+                            circle = db_r.select("every_circle.circles", where={"circle_profile_id": viewer_uid, "circle_related_person_id": rater_uid})
+                            if not circle.get("result"):
+                                circle = db_r.select("every_circle.circles", where={"circle_profile_id": rater_uid, "circle_related_person_id": viewer_uid})
+                            if circle.get("result"):
+                                stored = circle["result"][0].get("circle_num_nodes")
+                                if stored is not None:
+                                    rating["circle_num_nodes"] = int(stored)
+                            else:
+                                try:
+                                    cp = ConnectionsPath()
+                                    path_resp, path_status = cp.get(viewer_uid, rater_uid)
+                                    if path_status == 200 and path_resp.get("combined_path"):
+                                        nodes = path_resp["combined_path"].split(",")
+                                        rating["circle_num_nodes"] = int(len(nodes) - 1)
+                                except Exception as e:
+                                    print(f"Could not calculate circle_num_nodes: {e}")
+                response["ratings"] = sorted(
+                    response["ratings"] or [],
+                    key=lambda r: (r["circle_num_nodes"] is None, int(r["circle_num_nodes"]) if r["circle_num_nodes"] is not None else 0)
+                )
+
+                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                with connect() as db_v:
+                    check = db_v.execute(
+                        "SELECT profile_view_uid, view_timestamp FROM every_circle.profile_views WHERE view_profile_id=%s AND view_viewer_id=%s LIMIT 1",
+                        (business_uid, viewer_uid)
+                    )
+                    existing = (check.get("result") or []) if check else []
+                    if existing:
+                        existing_uid = existing[0]["profile_view_uid"]
+                        raw_ts = existing[0].get("view_timestamp")
+                        if isinstance(raw_ts, list):
+                            timestamps = raw_ts
+                        else:
+                            try:
+                                parsed = json.loads(raw_ts) if raw_ts else []
+                                timestamps = parsed if isinstance(parsed, list) else [str(raw_ts)]
+                            except (TypeError, ValueError):
+                                timestamps = [str(raw_ts)] if raw_ts else []
+                        timestamps.append(now)
+                        db_v.execute(
+                            "UPDATE every_circle.profile_views SET view_timestamp=%s WHERE profile_view_uid=%s",
+                            (json.dumps(timestamps), existing_uid),
+                            "post"
+                        )
+                    else:
+                        uid_result = db_v.call("new_profile_view_uid")
+                        uid_rows = (uid_result.get("result") or []) if uid_result else []
+                        new_uid = uid_rows[0].get("new_id") if uid_rows else None
+                        if new_uid:
+                            db_v.insert("every_circle.profile_views", {
+                                "profile_view_uid": new_uid,
+                                "view_profile_id": business_uid,
+                                "view_viewer_id": viewer_uid,
+                                "view_timestamp": json.dumps([now])
+                            })
+
+                with connect() as db_vw:
+                    vr = db_vw.execute("""
+                        SELECT pv.view_viewer_id, pv.view_timestamp,
+                            pp.profile_personal_first_name AS viewer_first_name,
+                            pp.profile_personal_last_name AS viewer_last_name,
+                            pp.profile_personal_image AS viewer_image,
+                            pp.profile_personal_image_is_public AS viewer_image_is_public,
+                            pp.profile_personal_tag_line AS viewer_tag_line,
+                            pp.profile_personal_tag_line_is_public AS viewer_tag_line_is_public,
+                            pp.profile_personal_phone_number AS viewer_phone,
+                            pp.profile_personal_phone_number_is_public AS viewer_phone_is_public,
+                            pp.profile_personal_city AS viewer_city,
+                            pp.profile_personal_state AS viewer_state,
+                            pp.profile_personal_location_is_public AS viewer_location_is_public,
+                            pp.profile_personal_email_is_public AS viewer_email_is_public,
+                            u.user_email_id AS viewer_email
+                        FROM every_circle.profile_views pv
+                        LEFT JOIN every_circle.profile_personal pp ON pp.profile_personal_uid = pv.view_viewer_id
+                        LEFT JOIN every_circle.users u ON u.user_uid = pp.profile_personal_user_id
+                        WHERE pv.view_profile_id = %s
+                        ORDER BY pv.view_timestamp DESC
+                    """, (business_uid,))
+                    raw = vr.get("result", []) if vr else []
+                    seen = set()
+                    for row in raw:
+                        vid = row.get("view_viewer_id")
+                        if vid not in seen:
+                            seen.add(vid)
+                            rt = row.get("view_timestamp")
+                            last_ts = None
+                            if isinstance(rt, list):
+                                last_ts = rt[-1] if rt else None
+                            elif rt:
+                                try:
+                                    parsed_ts = json.loads(rt)
+                                    last_ts = parsed_ts[-1] if isinstance(parsed_ts, list) and parsed_ts else str(rt)
+                                except (TypeError, ValueError):
+                                    last_ts = str(rt)
+                            row["view_timestamp"] = last_ts
+                            viewers.append(row)
+                    viewers.sort(key=lambda r: r.get("view_timestamp") or "", reverse=True)
+
+            response["viewers"] = viewers
+            return response, 200
 
         except Exception as e:
-            print(f"Error in Business GET: {str(e)}")
+            logging.exception(f"Error in Business GET: {str(e)}")
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
