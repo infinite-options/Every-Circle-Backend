@@ -558,7 +558,7 @@ api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
 api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
-api.add_resource(DeclinedReturns, "/api/v1/transactions/returns/declined")
+api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 
 class GooglePlacesInfo(Resource):
     def post(self):

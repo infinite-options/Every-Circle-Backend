@@ -840,6 +840,7 @@ class DeclinedReturns(Resource):
     def put(self):
         print("In DeclinedReturns PUT")
         response = {}
+
  
         try:
             data = request.get_json()
@@ -851,32 +852,39 @@ class DeclinedReturns(Resource):
                 response["code"] = 400
                 return response, 400
  
+            action = data.get("action", "decline")
+
             with connect() as db:
-                query = """
-                    UPDATE every_circle.transactions
-                    SET 
-                        transaction_return_status = 'declined',
-                        transaction_return_seller_note = %s
-                    WHERE transaction_uid = %s
-                """
-                result = db.execute(query, (seller_note, transaction_uid))
+                if action == "resolve":
+                    update_fields = {"transaction_return_status": "resolved"}
+                else:
+                    update_fields = {
+                        "transaction_return_status": "declined",
+                        "transaction_return_seller_note": seller_note,
+                    }
+
+                print("DeclinedReturns PUT update_fields:", update_fields)
+                result = db.update(
+                    "every_circle.transactions",
+                    {"transaction_uid": transaction_uid},
+                    update_fields,
+                )
                 print("DeclinedReturns PUT result:", result)
- 
+
                 if result.get("code") == 200:
-                    response["message"] = "Return declined successfully"
+                    response["message"] = "Return declined successfully" if action == "decline" else "Return resolved successfully"
                     response["code"] = 200
                 else:
                     response["message"] = "Failed to update transaction"
                     response["code"] = result.get("code", 500)
                     return response, response["code"]
- 
+
                 return response, 200
- 
+
         except Exception as e:
             print(f"Error in DeclinedReturns PUT: {str(e)}")
             print(traceback.format_exc())
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
             return response, 500
-
    
