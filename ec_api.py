@@ -37,6 +37,7 @@ from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
+from profile_views import ProfileViews
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from circles import Circles
@@ -541,6 +542,7 @@ api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<str
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
+api.add_resource(ProfileViews, '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(TransactionReceipt, '/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')

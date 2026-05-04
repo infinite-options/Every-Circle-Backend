@@ -4,7 +4,6 @@ from datetime import datetime
 import ast
 import traceback
 import json
-import logging
 import googlemaps
 import os
 
@@ -15,7 +14,6 @@ from data_ec import (
     deleteImage,
     processSingleImageUpload,
 )
-from user_path_connection import ConnectionsPath
 
 
 def _strip_currency(value):
@@ -25,176 +23,6 @@ def _strip_currency(value):
     if isinstance(value, str):
         return value.replace("$", "").replace(",", "").strip()
     return value
-
-
-def _parse_public_flag(value):
-    """Normalize form/API public flags to 0 or 1 for tinyint columns."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return 1 if value else 0
-    s = str(value).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return 1
-    if s in ("0", "false", "no", "off", ""):
-        return 0
-    return 1 if s else 0
-
-
-# Only columns that exist on every_circle.business_services. Keys not in this set
-# are dropped on PUT (they do not cause SQL errors).
-#
-# Frontend-only keys (never DB columns) are removed in _derive_business_service_fields:
-#   bs_qty_unlimited, bs_available_quantity, bs_free_shipping, bs_buyer_pays_shipping,
-#   bs_cc_fee_payer, bs_condition_type, bs_condition_detail
-# They are mapped into bs_quantity, bs_shipping, bs_condition when possible.
-#
-# If you add new API fields, either add a DB column and list it here, or strip/map
-# them in _derive_business_service_fields so they never reach _prepare.
-_BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
-    {
-        "bs_service_name",
-        "bs_service_desc",
-        "bs_notes",
-        "bs_sku",
-        "bs_bounty",
-        "bs_bounty_currency",
-        "bs_bounty_limit",
-        "bs_bounty_type",
-        "bs_is_taxable",
-        "bs_tax_rate",
-        "bs_discount_allowed",
-        "bs_refund_policy",
-        "bs_return_window_days",
-        "bs_image_url",
-        "bs_image_url_is_public",
-        "bs_display_order",
-        "bs_tags",
-        "bs_duration_minutes",
-        "bs_cost",
-        "bs_cost_currency",
-        "bs_is_visible",
-        "bs_status",
-        "bs_updated_at",
-        "bs_updated_by",
-        "bs_quantity",
-        "bs_shipping",
-        "bs_condition",
-    }
-)
-
-
-def _truthy_flag(x):
-    if x is None:
-        return False
-    if isinstance(x, bool):
-        return x
-    s = str(x).strip().lower()
-    return s in ("1", "true", "yes", "on")
-
-
-def _derive_business_service_fields(service_data):
-    """
-    Map frontend-only keys to bs_quantity, bs_shipping, bs_condition and remove
-    keys that are not database columns (so UPDATE/INSERT never sees them).
-
-    bs_quantity: numeric string or 'unlimited'
-    bs_shipping: Free, Buyer, or NULL (None)
-    bs_condition: NEW or seller text
-    """
-    legacy_keys = (
-        "bs_qty_unlimited",
-        "bs_available_quantity",
-        "bs_free_shipping",
-        "bs_buyer_pays_shipping",
-        "bs_cc_fee_payer",
-        "bs_condition_type",
-        "bs_condition_detail",
-    )
-    legacy = {k: service_data.pop(k, None) for k in legacy_keys}
-
-    # --- bs_quantity ---
-    raw_q = service_data.get("bs_quantity")
-    if raw_q is not None and str(raw_q).strip() != "":
-        q = str(raw_q).strip()
-        service_data["bs_quantity"] = (
-            "unlimited" if q.lower() == "unlimited" else q
-        )
-    elif _truthy_flag(legacy.get("bs_qty_unlimited")):
-        service_data["bs_quantity"] = "unlimited"
-    elif legacy.get("bs_available_quantity") not in (None, ""):
-        service_data["bs_quantity"] = str(legacy["bs_available_quantity"]).strip()
-    else:
-        service_data.pop("bs_quantity", None)
-
-    # --- bs_shipping ---
-    if "bs_shipping" in service_data:
-        sh = service_data["bs_shipping"]
-        if sh is None or (isinstance(sh, str) and not str(sh).strip()):
-            service_data["bs_shipping"] = None
-        else:
-            s = str(sh).strip()
-            low = s.lower()
-            if low in ("null", "none"):
-                service_data["bs_shipping"] = None
-            elif low == "free":
-                service_data["bs_shipping"] = "Free"
-            elif low == "buyer":
-                service_data["bs_shipping"] = "Buyer"
-            else:
-                service_data["bs_shipping"] = s
-    elif _truthy_flag(legacy.get("bs_free_shipping")):
-        service_data["bs_shipping"] = "Free"
-    elif _truthy_flag(legacy.get("bs_buyer_pays_shipping")):
-        service_data["bs_shipping"] = "Buyer"
-    else:
-        service_data.pop("bs_shipping", None)
-
-    # --- bs_condition ---
-    raw_c = service_data.get("bs_condition")
-    if raw_c is not None and str(raw_c).strip() != "":
-        c = str(raw_c).strip()
-        service_data["bs_condition"] = "NEW" if c.upper() == "NEW" else c
-    else:
-        ct = legacy.get("bs_condition_type")
-        cd = legacy.get("bs_condition_detail")
-        ct_s = str(ct).strip().lower() if ct not in (None, "") else ""
-        cd_s = str(cd).strip() if cd not in (None, "") else ""
-        if ct_s == "new":
-            service_data["bs_condition"] = "NEW"
-        elif cd_s:
-            service_data["bs_condition"] = cd_s
-        elif ct_s:
-            service_data["bs_condition"] = str(ct).strip()
-        else:
-            service_data.pop("bs_condition", None)
-
-    return service_data
-
-
-def _prepare_business_service_update_dict(service_data):
-    """Drop unknown keys; turn '' into None for optional fields."""
-    empty_to_none = {
-        "bs_return_window_days",
-        "bs_duration_minutes",
-        "bs_bounty_limit",
-        "bs_quantity",
-        "bs_shipping",
-        "bs_condition",
-    }
-    out = {}
-    for k, v in service_data.items():
-        if k not in _BUSINESS_SERVICE_UPDATE_COLUMNS:
-            continue
-        if v == "" and k in empty_to_none:
-            v = None
-        if k == "bs_bounty_limit" and v is not None and v != "":
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                v = None
-        out[k] = v
-    return out
 
 
 class BusinessInfo(Resource):
@@ -393,122 +221,10 @@ class BusinessInfo(Resource):
                     "message": "Business data retrieved successfully",
                 }
 
-            # ── viewer_uid: enrich ratings + record view + fetch viewers ──
-            viewer_uid = (request.args.get("viewer_uid") or "").strip()
-            viewers = []
-
-            if viewer_uid:
-                for rating in response["ratings"]:
-                    rater_uid = rating.get("rating_profile_id")
-                    with connect() as db_r:
-                        tx = db_r.select("transactions", where={"transaction_profile_id": rater_uid, "transaction_business_id": business_uid})
-                        rating["is_verified"] = bool(tx.get("result"))
-                        rating["circle_num_nodes"] = None
-                        if rater_uid and viewer_uid != rater_uid:
-                            circle = db_r.select("every_circle.circles", where={"circle_profile_id": viewer_uid, "circle_related_person_id": rater_uid})
-                            if not circle.get("result"):
-                                circle = db_r.select("every_circle.circles", where={"circle_profile_id": rater_uid, "circle_related_person_id": viewer_uid})
-                            if circle.get("result"):
-                                stored = circle["result"][0].get("circle_num_nodes")
-                                if stored is not None:
-                                    rating["circle_num_nodes"] = int(stored)
-                            else:
-                                try:
-                                    cp = ConnectionsPath()
-                                    path_resp, path_status = cp.get(viewer_uid, rater_uid)
-                                    if path_status == 200 and path_resp.get("combined_path"):
-                                        nodes = path_resp["combined_path"].split(",")
-                                        rating["circle_num_nodes"] = int(len(nodes) - 1)
-                                except Exception as e:
-                                    print(f"Could not calculate circle_num_nodes: {e}")
-                response["ratings"] = sorted(
-                    response["ratings"] or [],
-                    key=lambda r: (r["circle_num_nodes"] is None, int(r["circle_num_nodes"]) if r["circle_num_nodes"] is not None else 0)
-                )
-
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                with connect() as db_v:
-                    check = db_v.execute(
-                        "SELECT profile_view_uid, view_timestamp FROM every_circle.profile_views WHERE view_profile_id=%s AND view_viewer_id=%s LIMIT 1",
-                        (business_uid, viewer_uid)
-                    )
-                    existing = (check.get("result") or []) if check else []
-                    if existing:
-                        existing_uid = existing[0]["profile_view_uid"]
-                        raw_ts = existing[0].get("view_timestamp")
-                        if isinstance(raw_ts, list):
-                            timestamps = raw_ts
-                        else:
-                            try:
-                                parsed = json.loads(raw_ts) if raw_ts else []
-                                timestamps = parsed if isinstance(parsed, list) else [str(raw_ts)]
-                            except (TypeError, ValueError):
-                                timestamps = [str(raw_ts)] if raw_ts else []
-                        timestamps.append(now)
-                        db_v.execute(
-                            "UPDATE every_circle.profile_views SET view_timestamp=%s WHERE profile_view_uid=%s",
-                            (json.dumps(timestamps), existing_uid),
-                            "post"
-                        )
-                    else:
-                        uid_result = db_v.call("new_profile_view_uid")
-                        uid_rows = (uid_result.get("result") or []) if uid_result else []
-                        new_uid = uid_rows[0].get("new_id") if uid_rows else None
-                        if new_uid:
-                            db_v.insert("every_circle.profile_views", {
-                                "profile_view_uid": new_uid,
-                                "view_profile_id": business_uid,
-                                "view_viewer_id": viewer_uid,
-                                "view_timestamp": json.dumps([now])
-                            })
-
-                with connect() as db_vw:
-                    vr = db_vw.execute("""
-                        SELECT pv.view_viewer_id, pv.view_timestamp,
-                            pp.profile_personal_first_name AS viewer_first_name,
-                            pp.profile_personal_last_name AS viewer_last_name,
-                            pp.profile_personal_image AS viewer_image,
-                            pp.profile_personal_image_is_public AS viewer_image_is_public,
-                            pp.profile_personal_tag_line AS viewer_tag_line,
-                            pp.profile_personal_tag_line_is_public AS viewer_tag_line_is_public,
-                            pp.profile_personal_phone_number AS viewer_phone,
-                            pp.profile_personal_phone_number_is_public AS viewer_phone_is_public,
-                            pp.profile_personal_city AS viewer_city,
-                            pp.profile_personal_state AS viewer_state,
-                            pp.profile_personal_location_is_public AS viewer_location_is_public,
-                            pp.profile_personal_email_is_public AS viewer_email_is_public,
-                            u.user_email_id AS viewer_email
-                        FROM every_circle.profile_views pv
-                        LEFT JOIN every_circle.profile_personal pp ON pp.profile_personal_uid = pv.view_viewer_id
-                        LEFT JOIN every_circle.users u ON u.user_uid = pp.profile_personal_user_id
-                        WHERE pv.view_profile_id = %s
-                        ORDER BY pv.view_timestamp DESC
-                    """, (business_uid,))
-                    raw = vr.get("result", []) if vr else []
-                    seen = set()
-                    for row in raw:
-                        vid = row.get("view_viewer_id")
-                        if vid not in seen:
-                            seen.add(vid)
-                            rt = row.get("view_timestamp")
-                            last_ts = None
-                            if isinstance(rt, list):
-                                last_ts = rt[-1] if rt else None
-                            elif rt:
-                                try:
-                                    parsed_ts = json.loads(rt)
-                                    last_ts = parsed_ts[-1] if isinstance(parsed_ts, list) and parsed_ts else str(rt)
-                                except (TypeError, ValueError):
-                                    last_ts = str(rt)
-                            row["view_timestamp"] = last_ts
-                            viewers.append(row)
-                    viewers.sort(key=lambda r: r.get("view_timestamp") or "", reverse=True)
-
-            response["viewers"] = viewers
-            return response, 200
+                return response, 200
 
         except Exception as e:
-            logging.exception(f"Error in Business GET: {str(e)}")
+            print(f"Error in Business GET: {str(e)}")
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
@@ -528,7 +244,6 @@ class BusinessInfo(Resource):
             user_uid = payload.pop("user_uid")
 
             with connect() as db:
-                # What do we do with the user info?
                 user_exists_query = db.select(
                     "every_circle.users", where={"user_uid": user_uid}
                 )
@@ -559,7 +274,9 @@ class BusinessInfo(Resource):
                     )
 
                 if business_look_up_query and business_look_up_query["result"]:
+                    existing = business_look_up_query["result"][0]
                     response["message"] = "BusinessInfo: Business already exists"
+                    response["business_uid"] = existing.get("business_uid")
                     response["code"] = 409
                     return response, 409
 
@@ -699,14 +416,59 @@ class BusinessInfo(Resource):
                     elif isinstance(val, str):
                         payload["business_category_id"] = val.strip()
 
-                # First service image (multipart): not columns on business table
-                print("Popping service_image_0_is_public - POST")
-                service_image_0_is_public = payload.pop(
-                    "bs_service_image_0_is_public", None
-                )
+                # Alias business_address → business_address_line_1 (sent by Google Places flow)
+                if (
+                    "business_address" in payload
+                    and "business_address_line_1" not in payload
+                ):
+                    payload["business_address_line_1"] = payload.pop("business_address")
+                elif "business_address" in payload:
+                    payload.pop("business_address")
 
-                # print("Insert Payload: ", payload)
+                # Strip any fields that don't exist in the business table
+                valid_columns = [
+                    "business_uid",
+                    "business_name",
+                    "business_location",
+                    "business_location_is_public",
+                    "business_address_line_1",
+                    "business_address_line_2",
+                    "business_city",
+                    "business_state",
+                    "business_country",
+                    "business_zip_code",
+                    "business_phone_number",
+                    "business_email_id",
+                    "business_category_id",
+                    "business_short_bio",
+                    "business_tag_line",
+                    "business_ein_number",
+                    "business_website",
+                    "business_images_url",
+                    "business_profile_img",
+                    "business_profile_img_is_public",
+                    "business_email_id_is_public",
+                    "business_phone_number_is_public",
+                    "business_tag_line_is_public",
+                    "business_short_bio_is_public",
+                    "business_google_id",
+                    "business_latitude",
+                    "business_longitude",
+                    "business_price_level",
+                    "business_google_rating",
+                    "business_joined_timestamp",
+                    "business_is_active",
+                ]
+                invalid_fields = [
+                    f for f in list(payload.keys()) if f not in valid_columns
+                ]
+                for field in invalid_fields:
+                    print(f"[POST] Removing invalid field: {field}")
+                    payload.pop(field)
+
+                print("[POST] Insert payload:", list(payload.keys()))
                 insert_response = db.insert("every_circle.business", payload)
+                print("[POST] insert_response:", insert_response)
                 # print("insert_response: ", insert_response)
 
                 # Insert into business_user table
@@ -758,7 +520,6 @@ class BusinessInfo(Resource):
                         new_business_uid,
                         business_user_id,
                         request.files,
-                        service_image_0_is_public=service_image_0_is_public,
                     )
 
                 # Process custom_tags if provided
@@ -781,21 +542,22 @@ class BusinessInfo(Resource):
                         exclude_user_id=business_user_id,
                     )
 
-                # print(insert_response["code"])
                 if insert_response["code"] == 200:
                     response = {
                         "business_uid": new_business_uid,
                         "message": "Business created successfully",
-                        "code": insert_response["code"],
+                        "code": 200,
                     }
+                    return response, 200
                 else:
                     response = {
-                        "Error": f"{new_business_uid} - Not Created",
-                        "message": insert_response["message"],
-                        "code": insert_response["code"],
+                        "business_uid": None,
+                        "error": f"{new_business_uid} - Not Created",
+                        "message": insert_response.get("message", "DB insert failed"),
+                        "code": 500,
                     }
-
-                return response, 200
+                    print(f"[POST] Business insert FAILED: {insert_response}")
+                    return response, 500
 
         except Exception as e:
             print(f"Error in BusinessInfo POST: {str(e)}")
@@ -804,41 +566,26 @@ class BusinessInfo(Resource):
             return response, 500
 
     def put(self):
-        print("In BusinessInfo PUT")
+        print("In Business PUT")
         response = {}
 
         try:
             payload = request.form.to_dict()
 
-            # Check if the business_uid is provided
             if "business_uid" not in payload:
                 response["message"] = "business_uid is required"
                 response["code"] = 400
                 return response, 400
 
             business_uid = payload.pop("business_uid")
-            # Service image (first service only): not business table columns
-            print("Popping service_image_0_is_public - PUT")
-            service_image_0_is_public = payload.pop(
-                "bs_service_image_0_is_public", None
-            )
-            delete_bs_service_image_0 = payload.pop(
-                "delete_bs_service_image_0", None
-            )
-
             key = {"business_uid": business_uid}
 
             with connect() as db:
-                # Check if the business exists and return the business data
                 business_exists_query = db.select("every_circle.business", where=key)
                 if not business_exists_query["result"]:
                     response["message"] = "Business does not exist"
                     response["code"] = 404
                     return response, 404
-
-                print("business_exists_query:", json.dumps(business_exists_query["result"], indent=2, default=str))
-
-                service_update_errors = []
 
                 # Keep profile image URL so we can re-apply before update (ensures it is never dropped)
                 business_profile_img_url = None
@@ -864,7 +611,6 @@ class BusinessInfo(Resource):
                     )
 
                     if business_user_query["result"]:
-                        print("business_user_query: ", business_user_query["result"])
                         # Record exists - check if role is different and update if needed
                         existing_record = business_user_query["result"][0]
                         existing_role = existing_record.get("bu_role")
@@ -1052,33 +798,23 @@ class BusinessInfo(Resource):
                     delete_services_str = payload.pop("delete_business_services")
                     delete_services = ast.literal_eval(delete_services_str)
                     for service_uid in delete_services:
-                        db.delete(
-                            f"""DELETE FROM every_circle.business_services 
-                                  WHERE bs_uid = "{service_uid}";"""
-                        )
+                        db.delete(f"""DELETE FROM every_circle.business_services 
+                                  WHERE bs_uid = "{service_uid}";""")
 
                 # Handle services update
                 if "business_services" in payload:
                     try:
-                        raw_svcs = payload.pop("business_services")
-                        if isinstance(raw_svcs, str):
-                            services_data = json.loads(raw_svcs)
-                        else:
-                            services_data = raw_svcs
-                        if not isinstance(services_data, list):
-                            raise ValueError("business_services must be a JSON array")
+                        services_data = json.loads(payload.pop("business_services"))
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                         # Process each service entry
-                        for idx, service_data in enumerate(services_data):
-                            if not isinstance(service_data, dict):
-                                continue
+                        for service_data in services_data:
                             print("Processing service data:", service_data)
 
                             # Check if this is an existing service (has UID)
                             if "bs_uid" in service_data:
                                 # Update existing service
-                                service_uid = str(service_data.pop("bs_uid")).strip()
+                                service_uid = service_data.pop("bs_uid")
                                 print(
                                     f"Updating existing service with UID: {service_uid}"
                                 )
@@ -1094,171 +830,71 @@ class BusinessInfo(Resource):
                                     print(
                                         f"Warning: Service with UID {service_uid} not found"
                                     )
-                                    service_update_errors.append(
-                                        {
-                                            "bs_uid": service_uid,
-                                            "error": "Service not found",
-                                        }
-                                    )
                                     continue
-
-                                svc_biz = service_exists_query["result"][0].get(
-                                    "bs_business_id"
-                                )
-                                if str(svc_biz) != str(business_uid):
-                                    print(
-                                        f"Service {service_uid} belongs to business "
-                                        f"{svc_biz}, not {business_uid}; skipping"
-                                    )
-                                    service_update_errors.append(
-                                        {
-                                            "bs_uid": service_uid,
-                                            "error": "Service does not belong to this business",
-                                        }
-                                    )
-                                    continue
-
-                                # Frontend sends bs_service_image_is_public; DB column is bs_image_url_is_public
-                                if "bs_service_image_is_public" in service_data:
-                                    service_data["bs_image_url_is_public"] = (
-                                        _parse_public_flag(
-                                            service_data.pop(
-                                                "bs_service_image_is_public"
-                                            )
-                                        )
-                                    )
-
-                                has_f0 = (
-                                    idx == 0
-                                    and request.files
-                                    and request.files.get("bs_service_image_0")
-                                    and getattr(
-                                        request.files["bs_service_image_0"],
-                                        "filename",
-                                        None,
-                                    )
-                                )
 
                                 # Add updated timestamp and user
                                 service_data["bs_updated_at"] = current_time
                                 if service_user_id:
                                     service_data["bs_updated_by"] = service_user_id
 
-                                # First service: bs_service_image_0 -> S3, URL -> bs_image_url
-                                print("idx: ", idx)
-                                if idx == 0:
-                                    has_del = delete_bs_service_image_0 not in (
-                                        None,
-                                        "",
-                                        "null",
-                                        "false",
-                                        False,
-                                    )
-                                    if has_f0 or has_del:
-                                        img_payload = {}
-                                        if has_del:
-                                            img_payload["delete_bs_service_image_0"] = (
-                                                delete_bs_service_image_0
-                                            )
-                                        new_url = processSingleImageUpload(
-                                            db,
-                                            service_uid,
-                                            "every_circle.business_services",
-                                            "bs_uid",
-                                            "bs_image_url",
-                                            "bs_service_image_0",
-                                            "delete_bs_service_image_0",
-                                            "business_service",
-                                            img_payload,
-                                            is_create=False,
-                                        )
-                                        if new_url is not None:
-                                            service_data["bs_image_url"] = new_url
-                                        elif has_del and not has_f0:
-                                            service_data["bs_image_url"] = None
-                                    if service_image_0_is_public is not None:
-                                        service_data[
-                                            "bs_image_url_is_public"
-                                        ] = _parse_public_flag(
-                                            service_image_0_is_public
-                                        )
+                                # Handle service images if present
+                                if "bs_image_key" in service_data:
+                                    image_key = service_data.pop("bs_image_key")
+                                    service_images = []
 
-                                # bs_image_key is a form field only (not a DB column).
-                                # Empty: ignore. URL: store as bs_image_url. Else: legacy multipart prefix.
-                                bs_image_key_val = service_data.pop("bs_image_key", None)
-                                if bs_image_key_val and str(bs_image_key_val).strip() and not (
-                                    idx == 0 and has_f0
-                                ):
-                                    image_key = str(bs_image_key_val).strip()
-                                    if image_key.lower().startswith(
-                                        ("http://", "https://")
+                                    # Get existing images if any
+                                    if service_exists_query["result"][0].get(
+                                        "bs_image_url"
                                     ):
-                                        service_data["bs_image_url"] = image_key
-                                    else:
-                                        service_images = []
-
-                                        # Get existing images if any
-                                        if service_exists_query["result"][0].get(
-                                            "bs_image_url"
-                                        ):
-                                            raw_img = service_exists_query["result"][
-                                                0
-                                            ]["bs_image_url"]
-                                            try:
-                                                service_images = json.loads(raw_img)
-                                                if not isinstance(
-                                                    service_images, list
-                                                ):
-                                                    service_images = []
-                                            except (json.JSONDecodeError, TypeError):
-                                                # Plain URL stored as string
-                                                if isinstance(raw_img, str) and raw_img:
-                                                    service_images = [raw_img]
-                                                else:
-                                                    service_images = []
-
-                                        # Handle image deletion if specified
-                                        if "delete_images" in service_data:
-                                            delete_images = json.loads(
-                                                service_data.pop("delete_images")
+                                        try:
+                                            service_images = json.loads(
+                                                service_exists_query["result"][0][
+                                                    "bs_image_url"
+                                                ]
                                             )
-                                            for image_url in delete_images:
-                                                if image_url in service_images:
-                                                    service_images.remove(image_url)
-                                                    try:
-                                                        delete_key = image_url.split(
-                                                            f"{os.getenv('BUCKET_NAME')}/",
-                                                            1,
-                                                        )[1]
-                                                        deleteImage(delete_key)
-                                                    except Exception as e:
-                                                        print(
-                                                            f"Error deleting image: {str(e)}"
-                                                        )
+                                        except:
+                                            service_images = []
 
-                                        # Add new images (multipart keys: {prefix}_img_*)
-                                        for file_key in request.files:
-                                            if file_key.startswith(f"{image_key}_img_"):
-                                                file = request.files[file_key]
-                                                if file and file.filename:
-                                                    unique_filename = f"service_{business_uid}_{service_uid}_{file.filename}"
-                                                    s3_key = f"services/{business_uid}/{unique_filename}"
-                                                    image_url = uploadImage(
-                                                        file, s3_key, ""
+                                    # Handle image deletion if specified
+                                    if "delete_images" in service_data:
+                                        delete_images = json.loads(
+                                            service_data.pop("delete_images")
+                                        )
+                                        for image_url in delete_images:
+                                            if image_url in service_images:
+                                                service_images.remove(image_url)
+                                                # Delete from S3
+                                                try:
+                                                    delete_key = image_url.split(
+                                                        f"{os.getenv('BUCKET_NAME')}/",
+                                                        1,
+                                                    )[1]
+                                                    deleteImage(delete_key)
+                                                except Exception as e:
+                                                    print(
+                                                        f"Error deleting image: {str(e)}"
                                                     )
-                                                    if image_url:
-                                                        service_images.append(
-                                                            image_url
-                                                        )
 
-                                        if service_images:
-                                            service_data["bs_image_url"] = (
-                                                json.dumps(service_images)
-                                                if len(service_images) > 1
-                                                else service_images[0]
-                                            )
-                                        else:
-                                            service_data["bs_image_url"] = None
+                                    # Add new images
+                                    for file_key in request.files:
+                                        if file_key.startswith(f"{image_key}_img_"):
+                                            file = request.files[file_key]
+                                            if file and file.filename:
+                                                unique_filename = f"service_{business_uid}_{service_uid}_{file.filename}"
+                                                image_key = f"services/{business_uid}/{unique_filename}"
+                                                image_url = uploadImage(
+                                                    file, image_key, ""
+                                                )
+                                                if image_url:
+                                                    service_images.append(image_url)
+
+                                    # Update the service with new image URLs
+                                    if service_images:
+                                        service_data["bs_image_url"] = json.dumps(
+                                            service_images
+                                        )
+                                    else:
+                                        service_data["bs_image_url"] = None
 
                                 # Strip $ from currency fields before storing
                                 if "bs_bounty" in service_data:
@@ -1271,10 +907,6 @@ class BusinessInfo(Resource):
                                     service_data["bs_cost"] = _strip_currency(
                                         service_data["bs_cost"]
                                     )
-                                _derive_business_service_fields(service_data)
-                                service_data = _prepare_business_service_update_dict(
-                                    service_data
-                                )
                                 print(f"Updating service with data: {service_data}")
                                 if service_data:
                                     update_response = db.update(
@@ -1283,15 +915,6 @@ class BusinessInfo(Resource):
                                         service_data,
                                     )
                                     print(f"Update response: {update_response}")
-                                    if update_response.get("code") != 200:
-                                        service_update_errors.append(
-                                            {
-                                                "bs_uid": service_uid,
-                                                "error": update_response.get(
-                                                    "message", str(update_response)
-                                                ),
-                                            }
-                                        )
                             else:
                                 # Add new service
                                 print("Adding new service")
@@ -1302,12 +925,6 @@ class BusinessInfo(Resource):
                                         business_uid,
                                         service_user_id,
                                         request.files,
-                                        service_image_0_is_public=(
-                                            service_image_0_is_public
-                                            if idx == 0
-                                            else None
-                                        ),
-                                        apply_service_image_0=(idx == 0),
                                     )
                                 else:
                                     print(
@@ -1469,13 +1086,11 @@ class BusinessInfo(Resource):
                     update_response = db.update("every_circle.business", key, payload)
                     print(update_response)
                 response = {"message": "Business updated successfully", "code": 200}
-                if service_update_errors:
-                    response["service_update_errors"] = service_update_errors
 
                 return response, 200
 
         except Exception as e:
-            print(f"Error in BusinessInfo PUT: {str(e)}")
+            print(f"Error in Business PUT: {str(e)}")
             traceback.print_exc()  # Add this for better error tracking
             response["message"] = "Internal Server Error"
             response["code"] = 500
@@ -1496,25 +1111,17 @@ class BusinessInfo(Resource):
                     return response, 404
 
                 # Delete business services
-                db.delete(
-                    f"""DELETE FROM every_circle.business_services 
-                              WHERE bs_business_id = "{uid}";"""
-                )
+                db.delete(f"""DELETE FROM every_circle.business_services 
+                              WHERE bs_business_id = "{uid}";""")
 
-                db.delete(
-                    f"""DELETE FROM every_circle.business_link 
-                              WHERE business_link_business_id = "{uid}";"""
-                )
+                db.delete(f"""DELETE FROM every_circle.business_link 
+                              WHERE business_link_business_id = "{uid}";""")
 
-                db.delete(
-                    f"""DELETE FROM every_circle.business_category 
-                              WHERE bc_business_id = "{uid}";"""
-                )
+                db.delete(f"""DELETE FROM every_circle.business_category 
+                              WHERE bc_business_id = "{uid}";""")
 
-                db.delete(
-                    f"""DELETE FROM every_circle.business 
-                              WHERE business_uid = "{uid}";"""
-                )
+                db.delete(f"""DELETE FROM every_circle.business 
+                              WHERE business_uid = "{uid}";""")
 
                 response = {
                     "message": "Business and associated data deleted successfully",
@@ -1907,51 +1514,21 @@ class BusinessInfo(Resource):
         return stored_tags
 
     def _add_services(
-        self,
-        db,
-        services_str,
-        business_uid,
-        user_uid,
-        request_files=None,
-        service_image_0_is_public=None,
-        apply_service_image_0=True,
+        self, db, services_str, business_uid, user_uid, request_files=None
     ):
         try:
             # import json
             services = json.loads(services_str)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            for idx, service in enumerate(services):
-                derived_input = dict(service)
-
+            for service in services:
                 # Generate a new bs_uid
                 bs_uid_response = db.call(procedure="new_bs_uid")
                 bs_uid = bs_uid_response["result"][0]["new_id"]
 
-                # Primary product image: bs_service_image_0 (first service only when allowed)
-                bs_image_url_value = None
-                if (
-                    apply_service_image_0
-                    and idx == 0
-                    and request_files
-                    and request_files.get("bs_service_image_0")
-                ):
-                    f0 = request_files["bs_service_image_0"]
-                    if f0 and getattr(f0, "filename", None):
-                        unique_filename = (
-                            f"service_{business_uid}_{bs_uid}_{f0.filename}"
-                        )
-                        s3_key = f"services/{business_uid}/{unique_filename}"
-                        bs_image_url_value = uploadImage(f0, s3_key, "")
-                        print("bs_image_url_value: ", bs_image_url_value)
-
-                # Legacy multi-image upload via bs_image_key
+                # Handle service images if present
                 service_images = []
-                if (
-                    bs_image_url_value is None
-                    and request_files
-                    and "bs_image_key" in service
-                ):
+                if request_files and "bs_image_key" in service:
                     image_key = service.pop("bs_image_key")
                     # Look for images with the matching key prefix
                     for key in request_files:
@@ -1962,17 +1539,10 @@ class BusinessInfo(Resource):
                                 unique_filename = (
                                     f"service_{business_uid}_{bs_uid}_{file.filename}"
                                 )
-                                image_key_s3 = (
-                                    f"services/{business_uid}/{unique_filename}"
-                                )
-                                image_url = uploadImage(file, image_key_s3, "")
+                                image_key = f"services/{business_uid}/{unique_filename}"
+                                image_url = uploadImage(file, image_key, "")
                                 if image_url:
                                     service_images.append(image_url)
-
-                if bs_image_url_value is None and service_images:
-                    bs_image_url_value = json.dumps(service_images)
-                elif bs_image_url_value is None and not service_images:
-                    bs_image_url_value = None
 
                 # Set default values for required fields
                 service_data = {
@@ -1986,14 +1556,15 @@ class BusinessInfo(Resource):
                     "bs_sku": service.get("bs_sku"),
                     "bs_bounty": _strip_currency(service.get("bs_bounty")),
                     "bs_bounty_currency": service.get("bs_bounty_currency"),
-                    "bs_bounty_limit": service.get("bs_bounty_limit"),
                     "bs_bounty_type": service.get("bs_bounty_type", "per_item"),
                     "bs_is_taxable": service.get("bs_is_taxable", 0),
                     "bs_tax_rate": service.get("bs_tax_rate"),
                     "bs_discount_allowed": service.get("bs_discount_allowed", 0),
                     "bs_refund_policy": service.get("bs_refund_policy"),
                     "bs_return_window_days": service.get("bs_return_window_days"),
-                    "bs_image_url": bs_image_url_value,
+                    "bs_image_url": (
+                        json.dumps(service_images) if service_images else None
+                    ),
                     "bs_display_order": service.get("bs_display_order"),
                     "bs_tags": service.get("bs_tags"),
                     "bs_created_at": current_time,
@@ -2004,29 +1575,6 @@ class BusinessInfo(Resource):
                     "bs_cost": _strip_currency(service.get("bs_cost")),
                     "bs_cost_currency": service.get("bs_cost_currency"),
                 }
-
-                blim = service_data.get("bs_bounty_limit")
-                if blim is not None and blim != "":
-                    try:
-                        service_data["bs_bounty_limit"] = int(blim)
-                    except (TypeError, ValueError):
-                        service_data.pop("bs_bounty_limit", None)
-                else:
-                    service_data.pop("bs_bounty_limit", None)
-
-                if (
-                    apply_service_image_0
-                    and idx == 0
-                    and service_image_0_is_public is not None
-                ):
-                    service_data["bs_image_url_is_public"] = _parse_public_flag(
-                        service_image_0_is_public
-                    )
-
-                _derive_business_service_fields(derived_input)
-                for k in ("bs_quantity", "bs_shipping", "bs_condition"):
-                    if k in derived_input:
-                        service_data[k] = derived_input[k]
 
                 # Remove None values to use database defaults
                 service_data = {k: v for k, v in service_data.items() if v is not None}
