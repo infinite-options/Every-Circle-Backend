@@ -32,7 +32,7 @@ from chatbot import ChatbotAPI
 from tag_generator_api import TagGeneratorAPI
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
-from transactions import Transactions, SellerTransactions
+from transactions import Transactions, SellerTransactions, DeclinedReturns
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -555,6 +555,7 @@ api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 api.add_resource(AblyToken, '/api/v1/ably/token')
+api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 
 class GooglePlacesInfo(Resource):
