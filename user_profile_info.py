@@ -411,6 +411,8 @@ class UserProfileInfo(Resource):
                                 expertise_info['profile_expertise_cost'] = exp_data['cost']
                             if 'bounty' in exp_data:
                                 expertise_info['profile_expertise_bounty'] = exp_data['bounty']
+                            if 'quantity' in exp_data:
+                                expertise_info['profile_expertise_quantity'] = exp_data['quantity']
                             
                             # Insert the expertise record
                             db.insert('every_circle.profile_expertise', expertise_info)
@@ -1163,10 +1165,12 @@ class UserProfileInfo(Resource):
                                     expertise_info['profile_expertise_bounty'] = exp_data['bounty']
                                 if 'isPublic' in exp_data:
                                     expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
+                                if 'quantity' in exp_data:
+                                    expertise_info['profile_expertise_quantity'] = exp_data['quantity']
                                 
                                 # Update the existing expertise
                                 if expertise_info:
-                                    db.update('every_circle.profile_expertise', 
+                                    db.update('every_circle.profile_expertise',
                                              {'profile_expertise_uid': expertise_uid}, expertise_info)
                                     
                                 expertise_uids.append(expertise_uid)
@@ -1188,6 +1192,8 @@ class UserProfileInfo(Resource):
                                     expertise_info['profile_expertise_bounty'] = exp_data['bounty']
                                 if 'isPublic' in exp_data:
                                     expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
+                                if 'quantity' in exp_data:
+                                    expertise_info['profile_expertise_quantity'] = exp_data['quantity']
                                 
                                 # Insert the expertise record
                                 db.insert('every_circle.profile_expertise', expertise_info)
