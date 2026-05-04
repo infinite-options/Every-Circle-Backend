@@ -856,7 +856,11 @@ class DeclinedReturns(Resource):
 
             with connect() as db:
                 if action == "resolve":
-                    update_fields = {"transaction_return_status": "resolved"}
+                    favor = data.get("resolved_in_favor_of", "seller")
+                    # buyer wins = treat same as accepted (triggers refund display)
+                    # seller wins = resolved (clears red highlight)
+                    status = "accepted" if favor == "buyer" else "resolved"
+                    update_fields = {"transaction_return_status": status}
                 else:
                     update_fields = {
                         "transaction_return_status": "declined",
