@@ -3,11 +3,28 @@ from flask_restful import Resource
 from datetime import datetime
 
 
-from data_ec import connect, processImage, processDocument
+from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 
 
 _EXPERTISE_PREFIX = "profile_expertise_"
 _WISH_PREFIX = "profile_wish_"
+# S3 key prefixes used by processSingleImageUpload for offering / seeking images.
+_EXPERTISE_S3_PREFIX = "profile_expertise"
+_WISH_S3_PREFIX = "profile_wish"
+
+
+def _delete_expertise_s3_assets(expertise_uid):
+    try:
+        deleteFolder(_EXPERTISE_S3_PREFIX, expertise_uid)
+    except Exception as e:
+        print(f"[EXPERTISE S3] Error deleting assets for {expertise_uid}: {e}")
+
+
+def _delete_wish_s3_assets(wish_uid):
+    try:
+        deleteFolder(_WISH_S3_PREFIX, wish_uid)
+    except Exception as e:
+        print(f"[WISH S3] Error deleting assets for {wish_uid}: {e}")
 
 
 def _expertise_dict_from_payload(exp_data):
@@ -117,6 +134,133 @@ def _normalize_record_uid(value):
 
 def _db_write_succeeded(res):
     return bool(res) and res.get("code") == 200
+
+
+def _form_truthy_public(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
+def _apply_profile_expertise_multipart_image(
+    db, payload, profile_expertise_uid, idx, expertise_info, is_create
+):
+    """
+    Upload profile_expertise_image_N from multipart form to S3; merge URL into expertise_info.
+    Form keys: profile_expertise_image_<idx>, delete_profile_expertise_image_<idx>,
+    profile_expertise_image_<idx>_is_public
+    """
+    file_key = f"profile_expertise_image_{idx}"
+    delete_key = f"delete_profile_expertise_image_{idx}"
+    pub_key = f"profile_expertise_image_{idx}_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(
+        fobj and getattr(fobj, "filename", None)
+    )
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (None, "", "null", "false", False)
+
+    print(
+        "[PROFILE EXPERTISE IMAGE] idx=%s uid=%s keys in request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_expertise_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_expertise_uid,
+            "every_circle.profile_expertise",
+            "profile_expertise_uid",
+            "profile_expertise_image",
+            file_key,
+            delete_key,
+            "profile_expertise",
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE EXPERTISE IMAGE] idx=%s uid=%s S3/profile_expertise_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_expertise_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            expertise_info["profile_expertise_image"] = new_url
+        elif has_del and not has_file:
+            expertise_info["profile_expertise_image"] = None
+
+    if pub_key in payload:
+        expertise_info["profile_expertise_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_key)
+        )
+
+
+def _apply_profile_wish_multipart_image(
+    db, payload, profile_wish_uid, idx, wish_info, is_create
+):
+    """
+    Upload profile_wish_image_N from multipart form to S3; merge URL into wish_info.
+    Mirrors offering/expertise: profile_wish_image_<idx>,
+    delete_profile_wish_image_<idx>, profile_wish_image_<idx>_is_public
+    """
+    file_key = f"profile_wish_image_{idx}"
+    delete_key = f"delete_profile_wish_image_{idx}"
+    pub_key = f"profile_wish_image_{idx}_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(fobj and getattr(fobj, "filename", None))
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (None, "", "null", "false", False)
+
+    print(
+        "[PROFILE WISH IMAGE] idx=%s uid=%s keys in request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_wish_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_wish_uid,
+            "every_circle.profile_wish",
+            "profile_wish_uid",
+            "profile_wish_image",
+            file_key,
+            delete_key,
+            "profile_wish",
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE WISH IMAGE] idx=%s uid=%s S3/profile_wish_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_wish_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            wish_info["profile_wish_image"] = new_url
+        elif has_del and not has_file:
+            wish_info["profile_wish_image"] = None
+
+    if pub_key in payload:
+        wish_info["profile_wish_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_key)
+        )
 
 
 class UserProfileInfo(Resource):
@@ -512,14 +656,22 @@ class UserProfileInfo(Resource):
                         expertises_data = json.loads(payload.pop('expertises'))
                         print("expertise data: ", expertises_data)
                         
-                        # Process each expertise entry
-                        for exp_data in expertises_data:
+                        # Process each expertise entry (multipart: profile_expertise_image_0, ...)
+                        for expertise_idx, exp_data in enumerate(expertises_data):
                             expertise_info = {}
                             expertise_stored_procedure_response = db.call(procedure='new_profile_expertise_uid')
                             new_expertise_uid = expertise_stored_procedure_response['result'][0]['new_id']
                             expertise_info['profile_expertise_uid'] = new_expertise_uid
                             expertise_info['profile_expertise_profile_personal_id'] = new_profile_uid
                             expertise_info.update(_expertise_dict_from_payload(exp_data))
+                            _apply_profile_expertise_multipart_image(
+                                db,
+                                payload,
+                                new_expertise_uid,
+                                expertise_idx,
+                                expertise_info,
+                                is_create=True,
+                            )
 
                             # Insert the expertise record
                             db.insert('every_circle.profile_expertise', expertise_info)
@@ -555,14 +707,22 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes'))
                         print("wishes data: ", wishes_data)
                         
-                        # Process each wish entry
-                        for wish_data in wishes_data:
+                        # Process each wish entry (multipart: profile_wish_image_0, ...)
+                        for wish_idx, wish_data in enumerate(wishes_data):
                             wish_info = {}
                             wishes_stored_procedure_response = db.call(procedure='new_profile_wish_uid')
                             new_wish_uid = wishes_stored_procedure_response['result'][0]['new_id']
                             wish_info['profile_wish_uid'] = new_wish_uid
                             wish_info['profile_wish_profile_personal_id'] = new_profile_uid
                             wish_info.update(_wish_dict_from_payload(wish_data))
+                            _apply_profile_wish_multipart_image(
+                                db,
+                                payload,
+                                new_wish_uid,
+                                wish_idx,
+                                wish_info,
+                                is_create=True,
+                            )
 
                             # Insert the wish record
                             db.insert('every_circle.profile_wish', wish_info)
@@ -828,6 +988,7 @@ class UserProfileInfo(Resource):
                                                              'profile_expertise_profile_personal_id': profile_uid})
                             
                             if exp_exists_query['result']:
+                                _delete_expertise_s3_assets(exp_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{exp_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_expertise_uids.append(exp_uid)
@@ -851,6 +1012,7 @@ class UserProfileInfo(Resource):
                                                               'profile_wish_profile_personal_id': profile_uid})
                             
                             if wish_exists_query['result']:
+                                _delete_wish_s3_assets(wish_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_wish WHERE profile_wish_uid = '{wish_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_wish_uids.append(wish_uid)
@@ -1232,8 +1394,8 @@ class UserProfileInfo(Resource):
                         expertise_payload_refresh = True
                         expertise_uids = []
                         
-                        # Process each expertise entry
-                        for exp_data in expertises_data:
+                        # Process each expertise entry (multipart files: profile_expertise_image_0, _1, ...)
+                        for expertise_idx, exp_data in enumerate(expertises_data):
                             print("exp_data", exp_data)
                             expertise_info = {}
                             
@@ -1255,6 +1417,14 @@ class UserProfileInfo(Resource):
                                     continue
 
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                _apply_profile_expertise_multipart_image(
+                                    db,
+                                    payload,
+                                    expertise_uid,
+                                    expertise_idx,
+                                    expertise_info,
+                                    is_create=False,
+                                )
 
                                 # Update the existing expertise
                                 if expertise_info:
@@ -1276,6 +1446,14 @@ class UserProfileInfo(Resource):
                                 expertise_info['profile_expertise_uid'] = new_expertise_uid
                                 expertise_info['profile_expertise_profile_personal_id'] = profile_uid
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                _apply_profile_expertise_multipart_image(
+                                    db,
+                                    payload,
+                                    new_expertise_uid,
+                                    expertise_idx,
+                                    expertise_info,
+                                    is_create=True,
+                                )
 
                                 # Insert the expertise record
                                 ins_res = db.insert(
@@ -1301,8 +1479,8 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_uids = []
                         
-                        # Process each wish entry
-                        for wish_data in wishes_data:
+                        # Process each wish entry (multipart: profile_wish_image_0, ...)
+                        for wish_idx, wish_data in enumerate(wishes_data):
                             print("wish_data", wish_data)
                             wish_info = {}
                             
@@ -1322,13 +1500,25 @@ class UserProfileInfo(Resource):
                                     continue
 
                                 wish_info.update(_wish_dict_from_payload(wish_data))
+                                _apply_profile_wish_multipart_image(
+                                    db,
+                                    payload,
+                                    wish_uid,
+                                    wish_idx,
+                                    wish_info,
+                                    is_create=False,
+                                )
 
                                 if wish_info:
-                                    db.update(
+                                    upd_res = db.update(
                                         'every_circle.profile_wish',
                                         {'profile_wish_uid': wish_uid},
                                         wish_info,
                                     )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Wish update failed")
+                                        )
 
                                 wishes_uids.append(wish_uid)
                             else:
@@ -1338,12 +1528,26 @@ class UserProfileInfo(Resource):
                                 wish_info['profile_wish_uid'] = new_wish_uid
                                 wish_info['profile_wish_profile_personal_id'] = profile_uid
                                 wish_info.update(_wish_dict_from_payload(wish_data))
+                                _apply_profile_wish_multipart_image(
+                                    db,
+                                    payload,
+                                    new_wish_uid,
+                                    wish_idx,
+                                    wish_info,
+                                    is_create=True,
+                                )
 
                                 # Insert the wish record
-                                db.insert('every_circle.profile_wish', wish_info)
+                                ins_res = db.insert('every_circle.profile_wish', wish_info)
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Wish insert failed")
+                                    )
                                 wishes_uids.append(new_wish_uid)
                         
                         updated_uids['profile_wish_uids'] = wishes_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
                         print(f"Error processing wishes JSON in PUT: {str(e)}")
                 
@@ -1524,6 +1728,26 @@ class UserProfileInfo(Resource):
                     links_query = f"DELETE FROM every_circle.profile_link WHERE profile_link_profile_personal_id = '{profile_uid}'"
                     delete_results['links'] = db.delete(links_query)
                     
+                    expertise_rows = db.select(
+                        'every_circle.profile_expertise',
+                        where={
+                            'profile_expertise_profile_personal_id': profile_uid},
+                    )
+                    for row in expertise_rows.get('result') or []:
+                        eid = row.get('profile_expertise_uid')
+                        if eid:
+                            _delete_expertise_s3_assets(eid)
+
+                    wishes_rows = db.select(
+                        'every_circle.profile_wish',
+                        where={
+                            'profile_wish_profile_personal_id': profile_uid},
+                    )
+                    for row in wishes_rows.get('result') or []:
+                        wid = row.get('profile_wish_uid')
+                        if wid:
+                            _delete_wish_s3_assets(wid)
+
                     # Delete expertise
                     expertise_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_profile_personal_id = '{profile_uid}'"
                     delete_results['expertise'] = db.delete(expertise_query)
@@ -1608,6 +1832,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_expertise_s3_assets(uid)
+
                     # Delete the specific expertise
                     expertise_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{uid}'"
                     delete_result = db.delete(expertise_query)
@@ -1625,6 +1851,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_wish_s3_assets(uid)
+
                     # Delete the specific wish
                     wish_query = f"DELETE FROM every_circle.profile_wish WHERE profile_wish_uid = '{uid}'"
                     delete_result = db.delete(wish_query)
