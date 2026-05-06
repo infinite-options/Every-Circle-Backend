@@ -3,7 +3,265 @@ from flask_restful import Resource
 from datetime import datetime
 
 
-from data_ec import connect, processImage, processDocument
+from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
+
+
+_EXPERTISE_PREFIX = "profile_expertise_"
+_WISH_PREFIX = "profile_wish_"
+# S3 key prefixes used by processSingleImageUpload for offering / seeking images.
+_EXPERTISE_S3_PREFIX = "profile_expertise"
+_WISH_S3_PREFIX = "profile_wish"
+
+
+def _delete_expertise_s3_assets(expertise_uid):
+    try:
+        deleteFolder(_EXPERTISE_S3_PREFIX, expertise_uid)
+    except Exception as e:
+        print(f"[EXPERTISE S3] Error deleting assets for {expertise_uid}: {e}")
+
+
+def _delete_wish_s3_assets(wish_uid):
+    try:
+        deleteFolder(_WISH_S3_PREFIX, wish_uid)
+    except Exception as e:
+        print(f"[WISH S3] Error deleting assets for {wish_uid}: {e}")
+
+
+def _expertise_dict_from_payload(exp_data):
+    """Map offering (expertise) JSON keys to profile_expertise columns."""
+    m = {}
+    if "title" in exp_data:
+        m["profile_expertise_title"] = exp_data["title"]
+    elif "name" in exp_data:
+        m["profile_expertise_title"] = exp_data["name"]
+    if "description" in exp_data:
+        m["profile_expertise_description"] = exp_data["description"]
+    if "cost" in exp_data:
+        m["profile_expertise_cost"] = exp_data["cost"]
+    if "bounty" in exp_data:
+        m["profile_expertise_bounty"] = exp_data["bounty"]
+    if "quantity" in exp_data:
+        m["profile_expertise_quantity"] = exp_data["quantity"]
+    if "isPublic" in exp_data:
+        m["profile_expertise_is_public"] = exp_data["isPublic"]
+    _set_if_present(m, exp_data, "profile_expertise_details", "details")
+    _set_if_present(m, exp_data, "profile_expertise_cost_currency", "costCurrency")
+    _set_if_present(m, exp_data, "profile_expertise_is_taxable", "isTaxable")
+    _set_if_present(m, exp_data, "profile_expertise_tax_rate", "taxRate")
+    _set_if_present(m, exp_data, "profile_expertise_refund_policy", "refundPolicy")
+    _set_if_present(m, exp_data, "profile_expertise_return_window_days", "returnWindowDays")
+    if "startDateTime" in exp_data:
+        m["profile_expertise_start"] = exp_data["startDateTime"]
+    elif "start" in exp_data:
+        m["profile_expertise_start"] = exp_data["start"]
+    if "endDateTime" in exp_data:
+        m["profile_expertise_end"] = exp_data["endDateTime"]
+    elif "end" in exp_data:
+        m["profile_expertise_end"] = exp_data["end"]
+    if "location" in exp_data:
+        m["profile_expertise_location"] = exp_data["location"]
+    if "mode" in exp_data:
+        m["profile_expertise_mode"] = exp_data["mode"]
+    for k, v in exp_data.items():
+        if k.startswith(_EXPERTISE_PREFIX) and k not in (
+            "profile_expertise_uid",
+            "profile_expertise_profile_personal_id",
+        ):
+            m[k] = v
+    return m
+
+
+def _wish_dict_from_payload(wish_data):
+    """Map seeking (wish) JSON keys to profile_wish columns."""
+    m = {}
+    if "title" in wish_data:
+        m["profile_wish_title"] = wish_data["title"]
+    elif "helpNeeds" in wish_data:
+        m["profile_wish_title"] = wish_data["helpNeeds"]
+    if "description" in wish_data:
+        m["profile_wish_description"] = wish_data["description"]
+    elif "details" in wish_data:
+        m["profile_wish_description"] = wish_data["details"]
+    if "bounty" in wish_data:
+        m["profile_wish_bounty"] = wish_data["bounty"]
+    elif "amount" in wish_data:
+        m["profile_wish_bounty"] = wish_data["amount"]
+    if "cost" in wish_data:
+        m["profile_wish_cost"] = wish_data["cost"]
+    if "quantity" in wish_data:
+        m["profile_wish_quantity"] = wish_data["quantity"]
+    if "isPublic" in wish_data:
+        m["profile_wish_is_public"] = wish_data["isPublic"]
+    _set_if_present(m, wish_data, "profile_wish_cost_currency", "costCurrency")
+    _set_if_present(m, wish_data, "profile_wish_is_taxable", "isTaxable")
+    _set_if_present(m, wish_data, "profile_wish_tax_rate", "taxRate")
+    _set_if_present(m, wish_data, "profile_wish_refund_policy", "refundPolicy")
+    _set_if_present(m, wish_data, "profile_wish_return_window_days", "returnWindowDays")
+    if "startDateTime" in wish_data:
+        m["profile_wish_start"] = wish_data["startDateTime"]
+    elif "start" in wish_data:
+        m["profile_wish_start"] = wish_data["start"]
+    if "endDateTime" in wish_data:
+        m["profile_wish_end"] = wish_data["endDateTime"]
+    elif "end" in wish_data:
+        m["profile_wish_end"] = wish_data["end"]
+    if "location" in wish_data:
+        m["profile_wish_location"] = wish_data["location"]
+    if "mode" in wish_data:
+        m["profile_wish_mode"] = wish_data["mode"]
+    for k, v in wish_data.items():
+        if k.startswith(_WISH_PREFIX) and k not in (
+            "profile_wish_uid",
+            "profile_wish_profile_personal_id",
+        ):
+            m[k] = v
+    return m
+
+
+def _set_if_present(target, src, db_key, client_key):
+    if client_key in src:
+        target[db_key] = src[client_key]
+
+
+def _normalize_record_uid(value):
+    """Treat missing/blank UID as absent so PUT creates rows instead of update-by-empty-id."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return str(value).strip() or None
+
+
+def _db_write_succeeded(res):
+    return bool(res) and res.get("code") == 200
+
+
+def _form_truthy_public(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
+def _apply_profile_expertise_multipart_image(
+    db, payload, profile_expertise_uid, idx, expertise_info, is_create
+):
+    """
+    Upload profile_expertise_image_N from multipart form to S3; merge URL into expertise_info.
+    Form keys: profile_expertise_image_<idx>, delete_profile_expertise_image_<idx>,
+    profile_expertise_image_<idx>_is_public
+    """
+    file_key = f"profile_expertise_image_{idx}"
+    delete_key = f"delete_profile_expertise_image_{idx}"
+    pub_key = f"profile_expertise_image_{idx}_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(
+        fobj and getattr(fobj, "filename", None)
+    )
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (None, "", "null", "false", False)
+
+    print(
+        "[PROFILE EXPERTISE IMAGE] idx=%s uid=%s keys in request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_expertise_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_expertise_uid,
+            "every_circle.profile_expertise",
+            "profile_expertise_uid",
+            "profile_expertise_image",
+            file_key,
+            delete_key,
+            "profile_expertise",
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE EXPERTISE IMAGE] idx=%s uid=%s S3/profile_expertise_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_expertise_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            expertise_info["profile_expertise_image"] = new_url
+        elif has_del and not has_file:
+            expertise_info["profile_expertise_image"] = None
+
+    if pub_key in payload:
+        expertise_info["profile_expertise_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_key)
+        )
+
+
+def _apply_profile_wish_multipart_image(
+    db, payload, profile_wish_uid, idx, wish_info, is_create
+):
+    """
+    Upload profile_wish_image_N from multipart form to S3; merge URL into wish_info.
+    Mirrors offering/expertise: profile_wish_image_<idx>,
+    delete_profile_wish_image_<idx>, profile_wish_image_<idx>_is_public
+    """
+    file_key = f"profile_wish_image_{idx}"
+    delete_key = f"delete_profile_wish_image_{idx}"
+    pub_key = f"profile_wish_image_{idx}_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(fobj and getattr(fobj, "filename", None))
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (None, "", "null", "false", False)
+
+    print(
+        "[PROFILE WISH IMAGE] idx=%s uid=%s keys in request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_wish_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_wish_uid,
+            "every_circle.profile_wish",
+            "profile_wish_uid",
+            "profile_wish_image",
+            file_key,
+            delete_key,
+            "profile_wish",
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE WISH IMAGE] idx=%s uid=%s S3/profile_wish_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_wish_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            wish_info["profile_wish_image"] = new_url
+        elif has_del and not has_file:
+            wish_info["profile_wish_image"] = None
+
+    if pub_key in payload:
+        wish_info["profile_wish_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_key)
+        )
+
 
 class UserProfileInfo(Resource):
     def get(self, uid):
@@ -50,9 +308,10 @@ class UserProfileInfo(Resource):
                             response['code'] = 404
                             return response, 404
 
+                        # print("user_response: ", user_response['result'][0])
                         email_id = user_response['result'][0]['user_email_id']
                         user_uid = uid
-                        print("User UID Passed", user_uid)
+                        # print("User UID Passed", email_id, user_uid)
                             
 
                     elif "@" in uid:
@@ -66,9 +325,10 @@ class UserProfileInfo(Resource):
                             response['code'] = 404
                             return response, 404
 
+                        # print("user_response: ", user_response['result'][0])
                         email_id = uid
                         user_uid = user_response['result'][0]['user_uid']
-                        print("User UID: ", user_uid)
+                        # print("User UID: ", email_id, user_uid)
 
                     # Get profile info
                     profile_response = db.select('every_circle.profile_personal', where={'profile_personal_user_id': user_uid})
@@ -78,6 +338,7 @@ class UserProfileInfo(Resource):
                         return response, 404
 
                     # print("profile_response: ", profile_response)
+                    # print("profile_response: ", profile_response['result'][0])
                     profile_id = profile_response['result'][0]['profile_personal_uid']
                     print("Profile UID: ", profile_id)
 
@@ -92,6 +353,7 @@ class UserProfileInfo(Resource):
                         JOIN every_circle.social_link sl ON pl.profile_link_social_link_id = sl.social_link_uid
                         WHERE pl.profile_link_profile_personal_id = '{profile_id}'
                     """
+                # print("social_links_query: ", social_links_query)
                 social_links_response = db.execute(social_links_query)
                 response['links_info'] = social_links_response['result'] if social_links_response['result'] else []
                 # print("Get 2")
@@ -394,26 +656,23 @@ class UserProfileInfo(Resource):
                         expertises_data = json.loads(payload.pop('expertises'))
                         print("expertise data: ", expertises_data)
                         
-                        # Process each expertise entry
-                        for exp_data in expertises_data:
+                        # Process each expertise entry (multipart: profile_expertise_image_0, ...)
+                        for expertise_idx, exp_data in enumerate(expertises_data):
                             expertise_info = {}
                             expertise_stored_procedure_response = db.call(procedure='new_profile_expertise_uid')
                             new_expertise_uid = expertise_stored_procedure_response['result'][0]['new_id']
                             expertise_info['profile_expertise_uid'] = new_expertise_uid
                             expertise_info['profile_expertise_profile_personal_id'] = new_profile_uid
-                            
-                            # Map fields from the expertise data
-                            if 'title' in exp_data:
-                                expertise_info['profile_expertise_title'] = exp_data['title']
-                            if 'description' in exp_data:
-                                expertise_info['profile_expertise_description'] = exp_data['description']
-                            if 'cost' in exp_data:
-                                expertise_info['profile_expertise_cost'] = exp_data['cost']
-                            if 'bounty' in exp_data:
-                                expertise_info['profile_expertise_bounty'] = exp_data['bounty']
-                            if 'quantity' in exp_data:
-                                expertise_info['profile_expertise_quantity'] = exp_data['quantity']
-                            
+                            expertise_info.update(_expertise_dict_from_payload(exp_data))
+                            _apply_profile_expertise_multipart_image(
+                                db,
+                                payload,
+                                new_expertise_uid,
+                                expertise_idx,
+                                expertise_info,
+                                is_create=True,
+                            )
+
                             # Insert the expertise record
                             db.insert('every_circle.profile_expertise', expertise_info)
                             expertise_entries.append(expertise_info)
@@ -448,32 +707,23 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes'))
                         print("wishes data: ", wishes_data)
                         
-                        # Process each wish entry
-                        for wish_data in wishes_data:
+                        # Process each wish entry (multipart: profile_wish_image_0, ...)
+                        for wish_idx, wish_data in enumerate(wishes_data):
                             wish_info = {}
                             wishes_stored_procedure_response = db.call(procedure='new_profile_wish_uid')
                             new_wish_uid = wishes_stored_procedure_response['result'][0]['new_id']
                             wish_info['profile_wish_uid'] = new_wish_uid
                             wish_info['profile_wish_profile_personal_id'] = new_profile_uid
-                            
-                            # Map fields from the wish data
-                            if 'title' in wish_data:
-                                wish_info['profile_wish_title'] = wish_data['title']
-                            if 'description' in wish_data:
-                                wish_info['profile_wish_description'] = wish_data['description']
-                            if 'bounty' in wish_data:
-                                wish_info['profile_wish_bounty'] = wish_data['bounty']
-                            if 'cost' in wish_data:  
-                                wish_info['profile_wish_cost'] = wish_data['cost']
-                            if 'profile_wish_start' in wish_data:
-                                wish_info['profile_wish_start'] = wish_data['profile_wish_start']
-                            if 'profile_wish_end' in wish_data:
-                                wish_info['profile_wish_end'] = wish_data['profile_wish_end']
-                            if 'profile_wish_location' in wish_data:
-                                wish_info['profile_wish_location'] = wish_data['profile_wish_location']
-                            if 'profile_wish_mode' in wish_data:
-                                wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
-                            
+                            wish_info.update(_wish_dict_from_payload(wish_data))
+                            _apply_profile_wish_multipart_image(
+                                db,
+                                payload,
+                                new_wish_uid,
+                                wish_idx,
+                                wish_info,
+                                is_create=True,
+                            )
+
                             # Insert the wish record
                             db.insert('every_circle.profile_wish', wish_info)
                             wishes_entries.append(wish_info)
@@ -648,6 +898,12 @@ class UserProfileInfo(Resource):
             payload = request.form.to_dict()
             print("PUT Payload: ", payload)
 
+            # profile_uid often sent as query param (e.g. API Gateway); form-only clients still work
+            if 'profile_uid' not in payload:
+                qa = request.args.get('profile_uid')
+                if qa:
+                    payload['profile_uid'] = qa.strip()
+
             if 'profile_uid' not in payload:
                 response['message'] = 'profile_uid is required'
                 response['code'] = 400
@@ -658,6 +914,7 @@ class UserProfileInfo(Resource):
             print("UPDATED Payload: ", payload)
             updated_uids = {}
             deleted_uids = {}
+            expertise_payload_refresh = False
 
             with connect() as db:
                 # Check if the profile exists
@@ -731,6 +988,7 @@ class UserProfileInfo(Resource):
                                                              'profile_expertise_profile_personal_id': profile_uid})
                             
                             if exp_exists_query['result']:
+                                _delete_expertise_s3_assets(exp_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{exp_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_expertise_uids.append(exp_uid)
@@ -754,6 +1012,7 @@ class UserProfileInfo(Resource):
                                                               'profile_wish_profile_personal_id': profile_uid})
                             
                             if wish_exists_query['result']:
+                                _delete_wish_s3_assets(wish_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_wish WHERE profile_wish_uid = '{wish_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_wish_uids.append(wish_uid)
@@ -1132,47 +1391,53 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         expertises_data = json.loads(payload.pop('expertise_info'))
+                        expertise_payload_refresh = True
                         expertise_uids = []
                         
-                        # Process each expertise entry
-                        for exp_data in expertises_data:
+                        # Process each expertise entry (multipart files: profile_expertise_image_0, _1, ...)
+                        for expertise_idx, exp_data in enumerate(expertises_data):
                             print("exp_data", exp_data)
                             expertise_info = {}
                             
-                            # Check if this is an existing expertise (has UID)
-                            if 'profile_expertise_uid' in exp_data:
-                                print("In existing expertise entry", exp_data['profile_expertise_uid'])
-                                # Get the existing expertise UID
-                                expertise_uid = exp_data.pop('profile_expertise_uid')
-                                
-                                # Check if expertise exists
-                                expertise_exists_query = db.select('every_circle.profile_expertise', 
-                                                                 where={'profile_expertise_uid': expertise_uid})
-                                
+                            expertise_uid = _normalize_record_uid(exp_data.pop('profile_expertise_uid', None))
+                            if expertise_uid:
+                                print("In existing expertise entry", expertise_uid)
+                                expertise_exists_query = db.select(
+                                    'every_circle.profile_expertise',
+                                    where={
+                                        'profile_expertise_uid': expertise_uid,
+                                        'profile_expertise_profile_personal_id': profile_uid,
+                                    },
+                                )
+
                                 if not expertise_exists_query['result']:
-                                    # Skip this one if it doesn't exist
-                                    print(f"Warning: Expertise with UID {expertise_uid} not found")
+                                    print(
+                                        f"Warning: Expertise {expertise_uid} not found for profile {profile_uid}"
+                                    )
                                     continue
-                                
-                                # Map fields from the expertise data
-                                if 'name' in exp_data:
-                                    expertise_info['profile_expertise_title'] = exp_data['name']
-                                if 'description' in exp_data:
-                                    expertise_info['profile_expertise_description'] = exp_data['description']
-                                if 'cost' in exp_data:
-                                    expertise_info['profile_expertise_cost'] = exp_data['cost']
-                                if 'bounty' in exp_data:
-                                    expertise_info['profile_expertise_bounty'] = exp_data['bounty']
-                                if 'isPublic' in exp_data:
-                                    expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
-                                if 'quantity' in exp_data:
-                                    expertise_info['profile_expertise_quantity'] = exp_data['quantity']
-                                
+
+                                expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                _apply_profile_expertise_multipart_image(
+                                    db,
+                                    payload,
+                                    expertise_uid,
+                                    expertise_idx,
+                                    expertise_info,
+                                    is_create=False,
+                                )
+
                                 # Update the existing expertise
                                 if expertise_info:
-                                    db.update('every_circle.profile_expertise',
-                                             {'profile_expertise_uid': expertise_uid}, expertise_info)
-                                    
+                                    upd_res = db.update(
+                                        'every_circle.profile_expertise',
+                                        {'profile_expertise_uid': expertise_uid},
+                                        expertise_info,
+                                    )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Expertise update failed")
+                                        )
+
                                 expertise_uids.append(expertise_uid)
                             else:
                                 # This is a new expertise entry
@@ -1180,26 +1445,29 @@ class UserProfileInfo(Resource):
                                 new_expertise_uid = expertise_stored_procedure_response['result'][0]['new_id']
                                 expertise_info['profile_expertise_uid'] = new_expertise_uid
                                 expertise_info['profile_expertise_profile_personal_id'] = profile_uid
-                                
-                                # Map fields from the expertise data
-                                if 'name' in exp_data:
-                                    expertise_info['profile_expertise_title'] = exp_data['name']
-                                if 'description' in exp_data:
-                                    expertise_info['profile_expertise_description'] = exp_data['description']
-                                if 'cost' in exp_data:
-                                    expertise_info['profile_expertise_cost'] = exp_data['cost']
-                                if 'bounty' in exp_data:
-                                    expertise_info['profile_expertise_bounty'] = exp_data['bounty']
-                                if 'isPublic' in exp_data:
-                                    expertise_info['profile_expertise_is_public'] = exp_data['isPublic']
-                                if 'quantity' in exp_data:
-                                    expertise_info['profile_expertise_quantity'] = exp_data['quantity']
-                                
+                                expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                _apply_profile_expertise_multipart_image(
+                                    db,
+                                    payload,
+                                    new_expertise_uid,
+                                    expertise_idx,
+                                    expertise_info,
+                                    is_create=True,
+                                )
+
                                 # Insert the expertise record
-                                db.insert('every_circle.profile_expertise', expertise_info)
+                                ins_res = db.insert(
+                                    'every_circle.profile_expertise', expertise_info
+                                )
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Expertise insert failed")
+                                    )
                                 expertise_uids.append(new_expertise_uid)
                         
                         updated_uids['profile_expertise_uids'] = expertise_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
                         print(f"Error processing expertises JSON in PUT: {str(e)}")
 
@@ -1211,52 +1479,47 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_uids = []
                         
-                        # Process each wish entry
-                        for wish_data in wishes_data:
+                        # Process each wish entry (multipart: profile_wish_image_0, ...)
+                        for wish_idx, wish_data in enumerate(wishes_data):
                             print("wish_data", wish_data)
                             wish_info = {}
                             
-                            # Check if this is an existing wish (has UID)
-                            if 'profile_wish_uid' in wish_data:
-                                print("In existing wish entry", wish_data['profile_wish_uid'])
-                                # Get the existing wish UID
-                                wish_uid = wish_data.pop('profile_wish_uid')
-                                
-                                # Check if wish exists
-                                wish_exists_query = db.select('every_circle.profile_wish', 
-                                                            where={'profile_wish_uid': wish_uid})
-                                
+                            wish_uid = _normalize_record_uid(wish_data.pop('profile_wish_uid', None))
+                            if wish_uid:
+                                print("In existing wish entry", wish_uid)
+                                wish_exists_query = db.select(
+                                    'every_circle.profile_wish',
+                                    where={
+                                        'profile_wish_uid': wish_uid,
+                                        'profile_wish_profile_personal_id': profile_uid,
+                                    },
+                                )
+
                                 if not wish_exists_query['result']:
-                                    # Skip this one if it doesn't exist
-                                    print(f"Warning: Wish with UID {wish_uid} not found")
+                                    print(f"Warning: Wish {wish_uid} not found for profile {profile_uid}")
                                     continue
-                                
-                                # Map fields from the wish data
-                                if 'helpNeeds' in wish_data:
-                                    wish_info['profile_wish_title'] = wish_data['helpNeeds']
-                                if 'details' in wish_data:
-                                    wish_info['profile_wish_description'] = wish_data['details']
-                                if 'amount' in wish_data:
-                                    wish_info['profile_wish_bounty'] = wish_data['amount']
-                                if 'cost' in wish_data: 
-                                    wish_info['profile_wish_cost'] = wish_data['cost']
-                                if 'isPublic' in wish_data:
-                                    wish_info['profile_wish_is_public'] = wish_data['isPublic']
-                                if 'profile_wish_start' in wish_data:
-                                    wish_info['profile_wish_start'] = wish_data['profile_wish_start']
-                                if 'profile_wish_end' in wish_data:
-                                    wish_info['profile_wish_end'] = wish_data['profile_wish_end']
-                                if 'profile_wish_location' in wish_data:
-                                    wish_info['profile_wish_location'] = wish_data['profile_wish_location']
-                                if 'profile_wish_mode' in wish_data:
-                                    wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
-                                
-                                
-                                # Update the existing wish
+
+                                wish_info.update(_wish_dict_from_payload(wish_data))
+                                _apply_profile_wish_multipart_image(
+                                    db,
+                                    payload,
+                                    wish_uid,
+                                    wish_idx,
+                                    wish_info,
+                                    is_create=False,
+                                )
+
                                 if wish_info:
-                                    db.update('every_circle.profile_wish', 
-                                             {'profile_wish_uid': wish_uid}, wish_info)
-                                    
+                                    upd_res = db.update(
+                                        'every_circle.profile_wish',
+                                        {'profile_wish_uid': wish_uid},
+                                        wish_info,
+                                    )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Wish update failed")
+                                        )
+
                                 wishes_uids.append(wish_uid)
                             else:
                                 # This is a new wish entry
@@ -1264,32 +1527,27 @@ class UserProfileInfo(Resource):
                                 new_wish_uid = wishes_stored_procedure_response['result'][0]['new_id']
                                 wish_info['profile_wish_uid'] = new_wish_uid
                                 wish_info['profile_wish_profile_personal_id'] = profile_uid
-                                
-                                # Map fields from the wish data
-                                if 'helpNeeds' in wish_data:
-                                    wish_info['profile_wish_title'] = wish_data['helpNeeds']
-                                if 'details' in wish_data:
-                                    wish_info['profile_wish_description'] = wish_data['details']
-                                if 'amount' in wish_data:
-                                    wish_info['profile_wish_bounty'] = wish_data['amount']
-                                if 'cost' in wish_data:  
-                                    wish_info['profile_wish_cost'] = wish_data['cost']
-                                if 'isPublic' in wish_data:
-                                    wish_info['profile_wish_is_public'] = wish_data['isPublic']
-                                if 'profile_wish_start' in wish_data:
-                                    wish_info['profile_wish_start'] = wish_data['profile_wish_start']
-                                if 'profile_wish_end' in wish_data:
-                                    wish_info['profile_wish_end'] = wish_data['profile_wish_end']
-                                if 'profile_wish_location' in wish_data:
-                                    wish_info['profile_wish_location'] = wish_data['profile_wish_location']
-                                if 'profile_wish_mode' in wish_data:
-                                    wish_info['profile_wish_mode'] = wish_data['profile_wish_mode']
-                                
+                                wish_info.update(_wish_dict_from_payload(wish_data))
+                                _apply_profile_wish_multipart_image(
+                                    db,
+                                    payload,
+                                    new_wish_uid,
+                                    wish_idx,
+                                    wish_info,
+                                    is_create=True,
+                                )
+
                                 # Insert the wish record
-                                db.insert('every_circle.profile_wish', wish_info)
+                                ins_res = db.insert('every_circle.profile_wish', wish_info)
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Wish insert failed")
+                                    )
                                 wishes_uids.append(new_wish_uid)
                         
                         updated_uids['profile_wish_uids'] = wishes_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
                         print(f"Error processing wishes JSON in PUT: {str(e)}")
                 
@@ -1404,6 +1662,15 @@ class UserProfileInfo(Resource):
                         import traceback
                         traceback.print_exc()
 
+                if expertise_payload_refresh:
+                    _ex_snap = db.select(
+                        'every_circle.profile_expertise',
+                        where={'profile_expertise_profile_personal_id': profile_uid},
+                    )
+                    response['expertise_info'] = (
+                        _ex_snap['result'] if _ex_snap.get('result') else []
+                    )
+
                 # Prepare the response with both updated and deleted UIDs
             response['updated_uids'] = updated_uids
             if deleted_uids:
@@ -1411,6 +1678,11 @@ class UserProfileInfo(Resource):
             response['message'] = 'Profile updated successfully'
             return response, 200
         
+        except RuntimeError as e:
+            print(f"Error in UserProfileInfo PUT: {str(e)}")
+            response["message"] = str(e)
+            response["code"] = 400
+            return response, 400
         except Exception as e:
             print(f"Error in UserProfileInfo PUT: {str(e)}")
             response['message'] = 'Internal Server Error'
@@ -1456,6 +1728,26 @@ class UserProfileInfo(Resource):
                     links_query = f"DELETE FROM every_circle.profile_link WHERE profile_link_profile_personal_id = '{profile_uid}'"
                     delete_results['links'] = db.delete(links_query)
                     
+                    expertise_rows = db.select(
+                        'every_circle.profile_expertise',
+                        where={
+                            'profile_expertise_profile_personal_id': profile_uid},
+                    )
+                    for row in expertise_rows.get('result') or []:
+                        eid = row.get('profile_expertise_uid')
+                        if eid:
+                            _delete_expertise_s3_assets(eid)
+
+                    wishes_rows = db.select(
+                        'every_circle.profile_wish',
+                        where={
+                            'profile_wish_profile_personal_id': profile_uid},
+                    )
+                    for row in wishes_rows.get('result') or []:
+                        wid = row.get('profile_wish_uid')
+                        if wid:
+                            _delete_wish_s3_assets(wid)
+
                     # Delete expertise
                     expertise_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_profile_personal_id = '{profile_uid}'"
                     delete_results['expertise'] = db.delete(expertise_query)
@@ -1540,6 +1832,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_expertise_s3_assets(uid)
+
                     # Delete the specific expertise
                     expertise_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{uid}'"
                     delete_result = db.delete(expertise_query)
@@ -1557,6 +1851,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_wish_s3_assets(uid)
+
                     # Delete the specific wish
                     wish_query = f"DELETE FROM every_circle.profile_wish WHERE profile_wish_uid = '{uid}'"
                     delete_result = db.delete(wish_query)

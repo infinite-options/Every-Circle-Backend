@@ -48,25 +48,41 @@ def pmDueDate(due_date):
 
 
 def deleteFolder(folder, uid):
-    #  Delete from S3 Bucket
-    print("In Delete S3 Folder")
+    """Remove all objects under s3 prefix {folder}/{uid}/ (handles pagination)."""
+    print("[deleteFolder] folder=%s uid=%s" % (folder, uid))
+    bucket_name = os.getenv("BUCKET_NAME")
+    if not bucket_name:
+        print("[deleteFolder] BUCKET_NAME unset, skipping S3 delete")
+        return
+    folder_prefix = f"{folder}/{uid}/"
 
-    # bucket_name = 'io-pm'
-    bucket_name = os.getenv('BUCKET_NAME')
-    folder_prefix = f'{folder}/{uid}/'
+    continuation_token = None
+    deleted_count = 0
+    while True:
+        kw = dict(Bucket=bucket_name, Prefix=folder_prefix)
+        if continuation_token:
+            kw["ContinuationToken"] = continuation_token
+        resp = s3.list_objects_v2(**kw)
 
-    # List all objects with the given prefix
-    s3Objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=folder_prefix)
-    print("S3 Objects: ", s3Objects)
+        contents = resp.get("Contents") or []
+        for obj in contents:
+            key = obj["Key"]
+            print(f"[deleteFolder] Deleting s3://{bucket_name}/{key}")
+            s3.delete_object(Bucket=bucket_name, Key=key)
+            deleted_count += 1
 
-    if 'Contents' in s3Objects:
-        print("In Contents")
-        for obj in s3Objects['Contents']:
-            print(f"Deleting {obj['Key']}")
-            s3.delete_object(Bucket=bucket_name, Key=obj['Key'])
-        print(f"Folder '{folder_prefix}' deleted successfully")
+        if resp.get("IsTruncated"):
+            continuation_token = resp.get("NextContinuationToken")
+        else:
+            break
+
+    if deleted_count:
+        print(
+            "[deleteFolder] Removed %s object(s) under prefix '%s'"
+            % (deleted_count, folder_prefix)
+        )
     else:
-        print(f"No files found to delete in '{folder_prefix}'")
+        print(f"[deleteFolder] No objects found under prefix '{folder_prefix}'")
 
 
 def deleteImage(key):
