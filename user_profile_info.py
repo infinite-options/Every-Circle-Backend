@@ -115,6 +115,10 @@ def _normalize_record_uid(value):
     return str(value).strip() or None
 
 
+def _db_write_succeeded(res):
+    return bool(res) and res.get("code") == 200
+
+
 class UserProfileInfo(Resource):
     def get(self, uid):
         print("In UserProfileInfo GET", uid, type(uid))
@@ -750,6 +754,7 @@ class UserProfileInfo(Resource):
             print("UPDATED Payload: ", payload)
             updated_uids = {}
             deleted_uids = {}
+            expertise_payload_refresh = False
 
             with connect() as db:
                 # Check if the profile exists
@@ -1224,6 +1229,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         expertises_data = json.loads(payload.pop('expertise_info'))
+                        expertise_payload_refresh = True
                         expertise_uids = []
                         
                         # Process each expertise entry
@@ -1252,11 +1258,15 @@ class UserProfileInfo(Resource):
 
                                 # Update the existing expertise
                                 if expertise_info:
-                                    db.update(
+                                    upd_res = db.update(
                                         'every_circle.profile_expertise',
                                         {'profile_expertise_uid': expertise_uid},
                                         expertise_info,
                                     )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Expertise update failed")
+                                        )
 
                                 expertise_uids.append(expertise_uid)
                             else:
@@ -1268,10 +1278,18 @@ class UserProfileInfo(Resource):
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
 
                                 # Insert the expertise record
-                                db.insert('every_circle.profile_expertise', expertise_info)
+                                ins_res = db.insert(
+                                    'every_circle.profile_expertise', expertise_info
+                                )
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Expertise insert failed")
+                                    )
                                 expertise_uids.append(new_expertise_uid)
                         
                         updated_uids['profile_expertise_uids'] = expertise_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
                         print(f"Error processing expertises JSON in PUT: {str(e)}")
 
@@ -1440,6 +1458,15 @@ class UserProfileInfo(Resource):
                         import traceback
                         traceback.print_exc()
 
+                if expertise_payload_refresh:
+                    _ex_snap = db.select(
+                        'every_circle.profile_expertise',
+                        where={'profile_expertise_profile_personal_id': profile_uid},
+                    )
+                    response['expertise_info'] = (
+                        _ex_snap['result'] if _ex_snap.get('result') else []
+                    )
+
                 # Prepare the response with both updated and deleted UIDs
             response['updated_uids'] = updated_uids
             if deleted_uids:
@@ -1447,6 +1474,11 @@ class UserProfileInfo(Resource):
             response['message'] = 'Profile updated successfully'
             return response, 200
         
+        except RuntimeError as e:
+            print(f"Error in UserProfileInfo PUT: {str(e)}")
+            response["message"] = str(e)
+            response["code"] = 400
+            return response, 400
         except Exception as e:
             print(f"Error in UserProfileInfo PUT: {str(e)}")
             response['message'] = 'Internal Server Error'
