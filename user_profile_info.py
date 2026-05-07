@@ -11,6 +11,8 @@ _WISH_PREFIX = "profile_wish_"
 # S3 key prefixes used by processSingleImageUpload for offering / seeking images.
 _EXPERTISE_S3_PREFIX = "profile_expertise"
 _WISH_S3_PREFIX = "profile_wish"
+_EXPERIENCE_S3_PREFIX = "profile_experience"
+_EDUCATION_S3_PREFIX = "profile_education"
 
 
 def _delete_expertise_s3_assets(expertise_uid):
@@ -25,6 +27,20 @@ def _delete_wish_s3_assets(wish_uid):
         deleteFolder(_WISH_S3_PREFIX, wish_uid)
     except Exception as e:
         print(f"[WISH S3] Error deleting assets for {wish_uid}: {e}")
+
+
+def _delete_experience_s3_assets(experience_uid):
+    try:
+        deleteFolder(_EXPERIENCE_S3_PREFIX, experience_uid)
+    except Exception as e:
+        print(f"[EXPERIENCE S3] Error deleting assets for {experience_uid}: {e}")
+
+
+def _delete_education_s3_assets(education_uid):
+    try:
+        deleteFolder(_EDUCATION_S3_PREFIX, education_uid)
+    except Exception as e:
+        print(f"[EDUCATION S3] Error deleting assets for {education_uid}: {e}")
 
 
 def _expertise_dict_from_payload(exp_data):
@@ -260,6 +276,189 @@ def _apply_profile_wish_multipart_image(
     if pub_key in payload:
         wish_info["profile_wish_image_is_public"] = _form_truthy_public(
             payload.pop(pub_key)
+        )
+
+
+def _multipart_file_present(field_name):
+    fobj = request.files.get(field_name) if request.files else None
+    return bool(fobj and getattr(fobj, "filename", None))
+
+
+def _pick_profile_experience_image_file_key(idx):
+    indexed = f"profile_experience_image_{idx}"
+    if _multipart_file_present(indexed):
+        return indexed
+    if idx == 0 and _multipart_file_present("profile_experience_image"):
+        return "profile_experience_image"
+    return indexed
+
+
+def _pick_profile_experience_image_delete_key(idx, payload):
+    indexed = f"delete_profile_experience_image_{idx}"
+    plain = "delete_profile_experience_image"
+    if indexed in payload:
+        return indexed
+    if idx == 0 and plain in payload:
+        return plain
+    return indexed
+
+
+def _apply_profile_experience_multipart_image(
+    db, payload, profile_experience_uid, idx, experience_info, is_create
+):
+    """
+    Multipart: profile_experience_image_<idx> or (idx 0) profile_experience_image;
+    delete: delete_profile_experience_image_<idx> or delete_profile_experience_image;
+    is_public: profile_experience_image_<idx>_is_public or profile_experience_image_is_public.
+    DB: profile_experience_image, profile_experience_image_is_public
+    """
+    file_key = _pick_profile_experience_image_file_key(idx)
+    delete_key = _pick_profile_experience_image_delete_key(idx, payload)
+    pub_idx = f"profile_experience_image_{idx}_is_public"
+    pub_plain = "profile_experience_image_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(fobj and getattr(fobj, "filename", None))
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (
+        None,
+        "",
+        "null",
+        "false",
+        False,
+    )
+
+    print(
+        "[PROFILE EXPERIENCE IMAGE] idx=%s uid=%s request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_experience_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_experience_uid,
+            "every_circle.profile_experience",
+            "profile_experience_uid",
+            "profile_experience_image",
+            file_key,
+            delete_key,
+            _EXPERIENCE_S3_PREFIX,
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE EXPERIENCE IMAGE] idx=%s uid=%s profile_experience_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_experience_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            experience_info["profile_experience_image"] = new_url
+        elif has_del and not has_file:
+            experience_info["profile_experience_image"] = None
+
+    if pub_idx in payload:
+        experience_info["profile_experience_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_idx)
+        )
+    elif idx == 0 and pub_plain in payload:
+        experience_info["profile_experience_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_plain)
+        )
+
+
+def _pick_profile_education_image_file_key(idx):
+    indexed = f"profile_education_image_{idx}"
+    if _multipart_file_present(indexed):
+        return indexed
+    if idx == 0 and _multipart_file_present("profile_education_image"):
+        return "profile_education_image"
+    return indexed
+
+
+def _pick_profile_education_image_delete_key(idx, payload):
+    indexed = f"delete_profile_education_image_{idx}"
+    plain = "delete_profile_education_image"
+    if indexed in payload:
+        return indexed
+    if idx == 0 and plain in payload:
+        return plain
+    return indexed
+
+
+def _apply_profile_education_multipart_image(
+    db, payload, profile_education_uid, idx, education_info, is_create
+):
+    """
+    Multipart: profile_education_image_<idx> or (idx 0) profile_education_image;
+    delete: delete_profile_education_image_<idx> or delete_profile_education_image;
+    is_public: profile_education_image_<idx>_is_public or profile_education_image_is_public.
+    DB: profile_education_image, profile_education_image_is_public
+    """
+    file_key = _pick_profile_education_image_file_key(idx)
+    delete_key = _pick_profile_education_image_delete_key(idx, payload)
+    pub_idx = f"profile_education_image_{idx}_is_public"
+    pub_plain = "profile_education_image_is_public"
+
+    fobj = request.files.get(file_key) if request.files else None
+    has_file = bool(fobj and getattr(fobj, "filename", None))
+    del_val = payload.get(delete_key)
+    has_del = delete_key in payload and del_val not in (
+        None,
+        "",
+        "null",
+        "false",
+        False,
+    )
+
+    print(
+        "[PROFILE EDUCATION IMAGE] idx=%s uid=%s request.files=%s file_key=%s has_file=%s has_del=%s is_create=%s"
+        % (
+            idx,
+            profile_education_uid,
+            list(request.files.keys()) if request.files else [],
+            file_key,
+            has_file,
+            has_del,
+            is_create,
+        )
+    )
+
+    if has_file or has_del:
+        new_url = processSingleImageUpload(
+            db,
+            profile_education_uid,
+            "every_circle.profile_education",
+            "profile_education_uid",
+            "profile_education_image",
+            file_key,
+            delete_key,
+            _EDUCATION_S3_PREFIX,
+            payload,
+            is_create=is_create,
+        )
+        print(
+            "[PROFILE EDUCATION IMAGE] idx=%s uid=%s profile_education_image URL=%r (has_del=%s has_file=%s)"
+            % (idx, profile_education_uid, new_url, has_del, has_file)
+        )
+        if new_url is not None:
+            education_info["profile_education_image"] = new_url
+        elif has_del and not has_file:
+            education_info["profile_education_image"] = None
+
+    if pub_idx in payload:
+        education_info["profile_education_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_idx)
+        )
+    elif idx == 0 and pub_plain in payload:
+        education_info["profile_education_image_is_public"] = _form_truthy_public(
+            payload.pop(pub_plain)
         )
 
 
@@ -758,8 +957,8 @@ class UserProfileInfo(Resource):
                         experiences_data = json.loads(payload.pop('experiences'))
                         print("experience data: ", experiences_data)
                         
-                        # Process each experience entry
-                        for exp_data in experiences_data:
+                        # Process each experience entry (multipart: profile_experience_image_0 / profile_experience_image)
+                        for exp_idx, exp_data in enumerate(experiences_data):
                             experience_info = {}
                             experience_stored_procedure_response = db.call(procedure='new_profile_experience_uid')
                             new_experience_uid = experience_stored_procedure_response['result'][0]['new_id']
@@ -778,6 +977,15 @@ class UserProfileInfo(Resource):
                             if 'endDate' in exp_data:
                                 experience_info['profile_experience_end_date'] = exp_data['endDate']
                             
+                            _apply_profile_experience_multipart_image(
+                                db,
+                                payload,
+                                new_experience_uid,
+                                exp_idx,
+                                experience_info,
+                                is_create=True,
+                            )
+
                             # Insert the experience record
                             db.insert('every_circle.profile_experience', experience_info)
                             experience_entries.append(experience_info)
@@ -812,8 +1020,8 @@ class UserProfileInfo(Resource):
                         educations_data = json.loads(payload.pop('educations'))
                         print("education data: ", educations_data)
                         
-                        # Process each education entry
-                        for edu_data in educations_data:
+                        # Process each education entry (multipart: profile_education_image_0 / profile_education_image)
+                        for edu_idx, edu_data in enumerate(educations_data):
                             education_info = {}
                             education_stored_procedure_response = db.call(procedure='new_profile_education_uid')
                             new_education_uid = education_stored_procedure_response['result'][0]['new_id']
@@ -832,6 +1040,15 @@ class UserProfileInfo(Resource):
                             if 'endDate' in edu_data:
                                 education_info['profile_education_end_date'] = edu_data['endDate']
                             
+                            _apply_profile_education_multipart_image(
+                                db,
+                                payload,
+                                new_education_uid,
+                                edu_idx,
+                                education_info,
+                                is_create=True,
+                            )
+
                             # Insert the education record
                             db.insert('every_circle.profile_education', education_info)
                             education_entries.append(education_info)
@@ -942,6 +1159,7 @@ class UserProfileInfo(Resource):
                                                              'profile_experience_profile_personal_id': profile_uid})
                             
                             if exp_exists_query['result']:
+                                _delete_experience_s3_assets(exp_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_experience WHERE profile_experience_uid = '{exp_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_experience_uids.append(exp_uid)
@@ -965,6 +1183,7 @@ class UserProfileInfo(Resource):
                                                              'profile_education_profile_personal_id': profile_uid})
                             
                             if edu_exists_query['result']:
+                                _delete_education_s3_assets(edu_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_education WHERE profile_education_uid = '{edu_uid}'"
                                 delete_result = db.delete(delete_query)
                                 deleted_education_uids.append(edu_uid)
@@ -1233,28 +1452,31 @@ class UserProfileInfo(Resource):
                         import json
                         educations_data = json.loads(payload.pop('education_info'))
                         education_uids = []
-                        
-                        # Process each education entry
-                        for edu_data in educations_data:
+
+                        # Process each education entry (multipart: profile_education_image_0 / profile_education_image)
+                        for edu_idx, edu_data in enumerate(educations_data):
                             print("edu_data", edu_data)
                             education_info = {}
-                            
-                            # Check if this is an existing education (has UID)
-                            if 'profile_education_uid' in edu_data:
-                                print("In existing education entry", edu_data['profile_education_uid'])
-                                # Get the existing education UID
-                                education_uid = edu_data.pop('profile_education_uid')
-                                
-                                # Check if education exists
-                                education_exists_query = db.select('every_circle.profile_education', 
-                                                                 where={'profile_education_uid': education_uid})
-                                
+
+                            education_uid = _normalize_record_uid(
+                                edu_data.pop('profile_education_uid', None)
+                            )
+                            if education_uid:
+                                print("In existing education entry", education_uid)
+                                education_exists_query = db.select(
+                                    'every_circle.profile_education',
+                                    where={
+                                        'profile_education_uid': education_uid,
+                                        'profile_education_profile_personal_id': profile_uid,
+                                    },
+                                )
+
                                 if not education_exists_query['result']:
-                                    # Skip this one if it doesn't exist
-                                    print(f"Warning: Education with UID {education_uid} not found")
+                                    print(
+                                        f"Warning: Education {education_uid} not found for profile {profile_uid}"
+                                    )
                                     continue
-                                
-                                # Map fields from the education data
+
                                 if 'school' in edu_data:
                                     education_info['profile_education_school_name'] = edu_data['school']
                                 if 'degree' in edu_data:
@@ -1267,21 +1489,36 @@ class UserProfileInfo(Resource):
                                     education_info['profile_education_end_date'] = edu_data['endDate']
                                 if 'isPublic' in edu_data:
                                     education_info['profile_education_is_public'] = edu_data['isPublic']
-                                
-                                # Update the existing education
+
+                                _apply_profile_education_multipart_image(
+                                    db,
+                                    payload,
+                                    education_uid,
+                                    edu_idx,
+                                    education_info,
+                                    is_create=False,
+                                )
+
                                 if education_info:
-                                    db.update('every_circle.profile_education', 
-                                             {'profile_education_uid': education_uid}, education_info)
-                                    
+                                    upd_res = db.update(
+                                        'every_circle.profile_education',
+                                        {'profile_education_uid': education_uid},
+                                        education_info,
+                                    )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Education update failed")
+                                        )
+
                                 education_uids.append(education_uid)
                             else:
-                                # This is a new education entry
-                                education_stored_procedure_response = db.call(procedure='new_profile_education_uid')
+                                education_stored_procedure_response = db.call(
+                                    procedure='new_profile_education_uid'
+                                )
                                 new_education_uid = education_stored_procedure_response['result'][0]['new_id']
                                 education_info['profile_education_uid'] = new_education_uid
                                 education_info['profile_education_profile_personal_id'] = profile_uid
-                                
-                                # Map fields from the education data
+
                                 if 'school' in edu_data:
                                     education_info['profile_education_school_name'] = edu_data['school']
                                 if 'degree' in edu_data:
@@ -1294,14 +1531,30 @@ class UserProfileInfo(Resource):
                                     education_info['profile_education_end_date'] = edu_data['endDate']
                                 if 'isPublic' in edu_data:
                                     education_info['profile_education_is_public'] = edu_data['isPublic']
-                                
-                                # Insert the education record
-                                db.insert('every_circle.profile_education', education_info)
+
+                                _apply_profile_education_multipart_image(
+                                    db,
+                                    payload,
+                                    new_education_uid,
+                                    edu_idx,
+                                    education_info,
+                                    is_create=True,
+                                )
+
+                                ins_res = db.insert(
+                                    'every_circle.profile_education', education_info
+                                )
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Education insert failed")
+                                    )
                                 education_uids.append(new_education_uid)
-                        
+
                         updated_uids['profile_education_uids'] = education_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
-                        print(f"Error processing educations JSON in PUT: {str(e)}")              
+                        print(f"Error processing educations JSON in PUT: {str(e)}")
                 
                 # Handle multiple experiences
                 if 'experience_info' in payload:
@@ -1310,30 +1563,32 @@ class UserProfileInfo(Resource):
                         import json
                         experiences_data = json.loads(payload.pop('experience_info'))
                         experience_uids = []
-                        
-                        # Process each experience entry
-                        for exp_data in experiences_data:
+
+                        # Process each experience entry (multipart: profile_experience_image_0 / profile_experience_image)
+                        for exp_idx, exp_data in enumerate(experiences_data):
                             print("exp_data", exp_data)
                             experience_info = {}
-                            
-                            # Check if this is an existing experience (has UID)
-                            if 'profile_experience_uid' in exp_data:
-                                print("In existing experience entry", exp_data['profile_experience_uid'])
-                                # Get the existing experience UID
-                                print("In existing experience entry")
-                                experience_uid = exp_data.pop('profile_experience_uid')
-                                
-                                # Check if experience exists
-                                experience_exists_query = db.select('every_circle.profile_experience', 
-                                                                  where={'profile_experience_uid': experience_uid})
+
+                            experience_uid = _normalize_record_uid(
+                                exp_data.pop('profile_experience_uid', None)
+                            )
+                            if experience_uid:
+                                print("In existing experience entry", experience_uid)
+                                experience_exists_query = db.select(
+                                    'every_circle.profile_experience',
+                                    where={
+                                        'profile_experience_uid': experience_uid,
+                                        'profile_experience_profile_personal_id': profile_uid,
+                                    },
+                                )
                                 print("experience_exists_query", experience_exists_query)
-                                
+
                                 if not experience_exists_query['result']:
-                                    # Skip this one if it doesn't exist
-                                    print(f"Warning: Experience with UID {experience_uid} not found")
+                                    print(
+                                        f"Warning: Experience {experience_uid} not found for profile {profile_uid}"
+                                    )
                                     continue
-                                
-                                # Map fields from the experience data
+
                                 if 'company' in exp_data:
                                     experience_info['profile_experience_company_name'] = exp_data['company']
                                 if 'title' in exp_data:
@@ -1346,23 +1601,37 @@ class UserProfileInfo(Resource):
                                     experience_info['profile_experience_end_date'] = exp_data['endDate']
                                 if 'isPublic' in exp_data:
                                     experience_info['profile_experience_is_public'] = exp_data['isPublic']
-                                
-                                
-                                # Update the existing experience
+
+                                _apply_profile_experience_multipart_image(
+                                    db,
+                                    payload,
+                                    experience_uid,
+                                    exp_idx,
+                                    experience_info,
+                                    is_create=False,
+                                )
+
                                 if experience_info:
-                                    db.update('every_circle.profile_experience', 
-                                             {'profile_experience_uid': experience_uid}, experience_info)
-                                    
+                                    upd_res = db.update(
+                                        'every_circle.profile_experience',
+                                        {'profile_experience_uid': experience_uid},
+                                        experience_info,
+                                    )
+                                    if not _db_write_succeeded(upd_res):
+                                        raise RuntimeError(
+                                            upd_res.get("message", "Experience update failed")
+                                        )
+
                                 experience_uids.append(experience_uid)
                             else:
-                                # This is a new experience entr
                                 print("In new experience entry")
-                                experience_stored_procedure_response = db.call(procedure='new_profile_experience_uid')
+                                experience_stored_procedure_response = db.call(
+                                    procedure='new_profile_experience_uid'
+                                )
                                 new_experience_uid = experience_stored_procedure_response['result'][0]['new_id']
                                 experience_info['profile_experience_uid'] = new_experience_uid
                                 experience_info['profile_experience_profile_personal_id'] = profile_uid
-                                
-                                # Map fields from the experience data
+
                                 if 'company' in exp_data:
                                     experience_info['profile_experience_company_name'] = exp_data['company']
                                 if 'title' in exp_data:
@@ -1375,13 +1644,29 @@ class UserProfileInfo(Resource):
                                     experience_info['profile_experience_end_date'] = exp_data['endDate']
                                 if 'isPublic' in exp_data:
                                     experience_info['profile_experience_is_public'] = exp_data['isPublic']
-                                
-                                # Insert the experience record
+
+                                _apply_profile_experience_multipart_image(
+                                    db,
+                                    payload,
+                                    new_experience_uid,
+                                    exp_idx,
+                                    experience_info,
+                                    is_create=True,
+                                )
+
                                 print("Inserting experience record", experience_info)
-                                db.insert('every_circle.profile_experience', experience_info)
+                                ins_res = db.insert(
+                                    'every_circle.profile_experience', experience_info
+                                )
+                                if not _db_write_succeeded(ins_res):
+                                    raise RuntimeError(
+                                        ins_res.get("message", "Experience insert failed")
+                                    )
                                 experience_uids.append(new_experience_uid)
-                        
+
                         updated_uids['profile_experience_uids'] = experience_uids
+                    except RuntimeError:
+                        raise
                     except Exception as e:
                         print(f"Error processing experiences JSON in PUT: {str(e)}")
                 
@@ -1748,6 +2033,24 @@ class UserProfileInfo(Resource):
                         if wid:
                             _delete_wish_s3_assets(wid)
 
+                    exp_rows_bulk = db.select(
+                        'every_circle.profile_experience',
+                        where={'profile_experience_profile_personal_id': profile_uid},
+                    )
+                    for row in exp_rows_bulk.get('result') or []:
+                        xid = row.get('profile_experience_uid')
+                        if xid:
+                            _delete_experience_s3_assets(xid)
+
+                    edu_rows_bulk = db.select(
+                        'every_circle.profile_education',
+                        where={'profile_education_profile_personal_id': profile_uid},
+                    )
+                    for row in edu_rows_bulk.get('result') or []:
+                        did = row.get('profile_education_uid')
+                        if did:
+                            _delete_education_s3_assets(did)
+
                     # Delete expertise
                     expertise_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_profile_personal_id = '{profile_uid}'"
                     delete_results['expertise'] = db.delete(expertise_query)
@@ -1781,6 +2084,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_experience_s3_assets(uid)
+
                     # Delete the specific experience
                     experience_query = f"DELETE FROM every_circle.profile_experience WHERE profile_experience_uid = '{uid}'"
                     delete_result = db.delete(experience_query)
@@ -1798,6 +2103,8 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
                     
+                    _delete_education_s3_assets(uid)
+
                     # Delete the specific education
                     education_query = f"DELETE FROM every_circle.profile_education WHERE profile_education_uid = '{uid}'"
                     delete_result = db.delete(education_query)
