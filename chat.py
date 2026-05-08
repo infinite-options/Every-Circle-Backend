@@ -13,6 +13,22 @@ load_dotenv()
 
 # --------------- helpers ---------------
 
+
+def _generate_uid_from_db(db_function_name, fallback_prefix):
+    """
+    Try DB UID generator function first, fallback to local UUID.
+    Example db_function_name: "new_message_uid"
+    """
+    try:
+        with connect() as db:
+            uid_result = db.execute(f"CALL every_circle.{db_function_name}()")
+        rows = (uid_result or {}).get("result") or []
+        if rows and rows[0].get("new_id"):
+            return rows[0]["new_id"]
+    except Exception as e:
+        print(f"UID generation via {db_function_name} failed, using fallback: {e}")
+    return f"{fallback_prefix}-{uuid.uuid4().hex[:12]}"
+
 def _get_participant_info(uid):
     """
     Return { first_name, last_name, image } for any UID type:
@@ -69,7 +85,7 @@ def _get_or_create_conversation(uid_a, uid_b):
     if result:
         return result[0]["conversation_uid"], False
 
-    conv_uid = f"conv-{uuid.uuid4().hex[:12]}"
+    conv_uid = _generate_uid_from_db("new_conversation_uid", "conv")
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with connect() as db:
         db.execute(
@@ -294,7 +310,7 @@ class Messages(Resource):
                 "code": 400,
             }, 400
 
-        msg_uid = f"msg-{uuid.uuid4().hex[:12]}"
+        msg_uid = _generate_uid_from_db("new_message_uid", "msg")
         now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         with connect() as db:
