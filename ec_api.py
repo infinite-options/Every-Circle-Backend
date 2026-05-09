@@ -39,6 +39,7 @@ from profile_details import ProfileDetails
 from profile_wish import ProfileWishInfo
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
+from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -545,6 +546,14 @@ api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo
 api.add_resource(TransactionReceipt, '/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')
+api.add_resource(
+    AccountScreenPersonal,
+    '/api/v1/account-screen/personal/<string:profile_id>',
+)
+api.add_resource(
+    AccountScreenBusiness,
+    '/api/v1/account-screen/business/<string:business_uid>',
+)
 api.add_resource(Circles, '/api/v1/circles/<string:circle_id>', '/api/v1/circles')
 api.add_resource(NearbyLocation,  '/api/v1/nearby/location')
 api.add_resource(NearbyUsers,     '/api/v1/nearby/<string:profile_uid>')
