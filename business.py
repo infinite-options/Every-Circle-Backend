@@ -595,3 +595,96 @@ class BusinessTagSearch(Resource):
         except Exception as e:
             print(f"Error in BusinessTagSearch GET: {str(e)}")
             return {'message': 'Internal Server Error', 'code': 500}, 500
+        
+
+class BusinessServicePurchase(Resource):
+    def post(self):
+        """Decrement bs_quantity when a purchase is made. Atomic SQL to prevent race conditions."""
+        print("In BusinessServicePurchase POST")
+        response = {}
+
+        try:
+            payload = request.get_json(force=True) or {}
+            bs_uid = payload.get("bs_uid", "").strip()
+            qty_purchased = payload.get("quantity", 1)
+
+            if not bs_uid:
+                response["message"] = "bs_uid is required"
+                response["code"] = 400
+                return response, 400
+
+            try:
+                qty_purchased = int(qty_purchased)
+                if qty_purchased < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                response["message"] = "quantity must be a positive integer"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                # Fetch current service
+                svc_query = db.select(
+                    "every_circle.business_services", where={"bs_uid": bs_uid}
+                )
+                if not svc_query["result"]:
+                    response["message"] = "Service not found"
+                    response["code"] = 404
+                    return response, 404
+
+                row = svc_query["result"][0]
+                current_qty = row.get("bs_quantity")
+
+                # If null or "unlimited" — nothing to decrement
+                if current_qty is None or str(current_qty).strip().lower() == "unlimited":
+                    response["message"] = "Unlimited stock — no decrement needed"
+                    response["remaining"] = None
+                    response["code"] = 200
+                    return response, 200
+
+                current_qty_int = int(current_qty)
+                print(f"DEBUG current_qty_int: {current_qty_int}, qty_purchased: {qty_purchased}")
+
+                if current_qty_int < qty_purchased:
+                    response["message"] = "Insufficient stock"
+                    response["remaining"] = current_qty_int
+                    response["code"] = 409
+                    return response, 409
+
+                # Simple direct update — skip rowcount check entirely
+                new_qty = current_qty_int - qty_purchased
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                update_result = db.update(
+                    "every_circle.business_services",
+                    {"bs_uid": bs_uid},
+                    {"bs_quantity": str(new_qty), "bs_updated_at": now},
+                )
+                print(f"DEBUG update_result: {update_result}")
+
+                # Verify it actually changed
+                verify = db.select("every_circle.business_services", where={"bs_uid": bs_uid})
+                actual_qty = verify["result"][0].get("bs_quantity") if verify["result"] else None
+                print(f"DEBUG actual_qty after update: {actual_qty}")
+
+                remaining = int(actual_qty) if actual_qty is not None else new_qty
+
+                # Auto-hide if sold out
+                if remaining == 0:
+                    db.update(
+                        "every_circle.business_services",
+                        {"bs_uid": bs_uid},
+                        {"bs_is_visible": 0, "bs_status": "out_of_stock"},
+                    )
+
+                response["message"] = "Purchase recorded successfully"
+                response["remaining"] = remaining
+                response["bs_uid"] = bs_uid
+                response["code"] = 200
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessServicePurchase POST: {str(e)}")
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
