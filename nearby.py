@@ -448,7 +448,7 @@ class NearbyUsers(Resource):
 
         if user['profile_personal_nearby_lat'] is None:
             return {
-                'message': 'No location set. Please update your location first.',
+                'message': 'No location set. Please update your location in Settings first.',
                 'code': 400,
                 'result': []
             }, 200
