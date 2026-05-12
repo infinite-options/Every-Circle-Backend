@@ -617,6 +617,7 @@ class UserProfileInfo(Resource):
                             b.business_tag_line_is_public,
                             b.business_profile_img,
                             b.business_profile_img_is_public,
+                            b.business_cc_fee_payer,
                             bu.bu_uid,
                             bu.bu_role,
                             bu.bu_individual_business_is_public

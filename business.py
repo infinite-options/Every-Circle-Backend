@@ -444,7 +444,9 @@ class BusinessAvgRatings(Resource):
                         FROM every_circle.ratings
                         WHERE rating_business_id IN ({placeholders})
                     """
+                    # print("reviewer_query: ", reviewer_query)
                     reviewer_result = db.execute(reviewer_query)
+                    # print("reviewer_result: ", reviewer_result)
                     biz_reviewers = {}
                     if reviewer_result.get('result'):
                         for row in reviewer_result['result']:
@@ -455,14 +457,14 @@ class BusinessAvgRatings(Resource):
                     all_reviewer_uids = set(
                         uid for uids in biz_reviewers.values() for uid in uids
                     )
-
+                    print("all_reviewer_uids: ", all_reviewer_uids)
                     if all_reviewer_uids:
                         # BFS: expand frontier in both directions (down=referred by me, up=who referred me)
                         reviewer_degrees = {}
                         seen = {viewer_uid}
                         frontier = [viewer_uid]
 
-                        for degree in range(1, 6):
+                        for degree in range(1, 16):
                             if not frontier:
                                 break
                             if not (all_reviewer_uids - set(reviewer_degrees.keys())):
@@ -565,6 +567,7 @@ class BusinessTagSearch(Resource):
                         b.business_tag_line_is_public,
                         b.business_short_bio_is_public,
                         b.business_profile_img_is_public,
+                        b.business_cc_fee_payer,
                         pp.profile_personal_uid
                     FROM every_circle.business b
                     JOIN every_circle.business_tags bt ON bt.bt_business_id = b.business_uid
