@@ -205,62 +205,150 @@ class Conversations(Resource):
             "created": created,
         }, 200
 
+    # def get(self, profile_uid):
+    #     # Fetch all conversations with last message joined in
+    #     print("Conversations chat get profile_uid: ", profile_uid)
+
+    #     query = """
+    #             SELECT
+    #                 c.conversation_uid,
+    #                 c.last_message_at,
+    #                 CASE
+    #                     WHEN c.participant_a_uid = %s THEN c.participant_b_uid
+    #                     ELSE c.participant_a_uid
+    #                 END AS other_uid,
+    #                 m.body       AS last_message,
+    #                 m.sender_uid AS last_sender_uid,
+    #                 m.sent_at    AS last_sent_at
+    #             FROM every_circle.conversations c
+    #             LEFT JOIN every_circle.messages m
+    #                 ON m.message_uid = (
+    #                     SELECT message_uid
+    #                     FROM every_circle.messages
+    #                     WHERE conversation_uid = c.conversation_uid
+    #                     ORDER BY sent_at DESC
+    #                     LIMIT 1
+    #                 )
+    #             WHERE c.participant_a_uid = %s
+    #                OR c.participant_b_uid = %s
+    #             ORDER BY c.last_message_at DESC
+    #         """
+
+    #     args=(profile_uid, profile_uid, profile_uid)
+    #     with connect() as db:
+    #         print("chat query: ", query)
+    #         print("chat args: ", args)
+    #         rows = db.execute(
+    #             query,
+    #             args,
+    #         )
+    #     conversations = rows.get("result") or []
+
+    #     # Enrich each conversation with the other participant's profile
+    #     result = []
+    #     for conv in conversations:
+    #         other_uid = conv.get("other_uid")
+    #         info = _get_participant_info(other_uid) if other_uid else {}
+    #         other_info = {
+    #             "first_name": info.get("first_name"),
+    #             "last_name":  info.get("last_name"),
+    #             "image":      info.get("image"),
+    #         }
+
+    #         result.append(
+    #             {
+    #                 "conversation_uid": conv.get("conversation_uid"),
+    #                 "last_message_at": str(conv.get("last_message_at") or ""),
+    #                 "last_message": conv.get("last_message"),
+    #                 "last_sent_at": str(conv.get("last_sent_at") or ""),
+    #                 "other_uid": other_uid,
+    #                 "my_uid": profile_uid,  # lets the client know which side it is
+    #                 **other_info,
+    #             }
+    #         )
+
+    #     return {"message": "Success", "code": 200, "result": result}, 200
+
     def get(self, profile_uid):
         # Fetch all conversations with last message joined in
-        with connect() as db:
-            rows = db.execute(
-                """
+        print("Conversations chat get profile_uid: ", profile_uid)
+
+        query = """
                 SELECT
-                    c.conversation_uid,
-                    c.last_message_at,
-                    CASE
-                        WHEN c.participant_a_uid = %s THEN c.participant_b_uid
-                        ELSE c.participant_a_uid
-                    END AS other_uid,
-                    m.body       AS last_message,
-                    m.sender_uid AS last_sender_uid,
-                    m.sent_at    AS last_sent_at
+                    c.*,
+                    pa.profile_personal_first_name AS partipant_a_first_name,
+                    pa.profile_personal_last_name AS partipant_a_last_name,
+                    pa.profile_personal_image AS partipant_a_image,
+                    pa.profile_personal_image_is_public AS partipant_a_image_is_public,
+                    pb.profile_personal_first_name AS partipant_b_first_name,
+                    pb.profile_personal_last_name AS partipant_b_last_name,
+                    pb.profile_personal_image AS partipant_b_image,
+                    pb.profile_personal_image_is_public AS partipant_b_image_is_public,
+
+                    ba.business_name,
+                    bb.business_name,
+
+                    bua.bu_business_id AS bua_business_id,
+                    bua.bu_user_id AS bua_user_id,
+                    bua.bu_role AS bua_role,
+                    bua.bu_individual_business_is_public AS bua_public,
+
+                    bub.bu_business_id AS bub_business_id,
+                    bub.bu_user_id AS bub_user_id,
+                    bub.bu_role AS bub_role,
+                    bub.bu_individual_business_is_public AS bub_public,
+
+                    bpa.profile_personal_uid AS bpa_profile_uid,
+                    bpa.profile_personal_first_name AS bpa_first_name,
+                    bpa.profile_personal_last_name AS bpa_last_name,
+                    bpa.profile_personal_image AS bpa_partipant_a_image,
+                    bpa.profile_personal_image_is_public AS bpa_partipant_a_image_is_public,
+                    bpb.profile_personal_uid AS bpb_profile_uid,
+                    bpb.profile_personal_first_name AS bpb_first_name,
+                    bpb.profile_personal_last_name AS bpb_last_name,
+                    bpb.profile_personal_image AS bpb_partipant_a_image,
+                    bpb.profile_personal_image_is_public AS bpb_partipant_a_image_is_public,
+                    
+                    m.*
+
                 FROM every_circle.conversations c
-                LEFT JOIN every_circle.messages m
-                    ON m.message_uid = (
-                        SELECT message_uid
-                        FROM every_circle.messages
-                        WHERE conversation_uid = c.conversation_uid
-                        ORDER BY sent_at DESC
-                        LIMIT 1
-                    )
-                WHERE c.participant_a_uid = %s
-                   OR c.participant_b_uid = %s
-                ORDER BY c.last_message_at DESC
-                """,
-                args=(profile_uid, profile_uid, profile_uid),
+                LEFT JOIN every_circle.profile_personal pa ON c.participant_a_uid = pa.profile_personal_uid
+                LEFT JOIN every_circle.profile_personal pb ON c.participant_b_uid = pb.profile_personal_uid
+
+                LEFT JOIN every_circle.business ba ON c.participant_a_uid = ba.business_uid
+                LEFT JOIN every_circle.business bb ON c.participant_b_uid = bb.business_uid
+                LEFT JOIN every_circle.business_user bua ON c.participant_a_uid = bua.bu_business_id
+                LEFT JOIN every_circle.business_user bub ON c.participant_b_uid = bub.bu_business_id
+                LEFT JOIN every_circle.profile_personal bpa ON bua.bu_user_id = bpa.profile_personal_user_id
+                LEFT JOIN every_circle.profile_personal bpb ON bub.bu_user_id = bpb.profile_personal_user_id
+                LEFT JOIN every_circle.messages m ON c.conversation_uid = m.message_conversation_id
+                # WHERE  (c.participant_a_uid = '110-000018'
+                #     OR c.participant_b_uid = '110-000018'
+                #     OR bpa.profile_personal_user_id = '110-000018'
+                #     OR bpb.profile_personal_user_id = '110-000018')
+                #     AND last_message_at = message_sent_at
+                WHERE  (c.participant_a_uid = %s
+                    OR c.participant_b_uid = %s
+                    OR bpa.profile_personal_user_id = %s
+                    OR bpb.profile_personal_user_id = %s)
+                    AND last_message_at = message_sent_at
+                ORDER BY c.created_at DESC;
+            """
+
+        args=(profile_uid, profile_uid, profile_uid, profile_uid)
+        with connect() as db:
+            # print("chat query: ", query)
+            # print("chat args: ", args)
+            rows = db.execute(
+                query,
+                args,
             )
         conversations = rows.get("result") or []
 
         # Enrich each conversation with the other participant's profile
         result = []
-        for conv in conversations:
-            other_uid = conv.get("other_uid")
-            info = _get_participant_info(other_uid) if other_uid else {}
-            other_info = {
-                "first_name": info.get("first_name"),
-                "last_name":  info.get("last_name"),
-                "image":      info.get("image"),
-            }
 
-            result.append(
-                {
-                    "conversation_uid": conv.get("conversation_uid"),
-                    "last_message_at": str(conv.get("last_message_at") or ""),
-                    "last_message": conv.get("last_message"),
-                    "last_sent_at": str(conv.get("last_sent_at") or ""),
-                    "other_uid": other_uid,
-                    "my_uid": profile_uid,  # lets the client know which side it is
-                    **other_info,
-                }
-            )
-
-        return {"message": "Success", "code": 200, "result": result}, 200
+        return {"message": "Success", "code": 200, "result": conversations}, 200
 
 
 class Messages(Resource):
@@ -270,6 +358,11 @@ class Messages(Resource):
 
     POST /api/v1/chat/messages
         Body: { conversation_uid, sender_uid, body }
+        Persists: message_conversation_id, message_sender_uid, message_body, message_sent_at
+
+    PUT  /api/v1/chat/messages  or  /api/v1/chat/messages/<conversation_uid>
+        Body: { message_uid, message_read_at? } — sets message_read_at (defaults to now UTC).
+        If conversation_uid is in the path, the row must belong to that conversation.
     """
 
     def get(self, conversation_uid):
@@ -277,24 +370,25 @@ class Messages(Resource):
         before = request.args.get("before")
 
         query = """
-            SELECT message_uid, sender_uid, body, sent_at
+            SELECT * 
             FROM every_circle.messages
-            WHERE conversation_uid = %s
+            -- WHERE message_conversation_id = '800-000002'
+            WHERE message_conversation_id = %s
+            ORDER BY message_sent_at DESC
+            LIMIT %s
         """
-        args = [conversation_uid]
-        if before:
-            query += " AND sent_at < %s"
-            args.append(before)
-        query += " ORDER BY sent_at DESC LIMIT %s"
-        args.append(limit)
+        args = [conversation_uid, limit]
+        # if before:
+        #     query += " AND message_sent_at < %s"
+        #     args.append(before)
+        # query += " ORDER BY message_sent_at DESC LIMIT %s"
+        # args.append(limit)
 
         with connect() as db:
+            # print("chat query: ", query)
+            # print("chat args: ", args)
             rows = db.execute(query, args=tuple(args))
-
-        # Return oldest-first so the frontend can render top-to-bottom
-        messages = list(reversed(rows.get("result") or []))
-        for m in messages:
-            m["sent_at"] = str(m.get("sent_at") or "")
+            messages = rows.get("result") or []
 
         return {"message": "Success", "code": 200, "result": messages}, 200
 
@@ -317,8 +411,9 @@ class Messages(Resource):
             db.execute(
                 """
                 INSERT INTO every_circle.messages
-                    (message_uid, conversation_uid, sender_uid, body, sent_at)
-                VALUES (%s, %s, %s, %s, %s)
+                    (message_uid, message_conversation_id, message_sender_uid,
+                     message_body, message_sent_at, message_read_at)
+                VALUES (%s, %s, %s, %s, %s, NULL)
                 """,
                 args=(msg_uid, conv_uid, sender_uid, body, now),
                 cmd="post",
@@ -350,4 +445,53 @@ class Messages(Resource):
             "code": 200,
             "message_uid": msg_uid,
             "sent_at": now,
+            "message_sent_at": now,
+        }, 200
+
+    def put(self, conversation_uid=None):
+        data = request.get_json(silent=True) or {}
+        message_uid = data.get("message_uid")
+        if not message_uid:
+            return {"message": "message_uid is required", "code": 400}, 400
+
+        read_at = data.get("message_read_at")
+        if read_at:
+            read_at = str(read_at).strip()
+        if not read_at:
+            read_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        if conversation_uid:
+            sql = """
+                UPDATE every_circle.messages
+                SET message_read_at = %s
+                WHERE message_uid = %s AND message_conversation_id = %s
+            """
+            args = (read_at, message_uid, conversation_uid)
+        else:
+            sql = """
+                UPDATE every_circle.messages
+                SET message_read_at = %s
+                WHERE message_uid = %s
+            """
+            args = (read_at, message_uid)
+
+        with connect() as db:
+            res = db.execute(sql, args=args, cmd="post")
+            if res.get("code") != 200:
+                return {
+                    "message": res.get("message", "Update failed"),
+                    "code": res.get("code", 500),
+                }, res.get("code", 500)
+            affected = str(res.get("change", ""))
+            if affected.startswith("0 rows"):
+                return {
+                    "message": "No message updated (check message_uid or conversation)",
+                    "code": 404,
+                }, 404
+
+        return {
+            "message": "Message updated",
+            "code": 200,
+            "message_uid": message_uid,
+            "message_read_at": read_at,
         }, 200

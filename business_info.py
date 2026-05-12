@@ -39,6 +39,20 @@ def _parse_public_flag(value):
     return 1 if s else 0
 
 
+def _normalize_business_cc_fee_payer(value):
+    """Persist only 'seller' or 'buyer'; empty / null / none -> 'seller'."""
+    if value is None:
+        return "seller"
+    s = str(value).strip().lower()
+    if s in ("", "none", "null"):
+        return "seller"
+    if s == "buyer":
+        return "buyer"
+    if s == "seller":
+        return "seller"
+    return "seller"
+
+
 # Only columns that exist on every_circle.business_services. Keys not in this set
 # are dropped on PUT (they do not cause SQL errors).
 #
@@ -590,6 +604,13 @@ class BusinessInfo(Resource):
                 service_image_0_is_public = payload.pop(
                     "bs_service_image_0_is_public", None
                 )
+
+                if "business_cc_fee_payer" in payload:
+                    payload["business_cc_fee_payer"] = _normalize_business_cc_fee_payer(
+                        payload.get("business_cc_fee_payer")
+                    )
+                else:
+                    payload["business_cc_fee_payer"] = "seller"
 
                 # print("Insert Payload: ", payload)
                 insert_response = db.insert("every_circle.business", payload)
@@ -1313,7 +1334,15 @@ class BusinessInfo(Resource):
                     "business_google_rating",
                     "business_joined_timestamp",
                     "business_is_active",
+                    "business_cc_fee_payer",
                 ]
+
+                if "business_cc_fee_payer" in request.form:
+                    payload["business_cc_fee_payer"] = _normalize_business_cc_fee_payer(
+                        request.form.get("business_cc_fee_payer")
+                    )
+                else:
+                    payload.pop("business_cc_fee_payer", None)
 
                 # Remove any fields that don't exist in the business table
                 invalid_fields = [
@@ -2016,6 +2045,7 @@ class BusinessInfo(Resource):
                     "business_price_level": place_data.get("price_level"),
                     "business_google_rating": str(place_data.get("rating")),
                     "business_website": place_data.get("website"),
+                    "business_cc_fee_payer": "seller",
                 }
 
                 # Insert into database
@@ -2027,7 +2057,7 @@ class BusinessInfo(Resource):
                         business_country, business_zip_code, business_latitude, 
                         business_longitude, business_joined_timestamp, 
                         business_price_level, business_google_rating, 
-                        business_website, business_is_active)
+                        business_website, business_is_active, business_cc_fee_payer)
                     VALUES 
                         (%(business_uid)s, %(business_google_id)s, %(business_name)s,
                         %(business_phone_number)s, 1,
@@ -2035,7 +2065,7 @@ class BusinessInfo(Resource):
                         %(business_country)s, %(business_zip_code)s, %(business_latitude)s,
                         %(business_longitude)s, %(business_joined_timestamp)s,
                         %(business_price_level)s, %(business_google_rating)s,
-                        %(business_website)s, 1)
+                        %(business_website)s, 1, %(business_cc_fee_payer)s)
                     ON DUPLICATE KEY UPDATE
                         business_name = %(business_name)s,
                         business_phone_number = %(business_phone_number)s,
