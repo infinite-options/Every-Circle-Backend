@@ -20,7 +20,7 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessAvgRatings, BusinessMaxBounty, Businesses, BusinessTagSearch, BusinessServicePurchase  
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase  
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -561,8 +561,8 @@ api.add_resource(Conversations,   '/api/v1/chat/conversations', '/api/v1/chat/co
 api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/messages/<string:conversation_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
-api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
-api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
+api.add_resource(BusinessDetails, '/api/v1/business_details')
+# api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 api.add_resource(AblyToken, '/api/v1/ably/token')
 api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')

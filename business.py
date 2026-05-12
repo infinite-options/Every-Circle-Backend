@@ -3,8 +3,10 @@ from flask_restful import Resource
 from werkzeug.exceptions import BadRequest
 from datetime import datetime
 import ast
+import traceback
 
 from data_ec import connect, uploadImage, s3, processImage
+
 
 # add google social id in GET api
 class Business(Resource):
@@ -396,70 +398,134 @@ class Businesses(Resource):
             return response, 500
         
 
-class BusinessAvgRatings(Resource):
-    def get(self):
-        business_uids = request.args.get('uids', '').strip()
-        viewer_uid = request.args.get('viewer_uid', '').strip()
-        if not business_uids:
-            return {'message': 'uids required', 'code': 400}, 400
-        
-        uid_list = [uid.strip() for uid in business_uids.split(',')]
-        placeholders = ','.join([f"'{uid}'" for uid in uid_list])
-        
-        response = {}
+class BusinessDetails(Resource):
+    """
+    POST JSON: { "uids": ["200-000101", ...], "profile_uid": "110-000015" }
+    profile_uid is optional; when empty, nearest_connection is not computed.
+    Same response body as legacy GET /api/v1/businessavgratings.
+    """
+
+    def post(self):
         try:
+            body = request.get_json(silent=True) or {}
+            uids = body.get("uids")
+            profile_uid = body.get("profile_uid")
+
+            if not isinstance(uids, list):
+                return {"message": "uids must be a JSON array", "code": 400}, 400
+
+            uid_list = [str(u).strip() for u in uids if u is not None and str(u).strip()]
+            if not uid_list:
+                return {"message": "uids required", "code": 400}, 400
+
+            viewer_uid = ""
+            if profile_uid is not None:
+                viewer_uid = str(profile_uid).strip()
+
             with connect() as db:
-                # Initialize all requested businesses (even those with no ratings)
+                placeholders = ",".join([f"'{uid}'" for uid in uid_list])
+
                 ratings_map = {
                     uid: {
-                        'avg_rating': None,
-                        'rating_count': 0,
-                        'nearest_connection': None,
+                        "avg_rating": None,
+                        "rating_count": 0,
+                        "nearest_connection": None,
+                        "max_bounty": None,
+                        "max_per_item_bounty": None,
+                        "max_total_bounty": None,
                     }
                     for uid in uid_list
                 }
 
-                query = f"""
-                    SELECT 
+                bounty_query = f"""
+                    SELECT
+                        bs_business_id,
+                        MAX(
+                            CASE
+                                WHEN bs_bounty_type = 'per_item'
+                                THEN bs_bounty
+                            END
+                        ) AS max_per_item_bounty,
+
+                        MAX(
+                            CASE
+                                WHEN bs_bounty_type = 'total'
+                                THEN bs_bounty
+                            END
+                        ) AS max_total_bounty,
+
+                        MAX(bs_bounty) AS max_bounty
+
+                    FROM every_circle.business_services
+
+                    WHERE bs_business_id IN ({placeholders})
+                    AND bs_bounty IS NOT NULL
+                    AND bs_bounty > 0
+
+                    GROUP BY bs_business_id
+                """
+
+                bounty_result = db.execute(bounty_query)
+                bounty_map = {}
+
+                if bounty_result.get("result"):
+                    for row in bounty_result["result"]:
+                        bounty_map[row["bs_business_id"]] = {
+                            "max_bounty": row["max_bounty"],
+                            "max_per_item_bounty": row["max_per_item_bounty"],
+                            "max_total_bounty": row["max_total_bounty"],
+                        }
+
+                for bid, bounty_data in bounty_map.items():
+                    if bid in ratings_map:
+                        ratings_map[bid].update(bounty_data)
+
+                ratings_sql = f"""
+                    SELECT
                         rating_business_id,
                         ROUND(AVG(rating_star), 1) AS avg_rating,
                         COUNT(rating_uid) AS rating_count
+
                     FROM every_circle.ratings
+
                     WHERE rating_business_id IN ({placeholders})
+
                     GROUP BY rating_business_id
                 """
-                result = db.execute(query)
-                if result['result']:
-                    for row in result['result']:
-                        bid = row['rating_business_id']
-                        ratings_map[bid]['avg_rating'] = row['avg_rating']
-                        ratings_map[bid]['rating_count'] = row['rating_count']
 
-                # If viewer_uid provided, BFS through referral tree to find
-                # degree from viewer to any reviewer of each business
+                ratings_result = db.execute(ratings_sql)
+
+                if ratings_result.get("result"):
+                    for row in ratings_result["result"]:
+                        bid = row["rating_business_id"]
+                        ratings_map[bid]["avg_rating"] = row["avg_rating"]
+                        ratings_map[bid]["rating_count"] = row["rating_count"]
+
                 if viewer_uid:
-                    # Get all reviewer UIDs for these businesses
                     reviewer_query = f"""
-                        SELECT rating_business_id, rating_profile_id
+                        SELECT
+                            rating_business_id,
+                            rating_profile_id
+
                         FROM every_circle.ratings
+
                         WHERE rating_business_id IN ({placeholders})
                     """
-                    # print("reviewer_query: ", reviewer_query)
+
                     reviewer_result = db.execute(reviewer_query)
-                    # print("reviewer_result: ", reviewer_result)
                     biz_reviewers = {}
-                    if reviewer_result.get('result'):
-                        for row in reviewer_result['result']:
+
+                    if reviewer_result.get("result"):
+                        for row in reviewer_result["result"]:
                             biz_reviewers.setdefault(
-                                row['rating_business_id'], []
-                            ).append(row['rating_profile_id'])
+                                row["rating_business_id"], []
+                            ).append(row["rating_profile_id"])
 
                     all_reviewer_uids = set(
                         uid for uids in biz_reviewers.values() for uid in uids
                     )
-                    print("all_reviewer_uids: ", all_reviewer_uids)
+
                     if all_reviewer_uids:
-                        # BFS: expand frontier in both directions (down=referred by me, up=who referred me)
                         reviewer_degrees = {}
                         seen = {viewer_uid}
                         frontier = [viewer_uid]
@@ -467,78 +533,75 @@ class BusinessAvgRatings(Resource):
                         for degree in range(1, 16):
                             if not frontier:
                                 break
-                            if not (all_reviewer_uids - set(reviewer_degrees.keys())):
+
+                            if not (
+                                all_reviewer_uids - set(reviewer_degrees.keys())
+                            ):
                                 break
-                            ph = ','.join(f"'{u}'" for u in frontier)
+
+                            ph = ",".join(f"'{u}'" for u in frontier)
+
                             r_down = db.execute(
-                                f"SELECT profile_personal_uid FROM every_circle.profile_personal WHERE profile_personal_referred_by IN ({ph})"
+                                f"""
+                                SELECT profile_personal_uid
+
+                                FROM every_circle.profile_personal
+
+                                WHERE profile_personal_referred_by IN ({ph})
+                                """
                             )
+
                             r_up = db.execute(
-                                f"SELECT profile_personal_referred_by AS uid FROM every_circle.profile_personal WHERE profile_personal_uid IN ({ph}) AND profile_personal_referred_by IS NOT NULL"
+                                f"""
+                                SELECT profile_personal_referred_by AS uid
+
+                                FROM every_circle.profile_personal
+
+                                WHERE profile_personal_uid IN ({ph})
+                                AND profile_personal_referred_by IS NOT NULL
+                                """
                             )
+
                             next_frontier = []
-                            for row in (r_down.get('result') or []) + (r_up.get('result') or []):
-                                uid = row.get('profile_personal_uid') or row.get('uid')
+
+                            for row in (r_down.get("result") or []) + (
+                                r_up.get("result") or []
+                            ):
+                                uid = row.get("profile_personal_uid") or row.get(
+                                    "uid"
+                                )
+
                                 if uid and uid not in seen:
                                     seen.add(uid)
                                     next_frontier.append(uid)
+
                                     if uid in all_reviewer_uids:
                                         reviewer_degrees[uid] = degree
+
                             frontier = next_frontier
 
-                        # For each business, pick the min degree among its reviewers
                         for bid, reviewers in biz_reviewers.items():
                             degrees = [
                                 reviewer_degrees[r]
                                 for r in reviewers
                                 if r in reviewer_degrees
                             ]
+
                             if degrees:
-                                ratings_map[bid]['nearest_connection'] = min(degrees)
+                                ratings_map[bid]["nearest_connection"] = min(
+                                    degrees
+                                )
 
-                response['result'] = ratings_map
-                return response, 200
+                return {"result": ratings_map}, 200
+
         except Exception as e:
-            return {'message': 'Internal Server Error', 'code': 500}, 500
-
-
-class BusinessMaxBounty(Resource):
-    def get(self):
-        business_uids = request.args.get('uids', '').strip()
-        if not business_uids:
-            return {'message': 'uids required', 'code': 400}, 400
-
-        uid_list = [uid.strip() for uid in business_uids.split(',')]
-        placeholders = ','.join([f"'{uid}'" for uid in uid_list])
-
-        response = {}
-        try:
-            with connect() as db:
-                query = f"""
-                    SELECT
-                        bs_business_id,
-                        MAX(CASE WHEN bs_bounty_type = 'per_item' THEN bs_bounty END) AS max_per_item_bounty,
-                        MAX(CASE WHEN bs_bounty_type = 'total'    THEN bs_bounty END) AS max_total_bounty,
-                        MAX(bs_bounty) AS max_bounty
-                    FROM every_circle.business_services
-                    WHERE bs_business_id IN ({placeholders})
-                      AND bs_bounty IS NOT NULL AND bs_bounty > 0
-                    GROUP BY bs_business_id
-                """
-                result = db.execute(query)
-                bounty_map = {}
-                if result['result']:
-                    for row in result['result']:
-                        bounty_map[row['bs_business_id']] = {
-                            'max_bounty': row['max_bounty'],
-                            'max_per_item_bounty': row['max_per_item_bounty'],
-                            'max_total_bounty': row['max_total_bounty'],
-                        }
-                response['result'] = bounty_map
-                return response, 200
-        except Exception as e:
-            print(f"Error in BusinessMaxBounty GET: {str(e)}")
-            return {'message': 'Internal Server Error', 'code': 500}, 500
+            print("ERROR:", str(e))
+            traceback.print_exc()
+            return {
+                "message": "Internal Server Error",
+                "code": 500,
+                "error": str(e),
+            }, 500
 
 
 class BusinessTagSearch(Resource):
