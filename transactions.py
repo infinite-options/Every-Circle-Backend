@@ -34,77 +34,80 @@ class Transactions(Resource):
             with connect() as db:
                 # Execute query with parameterized profile_id for security
                 query = """
-                   SELECT
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_taxes,
-                       t.transaction_profile_id,
-                       t.transaction_in_escrow,
-                       t.transaction_return_requested,
-                       t.transaction_return_note,
-                       t.transaction_return_status,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_uid
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN expertise_pp.profile_personal_uid
-                           ELSE NULL
-                       END AS seller_id,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN
-                               CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
-                           ELSE NULL
-                       END AS business_name,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
-                           WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
-                           ELSE 'Unknown'
-                       END AS purchase_type,
-                       GROUP_CONCAT(
-                           CASE
-                               WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
-                               WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
-                               WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
-                               ELSE 'See Receipt'
-                           END
-                           ORDER BY ti.ti_uid
-                           SEPARATOR ', '
-                       ) AS purchased_item,
-                       SUM(ti.ti_bs_qty) AS ti_bs_qty,
-                       MIN(ti.ti_uid) AS ti_uid
-                   FROM every_circle.transactions t
-                   LEFT JOIN every_circle.transactions_items ti
-                       ON t.transaction_uid = ti.ti_transaction_id
-                   LEFT JOIN every_circle.business_services bs
-                       ON ti.ti_bs_id = bs.bs_uid
-                   LEFT JOIN every_circle.business biz
-                       ON bs.bs_business_id = biz.business_uid
-                   LEFT JOIN every_circle.profile_personal seller_pp
-                       ON biz.`business_user_id-DNU` = seller_pp.profile_personal_user_id
-                   LEFT JOIN every_circle.profile_expertise pe
-                       ON ti.ti_bs_id = pe.profile_expertise_uid
-                   LEFT JOIN every_circle.profile_personal expertise_pp
-                       ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
-                   LEFT JOIN every_circle.wish_response wr
-                       ON ti.ti_bs_id = wr.wish_response_uid
-                   LEFT JOIN every_circle.profile_wish pw
-                       ON wr.wr_profile_wish_id = pw.profile_wish_uid
-                   WHERE t.transaction_profile_id = %s
-                   GROUP BY
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_profile_id,
-                       seller_id,
-                       business_name,
-                       purchase_type
-                   ORDER BY t.transaction_datetime DESC, ti_uid ASC
+                    SELECT
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_taxes,
+                    t.transaction_profile_id,
+                    t.transaction_in_escrow,
+                    t.transaction_return_requested,
+                    t.transaction_return_note,
+                    t.transaction_return_status,
+                    t.transaction_business_id AS seller_id,
+                    -- ti.*,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                            CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN
+                            CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                        ELSE NULL
+                    END AS business_name,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                        ELSE 'Unknown'
+                    END AS purchase_type,
+                    GROUP_CONCAT(
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                            ELSE 'See Receipt'
+                        END
+                        ORDER BY ti.ti_uid
+                        SEPARATOR ', '
+                    ) AS purchased_item,
+                    SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                    MIN(ti.ti_uid) AS ti_uid
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                    ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                    ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                    ON bs.bs_business_id = biz.business_uid
+                    
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    LEFT JOIN every_circle.profile_expertise pe
+                    ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                    ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                    ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    LEFT JOIN every_circle.profile_personal wish_pp
+                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
+                    WHERE t.transaction_profile_id = %s
+                    -- WHERE t.transaction_profile_id = '110-000014'
+                    GROUP BY
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_profile_id,
+                    seller_id,
+                    business_name,
+                    purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
 
                 print(f"Executing query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
-                print(f"Query result: {result}")
+                # print(f"Query result: {result}")
 
                 if result.get("code") == 200:
                     response["message"] = "Transactions retrieved successfully"
@@ -766,7 +769,7 @@ class SellerTransactions(Resource):
 
                 print(f"Executing seller query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
-                print(f"Seller query result: {result}")
+                # print(f"Seller query result: {result}")
 
                 if result.get("code") == 200:
                     response["message"] = "Seller transactions retrieved successfully"
