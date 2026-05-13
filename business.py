@@ -400,9 +400,9 @@ class Businesses(Resource):
 
 class BusinessDetails(Resource):
     """
-    POST JSON: { "uids": ["200-000101", ...], "profile_uid": "110-000015" }
-    profile_uid is optional; when empty, nearest_connection is not computed.
-    Same response body as legacy GET /api/v1/businessavgratings.
+    POST JSON: { "uids": [...], "profile_uid": "..." }
+    Returns per-business: avg_rating, rating_count, nearest_connection,
+    max_bounty fields, and product_count (COUNT(bs_uid) from bounty query).
     """
 
     def post(self):
@@ -433,6 +433,7 @@ class BusinessDetails(Resource):
                         "max_bounty": None,
                         "max_per_item_bounty": None,
                         "max_total_bounty": None,
+                        "product_count": 0,
                     }
                     for uid in uid_list
                 }
@@ -440,6 +441,7 @@ class BusinessDetails(Resource):
                 bounty_query = f"""
                     SELECT
                         bs_business_id,
+                        COUNT(bs_uid) AS product_count,
                         MAX(
                             CASE
                                 WHEN bs_bounty_type = 'per_item'
@@ -459,8 +461,8 @@ class BusinessDetails(Resource):
                     FROM every_circle.business_services
 
                     WHERE bs_business_id IN ({placeholders})
-                    AND bs_bounty IS NOT NULL
-                    AND bs_bounty > 0
+                    -- AND bs_bounty IS NOT NULL
+                    -- AND bs_bounty > 0
 
                     GROUP BY bs_business_id
                 """
@@ -474,6 +476,7 @@ class BusinessDetails(Resource):
                             "max_bounty": row["max_bounty"],
                             "max_per_item_bounty": row["max_per_item_bounty"],
                             "max_total_bounty": row["max_total_bounty"],
+                            "product_count": row["product_count"],
                         }
 
                 for bid, bounty_data in bounty_map.items():
