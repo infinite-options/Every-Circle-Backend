@@ -483,18 +483,48 @@ class Transactions(Resource):
                             print(f"Error getting connection path: {str(e)}")
                             combined_path = None
 
-                        # Deduplicate known_participants while preserving order
-                        # e.g. buyer == recommender would otherwise create two tb records for the same person
-                        seen = set()
+                        profile_id = payload.get("profile_id")
+                        buyer_is_recommender = (
+                            profile_id
+                            and recommender_profile_id
+                            and profile_id == recommender_profile_id
+                        )
                         known_participants = []
-                        for p in [
-                            payload.get("profile_id"),
-                            recommender_profile_id,
-                            "every-circle",
-                        ]:
-                            if p and p not in seen:
-                                seen.add(p)
-                                known_participants.append(p)
+                        if buyer_is_recommender:
+                            known_participants.append(
+                                {
+                                    "tb_profile_id": profile_id,
+                                    "tb_percentage": "0.4",
+                                    "tb_amount": round(0.40 * effective_bounty, 4),
+                                }
+                            )
+                        else:
+                            if profile_id:
+                                known_participants.append(
+                                    {
+                                        "tb_profile_id": profile_id,
+                                        "tb_percentage": "0.2",
+                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                    }
+                                )
+                            if recommender_profile_id:
+                                known_participants.append(
+                                    {
+                                        "tb_profile_id": recommender_profile_id,
+                                        "tb_percentage": "0.2",
+                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                    }
+                                )
+                        known_participants.append(
+                            {
+                                "tb_profile_id": "every-circle",
+                                "tb_percentage": "0.2",
+                                "tb_amount": round(0.20 * effective_bounty, 4),
+                            }
+                        )
+                        seen = {
+                            p["tb_profile_id"] for p in known_participants if p["tb_profile_id"]
+                        }
 
                         # Process network path if available
                         network_result = []
@@ -519,10 +549,11 @@ class Transactions(Resource):
 
                         # Process known participants (buyer, recommender, every-circle)
                         for participant in known_participants:
-                            if not participant:
+                            participant_id = participant.get("tb_profile_id")
+                            if not participant_id:
                                 continue
 
-                            print(f"Processing known participant: {participant}")
+                            print(f"Processing known participant: {participant_id}")
 
                             try:
                                 transaction_bounty_stored_procedure_response = db.call(
@@ -540,7 +571,7 @@ class Transactions(Resource):
                                     == 0
                                 ):
                                     print(
-                                        f"Warning: Failed to generate bounty UID for participant: {participant}"
+                                        f"Warning: Failed to generate bounty UID for participant: {participant_id}"
                                     )
                                     continue
 
@@ -559,9 +590,9 @@ class Transactions(Resource):
                                 tx_bounty = {
                                     "tb_uid": new_transaction_bounty_uid,
                                     "tb_ti_id": new_transaction_item_uid,
-                                    "tb_profile_id": participant,
-                                    "tb_percentage": "0.2",
-                                    "tb_amount": round(0.20 * effective_bounty, 4),
+                                    "tb_profile_id": participant_id,
+                                    "tb_percentage": participant["tb_percentage"],
+                                    "tb_amount": participant["tb_amount"],
                                 }
                                 print("tx_bounty: ", tx_bounty)
 
@@ -577,11 +608,11 @@ class Transactions(Resource):
                                     bounty_count += 1
                                 else:
                                     print(
-                                        f"Warning: Failed to insert bounty for participant {participant}: {bounty_response}"
+                                        f"Warning: Failed to insert bounty for participant {participant_id}: {bounty_response}"
                                     )
                             except Exception as e:
                                 print(
-                                    f"Error processing bounty for participant {participant}: {str(e)}"
+                                    f"Error processing bounty for participant {participant_id}: {str(e)}"
                                 )
                                 continue
 
