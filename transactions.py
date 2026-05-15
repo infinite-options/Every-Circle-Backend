@@ -39,6 +39,7 @@ class Transactions(Resource):
                     t.transaction_datetime,
                     t.transaction_total,
                     t.transaction_taxes,
+                    t.transaction_fees,
                     t.transaction_profile_id,
                     t.transaction_in_escrow,
                     t.transaction_return_requested,
@@ -167,6 +168,7 @@ class Transactions(Resource):
                 "transaction_total": payload.get("total_amount_paid"),
                 "transaction_amount": payload.get("total_costs"),
                 "transaction_taxes": payload.get("total_taxes"),
+                "transaction_fees": payload.get("total_fees"),
                 "transaction_in_escrow": (
                     1 if payload.get("transaction_in_escrow") else 0
                 ),
@@ -750,6 +752,7 @@ class SellerTransactions(Resource):
                        t.transaction_datetime,
                        t.transaction_total,
                        t.transaction_taxes,
+                       t.transaction_fees,
                        t.transaction_business_id,
                        t.transaction_profile_id,
                        t.transaction_in_escrow,
