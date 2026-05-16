@@ -32,7 +32,12 @@ from chatbot import ChatbotAPI
 from tag_generator_api import TagGeneratorAPI
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
-from transactions import Transactions, SellerTransactions, DeclinedReturns
+from transactions import (
+    Transactions,
+    SellerTransactions,
+    ReturnTransactions,
+    DeclinedReturns,
+)
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -565,6 +570,7 @@ api.add_resource(BusinessDetails, '/api/v1/business_details')
 # api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 api.add_resource(AblyToken, '/api/v1/ably/token')
+api.add_resource(ReturnTransactions, '/api/v1/transactions/return')
 api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")

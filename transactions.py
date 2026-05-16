@@ -826,6 +826,176 @@ class SellerTransactions(Resource):
             return response, 500
         
 
+class ReturnTransactions(Resource):
+
+    def post(self):
+        print("In ReturnTransactions POST")
+
+        response = {}
+
+        try:
+            payload = request.get_json()
+
+            print("ReturnTransactions received:", payload)
+
+            transaction_items = payload.get('transaction_return_items', [])
+
+            # ----------------------------------------
+            # Build return quantity lookup map
+            # ----------------------------------------
+
+            return_qty_map = {
+                item['transaction_item_uid']: int(item['return_quantity'])
+                for item in transaction_items
+            }
+
+            item_uids = list(return_qty_map.keys())
+
+            if not item_uids:
+                return {
+                    'message': 'No transaction items provided',
+                    'code': 400
+                }, 400
+
+            placeholders = ', '.join(['%s'] * len(item_uids))
+
+            query = f"""
+                SELECT *
+                FROM every_circle.transactions_items
+                WHERE ti_uid IN ({placeholders})
+            """
+
+            print("query:", query)
+            print("item_uids:", item_uids)
+
+            with connect() as db:
+
+                result = db.execute(query, item_uids)
+
+                print("transaction_items_result:", result)
+
+                if not result.get('result'):
+                    return {
+                        'message': 'No matching transaction items found',
+                        'code': 404
+                    }, 404
+
+                inserted_items = []
+
+                for row in result['result']:
+
+                    original_uid = row['ti_uid']
+
+                    # ----------------------------------------
+                    # Get requested return quantity
+                    # ----------------------------------------
+
+                    return_qty = return_qty_map.get(original_uid)
+
+                    if return_qty is None:
+                        continue
+
+                    # ----------------------------------------
+                    # Validate quantity
+                    # ----------------------------------------
+
+                    original_qty = int(row['ti_bs_qty'])
+
+                    if return_qty > original_qty:
+                        return {
+                            'message': f'Return quantity exceeds original quantity for {original_uid}',
+                            'code': 400
+                        }, 400
+
+                    # ----------------------------------------
+                    # Generate NEW transaction item UID
+                    # ----------------------------------------
+
+                    transaction_item_stored_procedure_response = db.call(
+                        procedure="new_transaction_item_uid"
+                    )
+
+                    print(
+                        "transaction_item_stored_procedure_response:",
+                        transaction_item_stored_procedure_response
+                    )
+
+                    new_transaction_item_uid = (
+                        transaction_item_stored_procedure_response['result'][0]['new_id']
+                    )
+
+                    # ----------------------------------------
+                    # Create new return transaction item
+                    # ----------------------------------------
+
+                    new_item = dict(row)
+
+                    # Assign new UID
+                    new_item['ti_uid'] = new_transaction_item_uid
+
+                    # Replace quantity with negative return quantity
+                    new_item['ti_bs_qty'] = -abs(return_qty)
+
+                    print("new_return_item:", new_item)
+
+                    insert_query = """
+                        INSERT INTO every_circle.transactions_items (
+                            ti_uid,
+                            ti_transaction_id,
+                            ti_bs_id,
+                            ti_bs_qty,
+                            ti_bs_cost,
+                            ti_bs_cost_currency,
+                            ti_bs_sku,
+                            ti_bs_is_taxable,
+                            ti_bs_tax_rate,
+                            ti_bs_refund_policy,
+                            ti_bs_return_window_days
+                        )
+                        VALUES (
+                            %(ti_uid)s,
+                            %(ti_transaction_id)s,
+                            %(ti_bs_id)s,
+                            %(ti_bs_qty)s,
+                            %(ti_bs_cost)s,
+                            %(ti_bs_cost_currency)s,
+                            %(ti_bs_sku)s,
+                            %(ti_bs_is_taxable)s,
+                            %(ti_bs_tax_rate)s,
+                            %(ti_bs_refund_policy)s,
+                            %(ti_bs_return_window_days)s
+                        )
+                    """
+
+                    # Must use cmd='post' so execute() commits; default 'get' does not commit
+                    # and closing the connection rolls back the INSERT.
+                    insert_result = db.execute(insert_query, new_item, "post")
+
+                    print("insert_result:", insert_result)
+
+                    inserted_items.append({
+                        'original_ti_uid': original_uid,
+                        'new_ti_uid': new_transaction_item_uid,
+                        'return_quantity': new_item['ti_bs_qty'],
+                        'insert_result': insert_result
+                    })
+
+                response['message'] = 'Return transaction items created successfully'
+                response['code'] = 200
+                response['result'] = inserted_items
+
+                return response, 200
+
+        except Exception as e:
+
+            print(f"Error in ReturnTransactions POST: {str(e)}")
+            print(traceback.format_exc())
+
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+
+            return response, 500
+
 class DeclinedReturns(Resource):
 
     def get(self):
