@@ -32,7 +32,12 @@ from chatbot import ChatbotAPI
 from tag_generator_api import TagGeneratorAPI
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
-from transactions import Transactions, SellerTransactions, DeclinedReturns
+from transactions import (
+    Transactions,
+    SellerTransactions,
+    DeclinedReturns,
+    ReturnTransaction,
+)
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -536,6 +541,8 @@ api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<strin
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
+# Static paths must register before `/api/v1/transactions/<profile_id>` so `return` is not captured as profile_id.
+api.add_resource(ReturnTransaction, '/api/v1/transactions/return')
 api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 

@@ -19,6 +19,417 @@ def _strip_currency(value):
     return value
 
 
+def _to_float(value):
+    if value is None:
+        return 0.0
+    try:
+        return float(_strip_currency(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bounty_scale_for_line(return_qty, original_qty):
+    """Scale bounty reversal for a partial line return (return_qty / original_qty)."""
+    if original_qty <= 0:
+        return None
+    rq = int(return_qty)
+    oq = int(original_qty)
+    if rq <= 0 or rq > oq:
+        return None
+    return rq / float(oq)
+
+
+def _tax_amount_for_line(line_subtotal, ti_bs_is_taxable, ti_bs_tax_rate):
+    if not ti_bs_is_taxable:
+        return 0.0
+    rate = _to_float(ti_bs_tax_rate)
+    if rate <= 0:
+        return 0.0
+    # Rates may be stored as whole percent (e.g. 8.25) or fraction (0.0825).
+    if rate > 1:
+        rate = rate / 100.0
+    return round(line_subtotal * rate, 4)
+
+
+class ReturnTransaction(Resource):
+    """
+    POST: record a return as a negative sale (new transaction + negative line items + bounty reversals).
+
+    Required from Front End:
+      - profile_id: buyer profile (must match original transaction_profile_id).
+      - transaction_uid: original sale to return against.
+      - transaction_return_items: [{ "transaction_item_uid": "<ti_uid>", "return_quantity": <int> }, ...]
+
+    Optional from Front End:
+      - transaction_return_note
+      - transaction_return_requested / transaction_return_status (updates original tx metadata after success)
+
+    Loaded from DB (not required from FE):
+      - Original transaction row (seller, buyer, stripe PI, historical taxes/fees).
+      - Each transactions_items row (ti_bs_cost, qty, tax flags, ti_bs_id).
+      - transactions_bounty rows per original ti_uid for reversal amounts.
+
+    Still missing / follow-ups:
+      - Cumulative returned qty per line (needs column or ledger query) to block over-returning.
+      - Stripe Refund API call + storing refund id (money movement).
+      - Restocking via BusinessServicePurchase inverse when applicable.
+    """
+
+    def post(self):
+        print("In ReturnTransaction POST")
+        response = {}
+
+        try:
+            payload = request.get_json()
+            if not payload:
+                response["message"] = "Request body is required"
+                response["code"] = 400
+                return response, 400
+
+            profile_id = payload.get("profile_id")
+            original_tx_uid = payload.get("transaction_uid")
+            items_payload = payload.get("transaction_return_items") or []
+
+            if not profile_id:
+                response["message"] = "profile_id is required"
+                response["code"] = 400
+                return response, 400
+            if not original_tx_uid:
+                response["message"] = "transaction_uid is required"
+                response["code"] = 400
+                return response, 400
+            if not isinstance(items_payload, list) or len(items_payload) == 0:
+                response["message"] = (
+                    "transaction_return_items must be a non-empty list"
+                )
+                response["code"] = 400
+                return response, 400
+
+            return_note = payload.get("transaction_return_note")
+
+            with connect() as db:
+                tx_row_q = db.execute(
+                    """
+                    SELECT transaction_uid, transaction_profile_id, transaction_business_id,
+                           transaction_stripe_pi, transaction_total, transaction_amount,
+                           transaction_taxes, transaction_fees
+                    FROM every_circle.transactions
+                    WHERE transaction_uid = %s
+                    """,
+                    (original_tx_uid,),
+                )
+                tx_rows = tx_row_q.get("result") or []
+                if not tx_rows:
+                    response["message"] = "Original transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                orig_tx = tx_rows[0]
+                if orig_tx.get("transaction_profile_id") != profile_id:
+                    response["message"] = (
+                        "profile_id does not match the buyer on this transaction"
+                    )
+                    response["code"] = 403
+                    return response, 403
+
+                subtotal_q = db.execute(
+                    """
+                    SELECT COALESCE(SUM(CAST(ti_bs_cost AS DECIMAL(18,6)) * ti_bs_qty), 0) AS order_subtotal
+                    FROM every_circle.transactions_items
+                    WHERE ti_transaction_id = %s
+                    """,
+                    (original_tx_uid,),
+                )
+                order_subtotal_rows = subtotal_q.get("result") or []
+                order_subtotal = _to_float(
+                    order_subtotal_rows[0].get("order_subtotal")
+                    if order_subtotal_rows
+                    else 0
+                )
+
+                refund_subtotal = 0.0
+                refund_tax = 0.0
+                lines_processed = []
+
+                seen_ti = set()
+                for entry in items_payload:
+                    ti_uid = entry.get("transaction_item_uid")
+                    try:
+                        rq = int(entry.get("return_quantity"))
+                    except (TypeError, ValueError):
+                        rq = -1
+
+                    if not ti_uid:
+                        response["message"] = (
+                            "Each entry requires transaction_item_uid"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if rq < 1:
+                        response["message"] = (
+                            f"Invalid return_quantity for item {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if ti_uid in seen_ti:
+                        response["message"] = (
+                            f"Duplicate transaction_item_uid: {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    seen_ti.add(ti_uid)
+
+                    ti_q = db.execute(
+                        """
+                        SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bs_qty, ti_bs_cost,
+                               ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
+                               ti_bs_refund_policy, ti_bs_return_window_days
+                        FROM every_circle.transactions_items
+                        WHERE ti_uid = %s AND ti_transaction_id = %s
+                        """,
+                        (ti_uid, original_tx_uid),
+                    )
+                    ti_rows = ti_q.get("result") or []
+                    if not ti_rows:
+                        response["message"] = (
+                            f"Transaction item not found on this sale: {ti_uid}"
+                        )
+                        response["code"] = 404
+                        return response, 404
+
+                    ti_row = ti_rows[0]
+                    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+                    unit_cost = _to_float(ti_row.get("ti_bs_cost"))
+                    scale = _bounty_scale_for_line(rq, original_qty)
+                    if scale is None:
+                        response["message"] = (
+                            f"return_quantity must be between 1 and {original_qty} for {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    line_subtotal = round(unit_cost * rq, 4)
+                    line_tax = _tax_amount_for_line(
+                        line_subtotal,
+                        ti_row.get("ti_bs_is_taxable"),
+                        ti_row.get("ti_bs_tax_rate"),
+                    )
+                    refund_subtotal += line_subtotal
+                    refund_tax += line_tax
+
+                    lines_processed.append(
+                        {
+                            "original_ti_uid": ti_uid,
+                            "ti_bs_id": ti_row.get("ti_bs_id"),
+                            "return_quantity": rq,
+                            "original_quantity": original_qty,
+                            "unit_cost": unit_cost,
+                            "line_subtotal": line_subtotal,
+                            "line_tax": line_tax,
+                            "snapshot": ti_row,
+                        }
+                    )
+
+                orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
+                fee_ratio = (
+                    refund_subtotal / order_subtotal
+                    if order_subtotal > 0
+                    else 0.0
+                )
+                refund_fees = round(orig_fees * fee_ratio, 4)
+
+                refund_grand = round(refund_subtotal + refund_tax + refund_fees, 4)
+
+                new_uid_resp = db.call(procedure="new_transaction_uid")
+                if (
+                    not new_uid_resp.get("result")
+                    or len(new_uid_resp["result"]) == 0
+                ):
+                    response["message"] = "Failed to generate return transaction UID"
+                    response["code"] = 500
+                    return response, 500
+
+                new_transaction_uid = new_uid_resp["result"][0]["new_id"]
+                transactions_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                new_transaction = {
+                    "transaction_uid": new_transaction_uid,
+                    "transaction_datetime": transactions_datetime,
+                    "transaction_profile_id": orig_tx.get("transaction_profile_id"),
+                    "transaction_business_id": orig_tx.get("transaction_business_id"),
+                    "transaction_stripe_pi": orig_tx.get("transaction_stripe_pi"),
+                    "transaction_total": f"{-refund_grand:.4f}",
+                    "transaction_amount": f"{-refund_subtotal:.4f}",
+                    "transaction_taxes": f"{-refund_tax:.4f}",
+                    "transaction_fees": f"{-refund_fees:.4f}",
+                    "transaction_in_escrow": 0,
+                    "transaction_return_note": return_note,
+                }
+
+                tx_insert = db.insert("every_circle.transactions", new_transaction)
+                if tx_insert.get("code") != 200:
+                    response["message"] = tx_insert.get(
+                        "message", "Failed to insert return transaction"
+                    )
+                    response["code"] = tx_insert.get("code", 500)
+                    return response, response["code"]
+
+                bounty_insert_count = 0
+                item_insert_count = 0
+                response_lines = []
+
+                for line in lines_processed:
+                    ti_row = line["snapshot"]
+                    rq = line["return_quantity"]
+                    original_qty = line["original_quantity"]
+                    ti_bs_id = ti_row.get("ti_bs_id")
+
+                    ti_uid_resp = db.call(procedure="new_transaction_item_uid")
+                    if (
+                        not ti_uid_resp.get("result")
+                        or len(ti_uid_resp["result"]) == 0
+                    ):
+                        response["message"] = "Failed to generate return line item UID"
+                        response["code"] = 500
+                        return response, 500
+
+                    new_ti_uid = ti_uid_resp["result"][0]["new_id"]
+                    neg_qty = -int(rq)
+
+                    tx_item = {
+                        "ti_uid": new_ti_uid,
+                        "ti_transaction_id": new_transaction_uid,
+                        "ti_bs_id": ti_bs_id,
+                        "ti_bs_qty": neg_qty,
+                        "ti_bs_cost": ti_row.get("ti_bs_cost"),
+                        "ti_bs_cost_currency": ti_row.get("ti_bs_cost_currency"),
+                        "ti_bs_sku": ti_row.get("ti_bs_sku"),
+                        "ti_bs_is_taxable": ti_row.get("ti_bs_is_taxable"),
+                        "ti_bs_tax_rate": ti_row.get("ti_bs_tax_rate"),
+                        "ti_bs_refund_policy": ti_row.get("ti_bs_refund_policy"),
+                        "ti_bs_return_window_days": ti_row.get(
+                            "ti_bs_return_window_days"
+                        ),
+                    }
+
+                    ti_insert = db.insert(
+                        "every_circle.transactions_items", tx_item
+                    )
+                    if ti_insert.get("code") != 200:
+                        response["message"] = ti_insert.get(
+                            "message", "Failed to insert return transaction item"
+                        )
+                        response["code"] = ti_insert.get("code", 500)
+                        return response, response["code"]
+                    item_insert_count += 1
+
+                    scale = _bounty_scale_for_line(rq, original_qty)
+                    if scale is None:
+                        scale = 0.0
+
+                    bounty_q = db.execute(
+                        """
+                        SELECT tb_uid, tb_profile_id, tb_percentage, tb_amount
+                        FROM every_circle.transactions_bounty
+                        WHERE tb_ti_id = %s
+                        """,
+                        (line["original_ti_uid"],),
+                    )
+                    bounty_rows = bounty_q.get("result") or []
+
+                    for br in bounty_rows:
+                        raw_amt = _to_float(br.get("tb_amount"))
+                        reversal = round(-scale * raw_amt, 4)
+                        if reversal == 0:
+                            continue
+
+                        bounty_uid_resp = db.call(procedure="new_transaction_bounty_uid")
+                        if (
+                            not bounty_uid_resp.get("result")
+                            or len(bounty_uid_resp["result"]) == 0
+                        ):
+                            print(
+                                "Warning: Failed to generate bounty UID for reversal"
+                            )
+                            continue
+
+                        new_tb_uid = bounty_uid_resp["result"][0]["new_id"]
+                        tx_bounty = {
+                            "tb_uid": new_tb_uid,
+                            "tb_ti_id": new_ti_uid,
+                            "tb_profile_id": br.get("tb_profile_id"),
+                            "tb_percentage": br.get("tb_percentage"),
+                            "tb_amount": reversal,
+                        }
+                        bins = db.insert(
+                            "every_circle.transactions_bounty", tx_bounty
+                        )
+                        if bins.get("code") == 200:
+                            bounty_insert_count += 1
+
+                    response_lines.append(
+                        {
+                            "original_transaction_item_uid": line[
+                                "original_ti_uid"
+                            ],
+                            "new_transaction_item_uid": new_ti_uid,
+                            "return_quantity": rq,
+                            "line_subtotal": line["line_subtotal"],
+                            "line_tax": line["line_tax"],
+                        }
+                    )
+
+                update_original = {}
+                if "transaction_return_requested" in payload:
+                    update_original["transaction_return_requested"] = (
+                        1 if payload.get("transaction_return_requested") else 0
+                    )
+                if "transaction_return_status" in payload:
+                    update_original["transaction_return_status"] = payload.get(
+                        "transaction_return_status"
+                    )
+                if return_note is not None:
+                    update_original["transaction_return_note"] = return_note
+
+                if update_original:
+                    db.update(
+                        "every_circle.transactions",
+                        {"transaction_uid": original_tx_uid},
+                        update_original,
+                    )
+
+                response["message"] = "Return transaction recorded successfully"
+                response["code"] = 200
+                response["return_transaction_uid"] = new_transaction_uid
+                response["original_transaction_uid"] = original_tx_uid
+                response["refund_breakdown"] = {
+                    "subtotal": round(refund_subtotal, 4),
+                    "taxes": round(refund_tax, 4),
+                    "fees_allocated": round(refund_fees, 4),
+                    "total_customer_credit": round(refund_grand, 4),
+                    "fee_allocation_ratio": round(fee_ratio, 6),
+                    "original_order_subtotal": round(order_subtotal, 4),
+                }
+                response["ledger_amounts_negative"] = {
+                    "transaction_total": new_transaction["transaction_total"],
+                    "transaction_amount": new_transaction["transaction_amount"],
+                    "transaction_taxes": new_transaction["transaction_taxes"],
+                    "transaction_fees": new_transaction["transaction_fees"],
+                }
+                response["transaction_items_created"] = item_insert_count
+                response["bounty_reversal_rows_created"] = bounty_insert_count
+                response["lines"] = response_lines
+
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in ReturnTransaction POST: {str(e)}")
+            print(traceback.format_exc())
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+            return response, 500
+
+
 class Transactions(Resource):
 
     def get(self, profile_id=None):
