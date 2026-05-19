@@ -958,6 +958,8 @@ class Transactions(Resource):
                                 print(f"Error processing network path: {str(e)}")
                                 network_result = []
 
+                        in_escrow = bool(transaction.get("transaction_in_escrow"))
+
                         # Process known participants (buyer, recommender, every-circle)
                         for participant in known_participants:
                             participant_id = participant.get("tb_profile_id")
@@ -1017,6 +1019,64 @@ class Transactions(Resource):
 
                                 if bounty_response.get("code") == 200:
                                     bounty_count += 1
+
+                                    print("bounty_count: ", bounty_count)
+
+                                    bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_response = db.execute(
+                                        """
+                                        SELECT *
+                                        FROM every_circle.wallet
+                                        WHERE wallet_profile_id = %s
+                                        """,
+                                        {"wallet_profile_id": participant_id}
+                                    )
+                                    print("wallet_response: ", wallet_response)
+
+                                    if wallet_response.get("code") == 200:
+                                        wallet = wallet_response.get("result")[0]
+                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
+                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
+                                        wallet_pending = wallet.get("wallet_pending") or 0
+                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
+                                        print("wallet_actual_balance: ", wallet_actual_balance)
+
+                                        wallet_updates = {
+                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
+                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
+                                        }
+                                        if in_escrow:
+                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
+                                        else:
+                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
+
+                                        # update Wallet here for KNOWN participants
+                                        update_wallet_response = db.update(
+                                            "every_circle.wallet",
+                                            {"wallet_profile_id": participant_id},
+                                            wallet_updates,
+                                        )
+                                        print("update_wallet_response: ", update_wallet_response)
+                                        if update_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to update wallet for participant {participant_id}: {update_wallet_response}")
+
+                                    else:
+                                        insert_wallet_response = db.insert(
+                                            "every_circle.wallet",
+                                            {
+                                                "wallet_profile_id": participant_id,
+                                                "wallet_actual_balance": bounty_amount,
+                                                "wallet_pending": bounty_amount if in_escrow else 0,
+                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
+                                                "wallet_reserve": 0,
+                                                "wallet_lifetime_earning": bounty_amount,
+                                                "wallet_lifetime_spent": 0,
+                                            },
+                                        )
+                                        print("insert_wallet_response: ", insert_wallet_response)
+                                        if insert_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to create wallet for participant {participant_id}: {insert_wallet_response}")
+                                    
                                 else:
                                     print(
                                         f"Warning: Failed to insert bounty for participant {participant_id}: {bounty_response}"
@@ -1087,6 +1147,64 @@ class Transactions(Resource):
 
                                 if bounty_response.get("code") == 200:
                                     bounty_count += 1
+
+                                    print("bounty_count: ", bounty_count)
+
+                                    bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_response = db.execute(
+                                        """
+                                        SELECT *
+                                        FROM every_circle.wallet
+                                        WHERE wallet_profile_id = %s
+                                        """,
+                                        {"wallet_profile_id": participant}
+                                    )
+                                    print("wallet_response: ", wallet_response)
+
+                                    if wallet_response.get("code") == 200:
+                                        wallet = wallet_response.get("result")[0]
+                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
+                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
+                                        wallet_pending = wallet.get("wallet_pending") or 0
+                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
+                                        print("wallet_actual_balance: ", wallet_actual_balance)
+
+                                        wallet_updates = {
+                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
+                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
+                                        }
+                                        if in_escrow:
+                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
+                                        else:
+                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
+
+                                        # update Wallet here for NETWORK participants
+                                        update_wallet_response = db.update(
+                                            "every_circle.wallet",
+                                            {"wallet_profile_id": participant},
+                                            wallet_updates,
+                                        )
+                                        print("update_wallet_response: ", update_wallet_response)
+                                        if update_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to update wallet for network participant {participant}: {update_wallet_response}")
+
+                                    else:
+                                        insert_wallet_response = db.insert(
+                                            "every_circle.wallet",
+                                            {
+                                                "wallet_profile_id": participant,
+                                                "wallet_actual_balance": bounty_amount,
+                                                "wallet_pending": bounty_amount if in_escrow else 0,
+                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
+                                                "wallet_reserve": 0,
+                                                "wallet_lifetime_earning": bounty_amount,
+                                                "wallet_lifetime_spent": 0,
+                                            },
+                                        )
+                                        print("insert_wallet_response: ", insert_wallet_response)
+                                        if insert_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to create wallet for network participant {participant}: {insert_wallet_response}")
+
                                 else:
                                     print(
                                         f"Warning: Failed to insert bounty for network participant {participant}: {bounty_response}"
@@ -1112,6 +1230,7 @@ class Transactions(Resource):
 
     def put(self):
         print("In Transactions PUT")
+        # print("PUT Transactions only for updating transaction_in_escrow and transaction_return_requested")
         response = {}
 
         try:
@@ -1189,27 +1308,79 @@ class SellerTransactions(Resource):
             with connect() as db:
                 # Execute query to get transactions
                 query = """
-                   SELECT
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_taxes,
-                       t.transaction_fees,
-                       t.transaction_business_id,
-                       t.transaction_profile_id,
-                       t.transaction_in_escrow,
-                       t.transaction_return_requested,
-                       t.transaction_return_note,
-                       ti.ti_uid,
-                       ti.ti_uid,
-                       ti.ti_bs_id,
-                       ti.ti_bs_qty,
-                       ti.ti_bs_cost
-                   FROM every_circle.transactions t
-                   LEFT JOIN every_circle.transactions_items ti ON ti.ti_transaction_id = t.transaction_uid
-                   -- WHERE t.transaction_profile_id = '110-000014'
-                   WHERE t.transaction_business_id = %s
-                   ORDER BY t.transaction_datetime DESC
+                    SELECT
+                        t.transaction_uid,
+                        t.transaction_datetime,
+                        t.transaction_total,
+                        t.transaction_taxes,
+                        t.transaction_fees,
+                        t.transaction_business_id AS seller_id,
+                        t.transaction_profile_id,
+                        t.transaction_in_escrow,
+                        t.transaction_return_requested,
+                        t.transaction_return_note,
+                        t.transaction_return_status,
+                        
+                        -- ti.*,
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                                CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN
+                                CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                            ELSE NULL
+                        END AS business_name,
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                            ELSE 'Unknown'
+                        END AS purchase_type,
+                        GROUP_CONCAT(
+                            CASE
+                                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                                WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                                ELSE 'See Receipt'
+                            END
+                            ORDER BY ti.ti_uid
+                            SEPARATOR ', '
+                        ) AS purchased_item,
+                        ti.ti_bs_qty,
+                        SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                        ti.ti_uid,
+                        MIN(ti.ti_uid) AS ti_uid
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                    ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                    ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                    ON bs.bs_business_id = biz.business_uid
+
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    LEFT JOIN every_circle.profile_expertise pe
+                    ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                    ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                    ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    LEFT JOIN every_circle.profile_personal wish_pp
+                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
+                    WHERE t.transaction_business_id = %s
+                    -- WHERE t.transaction_business_id = '110-000014'
+                    GROUP BY
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_profile_id,
+                    seller_id,
+                    business_name,
+                    purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
 
                 print(f"Executing seller query for profile_id: {profile_id}")

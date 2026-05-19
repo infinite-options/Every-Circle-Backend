@@ -36,8 +36,8 @@ class BountyResults(Resource):
                 #     ORDER BY t.transaction_datetime DESC
                 # """
                 bounty_query = f""" 
-                SELECT *,
-                        SUM(tb_amount) AS bounty_earned
+                    SELECT *,
+                            SUM(tb_amount) AS bounty_earned
                     FROM (
                         SELECT 
                             tb.*,
@@ -77,6 +77,20 @@ class BountyResults(Resource):
                         for bounty in bounty_response["result"]
                     )
                     response["total_bounty_earned"] = total_bounty
+
+                    wallet_query = """
+                        SELECT *
+                        FROM every_circle.wallet
+                        WHERE wallet_profile_id = %s
+                    """
+                    wallet_response = db.execute(wallet_query, (profile_id,))
+                    if (
+                        wallet_response.get("code") == 200
+                        and wallet_response.get("result")
+                    ):
+                        response["wallet"] = wallet_response["result"][0]
+                    else:
+                        response["wallet"] = None
 
                     return response, 200
                 else:
