@@ -304,7 +304,11 @@ def processImage(key, payload):
                 # print("Image after upload: ", images)
 
             payload_delete_images = payload.pop('delete_images', None)      # Images to Delete
-            if 'img_0' in request.files or payload_delete_images != None:   #  New appliance images are passed in as img_0, img_1.  No Image attributes are passed in
+            has_gallery_change = (
+                'img_0' in request.files
+                or payload_delete_images is not None
+            )
+            if has_gallery_change:
                 payload_query = db.execute(""" SELECT rating_images_url FROM every_circle.ratings WHERE rating_uid = \'""" + key_uid + """\'; """)     # Current Images
                 print("1: ", payload_query)
                 print("2: ", payload_query['result'], type(payload_query['result']))
@@ -313,6 +317,9 @@ def processImage(key, payload):
                 payload_images = payload_query['result'][0]['rating_images_url'] if payload_query['result'] else None  # Current Images from database
                 payload_fav_images = payload.get("rating_favorite_image", None) or payload.pop("img_favorite", None)   # (PUT & POST)
                 print("5: ", payload_fav_images)
+            elif receiptImage:
+                payload['rating_receipt_url'] = receiptImage
+                return payload
             else:
                 return payload
         

@@ -249,7 +249,7 @@ class Ratings(Resource):
                 # payload['rating_rating_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 rating_payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                # processImage(key, rating_payload)
+                processImage(key, rating_payload)
 
                 response = db.insert('every_circle.ratings', rating_payload)
             

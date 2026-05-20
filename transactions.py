@@ -19,6 +19,417 @@ def _strip_currency(value):
     return value
 
 
+def _to_float(value):
+    if value is None:
+        return 0.0
+    try:
+        return float(_strip_currency(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bounty_scale_for_line(return_qty, original_qty):
+    """Scale bounty reversal for a partial line return (return_qty / original_qty)."""
+    if original_qty <= 0:
+        return None
+    rq = int(return_qty)
+    oq = int(original_qty)
+    if rq <= 0 or rq > oq:
+        return None
+    return rq / float(oq)
+
+
+def _tax_amount_for_line(line_subtotal, ti_bs_is_taxable, ti_bs_tax_rate):
+    if not ti_bs_is_taxable:
+        return 0.0
+    rate = _to_float(ti_bs_tax_rate)
+    if rate <= 0:
+        return 0.0
+    # Rates may be stored as whole percent (e.g. 8.25) or fraction (0.0825).
+    if rate > 1:
+        rate = rate / 100.0
+    return round(line_subtotal * rate, 4)
+
+
+class ReturnTransaction(Resource):
+    """
+    POST: record a return as a negative sale (new transaction + negative line items + bounty reversals).
+
+    Required from Front End:
+      - profile_id: buyer profile (must match original transaction_profile_id).
+      - transaction_uid: original sale to return against.
+      - transaction_return_items: [{ "transaction_item_uid": "<ti_uid>", "return_quantity": <int> }, ...]
+
+    Optional from Front End:
+      - transaction_return_note
+      - transaction_return_requested / transaction_return_status (updates original tx metadata after success)
+
+    Loaded from DB (not required from FE):
+      - Original transaction row (seller, buyer, stripe PI, historical taxes/fees).
+      - Each transactions_items row (ti_bs_cost, qty, tax flags, ti_bs_id).
+      - transactions_bounty rows per original ti_uid for reversal amounts.
+
+    Still missing / follow-ups:
+      - Cumulative returned qty per line (needs column or ledger query) to block over-returning.
+      - Stripe Refund API call + storing refund id (money movement).
+      - Restocking via BusinessServicePurchase inverse when applicable.
+    """
+
+    def post(self):
+        print("In ReturnTransaction POST")
+        response = {}
+
+        try:
+            payload = request.get_json()
+            if not payload:
+                response["message"] = "Request body is required"
+                response["code"] = 400
+                return response, 400
+
+            profile_id = payload.get("profile_id")
+            original_tx_uid = payload.get("transaction_uid")
+            items_payload = payload.get("transaction_return_items") or []
+
+            if not profile_id:
+                response["message"] = "profile_id is required"
+                response["code"] = 400
+                return response, 400
+            if not original_tx_uid:
+                response["message"] = "transaction_uid is required"
+                response["code"] = 400
+                return response, 400
+            if not isinstance(items_payload, list) or len(items_payload) == 0:
+                response["message"] = (
+                    "transaction_return_items must be a non-empty list"
+                )
+                response["code"] = 400
+                return response, 400
+
+            return_note = payload.get("transaction_return_note")
+
+            with connect() as db:
+                tx_row_q = db.execute(
+                    """
+                    SELECT transaction_uid, transaction_profile_id, transaction_business_id,
+                           transaction_stripe_pi, transaction_total, transaction_amount,
+                           transaction_taxes, transaction_fees
+                    FROM every_circle.transactions
+                    WHERE transaction_uid = %s
+                    """,
+                    (original_tx_uid,),
+                )
+                tx_rows = tx_row_q.get("result") or []
+                if not tx_rows:
+                    response["message"] = "Original transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                orig_tx = tx_rows[0]
+                if orig_tx.get("transaction_profile_id") != profile_id:
+                    response["message"] = (
+                        "profile_id does not match the buyer on this transaction"
+                    )
+                    response["code"] = 403
+                    return response, 403
+
+                subtotal_q = db.execute(
+                    """
+                    SELECT COALESCE(SUM(CAST(ti_bs_cost AS DECIMAL(18,6)) * ti_bs_qty), 0) AS order_subtotal
+                    FROM every_circle.transactions_items
+                    WHERE ti_transaction_id = %s
+                    """,
+                    (original_tx_uid,),
+                )
+                order_subtotal_rows = subtotal_q.get("result") or []
+                order_subtotal = _to_float(
+                    order_subtotal_rows[0].get("order_subtotal")
+                    if order_subtotal_rows
+                    else 0
+                )
+
+                refund_subtotal = 0.0
+                refund_tax = 0.0
+                lines_processed = []
+
+                seen_ti = set()
+                for entry in items_payload:
+                    ti_uid = entry.get("transaction_item_uid")
+                    try:
+                        rq = int(entry.get("return_quantity"))
+                    except (TypeError, ValueError):
+                        rq = -1
+
+                    if not ti_uid:
+                        response["message"] = (
+                            "Each entry requires transaction_item_uid"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if rq < 1:
+                        response["message"] = (
+                            f"Invalid return_quantity for item {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if ti_uid in seen_ti:
+                        response["message"] = (
+                            f"Duplicate transaction_item_uid: {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    seen_ti.add(ti_uid)
+
+                    ti_q = db.execute(
+                        """
+                        SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bs_qty, ti_bs_cost,
+                               ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
+                               ti_bs_refund_policy, ti_bs_return_window_days
+                        FROM every_circle.transactions_items
+                        WHERE ti_uid = %s AND ti_transaction_id = %s
+                        """,
+                        (ti_uid, original_tx_uid),
+                    )
+                    ti_rows = ti_q.get("result") or []
+                    if not ti_rows:
+                        response["message"] = (
+                            f"Transaction item not found on this sale: {ti_uid}"
+                        )
+                        response["code"] = 404
+                        return response, 404
+
+                    ti_row = ti_rows[0]
+                    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+                    unit_cost = _to_float(ti_row.get("ti_bs_cost"))
+                    scale = _bounty_scale_for_line(rq, original_qty)
+                    if scale is None:
+                        response["message"] = (
+                            f"return_quantity must be between 1 and {original_qty} for {ti_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    line_subtotal = round(unit_cost * rq, 4)
+                    line_tax = _tax_amount_for_line(
+                        line_subtotal,
+                        ti_row.get("ti_bs_is_taxable"),
+                        ti_row.get("ti_bs_tax_rate"),
+                    )
+                    refund_subtotal += line_subtotal
+                    refund_tax += line_tax
+
+                    lines_processed.append(
+                        {
+                            "original_ti_uid": ti_uid,
+                            "ti_bs_id": ti_row.get("ti_bs_id"),
+                            "return_quantity": rq,
+                            "original_quantity": original_qty,
+                            "unit_cost": unit_cost,
+                            "line_subtotal": line_subtotal,
+                            "line_tax": line_tax,
+                            "snapshot": ti_row,
+                        }
+                    )
+
+                orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
+                fee_ratio = (
+                    refund_subtotal / order_subtotal
+                    if order_subtotal > 0
+                    else 0.0
+                )
+                refund_fees = round(orig_fees * fee_ratio, 4)
+
+                refund_grand = round(refund_subtotal + refund_tax + refund_fees, 4)
+
+                new_uid_resp = db.call(procedure="new_transaction_uid")
+                if (
+                    not new_uid_resp.get("result")
+                    or len(new_uid_resp["result"]) == 0
+                ):
+                    response["message"] = "Failed to generate return transaction UID"
+                    response["code"] = 500
+                    return response, 500
+
+                new_transaction_uid = new_uid_resp["result"][0]["new_id"]
+                transactions_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                new_transaction = {
+                    "transaction_uid": new_transaction_uid,
+                    "transaction_datetime": transactions_datetime,
+                    "transaction_profile_id": orig_tx.get("transaction_profile_id"),
+                    "transaction_business_id": orig_tx.get("transaction_business_id"),
+                    "transaction_stripe_pi": orig_tx.get("transaction_stripe_pi"),
+                    "transaction_total": f"{-refund_grand:.4f}",
+                    "transaction_amount": f"{-refund_subtotal:.4f}",
+                    "transaction_taxes": f"{-refund_tax:.4f}",
+                    "transaction_fees": f"{-refund_fees:.4f}",
+                    "transaction_in_escrow": 0,
+                    "transaction_return_note": return_note,
+                }
+
+                tx_insert = db.insert("every_circle.transactions", new_transaction)
+                if tx_insert.get("code") != 200:
+                    response["message"] = tx_insert.get(
+                        "message", "Failed to insert return transaction"
+                    )
+                    response["code"] = tx_insert.get("code", 500)
+                    return response, response["code"]
+
+                bounty_insert_count = 0
+                item_insert_count = 0
+                response_lines = []
+
+                for line in lines_processed:
+                    ti_row = line["snapshot"]
+                    rq = line["return_quantity"]
+                    original_qty = line["original_quantity"]
+                    ti_bs_id = ti_row.get("ti_bs_id")
+
+                    ti_uid_resp = db.call(procedure="new_transaction_item_uid")
+                    if (
+                        not ti_uid_resp.get("result")
+                        or len(ti_uid_resp["result"]) == 0
+                    ):
+                        response["message"] = "Failed to generate return line item UID"
+                        response["code"] = 500
+                        return response, 500
+
+                    new_ti_uid = ti_uid_resp["result"][0]["new_id"]
+                    neg_qty = -int(rq)
+
+                    tx_item = {
+                        "ti_uid": new_ti_uid,
+                        "ti_transaction_id": new_transaction_uid,
+                        "ti_bs_id": ti_bs_id,
+                        "ti_bs_qty": neg_qty,
+                        "ti_bs_cost": ti_row.get("ti_bs_cost"),
+                        "ti_bs_cost_currency": ti_row.get("ti_bs_cost_currency"),
+                        "ti_bs_sku": ti_row.get("ti_bs_sku"),
+                        "ti_bs_is_taxable": ti_row.get("ti_bs_is_taxable"),
+                        "ti_bs_tax_rate": ti_row.get("ti_bs_tax_rate"),
+                        "ti_bs_refund_policy": ti_row.get("ti_bs_refund_policy"),
+                        "ti_bs_return_window_days": ti_row.get(
+                            "ti_bs_return_window_days"
+                        ),
+                    }
+
+                    ti_insert = db.insert(
+                        "every_circle.transactions_items", tx_item
+                    )
+                    if ti_insert.get("code") != 200:
+                        response["message"] = ti_insert.get(
+                            "message", "Failed to insert return transaction item"
+                        )
+                        response["code"] = ti_insert.get("code", 500)
+                        return response, response["code"]
+                    item_insert_count += 1
+
+                    scale = _bounty_scale_for_line(rq, original_qty)
+                    if scale is None:
+                        scale = 0.0
+
+                    bounty_q = db.execute(
+                        """
+                        SELECT tb_uid, tb_profile_id, tb_percentage, tb_amount
+                        FROM every_circle.transactions_bounty
+                        WHERE tb_ti_id = %s
+                        """,
+                        (line["original_ti_uid"],),
+                    )
+                    bounty_rows = bounty_q.get("result") or []
+
+                    for br in bounty_rows:
+                        raw_amt = _to_float(br.get("tb_amount"))
+                        reversal = round(-scale * raw_amt, 4)
+                        if reversal == 0:
+                            continue
+
+                        bounty_uid_resp = db.call(procedure="new_transaction_bounty_uid")
+                        if (
+                            not bounty_uid_resp.get("result")
+                            or len(bounty_uid_resp["result"]) == 0
+                        ):
+                            print(
+                                "Warning: Failed to generate bounty UID for reversal"
+                            )
+                            continue
+
+                        new_tb_uid = bounty_uid_resp["result"][0]["new_id"]
+                        tx_bounty = {
+                            "tb_uid": new_tb_uid,
+                            "tb_ti_id": new_ti_uid,
+                            "tb_profile_id": br.get("tb_profile_id"),
+                            "tb_percentage": br.get("tb_percentage"),
+                            "tb_amount": reversal,
+                        }
+                        bins = db.insert(
+                            "every_circle.transactions_bounty", tx_bounty
+                        )
+                        if bins.get("code") == 200:
+                            bounty_insert_count += 1
+
+                    response_lines.append(
+                        {
+                            "original_transaction_item_uid": line[
+                                "original_ti_uid"
+                            ],
+                            "new_transaction_item_uid": new_ti_uid,
+                            "return_quantity": rq,
+                            "line_subtotal": line["line_subtotal"],
+                            "line_tax": line["line_tax"],
+                        }
+                    )
+
+                update_original = {}
+                if "transaction_return_requested" in payload:
+                    update_original["transaction_return_requested"] = (
+                        1 if payload.get("transaction_return_requested") else 0
+                    )
+                if "transaction_return_status" in payload:
+                    update_original["transaction_return_status"] = payload.get(
+                        "transaction_return_status"
+                    )
+                if return_note is not None:
+                    update_original["transaction_return_note"] = return_note
+
+                if update_original:
+                    db.update(
+                        "every_circle.transactions",
+                        {"transaction_uid": original_tx_uid},
+                        update_original,
+                    )
+
+                response["message"] = "Return transaction recorded successfully"
+                response["code"] = 200
+                response["return_transaction_uid"] = new_transaction_uid
+                response["original_transaction_uid"] = original_tx_uid
+                response["refund_breakdown"] = {
+                    "subtotal": round(refund_subtotal, 4),
+                    "taxes": round(refund_tax, 4),
+                    "fees_allocated": round(refund_fees, 4),
+                    "total_customer_credit": round(refund_grand, 4),
+                    "fee_allocation_ratio": round(fee_ratio, 6),
+                    "original_order_subtotal": round(order_subtotal, 4),
+                }
+                response["ledger_amounts_negative"] = {
+                    "transaction_total": new_transaction["transaction_total"],
+                    "transaction_amount": new_transaction["transaction_amount"],
+                    "transaction_taxes": new_transaction["transaction_taxes"],
+                    "transaction_fees": new_transaction["transaction_fees"],
+                }
+                response["transaction_items_created"] = item_insert_count
+                response["bounty_reversal_rows_created"] = bounty_insert_count
+                response["lines"] = response_lines
+
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in ReturnTransaction POST: {str(e)}")
+            print(traceback.format_exc())
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+            return response, 500
+
+
 class Transactions(Resource):
 
     def get(self, profile_id=None):
@@ -34,77 +445,81 @@ class Transactions(Resource):
             with connect() as db:
                 # Execute query with parameterized profile_id for security
                 query = """
-                   SELECT
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_taxes,
-                       t.transaction_profile_id,
-                       t.transaction_in_escrow,
-                       t.transaction_return_requested,
-                       t.transaction_return_note,
-                       t.transaction_return_status,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_uid
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN expertise_pp.profile_personal_uid
-                           ELSE NULL
-                       END AS seller_id,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN
-                               CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
-                           ELSE NULL
-                       END AS business_name,
-                       CASE
-                           WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
-                           WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
-                           WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
-                           ELSE 'Unknown'
-                       END AS purchase_type,
-                       GROUP_CONCAT(
-                           CASE
-                               WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
-                               WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
-                               WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
-                               ELSE 'See Receipt'
-                           END
-                           ORDER BY ti.ti_uid
-                           SEPARATOR ', '
-                       ) AS purchased_item,
-                       SUM(ti.ti_bs_qty) AS ti_bs_qty,
-                       MIN(ti.ti_uid) AS ti_uid
-                   FROM every_circle.transactions t
-                   LEFT JOIN every_circle.transactions_items ti
-                       ON t.transaction_uid = ti.ti_transaction_id
-                   LEFT JOIN every_circle.business_services bs
-                       ON ti.ti_bs_id = bs.bs_uid
-                   LEFT JOIN every_circle.business biz
-                       ON bs.bs_business_id = biz.business_uid
-                   LEFT JOIN every_circle.profile_personal seller_pp
-                       ON biz.`business_user_id-DNU` = seller_pp.profile_personal_user_id
-                   LEFT JOIN every_circle.profile_expertise pe
-                       ON ti.ti_bs_id = pe.profile_expertise_uid
-                   LEFT JOIN every_circle.profile_personal expertise_pp
-                       ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
-                   LEFT JOIN every_circle.wish_response wr
-                       ON ti.ti_bs_id = wr.wish_response_uid
-                   LEFT JOIN every_circle.profile_wish pw
-                       ON wr.wr_profile_wish_id = pw.profile_wish_uid
-                   WHERE t.transaction_profile_id = %s
-                   GROUP BY
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_profile_id,
-                       seller_id,
-                       business_name,
-                       purchase_type
-                   ORDER BY t.transaction_datetime DESC, ti_uid ASC
+                    SELECT
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_taxes,
+                    t.transaction_fees,
+                    t.transaction_profile_id,
+                    t.transaction_in_escrow,
+                    t.transaction_return_requested,
+                    t.transaction_return_note,
+                    t.transaction_return_status,
+                    t.transaction_business_id AS seller_id,
+                    -- ti.*,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                            CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN
+                            CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                        ELSE NULL
+                    END AS business_name,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                        ELSE 'Unknown'
+                    END AS purchase_type,
+                    GROUP_CONCAT(
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                            ELSE 'See Receipt'
+                        END
+                        ORDER BY ti.ti_uid
+                        SEPARATOR ', '
+                    ) AS purchased_item,
+                    SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                    MIN(ti.ti_uid) AS ti_uid
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                    ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                    ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                    ON bs.bs_business_id = biz.business_uid
+                    
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    LEFT JOIN every_circle.profile_expertise pe
+                    ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                    ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                    ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    LEFT JOIN every_circle.profile_personal wish_pp
+                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
+                    WHERE t.transaction_profile_id = %s
+                    -- WHERE t.transaction_profile_id = '110-000014'
+                    GROUP BY
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_profile_id,
+                    seller_id,
+                    business_name,
+                    purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
 
                 print(f"Executing query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
-                print(f"Query result: {result}")
+                # print(f"Query result: {result}")
 
                 if result.get("code") == 200:
                     response["message"] = "Transactions retrieved successfully"
@@ -164,6 +579,7 @@ class Transactions(Resource):
                 "transaction_total": payload.get("total_amount_paid"),
                 "transaction_amount": payload.get("total_costs"),
                 "transaction_taxes": payload.get("total_taxes"),
+                "transaction_fees": payload.get("total_fees"),
                 "transaction_in_escrow": (
                     1 if payload.get("transaction_in_escrow") else 0
                 ),
@@ -478,18 +894,48 @@ class Transactions(Resource):
                             print(f"Error getting connection path: {str(e)}")
                             combined_path = None
 
-                        # Deduplicate known_participants while preserving order
-                        # e.g. buyer == recommender would otherwise create two tb records for the same person
-                        seen = set()
+                        profile_id = payload.get("profile_id")
+                        buyer_is_recommender = (
+                            profile_id
+                            and recommender_profile_id
+                            and profile_id == recommender_profile_id
+                        )
                         known_participants = []
-                        for p in [
-                            payload.get("profile_id"),
-                            recommender_profile_id,
-                            "every-circle",
-                        ]:
-                            if p and p not in seen:
-                                seen.add(p)
-                                known_participants.append(p)
+                        if buyer_is_recommender:
+                            known_participants.append(
+                                {
+                                    "tb_profile_id": profile_id,
+                                    "tb_percentage": "0.4",
+                                    "tb_amount": round(0.40 * effective_bounty, 4),
+                                }
+                            )
+                        else:
+                            if profile_id:
+                                known_participants.append(
+                                    {
+                                        "tb_profile_id": profile_id,
+                                        "tb_percentage": "0.2",
+                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                    }
+                                )
+                            if recommender_profile_id:
+                                known_participants.append(
+                                    {
+                                        "tb_profile_id": recommender_profile_id,
+                                        "tb_percentage": "0.2",
+                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                    }
+                                )
+                        known_participants.append(
+                            {
+                                "tb_profile_id": "every-circle",
+                                "tb_percentage": "0.2",
+                                "tb_amount": round(0.20 * effective_bounty, 4),
+                            }
+                        )
+                        seen = {
+                            p["tb_profile_id"] for p in known_participants if p["tb_profile_id"]
+                        }
 
                         # Process network path if available
                         network_result = []
@@ -512,12 +958,15 @@ class Transactions(Resource):
                                 print(f"Error processing network path: {str(e)}")
                                 network_result = []
 
+                        in_escrow = bool(transaction.get("transaction_in_escrow"))
+
                         # Process known participants (buyer, recommender, every-circle)
                         for participant in known_participants:
-                            if not participant:
+                            participant_id = participant.get("tb_profile_id")
+                            if not participant_id:
                                 continue
 
-                            print(f"Processing known participant: {participant}")
+                            print(f"Processing known participant: {participant_id}")
 
                             try:
                                 transaction_bounty_stored_procedure_response = db.call(
@@ -535,7 +984,7 @@ class Transactions(Resource):
                                     == 0
                                 ):
                                     print(
-                                        f"Warning: Failed to generate bounty UID for participant: {participant}"
+                                        f"Warning: Failed to generate bounty UID for participant: {participant_id}"
                                     )
                                     continue
 
@@ -554,9 +1003,9 @@ class Transactions(Resource):
                                 tx_bounty = {
                                     "tb_uid": new_transaction_bounty_uid,
                                     "tb_ti_id": new_transaction_item_uid,
-                                    "tb_profile_id": participant,
-                                    "tb_percentage": "0.2",
-                                    "tb_amount": round(0.20 * effective_bounty, 4),
+                                    "tb_profile_id": participant_id,
+                                    "tb_percentage": participant["tb_percentage"],
+                                    "tb_amount": participant["tb_amount"],
                                 }
                                 print("tx_bounty: ", tx_bounty)
 
@@ -570,13 +1019,71 @@ class Transactions(Resource):
 
                                 if bounty_response.get("code") == 200:
                                     bounty_count += 1
+
+                                    print("bounty_count: ", bounty_count)
+
+                                    bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_response = db.execute(
+                                        """
+                                        SELECT *
+                                        FROM every_circle.wallet
+                                        WHERE wallet_profile_id = %s
+                                        """,
+                                        {"wallet_profile_id": participant_id}
+                                    )
+                                    print("wallet_response: ", wallet_response)
+
+                                    if wallet_response.get("code") == 200:
+                                        wallet = wallet_response.get("result")[0]
+                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
+                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
+                                        wallet_pending = wallet.get("wallet_pending") or 0
+                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
+                                        print("wallet_actual_balance: ", wallet_actual_balance)
+
+                                        wallet_updates = {
+                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
+                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
+                                        }
+                                        if in_escrow:
+                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
+                                        else:
+                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
+
+                                        # update Wallet here for KNOWN participants
+                                        update_wallet_response = db.update(
+                                            "every_circle.wallet",
+                                            {"wallet_profile_id": participant_id},
+                                            wallet_updates,
+                                        )
+                                        print("update_wallet_response: ", update_wallet_response)
+                                        if update_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to update wallet for participant {participant_id}: {update_wallet_response}")
+
+                                    else:
+                                        insert_wallet_response = db.insert(
+                                            "every_circle.wallet",
+                                            {
+                                                "wallet_profile_id": participant_id,
+                                                "wallet_actual_balance": bounty_amount,
+                                                "wallet_pending": bounty_amount if in_escrow else 0,
+                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
+                                                "wallet_reserve": 0,
+                                                "wallet_lifetime_earning": bounty_amount,
+                                                "wallet_lifetime_spent": 0,
+                                            },
+                                        )
+                                        print("insert_wallet_response: ", insert_wallet_response)
+                                        if insert_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to create wallet for participant {participant_id}: {insert_wallet_response}")
+                                    
                                 else:
                                     print(
-                                        f"Warning: Failed to insert bounty for participant {participant}: {bounty_response}"
+                                        f"Warning: Failed to insert bounty for participant {participant_id}: {bounty_response}"
                                     )
                             except Exception as e:
                                 print(
-                                    f"Error processing bounty for participant {participant}: {str(e)}"
+                                    f"Error processing bounty for participant {participant_id}: {str(e)}"
                                 )
                                 continue
 
@@ -640,6 +1147,64 @@ class Transactions(Resource):
 
                                 if bounty_response.get("code") == 200:
                                     bounty_count += 1
+
+                                    print("bounty_count: ", bounty_count)
+
+                                    bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_response = db.execute(
+                                        """
+                                        SELECT *
+                                        FROM every_circle.wallet
+                                        WHERE wallet_profile_id = %s
+                                        """,
+                                        {"wallet_profile_id": participant}
+                                    )
+                                    print("wallet_response: ", wallet_response)
+
+                                    if wallet_response.get("code") == 200:
+                                        wallet = wallet_response.get("result")[0]
+                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
+                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
+                                        wallet_pending = wallet.get("wallet_pending") or 0
+                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
+                                        print("wallet_actual_balance: ", wallet_actual_balance)
+
+                                        wallet_updates = {
+                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
+                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
+                                        }
+                                        if in_escrow:
+                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
+                                        else:
+                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
+
+                                        # update Wallet here for NETWORK participants
+                                        update_wallet_response = db.update(
+                                            "every_circle.wallet",
+                                            {"wallet_profile_id": participant},
+                                            wallet_updates,
+                                        )
+                                        print("update_wallet_response: ", update_wallet_response)
+                                        if update_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to update wallet for network participant {participant}: {update_wallet_response}")
+
+                                    else:
+                                        insert_wallet_response = db.insert(
+                                            "every_circle.wallet",
+                                            {
+                                                "wallet_profile_id": participant,
+                                                "wallet_actual_balance": bounty_amount,
+                                                "wallet_pending": bounty_amount if in_escrow else 0,
+                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
+                                                "wallet_reserve": 0,
+                                                "wallet_lifetime_earning": bounty_amount,
+                                                "wallet_lifetime_spent": 0,
+                                            },
+                                        )
+                                        print("insert_wallet_response: ", insert_wallet_response)
+                                        if insert_wallet_response.get("code") != 200:
+                                            print(f"Warning: Failed to create wallet for network participant {participant}: {insert_wallet_response}")
+
                                 else:
                                     print(
                                         f"Warning: Failed to insert bounty for network participant {participant}: {bounty_response}"
@@ -665,6 +1230,7 @@ class Transactions(Resource):
 
     def put(self):
         print("In Transactions PUT")
+        # print("PUT Transactions only for updating transaction_in_escrow and transaction_return_requested")
         response = {}
 
         try:
@@ -742,31 +1308,84 @@ class SellerTransactions(Resource):
             with connect() as db:
                 # Execute query to get transactions
                 query = """
-                   SELECT
-                       t.transaction_uid,
-                       t.transaction_datetime,
-                       t.transaction_total,
-                       t.transaction_taxes,
-                       t.transaction_business_id,
-                       t.transaction_profile_id,
-                       t.transaction_in_escrow,
-                       t.transaction_return_requested,
-                       t.transaction_return_note,
-                       ti.ti_uid,
-                       ti.ti_uid,
-                       ti.ti_bs_id,
-                       ti.ti_bs_qty,
-                       ti.ti_bs_cost
-                   FROM every_circle.transactions t
-                   LEFT JOIN every_circle.transactions_items ti ON ti.ti_transaction_id = t.transaction_uid
-                   -- WHERE t.transaction_profile_id = '110-000014'
-                   WHERE t.transaction_business_id = %s
-                   ORDER BY t.transaction_datetime DESC
+                    SELECT
+                        t.transaction_uid,
+                        t.transaction_datetime,
+                        t.transaction_total,
+                        t.transaction_taxes,
+                        t.transaction_fees,
+                        t.transaction_business_id AS seller_id,
+                        t.transaction_profile_id,
+                        t.transaction_in_escrow,
+                        t.transaction_return_requested,
+                        t.transaction_return_note,
+                        t.transaction_return_status,
+                        
+                        -- ti.*,
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                                CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN
+                                CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                            ELSE NULL
+                        END AS business_name,
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                            ELSE 'Unknown'
+                        END AS purchase_type,
+                        GROUP_CONCAT(
+                            CASE
+                                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                                WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                                ELSE 'See Receipt'
+                            END
+                            ORDER BY ti.ti_uid
+                            SEPARATOR ', '
+                        ) AS purchased_item,
+                        ti.ti_bs_qty,
+                        SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                        ti.ti_uid,
+                        MIN(ti.ti_uid) AS ti_uid
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                    ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                    ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                    ON bs.bs_business_id = biz.business_uid
+
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    LEFT JOIN every_circle.profile_expertise pe
+                    ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                    ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                    ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    LEFT JOIN every_circle.profile_personal wish_pp
+                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
+                    WHERE t.transaction_business_id = %s
+                    -- WHERE t.transaction_business_id = '110-000014'
+                    GROUP BY
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_profile_id,
+                    seller_id,
+                    business_name,
+                    purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
 
                 print(f"Executing seller query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
-                print(f"Seller query result: {result}")
+                # print(f"Seller query result: {result}")
 
                 if result.get("code") == 200:
                     response["message"] = "Seller transactions retrieved successfully"

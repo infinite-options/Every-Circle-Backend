@@ -20,7 +20,7 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessAvgRatings, BusinessMaxBounty, Businesses, BusinessTagSearch, BusinessServicePurchase  
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase  
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -33,7 +33,12 @@ from tag_generator_api import TagGeneratorAPI
 from user_profile_info import UserProfileInfo
 from business_info import BusinessInfo
 from business_services_options import BusinessServiceOptions
-from transactions import Transactions, SellerTransactions, DeclinedReturns
+from transactions import (
+    Transactions,
+    SellerTransactions,
+    DeclinedReturns,
+    ReturnTransaction,
+)
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
@@ -537,6 +542,8 @@ api.add_resource(Business_v3, '/api/v3/business_v3', '/api/v3/business_v3/<strin
 api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
+# Static paths must register before `/api/v1/transactions/<profile_id>` so `return` is not captured as profile_id.
+api.add_resource(ReturnTransaction, '/api/v1/transactions/return')
 api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
@@ -562,8 +569,8 @@ api.add_resource(Conversations,   '/api/v1/chat/conversations', '/api/v1/chat/co
 api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/messages/<string:conversation_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
-api.add_resource(BusinessAvgRatings, '/api/v1/businessavgratings')
-api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
+api.add_resource(BusinessDetails, '/api/v1/business_details')
+# api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 api.add_resource(AblyToken, '/api/v1/ably/token')
 api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
