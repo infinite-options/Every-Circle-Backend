@@ -8,10 +8,7 @@ class TransactionReceipt(Resource):
     def get(self, profile_id, transaction_uid):
         print(f"In TransactionReceipt GET for profile_id: {profile_id}, transaction_uid: {transaction_uid}")
         response = {}
-
-        # Optional seller filter: ?seller_id=250-XXXXXX or 150-XXXXXX
         seller_id = request.args.get('seller_id')
-        print(f"seller_id filter: {seller_id}")
 
         try:
             with connect() as db:
@@ -37,7 +34,23 @@ class TransactionReceipt(Resource):
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_business_id
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_uid
                             ELSE NULL
-                        END AS seller_ref_id
+                        END AS seller_ref_id,
+                        COALESCE(
+                            (
+                                SELECT JSON_ARRAYAGG(
+                                    JSON_OBJECT(
+                                        'group_title', bso.bso_group_title,
+                                        'option_label', bso.bso_option_label,
+                                        'extra_cost',   bso.bso_extra_cost
+                                    )
+                                )
+                                FROM every_circle.business_services_options bso
+                                WHERE bso.bso_business_service_id = ti.ti_bs_id
+                                AND bso.bso_is_active = 1
+                                AND bso.bso_extra_cost > 0
+                            ),
+                            JSON_ARRAY()
+                        ) AS available_options
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                         ON ti.ti_transaction_id = t.transaction_uid
@@ -53,7 +66,6 @@ class TransactionReceipt(Resource):
 
                 params = [profile_id, transaction_uid]
 
-                # Filter by seller if provided
                 if seller_id:
                     if seller_id.startswith('150-'):
                         query += " AND ti.ti_bs_id = %s"
@@ -62,16 +74,28 @@ class TransactionReceipt(Resource):
                         query += " AND ti.ti_bs_id = %s"
                         params.append(seller_id)
                     else:
-                        # Catches 200-, 250-, or any business UID prefix
                         query += " AND bs.bs_business_id = %s"
                         params.append(seller_id)
 
                 result = db.execute(query, tuple(params))
 
                 if result.get('code') == 200:
+                    rows = result.get('result', [])
+                    # Parse available_options JSON string if returned as string
+                    import json as _json
+                    for row in rows:
+                        raw = row.get('available_options')
+                        if isinstance(raw, str):
+                            try:
+                                row['available_options'] = _json.loads(raw)
+                            except Exception:
+                                row['available_options'] = []
+                        elif raw is None:
+                            row['available_options'] = []
+
                     response['message'] = 'Transaction receipt retrieved successfully'
                     response['code'] = 200
-                    response['data'] = result.get('result', [])
+                    response['data'] = rows
                     return response, 200
                 else:
                     response['message'] = result.get('message', 'Error retrieving transaction receipt')

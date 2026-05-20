@@ -1383,7 +1383,23 @@ class BusinessInfo(Resource):
                 if payload:
                     update_response = db.update("every_circle.business", key, payload)
                     print(update_response)
-                response = {"message": "Business updated successfully", "code": 200}
+                # Fetch all services for this business so frontend gets bs_uid for newly created ones
+                try:
+                    services_after_update = db.execute(f"""
+                        SELECT bs_uid, bs_service_name, bs_special_instructions_enabled, bs_special_instructions_max_chars
+                        FROM every_circle.business_services
+                        WHERE bs_business_id = '{business_uid}'
+                    """)
+                    saved_services = services_after_update.get('result', [])
+                except Exception as e:
+                    print(f"Could not fetch services after update: {e}")
+                    saved_services = []
+
+                response = {
+                    "message": "Business updated successfully",
+                    "code": 200,
+                    "business_services": saved_services,
+                }
                 if service_update_errors:
                     response["service_update_errors"] = service_update_errors
 
