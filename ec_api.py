@@ -20,7 +20,7 @@ load_dotenv()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3
 from users import UserInfo
-from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase  
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim  
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -577,6 +577,7 @@ api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
+api.add_resource(BusinessClaim, "/api/v1/business_claim")
 
 
 class GooglePlacesInfo(Resource):

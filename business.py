@@ -4,6 +4,7 @@ from werkzeug.exceptions import BadRequest
 from datetime import datetime
 import ast
 import traceback
+import uuid
 
 from data_ec import connect, uploadImage, s3, processImage
 
@@ -78,6 +79,7 @@ class Business(Resource):
 
         try:
             payload = request.form.to_dict()
+            
 
             if 'user_uid' not in payload:
                     response['message'] = 'user_uid is required to register a business'
@@ -754,6 +756,202 @@ class BusinessServicePurchase(Resource):
 
         except Exception as e:
             print(f"Error in BusinessServicePurchase POST: {str(e)}")
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+
+class BusinessClaim(Resource):
+    def post(self):
+        print("In BusinessClaim POST")
+        response = {}
+        try:
+            # Read files
+            files = {}
+            index = 0
+            while True:
+                key = f"document_{index}"
+                if key in request.files:
+                    files[key] = request.files[key]
+                    index += 1
+                else:
+                    break
+
+            print(f"Files captured: {list(files.keys())}")
+
+            payload = request.form.to_dict()
+            print("Form keys:", list(payload.keys()))
+
+            profile_uid  = payload.get("profile_uid", "").strip()
+            business_uid = payload.get("business_uid", "").strip()
+            claim_role   = payload.get("claim_role", "").strip()
+            claim_note   = payload.get("claim_note", "").strip()
+
+            if not profile_uid or not business_uid or not claim_role:
+                response["message"] = "profile_uid, business_uid, and claim_role are required"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                business_check = db.select("every_circle.business", where={"business_uid": business_uid})
+                if not business_check["result"]:
+                    response["message"] = "Business not found"
+                    response["code"] = 404
+                    return response, 404
+
+                existing_query = f"""
+                    SELECT claim_uid FROM every_circle.business_claims
+                    WHERE claim_profile_id = '{profile_uid}'
+                    AND claim_business_id = '{business_uid}'
+                    AND claim_status IN ('pending', 'approved')
+                    LIMIT 1
+                """
+                existing = db.execute(existing_query)
+                if existing["result"]:
+                    response["message"] = "A claim already exists for this business"
+                    response["code"] = 409
+                    return response, 409
+
+                claim_uid_resp = db.call(procedure="new_claim_uid")
+                claim_uid = claim_uid_resp["result"][0]["new_id"]
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Upload files
+                uploaded_urls = []
+                for i, (key, file) in enumerate(files.items()):
+                    print(f"Processing file {i}: {file.filename}")
+                    file.stream.seek(0)  # reset stream in case it was partially read
+                    unique_filename = f"document_{i}_" + datetime.now().strftime('%Y%m%d%H%M%SZ')
+                    image_key = f"business_claims/{claim_uid}/{unique_filename}"
+                    print(f"Uploading to S3 key: {image_key}")
+                    url = uploadImage(file, image_key, '')
+                    print(f"Upload result URL: {url}")
+                    if url:
+                        uploaded_urls.append(url)
+
+                print(f"Total uploaded: {len(uploaded_urls)}, doc_urls: {uploaded_urls}")
+                doc_urls = ",".join(uploaded_urls)
+
+                db.execute(f"""
+                    INSERT INTO every_circle.business_claims
+                        (claim_uid, claim_profile_id, claim_business_id,
+                        claim_role, claim_note, claim_documents, claim_status, claim_created_at)
+                    VALUES
+                        ('{claim_uid}', '{profile_uid}', '{business_uid}',
+                        '{claim_role}', '{claim_note}', '{doc_urls}', 'pending', '{now}')
+                """, cmd='post')
+
+            response["message"] = "Claim submitted successfully"
+            response["claim_uid"] = claim_uid
+            response["code"] = 200
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessClaim POST: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def put(self):
+        """Admin resolves a claim — approve or reject."""
+        print("In BusinessClaim PUT")
+        response = {}
+        try:
+            payload = request.get_json(force=True) or {}
+            claim_uid   = payload.get("claim_uid", "").strip()
+            action      = payload.get("action", "").strip()       # 'approved' | 'rejected'
+            admin_uid   = payload.get("admin_uid", "").strip()
+
+            if not claim_uid or action not in ("approved", "rejected"):
+                response["message"] = "claim_uid and action ('approved' or 'rejected') are required"
+                response["code"] = 400
+                return response, 400
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            with connect() as db:
+                existing = db.execute(f"""
+                    SELECT * FROM every_circle.business_claims
+                    WHERE claim_uid = '{claim_uid}' LIMIT 1
+                """)
+                if not existing["result"]:
+                    response["message"] = "Claim not found"
+                    response["code"] = 404
+                    return response, 404
+
+                db.execute(f"""
+                    UPDATE every_circle.business_claims
+                    SET claim_status = '{action}',
+                        claim_resolved_at = '{now}',
+                        claim_resolved_by = '{admin_uid}'
+                    WHERE claim_uid = '{claim_uid}'
+                """, cmd='post')
+
+                # If approved, add the claimant as a business_user
+                if action == "approved":
+                    claim = existing["result"][0]
+                    bu_uid_resp = db.call(procedure="new_bu_uid")
+                    bu_uid = bu_uid_resp["result"][0]["new_id"]
+                    db.execute(f"""
+                        INSERT INTO every_circle.business_user
+                            (bu_uid, bu_business_id, bu_user_id, bu_role, bu_joined_at)
+                        SELECT '{bu_uid}', '{claim["claim_business_id"]}',
+                            u.user_uid, '{claim["claim_role"]}', '{now}'
+                        FROM every_circle.profile_personal pp
+                        JOIN every_circle.users u ON u.user_uid = pp.profile_personal_user_id
+                        WHERE pp.profile_personal_uid = '{claim["claim_profile_id"]}'
+                        LIMIT 1
+                    """, cmd='post')
+
+            response["message"] = f"Claim {action} successfully"
+            response["code"] = 200
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessClaim PUT: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def get(self):
+        """Admin fetch — all pending claims, or filter by business_uid or profile_uid."""
+        print("In BusinessClaim GET")
+        response = {}
+        try:
+            business_uid = request.args.get("business_uid", "").strip()
+            profile_uid  = request.args.get("profile_uid", "").strip()
+            status       = request.args.get("status", "pending").strip()
+
+            where_clause = f"claim_status = '{status}'"
+            if business_uid:
+                where_clause += f" AND claim_business_id = '{business_uid}'"
+            if profile_uid:
+                where_clause += f" AND claim_profile_id = '{profile_uid}'"
+
+            with connect() as db:
+                result = db.execute(f"""
+                    SELECT bc.*,
+                           b.business_name,
+                           pp.profile_personal_first_name,
+                           pp.profile_personal_last_name
+                    FROM every_circle.business_claims bc
+                    LEFT JOIN every_circle.business b
+                           ON b.business_uid = bc.claim_business_id
+                    LEFT JOIN every_circle.profile_personal pp
+                           ON pp.profile_personal_uid = bc.claim_profile_id
+                    WHERE {where_clause}
+                    ORDER BY bc.claim_created_at DESC
+                """)
+
+            response["result"] = result["result"] or []
+            response["code"] = 200
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessClaim GET: {str(e)}")
+            traceback.print_exc()
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
