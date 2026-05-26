@@ -895,9 +895,9 @@ class BusinessClaim(Resource):
                     bu_uid = bu_uid_resp["result"][0]["new_id"]
                     db.execute(f"""
                         INSERT INTO every_circle.business_user
-                            (bu_uid, bu_business_id, bu_user_id, bu_role, bu_joined_at)
+                            (bu_uid, bu_business_id, bu_user_id, bu_role, bu_joined_at, bu_individual_business_is_public)
                         SELECT '{bu_uid}', '{claim["claim_business_id"]}',
-                            u.user_uid, '{claim["claim_role"]}', '{now}'
+                            u.user_uid, '{claim["claim_role"]}', '{now}', 1
                         FROM every_circle.profile_personal pp
                         JOIN every_circle.users u ON u.user_uid = pp.profile_personal_user_id
                         WHERE pp.profile_personal_uid = '{claim["claim_profile_id"]}'
