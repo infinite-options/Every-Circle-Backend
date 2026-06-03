@@ -6,7 +6,7 @@ import ast
 import traceback
 import uuid
 
-from data_ec import connect, uploadImage, s3, processImage
+from data_ec import connect, uploadImage, s3, processImage, encrypt_data, decrypt_data
 
 
 # add google social id in GET api
@@ -675,7 +675,8 @@ class BusinessServicePurchase(Resource):
         response = {}
 
         try:
-            payload = request.get_json(force=True) or {}
+            #payload = request.get_json(force=True) or {}
+            payload = getattr(request, '_decrypted_json', None) or request.get_json(force=True) or {}
             bs_uid = payload.get("bs_uid", "").strip()
             qty_purchased = payload.get("quantity", 1)
 
