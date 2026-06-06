@@ -3,7 +3,7 @@ from flask_restful import Resource
 from datetime import datetime
 import json
 
-from sympy import group
+# from sympy import group
 
 from data_ec import connect
 

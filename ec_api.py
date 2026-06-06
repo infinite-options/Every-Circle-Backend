@@ -521,7 +521,59 @@ class Refer(Resource):
             response['message'] = 'Internal Server Error'
             return response, 500
 
+# -- CRON ENDPOINTS start here -------------------------------------------------------------------------------
 
+# -- CURRENT CRON JOB
+
+
+class Lists_CLASS(Resource):
+    def get(self):
+        print("In Lists CLASS JOB")
+
+        response = {}
+
+        try:
+            # Run query to find all APPROVED Contracts
+            with connect() as db:       
+                generic_query = db.execute("""
+                    SELECT * FROM every_circle.lists;
+                    """)
+
+                generic_list = generic_query['result']
+                print("\nApproved List Contents: ", generic_list)
+                response["Lists CRON Job completed"] = {'message': f'Lists CRON Job completed' ,
+                        'code': 200}
+
+                    
+        except:
+                response["Lists CRON Job failed"] = {'message': f'Lists CRON Job failed' ,
+                        'code': 500}
+
+        return response
+
+def Lists_CRON(Resource):
+        print("In Lists CRON JOB")
+
+        response = {}
+
+        try:
+            # Run query to find all APPROVED Contracts
+            with connect() as db:    
+                generic_query = db.execute("""
+                    SELECT * FROM every_circle.lists;
+                    """)
+
+                generic_list = generic_query['result']
+                print("\nApproved List Contents: ", generic_list)
+                response["Lists CRON Job completed"] = {'message': f'Lists CRON Job completed' ,
+                        'code': 200}
+
+                    
+        except:
+                response["Lists CRON Job failed"] = {'message': f'Lists CRON Job failed' ,
+                        'code': 500}
+
+        return response
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
@@ -578,6 +630,7 @@ api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
+api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
 
 
 class GooglePlacesInfo(Resource):
