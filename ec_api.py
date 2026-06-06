@@ -185,7 +185,7 @@ class DecryptingRequest(FlaskRequest):
     """Transparently decrypts AES-encrypted request bodies before any endpoint reads them."""
     def get_json(self, force=False, silent=False, cache=True):
         data = super().get_json(force=force, silent=silent, cache=cache)
-        if isinstance(data, dict) and "encrypted_data" in data:
+        if self.headers.get("X-Privacy-Mode") == "true" and isinstance(data, dict) and "encrypted_data" in data:
             try:
                 decrypted = decrypt_data(data["encrypted_data"])
                 return json.loads(decrypted)
@@ -250,6 +250,8 @@ UNENCRYPTED_ENDPOINTS = [
 def _encrypt_all_responses(response):
     from flask import request as flask_request
     if any(flask_request.path.startswith(ep) for ep in UNENCRYPTED_ENDPOINTS):
+        return response
+    if flask_request.headers.get("X-Privacy-Mode") != "true":
         return response
     if response.content_type and 'application/json' in response.content_type:
         try:
