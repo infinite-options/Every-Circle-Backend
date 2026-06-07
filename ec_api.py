@@ -181,6 +181,49 @@ def decrypt_request_body(payload):
         return json.loads(decrypted)
     return payload
 
+BLOCK_SIZE = int(os.getenv('BLOCK_SIZE', '16'))
+POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
+ENCRYPTION_ENABLED = True if os.getenv('ENCRYPTION_ENABLED') == "True" else False
+
+decrypted_data = None
+
+
+def decrypt_dict(encrypted_blob):
+    print("Actual decryption started")
+    try:
+        if not encrypted_blob or not isinstance(encrypted_blob, str):
+            return None
+        decrypted = decrypt_data(encrypted_blob.strip())
+        if not decrypted:
+            return None
+        return json.loads(decrypted)
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return None
+
+
+def decrypt_request(force=False):
+    if not force and not ENCRYPTION_ENABLED:
+        return
+    if request.is_json:
+        global decrypted_data
+        print(f"Inside is_json - {os.getenv('RDS_DB')}")
+        print(request.get_json().get('encrypted_data'))
+        encrypted_data = request.get_json().get('encrypted_data')
+        if encrypted_data:
+            decrypted_data = decrypt_dict(encrypted_data)
+            print('decrypted data', decrypted_data, type(decrypted_data))
+
+            def get_json_override(*args, **kwargs):
+                global decrypted_data
+                print("In function: ", decrypted_data, type(decrypted_data))
+                if isinstance(decrypted_data, str):
+                    decrypted_data = json.loads(decrypted_data)
+                    print("JSON Announcement Payload: ", decrypted_data, type(decrypted_data))
+                return decrypted_data
+
+            request.get_json = get_json_override
+
 class DecryptingRequest(FlaskRequest):
     """Transparently decrypts AES-encrypted request bodies before any endpoint reads them."""
     def get_json(self, force=False, silent=False, cache=True):
@@ -244,6 +287,7 @@ api = Api(app)
 
 UNENCRYPTED_ENDPOINTS = [
     "/api/v1/userprofileinfo",
+    "/decode",
 ]
 
 @app.after_request
@@ -728,6 +772,37 @@ class GooglePlacesInfo(Resource):
 # Add the new endpoint to the API
 api.add_resource(GooglePlacesInfo, '/api/google-places')
 
+
+@app.route('/decode', methods=['POST'])
+def decode():
+    print("In decode")
+
+    payload = request.get_json(force=True, silent=True)
+    encrypted_data = None
+    if isinstance(payload, dict):
+        encrypted_data = payload.get('encrypted_data')
+    if not encrypted_data:
+        encrypted_data = request.form.get('encrypted_data')
+
+    if encrypted_data:
+        decrypted = decrypt_dict(encrypted_data)
+        if decrypted is None:
+            return jsonify({
+                'error': 'Decryption failed — verify AES_SECRET_KEY matches the environment that encrypted this data',
+                'decode': None,
+            }), 400
+        return jsonify({'decode': decrypted})
+
+    if payload is not None:
+        return jsonify({'decode': payload})
+
+    decode_files = {}
+    for key, value in request.form.items():
+        decode_files[key] = value
+    for file_key, file_storage in request.files.items():
+        print(f"Key: {file_key}, Filename: {file_storage.filename}")
+        decode_files[file_key] = file_storage.filename
+    return jsonify(decode_files)
 
 
 if __name__ == '__main__':

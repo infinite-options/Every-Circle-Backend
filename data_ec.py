@@ -36,7 +36,7 @@ def encrypt_data(plain_text):
     if not plain_text:
         return ""
     try:
-        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
+        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
         # Pad key to 16 bytes
         key = key[:16].ljust(16, b'\0')
         json_data = plain_text.encode("utf-8") if isinstance(plain_text, str) else plain_text
@@ -44,7 +44,8 @@ def encrypt_data(plain_text):
         padder = PKCS7(BLOCK_SIZE * 8).padder()
         padded = padder.update(json_data) + padder.finalize()
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-        encrypted = cipher.encryptor().update(padded) + cipher.encryptor().finalize()
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
         return base64.b64encode(iv + encrypted).decode("utf-8")
     except Exception as e:
         print(f"Encryption error: {e}")
@@ -54,13 +55,14 @@ def decrypt_data(encrypted_blob):
     if not encrypted_blob:
         return ""
     try:
-        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
+        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
         key = key[:16].ljust(16, b'\0')
         data = base64.b64decode(encrypted_blob)
         iv = data[:BLOCK_SIZE]
         ciphertext = data[BLOCK_SIZE:]
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-        decrypted_padded = cipher.decryptor().update(ciphertext) + cipher.decryptor().finalize()
+        decryptor = cipher.decryptor()
+        decrypted_padded = decryptor.update(ciphertext) + decryptor.finalize()
         unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
         decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
         return decrypted.decode("utf-8")
