@@ -1,5 +1,4 @@
 from flask import request, make_response, jsonify
-from cryptography.fernet import Fernet
 
 import base64
 import hashlib
