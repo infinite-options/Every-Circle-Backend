@@ -54,7 +54,6 @@ from search_referral import SearchReferral
 from profile_views import ProfileViews
 # from jwtToken import JwtToken
 from functools import wraps
-import jwt
 
 # from flask import Request
 
@@ -70,7 +69,7 @@ from flask import Flask, request, render_template, url_for, redirect, jsonify, a
 from flask_restful import Resource, Api
 from flask_cors import CORS
 from flask_mail import Mail, Message  # used for email
-from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt_identity, jwt_required, create_access_token 
+from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt_identity, jwt_required, create_access_token, create_refresh_token
 from pytz import timezone as ptz  # Not sure what the difference is
 from decimal import Decimal
 from hashlib import sha512
@@ -88,10 +87,9 @@ from werkzeug.datastructures import ImmutableMultiDict
 # used for serializer email and error handling
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
-# from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-# from cryptography.hazmat.primitives.padding import PKCS7
-# from cryptography.hazmat.backends import default_backend
-import json
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+from cryptography.hazmat.backends import default_backend
 import base64
 import googlemaps
 
@@ -103,73 +101,49 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 
 # == Using Cryptography library for AES encryption ==
 
-# load_dotenv()
-# AES_SECRET_KEY = os.getenv('AES_SECRET_KEY')
-# # print("AES Secret Key: ", AES_SECRET_KEY)
-# AES_KEY = AES_SECRET_KEY.encode('utf-8')
-# BLOCK_SIZE = int(os.getenv('BLOCK_SIZE'))
-# # print("Block Size: ", BLOCK_SIZE)
-# POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
-# # print("POSTMAN_SECRET: ", POSTMAN_SECRET)
-# OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
-# print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
+AES_SECRET_KEY = os.getenv('AES_SECRET_KEY')
+AES_KEY = AES_SECRET_KEY.encode('utf-8')
+BLOCK_SIZE = int(os.getenv('BLOCK_SIZE'))
+POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
+
+ENCRYPTION_ENABLED = True if os.getenv('ENCRYPTION_ENABLED') == "True" else False
+print("ENCRYPTION_ENABLED: ", ENCRYPTION_ENABLED)
+
+decrypted_data = {}
 
 
-# Encrypt dictionary - Currently commented
-# def encrypt_dict(data_dict):
-#     try:
-#         print("In encrypt_dict: ", data_dict)
-#         # Convert dictionary to JSON string
-#         json_data = json.dumps(data_dict).encode()
+def encrypt_dict(data_dict):
+    try:
+        print("In encrypt_dict: ", data_dict)
+        json_data = json.dumps(data_dict).encode()
+        padder = PKCS7(BLOCK_SIZE * 8).padder()
+        padded_data = padder.update(json_data) + padder.finalize()
+        iv = os.urandom(BLOCK_SIZE)
+        cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+        encrypted_blob = base64.b64encode(iv + encrypted_data).decode()
+        return encrypted_blob
+    except Exception as e:
+        print(f"Encryption error: {e}")
+        return None
 
-#         # Pad the JSON data
-#         padder = PKCS7(BLOCK_SIZE * 8).padder()
-#         padded_data = padder.update(json_data) + padder.finalize()
 
-#         # Generate a random initialization vector (IV)
-#         iv = os.urandom(BLOCK_SIZE)
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         encryptor = cipher.encryptor()
-
-#         # Encrypt the padded data
-#         encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-
-#         # Combine IV and encrypted data, then Base64 encode
-#         encrypted_blob = base64.b64encode(iv + encrypted_data).decode()
-#         return encrypted_blob
-#     except Exception as e:
-#         print(f"Encryption error: {e}")
-#         return None
-
-# Decrypt dictionary - Currently commented
-# def decrypt_dict(encrypted_blob):
-#     print("Actual decryption started")
-#     try:
-#         # Base64 decode the encrypted blob
-#         encrypted_data = base64.b64decode(encrypted_blob)
-
-#         # Extract the IV (first BLOCK_SIZE bytes) and the encrypted content
-#         iv = encrypted_data[:BLOCK_SIZE]
-#         encrypted_content = encrypted_data[BLOCK_SIZE:]
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         decryptor = cipher.decryptor()
-
-#         # Decrypt the encrypted content
-#         decrypted_padded_data = decryptor.update(encrypted_content) + decryptor.finalize()
-
-#         # Unpad the decrypted content
-#         unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
-#         decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-
-#         # Convert the JSON string back to a dictionary
-#         return json.loads(decrypted_data.decode())
-#     except Exception as e:
-#         print(f"Decryption error: {e}")
-#         return None
+def decrypt_dict(encrypted_blob):
+    print("Actual decryption started")
+    try:
+        encrypted_data = base64.b64decode(encrypted_blob)
+        iv = encrypted_data[:BLOCK_SIZE]
+        encrypted_content = encrypted_data[BLOCK_SIZE:]
+        cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_padded_data = decryptor.update(encrypted_content) + decryptor.finalize()
+        unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
+        decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
+        return json.loads(decrypted_data.decode())
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return None
 
 
 
@@ -657,6 +631,178 @@ class GooglePlacesInfo(Resource):
 # Add the new endpoint to the API
 api.add_resource(GooglePlacesInfo, '/api/google-places')
 
+
+#  -- ENCRYPTION MIDDLEWARE    -----------------------------------------
+
+def check_jwt_token():
+    if (
+        request.path == '/auth/refreshToken'
+        or request.path == '/auth/accessToken'
+        or request.path.startswith('/userinfo')
+        or request.path.startswith('/api/v1/userprofileinfo')
+    ):
+        return jsonify({'message': 'JWT not required!'}), 201
+    try:
+        print('Request Headers:', request.headers['Authorization'])
+        verify_jwt_in_request()
+        current_user = get_jwt_identity()
+        print(f"Current User ID: {current_user}")
+        return jsonify({'message': 'JWT is present!'}), 201
+    except Exception as e:
+        exc_name = type(e).__name__
+        if exc_name == 'ExpiredSignatureError':
+            print('JWT Expired')
+            return jsonify({'message': 'Token is expired!'}), 401
+        if exc_name == 'InvalidTokenError':
+            print('JWT Invalid')
+            return jsonify({'message': 'Invalid token!'}), 404
+        print('JWT Missing')
+        return jsonify({'message': 'Missing token!'}), 404
+
+
+def decrypt_request():
+    if not ENCRYPTION_ENABLED:
+        return
+
+    if request.is_json:
+        global decrypted_data
+        print(f"Inside is_json - {os.getenv('RDS_DB')}")
+        print(request.get_json().get('encrypted_data'))
+        encrypted_data = request.get_json().get('encrypted_data')
+        if encrypted_data:
+            decrypted_data = decrypt_dict(encrypted_data)
+            print('decrypted data', decrypted_data, type(decrypted_data))
+
+            def get_json_override(*args, **kwargs):
+                global decrypted_data
+                print("In function: ", decrypted_data, type(decrypted_data))
+                if isinstance(decrypted_data, str):
+                    decrypted_data = json.loads(decrypted_data)
+                    print("JSON Announcement Payload: ", decrypted_data, type(decrypted_data))
+                return decrypted_data
+
+            request.get_json = get_json_override
+        else:
+            print("Data issue")
+    elif request.content_type and request.content_type.startswith('multipart/form-data'):
+        print(f"Inside multipart - {os.getenv('RDS_DB')}")
+        encrypted_data = request.form.get('encrypted_data')
+
+        if encrypted_data:
+            decrypted_data = decrypt_dict(encrypted_data)
+            fields = {}
+            files = {}
+
+            for key, value in decrypted_data.items():
+                if isinstance(value, dict) and 'fileName' in value and 'fileType' in value:
+                    file_binary = base64.b64decode(value['fileData'])
+                    file_stream = BytesIO(file_binary)
+                    files[key] = FileStorage(
+                        stream=file_stream,
+                        filename=value['fileName'],
+                        content_type=value['fileType']
+                    )
+                else:
+                    fields[key] = value
+
+            request.form = ImmutableMultiDict(fields)
+            request.files = ImmutableMultiDict(files)
+        else:
+            print("No encrypted data found in multipart/form-data request")
+    else:
+        print("GET Request, no JSON object received")
+
+
+def encrypt_response(data):
+    if not ENCRYPTION_ENABLED:
+        return jsonify(data)
+
+    encrypted_data = encrypt_dict(data)
+    return jsonify({'encrypted_data': encrypted_data})
+
+
+@app.route('/')
+def health_check():
+    print("In Health Check")
+    return jsonify({"message": "API is running!"})
+
+
+@app.route('/decode', methods=['POST'])
+def decode():
+    print("In decode")
+
+    decrypt_request()
+
+    if request.is_json:
+        response = jsonify({'decode': request.get_json(force=True)})
+    else:
+        decode_files = {}
+        for key, value in request.form.items():
+            decode_files[key] = value
+        for file_key, file_storage in request.files.items():
+            print(f"Key: {file_key}, Filename: {file_storage.filename}")
+            decode_files[file_key] = file_storage.filename
+        response = jsonify(decode_files)
+    return response
+
+
+@app.before_request
+def before_request():
+    if request.headers.get("Postman-Secret") != POSTMAN_SECRET:
+        if request.method != 'OPTIONS':
+            print("In Middleware before_request")
+            response, code = check_jwt_token()
+            if code == 201:
+                decrypt_request()
+            else:
+                print("Response Code: ", code)
+                response = encrypt_response(response.get_json()) if response.is_json else response
+                response.status_code = code
+                return response
+
+
+@app.after_request
+def after_request(response):
+    if request.headers.get("Postman-Secret") != POSTMAN_SECRET:
+        print("In Middleware after_request")
+        original_status_code = response.status_code
+        response = encrypt_response(response.get_json()) if response.is_json else response
+        response.status_code = original_status_code
+    return response
+
+
+@app.route('/auth/accessToken', methods=['POST'])
+def issue_access_token():
+    """Issue JWT for Every-Circle app API calls. Auth login lambda does not return JWT yet."""
+    try:
+        payload = request.get_json(force=True) or {}
+        user_uid = payload.get('user_uid')
+        if not user_uid:
+            return jsonify({'message': 'user_uid required'}), 400
+        with connect() as db:
+            response = db.select('users', {'user_uid': user_uid})
+        if not response.get('result'):
+            return jsonify({'message': 'User not found'}), 404
+        access_token = create_access_token(identity=user_uid)
+        refresh_token = create_refresh_token(identity=user_uid)
+        return jsonify(access_token=access_token, refresh_token=refresh_token)
+    except Exception as e:
+        print('Error issuing access token:', e)
+        return jsonify({'message': 'Could not issue access token'}), 500
+
+
+@app.route('/auth/refreshToken', methods=['GET'])
+@jwt_required(refresh=True)
+def refreshToken():
+    try:
+        print('Inside refresh token')
+        current_user = get_jwt_identity()
+        new_access_token = create_access_token(identity=current_user)
+        print('New token is', new_access_token)
+        return jsonify(access_token=new_access_token)
+    except Exception as e:
+        print('Error refreshing token:', e)
+        return jsonify({'message': 'Could not refresh token'}), 401
 
 
 if __name__ == '__main__':
