@@ -17,9 +17,17 @@ from werkzeug.datastructures import FileStorage
 import mimetypes
 import ast
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.padding import PKCS7
-from cryptography.hazmat.backends import default_backend
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+    from cryptography.hazmat.backends import default_backend
+except ImportError as exc:
+    from zappa_prebuild import CRYPTO_RESTORE_HINT, is_lambda_wheel_crypto_error
+    import sys
+    if is_lambda_wheel_crypto_error(exc):
+        print(CRYPTO_RESTORE_HINT, file=sys.stderr)
+        sys.exit(1)
+    raise
 import base64
 
 BLOCK_SIZE = 16
