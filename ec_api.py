@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
-from data_ec import connect, uploadImage, s3
+from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
 from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim  
 from business_v3 import Business_v3
@@ -66,7 +66,7 @@ import pytz
 from ably_auth import AblyToken
 import calendar
 from datetime import datetime, date, timedelta, timezone
-from flask import Flask, request, render_template, url_for, redirect, jsonify, abort
+from flask import Flask, request, Request as FlaskRequest, render_template, url_for, g, redirect, jsonify, abort
 from flask_restful import Resource, Api
 from flask_cors import CORS
 from flask_mail import Mail, Message  # used for email
@@ -171,6 +171,55 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 #         print(f"Decryption error: {e}")
 #         return None
 
+def encrypt_response(data):
+    json_str = json.dumps(data)
+    return {"encrypted_data": encrypt_data(json_str)}
+
+def decrypt_request_body(payload):
+    if isinstance(payload, dict) and payload.get("encrypted_data"):
+        decrypted = decrypt_data(payload["encrypted_data"])
+        return json.loads(decrypted)
+    return payload
+
+class DecryptingRequest(FlaskRequest):
+    """Transparently decrypts AES-encrypted request bodies before any endpoint reads them."""
+    def get_json(self, force=False, silent=False, cache=True):
+        data = super().get_json(force=force, silent=silent, cache=cache)
+        if self.headers.get("X-Privacy-Mode") == "true" and isinstance(data, dict) and "encrypted_data" in data:
+            try:
+                decrypted = decrypt_data(data["encrypted_data"])
+                return json.loads(decrypted)
+            except Exception as e:
+                print(f"Request decryption error: {e}")
+        return data
+
+# Middleware — wraps every response with encryption
+# @app.after_request
+# def encrypt_all_responses(response):
+#     if response.content_type == "application/json":
+#         try:
+#             data = response.get_json()
+#             if data is not None:
+#                 encrypted = encrypt_response(data)
+#                 response.data = json.dumps(encrypted)
+#                 response.content_type = "application/json"
+#         except Exception as e:
+#             print(f"Response encryption error: {e}")
+#     return response
+
+# @app.before_request
+# def decrypt_all_requests():
+#     if request.content_type == "application/json":
+#         try:
+#             payload = request.get_json(silent=True)
+#             if payload and payload.get("encrypted") and payload.get("data"):
+#                 decrypted_str = decrypt_data(payload["data"])
+#                 decrypted = json.loads(decrypted_str)
+#                 # Store decrypted data so endpoints can access it
+#                 request._decrypted_json = decrypted
+#         except Exception as e:
+#             print(f"Request decryption error: {e}")
+
 
 
 # NEED to figure out where the NotFound or InternalServerError is displayed
@@ -190,7 +239,29 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 
 
 app = Flask(__name__)
+app.request_class = DecryptingRequest
 api = Api(app)
+
+UNENCRYPTED_ENDPOINTS = [
+    "/api/v1/userprofileinfo",
+]
+
+@app.after_request
+def _encrypt_all_responses(response):
+    from flask import request as flask_request
+    if any(flask_request.path.startswith(ep) for ep in UNENCRYPTED_ENDPOINTS):
+        return response
+    if flask_request.headers.get("X-Privacy-Mode") != "true":
+        return response
+    if response.content_type and 'application/json' in response.content_type:
+        try:
+            data = response.get_json(silent=True)
+            if data is not None:
+                response.data = json.dumps({"encrypted_data": encrypt_data(json.dumps(data))})
+                response.content_type = "application/json"
+        except Exception as e:
+            print(f"Response encryption error: {e}")
+    return response
 
 CORS(app)
 
