@@ -188,6 +188,21 @@ ENCRYPTION_ENABLED = True if os.getenv('ENCRYPTION_ENABLED') == "True" else Fals
 decrypted_data = None
 
 
+def has_postman_bypass(req=None):
+    req = req or request
+    secret = req.headers.get('Postman-Secret')
+    return POSTMAN_SECRET is not None and secret == POSTMAN_SECRET
+
+
+def privacy_mode_enabled(req=None):
+    req = req or request
+    return req.headers.get('X-Privacy-Mode') == 'true'
+
+
+def should_apply_crypto(req=None):
+    return privacy_mode_enabled(req) and not has_postman_bypass(req)
+
+
 def decrypt_dict(encrypted_blob):
     print("Actual decryption started")
     try:
@@ -203,32 +218,38 @@ def decrypt_dict(encrypted_blob):
 
 
 def decrypt_request(force=False):
-    if not force and not ENCRYPTION_ENABLED:
+    if has_postman_bypass():
         return
-    if request.is_json:
-        global decrypted_data
-        print(f"Inside is_json - {os.getenv('RDS_DB')}")
-        print(request.get_json().get('encrypted_data'))
-        encrypted_data = request.get_json().get('encrypted_data')
-        if encrypted_data:
-            decrypted_data = decrypt_dict(encrypted_data)
-            print('decrypted data', decrypted_data, type(decrypted_data))
+    if not force and not ENCRYPTION_ENABLED and not privacy_mode_enabled():
+        return
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return
+    global decrypted_data
+    print(f"Inside decrypt_request - {os.getenv('RDS_DB')}")
+    print(payload.get('encrypted_data'))
+    encrypted_data = payload.get('encrypted_data')
+    if encrypted_data:
+        decrypted_data = decrypt_dict(encrypted_data)
+        print('decrypted data', decrypted_data, type(decrypted_data))
 
-            def get_json_override(*args, **kwargs):
-                global decrypted_data
-                print("In function: ", decrypted_data, type(decrypted_data))
-                if isinstance(decrypted_data, str):
-                    decrypted_data = json.loads(decrypted_data)
-                    print("JSON Announcement Payload: ", decrypted_data, type(decrypted_data))
-                return decrypted_data
+        def get_json_override(*args, **kwargs):
+            global decrypted_data
+            print("In function: ", decrypted_data, type(decrypted_data))
+            if isinstance(decrypted_data, str):
+                decrypted_data = json.loads(decrypted_data)
+                print("JSON Announcement Payload: ", decrypted_data, type(decrypted_data))
+            return decrypted_data
 
-            request.get_json = get_json_override
+        request.get_json = get_json_override
 
 class DecryptingRequest(FlaskRequest):
     """Transparently decrypts AES-encrypted request bodies before any endpoint reads them."""
     def get_json(self, force=False, silent=False, cache=True):
         data = super().get_json(force=force, silent=silent, cache=cache)
-        if self.headers.get("X-Privacy-Mode") == "true" and isinstance(data, dict) and "encrypted_data" in data:
+        if has_postman_bypass(self):
+            return data
+        if should_apply_crypto(self) and isinstance(data, dict) and "encrypted_data" in data:
             try:
                 decrypted = decrypt_data(data["encrypted_data"])
                 return json.loads(decrypted)
@@ -287,15 +308,26 @@ api = Api(app)
 
 UNENCRYPTED_ENDPOINTS = [
     "/api/v1/userprofileinfo",
-    "/decode",
 ]
+
+@app.before_request
+def _before_request():
+    if has_postman_bypass():
+        return
+    if request.method == 'OPTIONS':
+        return
+    if should_apply_crypto():
+        decrypt_request(force=True)
+
 
 @app.after_request
 def _encrypt_all_responses(response):
     from flask import request as flask_request
+    if has_postman_bypass(flask_request):
+        return response
     if any(flask_request.path.startswith(ep) for ep in UNENCRYPTED_ENDPOINTS):
         return response
-    if flask_request.headers.get("X-Privacy-Mode") != "true":
+    if not privacy_mode_enabled(flask_request):
         return response
     if response.content_type and 'application/json' in response.content_type:
         try:
