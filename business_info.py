@@ -193,6 +193,7 @@ def _prepare_business_service_update_dict(service_data):
         "bs_quantity",
         "bs_shipping",
         "bs_condition",
+        "bs_sku",
     }
     out = {}
     for k, v in service_data.items():
