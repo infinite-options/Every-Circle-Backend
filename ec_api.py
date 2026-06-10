@@ -17,8 +17,11 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+from zappa_prebuild import exit_if_crypto_broken
+exit_if_crypto_broken()
+
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
-from data_ec import connect, uploadImage, s3
+from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
 from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim, ProfileConnectionDegrees
 from business_v3 import Business_v3
@@ -66,7 +69,7 @@ import pytz
 from ably_auth import AblyToken
 import calendar
 from datetime import datetime, date, timedelta, timezone
-from flask import Flask, request, render_template, url_for, redirect, jsonify, abort
+from flask import Flask, request, Request as FlaskRequest, render_template, url_for, g, redirect, jsonify, abort
 from flask_restful import Resource, Api
 from flask_cors import CORS
 from flask_mail import Mail, Message  # used for email
@@ -171,6 +174,119 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 #         print(f"Decryption error: {e}")
 #         return None
 
+def encrypt_response(data):
+    json_str = json.dumps(data)
+    return {"encrypted_data": encrypt_data(json_str)}
+
+def decrypt_request_body(payload):
+    if isinstance(payload, dict) and payload.get("encrypted_data"):
+        decrypted = decrypt_data(payload["encrypted_data"])
+        return json.loads(decrypted)
+    return payload
+
+BLOCK_SIZE = int(os.getenv('BLOCK_SIZE', '16'))
+POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
+ENCRYPTION_ENABLED = True if os.getenv('ENCRYPTION_ENABLED') == "True" else False
+
+decrypted_data = None
+
+
+def has_postman_bypass(req=None):
+    req = req or request
+    secret = req.headers.get('Postman-Secret')
+    return POSTMAN_SECRET is not None and secret == POSTMAN_SECRET
+
+
+def privacy_mode_enabled(req=None):
+    req = req or request
+    return req.headers.get('X-Privacy-Mode') == 'true'
+
+
+def should_apply_crypto(req=None):
+    return privacy_mode_enabled(req) and not has_postman_bypass(req)
+
+
+def decrypt_dict(encrypted_blob):
+    print("Actual decryption started")
+    try:
+        if not encrypted_blob or not isinstance(encrypted_blob, str):
+            return None
+        decrypted = decrypt_data(encrypted_blob.strip())
+        if not decrypted:
+            return None
+        return json.loads(decrypted)
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return None
+
+
+def decrypt_request(force=False):
+    if has_postman_bypass():
+        return
+    if not force and not ENCRYPTION_ENABLED and not privacy_mode_enabled():
+        return
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return
+    global decrypted_data
+    print(f"Inside decrypt_request - {os.getenv('RDS_DB')}")
+    print(payload.get('encrypted_data'))
+    encrypted_data = payload.get('encrypted_data')
+    if encrypted_data:
+        decrypted_data = decrypt_dict(encrypted_data)
+        print('decrypted data', decrypted_data, type(decrypted_data))
+
+        def get_json_override(*args, **kwargs):
+            global decrypted_data
+            print("In function: ", decrypted_data, type(decrypted_data))
+            if isinstance(decrypted_data, str):
+                decrypted_data = json.loads(decrypted_data)
+                print("JSON Announcement Payload: ", decrypted_data, type(decrypted_data))
+            return decrypted_data
+
+        request.get_json = get_json_override
+
+class DecryptingRequest(FlaskRequest):
+    """Transparently decrypts AES-encrypted request bodies before any endpoint reads them."""
+    def get_json(self, force=False, silent=False, cache=True):
+        data = super().get_json(force=force, silent=silent, cache=cache)
+        if has_postman_bypass(self):
+            return data
+        if should_apply_crypto(self) and isinstance(data, dict) and "encrypted_data" in data:
+            try:
+                decrypted = decrypt_data(data["encrypted_data"])
+                return json.loads(decrypted)
+            except Exception as e:
+                print(f"Request decryption error: {e}")
+        return data
+
+# Middleware — wraps every response with encryption
+# @app.after_request
+# def encrypt_all_responses(response):
+#     if response.content_type == "application/json":
+#         try:
+#             data = response.get_json()
+#             if data is not None:
+#                 encrypted = encrypt_response(data)
+#                 response.data = json.dumps(encrypted)
+#                 response.content_type = "application/json"
+#         except Exception as e:
+#             print(f"Response encryption error: {e}")
+#     return response
+
+# @app.before_request
+# def decrypt_all_requests():
+#     if request.content_type == "application/json":
+#         try:
+#             payload = request.get_json(silent=True)
+#             if payload and payload.get("encrypted") and payload.get("data"):
+#                 decrypted_str = decrypt_data(payload["data"])
+#                 decrypted = json.loads(decrypted_str)
+#                 # Store decrypted data so endpoints can access it
+#                 request._decrypted_json = decrypted
+#         except Exception as e:
+#             print(f"Request decryption error: {e}")
+
 
 
 # NEED to figure out where the NotFound or InternalServerError is displayed
@@ -190,7 +306,41 @@ print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) ---------
 
 
 app = Flask(__name__)
+app.request_class = DecryptingRequest
 api = Api(app)
+
+UNENCRYPTED_ENDPOINTS = [
+    "/api/v1/userprofileinfo",
+]
+
+@app.before_request
+def _before_request():
+    if has_postman_bypass():
+        return
+    if request.method == 'OPTIONS':
+        return
+    if should_apply_crypto():
+        decrypt_request(force=True)
+
+
+@app.after_request
+def _encrypt_all_responses(response):
+    from flask import request as flask_request
+    if has_postman_bypass(flask_request):
+        return response
+    if any(flask_request.path.startswith(ep) for ep in UNENCRYPTED_ENDPOINTS):
+        return response
+    if not privacy_mode_enabled(flask_request):
+        return response
+    if response.content_type and 'application/json' in response.content_type:
+        try:
+            data = response.get_json(silent=True)
+            if data is not None:
+                response.data = json.dumps({"encrypted_data": encrypt_data(json.dumps(data))})
+                response.content_type = "application/json"
+        except Exception as e:
+            print(f"Response encryption error: {e}")
+    return response
 
 CORS(app)
 
@@ -521,7 +671,59 @@ class Refer(Resource):
             response['message'] = 'Internal Server Error'
             return response, 500
 
+# -- CRON ENDPOINTS start here -------------------------------------------------------------------------------
 
+# -- CURRENT CRON JOB
+
+
+class Lists_CLASS(Resource):
+    def get(self):
+        print("In Lists CLASS JOB")
+
+        response = {}
+
+        try:
+            # Run query to find all APPROVED Contracts
+            with connect() as db:       
+                generic_query = db.execute("""
+                    SELECT * FROM every_circle.lists;
+                    """)
+
+                generic_list = generic_query['result']
+                print("\nApproved List Contents: ", generic_list)
+                response["Lists CRON Job completed"] = {'message': f'Lists CRON Job completed' ,
+                        'code': 200}
+
+                    
+        except:
+                response["Lists CRON Job failed"] = {'message': f'Lists CRON Job failed' ,
+                        'code': 500}
+
+        return response
+
+def Lists_CRON(Resource):
+        print("In Lists CRON JOB")
+
+        response = {}
+
+        try:
+            # Run query to find all APPROVED Contracts
+            with connect() as db:    
+                generic_query = db.execute("""
+                    SELECT * FROM every_circle.lists;
+                    """)
+
+                generic_list = generic_query['result']
+                print("\nApproved List Contents: ", generic_list)
+                response["Lists CRON Job completed"] = {'message': f'Lists CRON Job completed' ,
+                        'code': 200}
+
+                    
+        except:
+                response["Lists CRON Job failed"] = {'message': f'Lists CRON Job failed' ,
+                        'code': 500}
+
+        return response
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
@@ -579,6 +781,7 @@ api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
+api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
 
 
 class GooglePlacesInfo(Resource):
@@ -605,6 +808,37 @@ class GooglePlacesInfo(Resource):
 # Add the new endpoint to the API
 api.add_resource(GooglePlacesInfo, '/api/google-places')
 
+
+@app.route('/decode', methods=['POST'])
+def decode():
+    print("In decode")
+
+    payload = request.get_json(force=True, silent=True)
+    encrypted_data = None
+    if isinstance(payload, dict):
+        encrypted_data = payload.get('encrypted_data')
+    if not encrypted_data:
+        encrypted_data = request.form.get('encrypted_data')
+
+    if encrypted_data:
+        decrypted = decrypt_dict(encrypted_data)
+        if decrypted is None:
+            return jsonify({
+                'error': 'Decryption failed — verify AES_SECRET_KEY matches the environment that encrypted this data',
+                'decode': None,
+            }), 400
+        return jsonify({'decode': decrypted})
+
+    if payload is not None:
+        return jsonify({'decode': payload})
+
+    decode_files = {}
+    for key, value in request.form.items():
+        decode_files[key] = value
+    for file_key, file_storage in request.files.items():
+        print(f"Key: {file_key}, Filename: {file_storage.filename}")
+        decode_files[file_key] = file_storage.filename
+    return jsonify(decode_files)
 
 
 if __name__ == '__main__':

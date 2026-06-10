@@ -1,5 +1,8 @@
 from flask import request, make_response, jsonify
 
+import base64
+import hashlib
+
 import os
 import pymysql
 import datetime
@@ -14,6 +17,21 @@ from werkzeug.datastructures import FileStorage
 import mimetypes
 import ast
 
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+    from cryptography.hazmat.backends import default_backend
+except ImportError as exc:
+    from zappa_prebuild import CRYPTO_RESTORE_HINT, is_lambda_wheel_crypto_error
+    import sys
+    if is_lambda_wheel_crypto_error(exc):
+        print(CRYPTO_RESTORE_HINT, file=sys.stderr)
+        sys.exit(1)
+    raise
+import base64
+
+BLOCK_SIZE = 16
+
 # s3 = boto3.client('s3')
 s3 = boto3.client(
     's3',
@@ -21,6 +39,44 @@ s3 = boto3.client(
     aws_secret_access_key=os.getenv('S3_SECRET'),
     region_name=os.getenv('S3_REGION')
 )
+
+def encrypt_data(plain_text):
+    if not plain_text:
+        return ""
+    try:
+        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        # Pad key to 16 bytes
+        key = key[:16].ljust(16, b'\0')
+        json_data = plain_text.encode("utf-8") if isinstance(plain_text, str) else plain_text
+        iv = os.urandom(BLOCK_SIZE)
+        padder = PKCS7(BLOCK_SIZE * 8).padder()
+        padded = padder.update(json_data) + padder.finalize()
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+        return base64.b64encode(iv + encrypted).decode("utf-8")
+    except Exception as e:
+        print(f"Encryption error: {e}")
+        return ""
+
+def decrypt_data(encrypted_blob):
+    if not encrypted_blob:
+        return ""
+    try:
+        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        key = key[:16].ljust(16, b'\0')
+        data = base64.b64decode(encrypted_blob)
+        iv = data[:BLOCK_SIZE]
+        ciphertext = data[BLOCK_SIZE:]
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_padded = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
+        decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
+        return decrypted.decode("utf-8")
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return ""
 
 
 
