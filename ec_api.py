@@ -23,7 +23,7 @@ exit_if_crypto_broken()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
-from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim  
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim, ProfileConnectionDegrees
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -772,6 +772,7 @@ api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/message
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessDetails, '/api/v1/business_details')
+api.add_resource(ProfileConnectionDegrees, '/api/v1/profile_connection_degrees')
 # api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
 api.add_resource(BusinessTagSearch, '/api/v1/businesstagsearch')
 api.add_resource(AblyToken, '/api/v1/ably/token')
