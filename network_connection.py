@@ -23,6 +23,43 @@ def _down_expandable_items(items):
     return [item for item in items if not _is_referred_by_zero_node(item)]
 
 
+def _fetch_uids_referred_by_zero_node(db):
+    placeholders = ",".join(f"'{u}'" for u in EVERYCIRCLE_ZERO_NODE_UIDS)
+    query = f'''
+        SELECT profile_personal_uid
+        FROM profile_personal
+        WHERE profile_personal_referred_by IN ({placeholders});
+    '''
+    response = db.execute(query)
+    if not response or not response.get('result'):
+        return frozenset()
+
+    return frozenset(
+        row['profile_personal_uid']
+        for row in response['result']
+        if row.get('profile_personal_uid')
+    )
+
+
+def _store_collected_uids(store):
+    uids = set()
+    for bucket in ('descendants', 'ancestors', 'ancestors_down'):
+        for items in store[bucket].values():
+            for item in items:
+                if isinstance(item, dict) and item.get('uid'):
+                    uids.add(item['uid'])
+    return uids
+
+
+def _filter_irrelevant_zero_neighbors(rows, zero_direct_children, connected_uids):
+    """Drop ZeroNode direct referrals that are not on the target's referral/circle path."""
+    return [
+        row for row in rows
+        if row['network_profile_personal_uid'] not in zero_direct_children
+        or row['network_profile_personal_uid'] in connected_uids
+    ]
+
+
 def _uids_after_zero_on_path(path_uids):
     for index, uid in enumerate(path_uids):
         if _is_zero_node(uid):
@@ -472,11 +509,24 @@ def get_circle_shortest_paths(target_uid):
     return results
 
 
+def _remaining_node_slots(seen, max_nodes):
+    return max(0, max_nodes - len(seen))
+
+
+def _take_nodes_up_to_limit(nodes, seen, max_nodes):
+    """Return unseen nodes, capped so seen does not exceed max_nodes."""
+    slots = _remaining_node_slots(seen, max_nodes)
+    if slots <= 0:
+        return []
+    unseen = [u for u in nodes if u['uid'] not in seen]
+    return unseen[:slots]
+
+
 def get_network_path(target_uid, degree):
     seen = set([target_uid])
     down_nodes =[]
     up_nodes = []
-    max_nodes  = 200
+    max_nodes  = 50
     #degree = 3
     store = {'descendants': defaultdict(list), 'ancestors': defaultdict(list), 'ancestors_down':defaultdict(list)}
 
@@ -643,83 +693,89 @@ def get_network_path(target_uid, degree):
 
     current_down = [target_uid]
     current_up = [] if _is_zero_node(target_uid) else [target_uid]
+    # Cousin/lateral frontier: each entry is {node, anc_down_level} for ancestors_down storage.
+    current_lateral_frontier = []
 
-    for deg in range(1, degree+1):
-
+    for deg in range(1, degree + 1):
         if len(seen) >= max_nodes:
             break
 
         new_down = fetch_descendants(current_down)
-
-        #print('new_down', new_down)
         new_down = [u for u in new_down if u['uid'] not in seen]
-        store['descendants'][deg] = new_down
-        down_nodes.extend(new_down)
-        seen.update([u['uid'] for u in new_down])
-        current_down = [u['uid'] for u in _down_expandable_items(new_down)]
-        # degree = deg
-        #print('down_nodes', down_nodes)
-        
 
-        if len(seen) >= max_nodes:
-            break
+        # Lateral relatives (siblings/cousins) from ancestors found at the previous degree.
+        lateral = []
+        if deg > 1:
+            anc_uids = [
+                a['uid'] for a in store['ancestors'].get(deg - 1, [])
+                if isinstance(a, dict) and a.get('uid') is not None
+                and not _is_zero_node(a['uid'])
+            ]
+            if anc_uids:
+                lateral = fetch_descendants(anc_uids)
+                lateral = [u for u in lateral if u['uid'] not in seen]
 
-        if not current_up:
-            continue
+        # Continue downward from the lateral frontier (second cousins, etc.).
+        lateral_deep = []
+        lateral_deep_levels = {}
+        if current_lateral_frontier:
+            by_level = defaultdict(list)
+            for entry in current_lateral_frontier:
+                by_level[entry['anc_down_level']].append(entry['node']['uid'])
+            for parent_level, parent_uids in by_level.items():
+                children = fetch_descendants(parent_uids)
+                for child in children:
+                    if child['uid'] in seen or child['uid'] in lateral_deep_levels:
+                        continue
+                    lateral_deep.append(child)
+                    lateral_deep_levels[child['uid']] = parent_level + 1
 
-        new_up = fetch_ancestors(current_up)
+        new_up = []
+        if current_up:
+            new_up = fetch_ancestors(current_up)
+            new_up = [u for u in new_up if u['uid'] not in seen]
 
-        #print('new_up', new_up)
+        # Nearest first: descendants, lateral relatives, then ancestors (deeper hops last).
+        to_add = _take_nodes_up_to_limit(
+            new_down + lateral + lateral_deep + new_up, seen, max_nodes
+        )
+        added_uids = {u['uid'] for u in to_add}
+        down_added = [u for u in new_down if u['uid'] in added_uids]
+        lateral_added = [u for u in lateral if u['uid'] in added_uids]
+        lateral_deep_added = [u for u in lateral_deep if u['uid'] in added_uids]
+        up_added = [u for u in new_up if u['uid'] in added_uids]
 
+        store['descendants'][deg] = down_added
+        store['ancestors'][deg] = up_added
+        if deg > 1 and lateral_added:
+            store['ancestors_down'][deg - 1].extend(lateral_added)
+        for node in lateral_deep_added:
+            store['ancestors_down'][lateral_deep_levels[node['uid']]].append(node)
 
-        new_up = [u for u in new_up if u['uid'] not in seen]
-        store['ancestors'][deg] = new_up
-        up_nodes.extend(new_up)
-        seen.update([u['uid'] for u in new_up])
-        current_up = frontier_without_zero_nodes([u['uid'] for u in new_up])
-        #print('up_nodes', up_nodes)
+        down_nodes.extend(down_added)
+        up_nodes.extend(up_added)
+        seen.update(added_uids)
 
-    # Phase 3a: for each ancestor group, fetch one level of descendants
-    all_ancestors_down_nodes = []
-    for id, val in store['ancestors'].items():
+        current_down = [u['uid'] for u in _down_expandable_items(down_added)]
+        current_up = frontier_without_zero_nodes([u['uid'] for u in up_added])
 
-        if not val:
-            continue
+        next_lateral_frontier = []
+        if deg > 1:
+            for node in lateral_added:
+                for expandable in _down_expandable_items([node]):
+                    next_lateral_frontier.append({
+                        'node': expandable,
+                        'anc_down_level': deg - 1,
+                    })
+        for node in lateral_deep_added:
+            level = lateral_deep_levels[node['uid']]
+            for expandable in _down_expandable_items([node]):
+                next_lateral_frontier.append({
+                    'node': expandable,
+                    'anc_down_level': level,
+                })
+        current_lateral_frontier = next_lateral_frontier
 
-        if len(seen) >= max_nodes:
-            break
-
-        val_uids = [v['uid'] for v in val if isinstance(v, dict) and v.get('uid') is not None]
-        if not val_uids:
-            continue
-
-        result = fetch_descendants(val_uids)
-        result = [u for u in result if u['uid'] not in seen]
-        store['ancestors_down'][id] = result
-        seen.update([u['uid'] for u in result])
-        all_ancestors_down_nodes.extend(result)
-
-    # Phase 3b: continue BFS downward from ancestors_down nodes so that cousins,
-    # second-cousins, etc. are found.  Each extra hop increments the level key by 1;
-    # add_to_rows uses base_degree=1, so degree = level + 1 stays correct.
-    # Nodes referred by ZeroNode are included once but never used as a down frontier.
-    max_anc_level = max(store['ancestors_down'].keys()) if store['ancestors_down'] else 0
-    current_down_frontier = _down_expandable_items(all_ancestors_down_nodes)
-    next_level = max_anc_level + 1
-
-    while current_down_frontier and len(seen) < max_nodes and (next_level + 1) <= degree:
-        frontier_uids = [u['uid'] for u in current_down_frontier if u.get('uid') is not None]
-        if not frontier_uids:
-            break
-        result = fetch_descendants(frontier_uids)
-        result = [u for u in result if u['uid'] not in seen]
-        if not result:
-            break
-        store['ancestors_down'][next_level] = result
-        seen.update([u['uid'] for u in result])
-        current_down_frontier = _down_expandable_items(result)
-        next_level += 1
-            
 
 
     # result_down = fetch_descendants([target_uid])
@@ -784,11 +840,15 @@ def get_network_path(target_uid, degree):
 
     with connect() as db:
         above_zero = _fetch_uids_above_zero_node(db)
+        zero_direct_children = _fetch_uids_referred_by_zero_node(db)
+        connected_uids = _store_collected_uids(store)
         circle_paths = _get_circle_paths_via_zero(target_uid, db)
         exception_uids = {
             uid for uid in circle_paths['exception_uids']
             if circle_paths['path_degrees'].get(uid, 0) <= degree
         }
+        connected_uids |= exception_uids
+        connected_uids |= _circle_path_uids_within_degree(circle_paths, degree)
 
         final_rows = [
             row for row in final_rows
@@ -796,11 +856,23 @@ def get_network_path(target_uid, degree):
             or row['network_profile_personal_uid'] in exception_uids
         ]
 
+        final_rows = _filter_irrelevant_zero_neighbors(
+            final_rows, zero_direct_children, connected_uids
+        )
+
         final_rows = _apply_circle_path_edges(
             target_uid, final_rows, circle_paths, db, degree
         )
 
+        connected_uids |= _circle_path_uids_within_degree(circle_paths, degree)
+        final_rows = _filter_irrelevant_zero_neighbors(
+            final_rows, zero_direct_children, connected_uids
+        )
+
     final_rows.sort(key=lambda x: x['degree'])
+    max_results = max_nodes - 1  # target_uid is in seen but not in final_rows
+    if len(final_rows) > max_results:
+        final_rows = final_rows[:max_results]
     return final_rows
 
 
