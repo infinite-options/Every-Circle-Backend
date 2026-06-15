@@ -44,7 +44,7 @@ def encrypt_data(plain_text):
     if not plain_text:
         return ""
     try:
-        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
         # Pad key to 16 bytes
         key = key[:16].ljust(16, b'\0')
         json_data = plain_text.encode("utf-8") if isinstance(plain_text, str) else plain_text
@@ -63,7 +63,7 @@ def decrypt_data(encrypted_blob):
     if not encrypted_blob:
         return ""
     try:
-        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
         key = key[:16].ljust(16, b'\0')
         data = base64.b64decode(encrypted_blob)
         iv = data[:BLOCK_SIZE]
