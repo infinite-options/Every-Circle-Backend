@@ -11,7 +11,8 @@ import boto3
 from botocore.response import StreamingBody
 import calendar
 from decimal import Decimal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
+import requests
 # from datetime import date, datetime, timedelta
 from werkzeug.datastructures import FileStorage
 import mimetypes
@@ -44,7 +45,7 @@ def encrypt_data(plain_text):
     if not plain_text:
         return ""
     try:
-        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
         # Pad key to 16 bytes
         key = key[:16].ljust(16, b'\0')
         json_data = plain_text.encode("utf-8") if isinstance(plain_text, str) else plain_text
@@ -63,7 +64,7 @@ def decrypt_data(encrypted_blob):
     if not encrypted_blob:
         return ""
     try:
-        key = os.getenv("AES_SECRET_KEY", "").encode("utf-8")
+        key = os.getenv("ENCRYPTION_KEY", "").encode("utf-8")
         key = key[:16].ljust(16, b'\0')
         data = base64.b64decode(encrypted_blob)
         iv = data[:BLOCK_SIZE]
@@ -205,6 +206,151 @@ def uploadImage(file, key, content):
         return filename
     
     return None
+
+
+def uploadImageBytes(file_content, key, content_type='image/jpeg'):
+    """Upload raw image bytes to S3; returns public URL or None."""
+    bucket = os.getenv('BUCKET_NAME')
+    if not file_content or not bucket:
+        return None
+    filename = f'https://s3-us-west-1.amazonaws.com/{bucket}/{key}'
+    upload_file = s3.put_object(
+        Bucket=bucket,
+        Body=file_content,
+        Key=key,
+        ACL='public-read',
+        ContentType=content_type or 'image/jpeg',
+    )
+    print(
+        "uploadImageBytes status=%s key=%s"
+        % (upload_file['ResponseMetadata']['HTTPStatusCode'], key)
+    )
+    return filename
+
+
+def _parse_json_string_list(value):
+    if value is None or value in ('', 'null'):
+        return []
+    if isinstance(value, list):
+        return [v for v in value if v]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(value)
+                return parsed if isinstance(parsed, list) else []
+            except (ValueError, SyntaxError):
+                return []
+    return []
+
+
+def _is_persisted_s3_url(url):
+    bucket = os.getenv('BUCKET_NAME')
+    return (
+        bucket
+        and url
+        and isinstance(url, str)
+        and bucket in url
+        and url.startswith('http')
+    )
+
+
+def _google_photo_request_headers(url):
+    headers = {
+        'User-Agent': 'EveryCircleBackend/1.0',
+    }
+    try:
+        query = parse_qs(urlparse(url).query)
+        referer = query.get('r_url', [None])[0]
+        if referer:
+            headers['Referer'] = unquote(referer)
+    except Exception:
+        pass
+    return headers
+
+
+def download_url_to_s3(url, s3_key):
+    """Download a remote image URL and store it in S3."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url.startswith('http'):
+        return None
+    if _is_persisted_s3_url(url):
+        return url
+    try:
+        resp = requests.get(
+            url,
+            headers=_google_photo_request_headers(url),
+            timeout=30,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200 or not resp.content:
+            print(
+                "download_url_to_s3 failed status=%s url=%s..."
+                % (resp.status_code, url[:120])
+            )
+            return None
+        content_type = resp.headers.get('Content-Type', 'image/jpeg').split(';')[0].strip()
+        if not content_type.startswith('image/'):
+            content_type = 'image/jpeg'
+        return uploadImageBytes(resp.content, s3_key, content_type)
+    except Exception as e:
+        print("download_url_to_s3 error for %s...: %s" % (url[:120], e))
+        return None
+
+
+def persist_business_google_photos(business_uid, photos_raw, favorite_raw=None):
+    """
+    Download Google Places photo URLs to S3 and return DB-ready field updates.
+
+    Google photos go only in business_google_photos (not business_images_url).
+    User uploads use business_images_url via processImage (business_img_*).
+    Profile photo uses business_profile_img via processSingleImageUpload.
+
+    Returns updates_dict with business_google_photos and/or business_favorite_image.
+    """
+    photos = _parse_json_string_list(photos_raw)
+    if not photos and not favorite_raw:
+        return {}
+
+    s3_urls = []
+    url_map = {}
+    timestamp = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%SZ')
+
+    for i, url in enumerate(photos):
+        if not url or not isinstance(url, str):
+            continue
+        url = url.strip()
+        if _is_persisted_s3_url(url):
+            s3_urls.append(url)
+            url_map[url] = url
+            continue
+        s3_key = f'business_personal/{business_uid}/google_photo_{i}_{timestamp}'
+        s3_url = download_url_to_s3(url, s3_key)
+        if s3_url:
+            s3_urls.append(s3_url)
+            url_map[url] = s3_url
+
+    updates = {}
+    if s3_urls:
+        updates['business_google_photos'] = json.dumps(s3_urls)
+
+    if favorite_raw not in (None, '', 'null'):
+        favorite = str(favorite_raw).strip()
+        if _is_persisted_s3_url(favorite):
+            updates['business_favorite_image'] = favorite
+        elif favorite in url_map:
+            updates['business_favorite_image'] = url_map[favorite]
+        elif favorite.startswith('http'):
+            fav_key = f'business_personal/{business_uid}/google_favorite_{timestamp}'
+            fav_s3 = download_url_to_s3(favorite, fav_key)
+            if fav_s3:
+                updates['business_favorite_image'] = fav_s3
+
+    return updates
 
 
 def _s3_key_from_url(url, bucket):
