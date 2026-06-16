@@ -7,7 +7,7 @@ class SearchReferral(Resource):
         """
         Search for users by name, city, or state
         Query params:
-        - query: search term (searches name, city, state)
+        - query: search term (single word searches name/city/state; multi-word searches first+last name)
         """
         try:
             query = request.args.get('query', '').strip()
@@ -19,8 +19,47 @@ class SearchReferral(Resource):
                     'results': []
                 }, 400
             
-            # Search in first name, last name, city, and state
-            search_query = """
+            parts = [part for part in query.split() if part]
+            search_term = f"%{query}%"
+
+            if len(parts) >= 2:
+                first_pattern = f"%{parts[0]}%"
+                last_pattern = f"%{' '.join(parts[1:])}%"
+                where_clauses = [
+                    """(
+                        LOWER(COALESCE(profile_personal_first_name, '')) LIKE LOWER(%s)
+                        AND LOWER(COALESCE(profile_personal_last_name, '')) LIKE LOWER(%s)
+                    )""",
+                    """LOWER(CONCAT(
+                        COALESCE(profile_personal_first_name, ''),
+                        ' ',
+                        COALESCE(profile_personal_last_name, '')
+                    )) LIKE LOWER(%s)""",
+                    "LOWER(COALESCE(profile_personal_city, '')) LIKE LOWER(%s)",
+                    "LOWER(COALESCE(profile_personal_state, '')) LIKE LOWER(%s)",
+                ]
+                params = [first_pattern, last_pattern, search_term, search_term, search_term]
+
+                if len(parts) == 2:
+                    where_clauses.insert(
+                        1,
+                        """(
+                            LOWER(COALESCE(profile_personal_first_name, '')) LIKE LOWER(%s)
+                            AND LOWER(COALESCE(profile_personal_last_name, '')) LIKE LOWER(%s)
+                        )""",
+                    )
+                    params.insert(2, f"%{parts[1]}%")
+                    params.insert(3, f"%{parts[0]}%")
+            else:
+                where_clauses = [
+                    "LOWER(COALESCE(profile_personal_first_name, '')) LIKE LOWER(%s)",
+                    "LOWER(COALESCE(profile_personal_last_name, '')) LIKE LOWER(%s)",
+                    "LOWER(COALESCE(profile_personal_city, '')) LIKE LOWER(%s)",
+                    "LOWER(COALESCE(profile_personal_state, '')) LIKE LOWER(%s)",
+                ]
+                params = [search_term, search_term, search_term, search_term]
+
+            search_query = f"""
                 SELECT 
                     profile_personal_uid,
                     profile_personal_user_id,
@@ -48,16 +87,9 @@ class SearchReferral(Resource):
                     END as profile_personal_image
                 FROM every_circle.profile_personal
                 LEFT JOIN every_circle.users u ON profile_personal_user_id = user_uid
-                WHERE 
-                    LOWER(COALESCE(profile_personal_first_name, '')) LIKE LOWER(%s) OR
-                    LOWER(COALESCE(profile_personal_last_name, '')) LIKE LOWER(%s) OR
-                    LOWER(COALESCE(profile_personal_city, '')) LIKE LOWER(%s) OR
-                    LOWER(COALESCE(profile_personal_state, '')) LIKE LOWER(%s)
+                WHERE {' OR '.join(where_clauses)}
                 LIMIT 50
             """
-            
-            search_term = f"%{query}%"
-            params = [search_term, search_term, search_term, search_term]
             
             # print(f"Searching for: '{query}' with pattern: '{search_term}'")  # DEBUG
             
