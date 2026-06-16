@@ -306,12 +306,15 @@ def persist_business_google_photos(business_uid, photos_raw, favorite_raw=None):
     """
     Download Google Places photo URLs to S3 and return DB-ready field updates.
 
-    Returns (updates_dict, s3_urls_list). updates_dict may contain
-    business_google_photos and/or business_favorite_image.
+    Google photos go only in business_google_photos (not business_images_url).
+    User uploads use business_images_url via processImage (business_img_*).
+    Profile photo uses business_profile_img via processSingleImageUpload.
+
+    Returns updates_dict with business_google_photos and/or business_favorite_image.
     """
     photos = _parse_json_string_list(photos_raw)
     if not photos and not favorite_raw:
-        return {}, []
+        return {}
 
     s3_urls = []
     url_map = {}
@@ -347,30 +350,7 @@ def persist_business_google_photos(business_uid, photos_raw, favorite_raw=None):
             if fav_s3:
                 updates['business_favorite_image'] = fav_s3
 
-    return updates, s3_urls
-
-
-def merge_business_images_url(payload, s3_urls):
-    """Merge persisted S3 gallery URLs into business_images_url on the payload."""
-    if not s3_urls:
-        return
-    existing = []
-    raw = payload.get('business_images_url')
-    if raw not in (None, '', 'null'):
-        try:
-            if isinstance(raw, str):
-                existing = ast.literal_eval(raw)
-            elif isinstance(raw, list):
-                existing = raw
-            if not isinstance(existing, list):
-                existing = [existing] if existing else []
-        except (ValueError, SyntaxError, TypeError):
-            existing = []
-    merged = list(s3_urls)
-    for url in existing:
-        if url and url not in merged and _is_persisted_s3_url(url):
-            merged.append(url)
-    payload['business_images_url'] = json.dumps(merged)
+    return updates
 
 
 def _s3_key_from_url(url, bucket):

@@ -14,7 +14,6 @@ from data_ec import (
     deleteImage,
     processSingleImageUpload,
     persist_business_google_photos,
-    merge_business_images_url,
 )
 
 
@@ -213,21 +212,20 @@ def _prepare_business_service_update_dict(service_data):
 
 
 def _apply_persisted_google_photos(payload, business_uid):
-    """Download Google photo URLs to S3 and update payload fields."""
+    """Download Google photo URLs to S3; store only in business_google_photos."""
     if payload.get("business_google_photos") in (
         None,
         "",
         "null",
     ) and payload.get("business_favorite_image") in (None, "", "null"):
         return
-    updates, s3_urls = persist_business_google_photos(
+    updates = persist_business_google_photos(
         business_uid,
         payload.get("business_google_photos"),
         payload.get("business_favorite_image"),
     )
     if updates:
         payload.update(updates)
-    merge_business_images_url(payload, s3_urls)
 
 
 class BusinessInfo(Resource):
