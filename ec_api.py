@@ -54,6 +54,7 @@ from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from feedback import Feedback
+from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
 from profile_views import ProfileViews
 # from jwtToken import JwtToken
@@ -342,6 +343,8 @@ def _encrypt_all_responses(response):
         except Exception as e:
             print(f"Response encryption error: {e}")
     return response
+
+register_request_logging(app)
 
 CORS(app)
 
