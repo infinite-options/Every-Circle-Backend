@@ -46,7 +46,7 @@ from transactions import (
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
-from profile_wish import ProfileWishInfo
+from profile_wish import ProfileWishInfo, ProfileWishResponse
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
@@ -757,6 +757,7 @@ api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<str
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
+api.add_resource(ProfileWishResponse, "/api/profilewishresponse/<string:profile_uid>")
 api.add_resource(TransactionReceipt, '/api/transactionreceipt/<string:profile_id>/<string:transaction_uid>')
 api.add_resource(BountyResults, '/api/bountyresults/<string:profile_id>')
 api.add_resource(BusinessBountyResults, '/api/business-bountyresults/<string:business_id>')

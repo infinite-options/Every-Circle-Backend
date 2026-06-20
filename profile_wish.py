@@ -157,3 +157,49 @@ class ProfileWishInfo(Resource):
             response['code'] = 500
             return response, 500
 
+
+class ProfileWishResponse(Resource):
+    def get(self, profile_uid):
+        print(f"In ProfileWishResponse GET - Wish Responses for profile: {profile_uid}")
+        response = {}
+
+        try:
+            if not profile_uid:
+                response['message'] = 'profile_uid is required'
+                response['code'] = 400
+                return response, 400
+
+            with connect() as db:
+                wish_responses_query = """
+                    SELECT wr.*
+                        , pp.profile_personal_first_name AS recommended_first_name
+                        , profile_personal_last_name AS recommended_last_name
+                    FROM every_circle.wish_response wr
+                    LEFT JOIN every_circle.profile_personal pp ON profile_personal_uid = wr_recommended_id
+                    -- WHERE wr_responder_id = '110-000056'
+                    WHERE wr_responder_id = %s
+                """
+
+                print(f"Executing query for profile_uid: {profile_uid}")
+                query_response = db.execute(wish_responses_query, (profile_uid,))
+                # print(f"Query response: {query_response}")
+
+                if query_response.get('code') == 200:
+                    response['message'] = 'Wish responses retrieved successfully'
+                    response['code'] = 200
+                    response['data'] = query_response.get('result', [])
+                    response['count'] = len(query_response.get('result', []))
+                else:
+                    response['message'] = 'Query execution failed'
+                    response['code'] = query_response.get('code', 500)
+                    response['error'] = query_response.get('error', 'Unknown error')
+                    return response, response['code']
+
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in ProfileWishResponse GET: {str(e)}")
+            response['message'] = f'An error occurred: {str(e)}'
+            response['code'] = 500
+            return response, 500
+
