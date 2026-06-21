@@ -676,6 +676,7 @@ class Transactions(Resource):
                     print("tx_item: ", tx_item)
                     ti_bs_id = tx_item.get("ti_bs_id")
                     item_bounty_type = "per_item"
+                    is_wish_item = False
 
                     if ti_bs_id and str(ti_bs_id).startswith("250"):
                         print("ti_bs_id is a business service")
@@ -759,6 +760,7 @@ class Transactions(Resource):
 
                     elif ti_bs_id and str(ti_bs_id).startswith("165"):
                         print("ti_bs_id is a wish")
+                        is_wish_item = True
                         # Get other item details from wish table using parameterized query
                         wish_query = """
                            SELECT wish_response.wish_response_uid, profile_wish.*
@@ -909,6 +911,15 @@ class Transactions(Resource):
                                     "tb_amount": round(0.40 * effective_bounty, 4),
                                 }
                             )
+                        elif is_wish_item:
+                            if recommender_profile_id:
+                                known_participants.append(
+                                    {
+                                        "tb_profile_id": recommender_profile_id,
+                                        "tb_percentage": "0.4",
+                                        "tb_amount": round(0.40 * effective_bounty, 4),
+                                    }
+                                )
                         else:
                             if profile_id:
                                 known_participants.append(
