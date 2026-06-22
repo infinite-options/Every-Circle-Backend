@@ -492,6 +492,8 @@ class NearbyUsers(Resource):
                     pp.profile_personal_first_name,
                     pp.profile_personal_last_name,
                     pp.profile_personal_image,
+                    pp.profile_personal_nearby_lat,
+                    pp.profile_personal_nearby_lng,
                     pp.profile_personal_nearby_updated_at,
                     mc.circle_relationship,
                     {dist_col}
@@ -517,6 +519,8 @@ class NearbyUsers(Resource):
                     pp.profile_personal_first_name,
                     pp.profile_personal_last_name,
                     pp.profile_personal_image,
+                    pp.profile_personal_nearby_lat,
+                    pp.profile_personal_nearby_lng,
                     pp.profile_personal_nearby_updated_at,
                     c.circle_relationship,
                     {dist_col}
@@ -542,10 +546,17 @@ class NearbyUsers(Resource):
             if row.get('distance_meters') is not None:
                 row['distance_meters'] = float(row['distance_meters'])
 
+        for row in nearby:
+            if row.get('profile_personal_nearby_lat') is not None:
+                row['profile_personal_nearby_lat'] = float(row['profile_personal_nearby_lat'])
+            if row.get('profile_personal_nearby_lng') is not None:
+                row['profile_personal_nearby_lng'] = float(row['profile_personal_nearby_lng'])
+
         return {
-            'message':       'Success',
-            'code':          200,
-            'result':        nearby,
-            'expiry_hours':  LOCATION_EXPIRY_HOURS,
-            'radius_meters': NEARBY_RADIUS_METERS,
+            'message':         'Success',
+            'code':            200,
+            'result':          nearby,
+            'viewer_location': {'lat': user_lat, 'lng': user_lng},
+            'expiry_hours':    LOCATION_EXPIRY_HOURS,
+            'radius_meters':   NEARBY_RADIUS_METERS,
         }, 200
