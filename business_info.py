@@ -13,6 +13,7 @@ from data_ec import (
     uploadImage,
     deleteImage,
     processSingleImageUpload,
+    persist_business_google_photos,
 )
 
 
@@ -208,6 +209,23 @@ def _prepare_business_service_update_dict(service_data):
                 v = None
         out[k] = v
     return out
+
+
+def _apply_persisted_google_photos(payload, business_uid):
+    """Download Google photo URLs to S3; store only in business_google_photos."""
+    if payload.get("business_google_photos") in (
+        None,
+        "",
+        "null",
+    ) and payload.get("business_favorite_image") in (None, "", "null"):
+        return
+    updates = persist_business_google_photos(
+        business_uid,
+        payload.get("business_google_photos"),
+        payload.get("business_favorite_image"),
+    )
+    if updates:
+        payload.update(updates)
 
 
 class BusinessInfo(Resource):
@@ -586,6 +604,8 @@ class BusinessInfo(Resource):
                         "[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s"
                         % (result)
                     )
+
+                _apply_persisted_google_photos(payload, new_business_uid)
 
                 # Normalize business_category_id to a single text field (comma-separated if multiple)
                 if "business_category_id" in payload:
@@ -1239,6 +1259,8 @@ class BusinessInfo(Resource):
                         json.dumps(images) if images else None
                     )
 
+                _apply_persisted_google_photos(payload, business_uid)
+
                 # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
                 if (
                     "business_profile_img" in request.files
@@ -1333,6 +1355,8 @@ class BusinessInfo(Resource):
                     "business_longitude",
                     "business_price_level",
                     "business_google_rating",
+                    "business_google_photos",
+                    "business_favorite_image",
                     "business_joined_timestamp",
                     "business_is_active",
                     "business_cc_fee_payer",
