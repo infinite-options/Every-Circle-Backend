@@ -428,6 +428,10 @@ class NearbyUsers(Resource):
         mode       = request.args.get('mode', 'all_circles')
         types_raw  = request.args.get('types', '')
         types_list = [t.strip() for t in types_raw.split(',') if t.strip()] if types_raw else []
+        try:
+            radius_meters = max(1, int(request.args.get('radius_meters', NEARBY_RADIUS_METERS)))
+        except (TypeError, ValueError):
+            radius_meters = NEARBY_RADIUS_METERS
 
         with connect() as db:
             user_resp = db.execute(
@@ -505,7 +509,7 @@ class NearbyUsers(Resource):
                   AND pp.profile_personal_nearby_lat IS NOT NULL
                   AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
                   {consent_clause}
-                HAVING distance_meters < {NEARBY_RADIUS_METERS}
+                HAVING distance_meters < {radius_meters}
                 ORDER BY distance_meters ASC
             """
             # consent_clause needs profile_uid twice (for each EXISTS)
@@ -532,7 +536,7 @@ class NearbyUsers(Resource):
                   AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
                   {rel_filter}
                   {consent_clause}
-                HAVING distance_meters < {NEARBY_RADIUS_METERS}
+                HAVING distance_meters < {radius_meters}
                 ORDER BY distance_meters ASC
             """
             # args: dist_col(lng,lat), viewer JOIN, rel_filter types, consent_clause uid×2
@@ -558,5 +562,5 @@ class NearbyUsers(Resource):
             'result':          nearby,
             'viewer_location': {'lat': user_lat, 'lng': user_lng},
             'expiry_hours':    LOCATION_EXPIRY_HOURS,
-            'radius_meters':   NEARBY_RADIUS_METERS,
+            'radius_meters':   radius_meters,
         }, 200
