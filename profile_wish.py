@@ -159,6 +159,7 @@ class ProfileWishInfo(Resource):
 
 
 class ProfileWishResponse(Resource):
+<<<<<<< Updated upstream
     def get(self, profile_uid):
         print(f"In ProfileWishResponse GET - Wish Responses for profile: {profile_uid}")
         response = {}
@@ -166,10 +167,20 @@ class ProfileWishResponse(Resource):
         try:
             if not profile_uid:
                 response['message'] = 'profile_uid is required'
+=======
+    def get(self, responder_id):
+        print(f"In ProfileWishResponse GET - responses by responder: {responder_id}")
+        response = {}
+
+        try:
+            if not responder_id:
+                response['message'] = 'responder_id is required'
+>>>>>>> Stashed changes
                 response['code'] = 400
                 return response, 400
 
             with connect() as db:
+<<<<<<< Updated upstream
                 wish_responses_query = """
                     SELECT wr.*
                         , pp.profile_personal_first_name AS recommended_first_name
@@ -197,6 +208,28 @@ class ProfileWishResponse(Resource):
 
                 return response, 200
 
+=======
+                wishes_responses_query = """
+                    SELECT *
+                    FROM every_circle.wish_response
+                    WHERE wr_responder_id = %s
+                    ORDER BY wr_datetime DESC
+                """
+                query_response = db.execute(wishes_responses_query, (responder_id,))
+
+            if query_response.get('code') == 200:
+                response['message'] = 'Wish responses retrieved successfully'
+                response['code'] = 200
+                response['data'] = query_response.get('result', [])
+                response['count'] = len(query_response.get('result', []))
+                return response, 200
+
+            response['message'] = 'Query execution failed'
+            response['code'] = query_response.get('code', 500)
+            response['error'] = query_response.get('error', 'Unknown error')
+            return response, response['code']
+
+>>>>>>> Stashed changes
         except Exception as e:
             print(f"Error in ProfileWishResponse GET: {str(e)}")
             response['message'] = f'An error occurred: {str(e)}'
