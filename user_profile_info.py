@@ -123,6 +123,14 @@ def _wish_dict_from_payload(wish_data):
         m["profile_wish_end"] = wish_data["end"]
     if "location" in wish_data:
         m["profile_wish_location"] = wish_data["location"]
+    if "profile_wish_latitude" in wish_data:
+        m["profile_wish_latitude"] = wish_data["profile_wish_latitude"]
+    if "profile_wish_longitude" in wish_data:
+        m["profile_wish_longitude"] = wish_data["profile_wish_longitude"]
+    if "profile_wish_city" in wish_data:
+        m["profile_wish_city"] = wish_data["profile_wish_city"]
+    if "profile_wish_state" in wish_data:
+        m["profile_wish_state"] = wish_data["profile_wish_state"]
     if "mode" in wish_data:
         m["profile_wish_mode"] = wish_data["mode"]
     for k, v in wish_data.items():

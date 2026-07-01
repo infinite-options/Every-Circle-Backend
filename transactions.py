@@ -1357,9 +1357,8 @@ class SellerTransactions(Resource):
                             ORDER BY ti.ti_uid
                             SEPARATOR ', '
                         ) AS purchased_item,
-                        ti.ti_bs_qty,
+                        MIN(ti.ti_bs_id) AS ti_bs_id,
                         SUM(ti.ti_bs_qty) AS ti_bs_qty,
-                        ti.ti_uid,
                         MIN(ti.ti_uid) AS ti_uid
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
