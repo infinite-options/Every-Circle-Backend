@@ -76,6 +76,14 @@ def _expertise_dict_from_payload(exp_data):
         m["profile_expertise_end"] = exp_data["end"]
     if "location" in exp_data:
         m["profile_expertise_location"] = exp_data["location"]
+    if "latitude" in exp_data:
+        m["profile_expertise_latitude"] = exp_data["latitude"]
+    if "longitude" in exp_data:
+        m["profile_expertise_longitude"] = exp_data["longitude"]
+    if "city" in exp_data:
+        m["profile_expertise_city"] = exp_data["city"]
+    if "state" in exp_data:
+        m["profile_expertise_state"] = exp_data["state"]
     if "mode" in exp_data:
         m["profile_expertise_mode"] = exp_data["mode"]
     for k, v in exp_data.items():
@@ -569,10 +577,16 @@ class UserProfileInfo(Resource):
                                             where={'profile_experience_profile_personal_id': profile_id})
                 response['experience_info'] = experience_info['result'] if experience_info['result'] else []
                 
-                # Get expertise info - returning all expertise entries for this profile
-                expertise_info = db.select('every_circle.profile_expertise', 
-                                        where={'profile_expertise_profile_personal_id': profile_id})
-                response['expertise_info'] = expertise_info['result'] if expertise_info['result'] else []
+                # Get expertise info - returning all expertise entries for this profile with message response counts
+                expertise_query = """
+                    SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses
+                    FROM every_circle.profile_expertise
+                    LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
+                    WHERE profile_expertise_profile_personal_id = %s
+                    GROUP BY profile_expertise_uid
+                """
+                expertise_info = db.execute(expertise_query, (profile_id,))
+                response['expertise_info'] = expertise_info['result'] if expertise_info.get('result') else []
 
                 # Get education info - returning all education entries for this profile
                 education_info = db.select('every_circle.profile_education', 

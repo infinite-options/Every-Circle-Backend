@@ -159,13 +159,13 @@ class ProfileWishInfo(Resource):
 
 
 class ProfileWishResponse(Resource):
-    def get(self, profile_uid):
-        print(f"In ProfileWishResponse GET - Wish Responses for profile: {profile_uid}")
+    def get(self, responder_id):
+        print(f"In ProfileWishResponse GET - responses by responder: {responder_id}")
         response = {}
 
         try:
-            if not profile_uid:
-                response['message'] = 'profile_uid is required'
+            if not responder_id:
+                response['message'] = 'responder_id is required'
                 response['code'] = 400
                 return response, 400
 
@@ -176,26 +176,22 @@ class ProfileWishResponse(Resource):
                         , profile_personal_last_name AS recommended_last_name
                     FROM every_circle.wish_response wr
                     LEFT JOIN every_circle.profile_personal pp ON profile_personal_uid = wr_recommended_id
-                    -- WHERE wr_responder_id = '110-000056'
                     WHERE wr_responder_id = %s
+                    ORDER BY wr_datetime DESC
                 """
+                query_response = db.execute(wish_responses_query, (responder_id,))
 
-                print(f"Executing query for profile_uid: {profile_uid}")
-                query_response = db.execute(wish_responses_query, (profile_uid,))
-                # print(f"Query response: {query_response}")
-
-                if query_response.get('code') == 200:
-                    response['message'] = 'Wish responses retrieved successfully'
-                    response['code'] = 200
-                    response['data'] = query_response.get('result', [])
-                    response['count'] = len(query_response.get('result', []))
-                else:
-                    response['message'] = 'Query execution failed'
-                    response['code'] = query_response.get('code', 500)
-                    response['error'] = query_response.get('error', 'Unknown error')
-                    return response, response['code']
-
+            if query_response.get('code') == 200:
+                response['message'] = 'Wish responses retrieved successfully'
+                response['code'] = 200
+                response['data'] = query_response.get('result', [])
+                response['count'] = len(query_response.get('result', []))
                 return response, 200
+
+            response['message'] = 'Query execution failed'
+            response['code'] = query_response.get('code', 500)
+            response['error'] = query_response.get('error', 'Unknown error')
+            return response, response['code']
 
         except Exception as e:
             print(f"Error in ProfileWishResponse GET: {str(e)}")
