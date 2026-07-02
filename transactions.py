@@ -848,6 +848,22 @@ class Transactions(Resource):
                         )
                         continue
 
+                    # Decrement expertise quantity in DB when an offering with limited stock is sold
+                    if ti_bs_id and str(ti_bs_id).startswith("150"):
+                        purchased_qty = int(item.get("quantity") or 1)
+                        db.execute(
+                            """
+                            UPDATE every_circle.profile_expertise
+                            SET profile_expertise_quantity = GREATEST(0, profile_expertise_quantity - %s)
+                            WHERE profile_expertise_uid = %s
+                              AND profile_expertise_quantity IS NOT NULL
+                              AND profile_expertise_quantity > 0
+                            """,
+                            (purchased_qty, ti_bs_id),
+                            cmd="post",
+                        )
+                        print(f"Decremented expertise quantity for {ti_bs_id} by {purchased_qty}")
+
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
                     if bounty_amount and float(bounty_amount) > 0:

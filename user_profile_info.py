@@ -1225,11 +1225,19 @@ class UserProfileInfo(Resource):
                         
                         for exp_uid in expertise_uids_to_delete:
                             # Verify the expertise exists and belongs to this profile
-                            exp_exists_query = db.select('every_circle.profile_expertise', 
-                                                      where={'profile_expertise_uid': exp_uid, 
+                            exp_exists_query = db.select('every_circle.profile_expertise',
+                                                      where={'profile_expertise_uid': exp_uid,
                                                              'profile_expertise_profile_personal_id': profile_uid})
-                            
+
                             if exp_exists_query['result']:
+                                # Block deletion if this expertise has been purchased
+                                sold_check = db.execute(
+                                    "SELECT 1 FROM every_circle.transactions_items WHERE ti_bs_id = %s LIMIT 1",
+                                    (exp_uid,)
+                                )
+                                if sold_check.get('result'):
+                                    print(f"Skipping delete of expertise {exp_uid}: has existing transactions")
+                                    continue
                                 _delete_expertise_s3_assets(exp_uid)
                                 delete_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{exp_uid}'"
                                 delete_result = db.delete(delete_query)
