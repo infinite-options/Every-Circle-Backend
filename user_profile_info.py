@@ -583,6 +583,7 @@ class UserProfileInfo(Resource):
                     FROM every_circle.profile_expertise
                     LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
                     WHERE profile_expertise_profile_personal_id = %s
+                      AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
                     GROUP BY profile_expertise_uid
                 """
                 expertise_info = db.execute(expertise_query, (profile_id,))
@@ -1230,17 +1231,25 @@ class UserProfileInfo(Resource):
                                                              'profile_expertise_profile_personal_id': profile_uid})
 
                             if exp_exists_query['result']:
-                                # Block deletion if this expertise has been purchased
+                                # Check if this expertise has been purchased — if so, soft-delete only
                                 sold_check = db.execute(
                                     "SELECT 1 FROM every_circle.transactions_items WHERE ti_bs_id = %s LIMIT 1",
                                     (exp_uid,)
                                 )
                                 if sold_check.get('result'):
-                                    print(f"Skipping delete of expertise {exp_uid}: has existing transactions")
-                                    continue
-                                _delete_expertise_s3_assets(exp_uid)
-                                delete_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{exp_uid}'"
-                                delete_result = db.delete(delete_query)
+                                    # Soft delete: flag the row, keep it for transaction history
+                                    db.execute(
+                                        "UPDATE every_circle.profile_expertise SET profile_expertise_is_deleted = 1, profile_expertise_is_public = 0 WHERE profile_expertise_uid = %s",
+                                        (exp_uid,),
+                                        cmd="post",
+                                    )
+                                    print(f"Soft-deleted expertise {exp_uid} (has transactions)")
+                                else:
+                                    # No transactions — hard delete and clean up S3
+                                    _delete_expertise_s3_assets(exp_uid)
+                                    delete_query = f"DELETE FROM every_circle.profile_expertise WHERE profile_expertise_uid = '{exp_uid}'"
+                                    db.delete(delete_query)
+                                    print(f"Hard-deleted expertise {exp_uid}")
                                 deleted_expertise_uids.append(exp_uid)
                         
                         if deleted_expertise_uids:
