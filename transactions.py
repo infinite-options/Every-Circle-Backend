@@ -1375,7 +1375,17 @@ class SellerTransactions(Resource):
                         ) AS purchased_item,
                         MIN(ti.ti_bs_id) AS ti_bs_id,
                         SUM(ti.ti_bs_qty) AS ti_bs_qty,
-                        MIN(ti.ti_uid) AS ti_uid
+                        MIN(ti.ti_uid) AS ti_uid,
+                        MIN(ti.ti_bs_cost) AS unit_price,
+                        MIN(buyer_pp.profile_personal_first_name) AS buyer_first_name,
+                        MIN(buyer_pp.profile_personal_last_name) AS buyer_last_name,
+                        MIN(buyer_u.user_email_id) AS buyer_email,
+                        MIN(buyer_pp.profile_personal_email_is_public) AS buyer_email_is_public,
+                        MIN(buyer_pp.profile_personal_phone_number) AS buyer_phone,
+                        MIN(buyer_pp.profile_personal_phone_number_is_public) AS buyer_phone_is_public,
+                        MIN(buyer_pp.profile_personal_city) AS buyer_city,
+                        MIN(buyer_pp.profile_personal_state) AS buyer_state,
+                        MIN(buyer_pp.profile_personal_location_is_public) AS buyer_location_is_public
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                     ON t.transaction_uid = ti.ti_transaction_id
@@ -1383,7 +1393,10 @@ class SellerTransactions(Resource):
                     ON ti.ti_bs_id = bs.bs_uid
                     LEFT JOIN every_circle.business biz
                     ON bs.bs_business_id = biz.business_uid
-
+                    LEFT JOIN every_circle.profile_personal buyer_pp
+                    ON t.transaction_profile_id = buyer_pp.profile_personal_uid
+                    LEFT JOIN every_circle.users buyer_u
+                    ON buyer_pp.profile_personal_user_id = buyer_u.user_uid
                     LEFT JOIN every_circle.profile_personal seller_pp
                     ON t.transaction_business_id = seller_pp.profile_personal_user_id
                     LEFT JOIN every_circle.profile_expertise pe
