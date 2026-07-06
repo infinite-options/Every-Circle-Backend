@@ -27,7 +27,7 @@ from business import Business, Business_v2, BusinessDetails, Businesses, Busines
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
-from charges import Charges
+# from charges import Charges
 from business_budget import Business_Budget
 from business_revenue import BusinessRevenue
 from category_list import CategoryList
@@ -740,7 +740,7 @@ api.add_resource(Businesses, "/businesses")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
-api.add_resource(Charges, "/charges")
+# api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")

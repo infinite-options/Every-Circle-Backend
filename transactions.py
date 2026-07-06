@@ -5,6 +5,7 @@ import traceback
 from flask import request, jsonify
 import json
 
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
 from user_path_connection import ConnectionsPath
@@ -49,6 +50,61 @@ def _tax_amount_for_line(line_subtotal, ti_bs_is_taxable, ti_bs_tax_rate):
     if rate > 1:
         rate = rate / 100.0
     return round(line_subtotal * rate, 4)
+
+
+def _get_authenticated_profile_id():
+    try:
+        verify_jwt_in_request(optional=True)
+        identity = get_jwt_identity()
+        if identity:
+            return str(identity)
+    except Exception:
+        pass
+
+    body = request.get_json(silent=True) or {}
+    profile_id = body.get("profile_id")
+    return str(profile_id) if profile_id else None
+
+
+def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
+    """Resolve a line item by ti_uid first, then ti_bs_id (same pattern as returns)."""
+    ti_q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_id, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s AND ti_uid = %s
+        """,
+        (transaction_uid, transaction_item_uid),
+    )
+    ti_rows = ti_q.get("result") or []
+    if ti_rows:
+        return ti_rows[0]
+
+    ti_q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_id, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s AND ti_bs_id = %s
+        """,
+        (transaction_uid, transaction_item_uid),
+    )
+    ti_rows = ti_q.get("result") or []
+    return ti_rows[0] if ti_rows else None
+
+
+def _all_lines_fully_received(db, transaction_uid):
+    incomplete_q = db.execute(
+        """
+        SELECT COUNT(*) AS incomplete_count
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+          AND ti_bs_qty > 0
+          AND COALESCE(ti_received_qty, 0) < ti_bs_qty
+        """,
+        (transaction_uid,),
+    )
+    rows = incomplete_q.get("result") or []
+    return int(rows[0].get("incomplete_count") or 0) == 0 if rows else False
 
 
 class ReturnTransaction(Resource):
@@ -1257,7 +1313,6 @@ class Transactions(Resource):
 
     def put(self):
         print("In Transactions PUT")
-        # print("PUT Transactions only for updating transaction_in_escrow and transaction_return_requested")
         response = {}
 
         try:
@@ -1273,19 +1328,34 @@ class Transactions(Resource):
                 return response, 400
 
             transaction_uid = payload.get("transaction_uid")
+            delivery_items = payload.get("delivery_verification_items")
+
+            if delivery_items is not None:
+                return self._put_delivery_verification(
+                    transaction_uid, payload, delivery_items
+                )
+
             update_fields = {}
 
             if "transaction_in_escrow" in payload:
-                update_fields["transaction_in_escrow"] = 1 if payload.get("transaction_in_escrow") else 0
+                update_fields["transaction_in_escrow"] = (
+                    1 if payload.get("transaction_in_escrow") else 0
+                )
 
             if "transaction_return_requested" in payload:
-                update_fields["transaction_return_requested"] = 1 if payload.get("transaction_return_requested") else 0
+                update_fields["transaction_return_requested"] = (
+                    1 if payload.get("transaction_return_requested") else 0
+                )
 
             if "transaction_return_note" in payload:
-                update_fields["transaction_return_note"] = payload.get("transaction_return_note")
+                update_fields["transaction_return_note"] = payload.get(
+                    "transaction_return_note"
+                )
 
             if "transaction_return_status" in payload:
-                update_fields["transaction_return_status"] = payload.get("transaction_return_status")    
+                update_fields["transaction_return_status"] = payload.get(
+                    "transaction_return_status"
+                )
 
             if not update_fields:
                 response["message"] = "No valid fields to update"
@@ -1314,6 +1384,184 @@ class Transactions(Resource):
 
         except Exception as e:
             print(f"Error in Transactions PUT: {str(e)}")
+            print(traceback.format_exc())
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+            return response, 500
+
+    def _put_delivery_verification(
+        self, transaction_uid, payload, delivery_items
+    ):
+        response = {}
+
+        if not isinstance(delivery_items, list) or len(delivery_items) == 0:
+            response["message"] = (
+                "delivery_verification_items must be a non-empty list"
+            )
+            response["code"] = 400
+            return response, 400
+
+        if "transaction_in_escrow" not in payload:
+            response["message"] = "transaction_in_escrow is required"
+            response["code"] = 400
+            return response, 400
+
+        buyer_profile_id = _get_authenticated_profile_id()
+        if not buyer_profile_id:
+            response["message"] = "Authenticated buyer profile is required"
+            response["code"] = 403
+            return response, 403
+
+        received_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated_lines = []
+        seen_ti = set()
+
+        try:
+            with connect() as db:
+                tx_row_q = db.execute(
+                    """
+                    SELECT transaction_uid, transaction_profile_id, transaction_in_escrow
+                    FROM every_circle.transactions
+                    WHERE transaction_uid = %s
+                    """,
+                    (transaction_uid,),
+                )
+                tx_rows = tx_row_q.get("result") or []
+                if not tx_rows:
+                    response["message"] = "Transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                tx_row = tx_rows[0]
+                if tx_row.get("transaction_profile_id") != buyer_profile_id:
+                    response["message"] = (
+                        "Caller is not the buyer on this transaction"
+                    )
+                    response["code"] = 403
+                    return response, 403
+
+                for entry in delivery_items:
+                    item_uid = entry.get("transaction_item_uid")
+                    try:
+                        received_qty = int(entry.get("received_quantity"))
+                    except (TypeError, ValueError):
+                        received_qty = -1
+
+                    if not item_uid:
+                        response["message"] = (
+                            "Each entry requires transaction_item_uid"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if received_qty < 1:
+                        response["message"] = (
+                            f"Invalid received_quantity for item {item_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if item_uid in seen_ti:
+                        response["message"] = (
+                            f"Duplicate transaction_item_uid: {item_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    seen_ti.add(item_uid)
+
+                    ti_row = _resolve_transaction_item(
+                        db, transaction_uid, item_uid
+                    )
+                    if not ti_row:
+                        response["message"] = (
+                            f"Transaction item not found on this sale: {item_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    ti_uid = ti_row.get("ti_uid")
+                    order_qty = int(ti_row.get("ti_bs_qty") or 0)
+                    current_received = int(ti_row.get("ti_received_qty") or 0)
+                    remaining = order_qty - current_received
+
+                    if order_qty <= 0:
+                        response["message"] = (
+                            f"Item {item_uid} is not eligible for delivery verification"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if received_qty > remaining:
+                        response["message"] = (
+                            f"received_quantity exceeds remaining qty for {item_uid} "
+                            f"(remaining: {remaining})"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    new_received = current_received + received_qty
+                    ti_update = db.execute(
+                        """
+                        UPDATE every_circle.transactions_items
+                        SET ti_received_qty = %s,
+                            ti_received_at = %s
+                        WHERE ti_uid = %s AND ti_transaction_id = %s
+                        """,
+                        (new_received, received_at, ti_uid, transaction_uid),
+                        "post",
+                    )
+                    if ti_update.get("code") != 200:
+                        response["message"] = ti_update.get(
+                            "message", "Failed to update transaction item"
+                        )
+                        response["code"] = ti_update.get("code", 500)
+                        return response, response["code"]
+
+                    updated_lines.append(
+                        {
+                            "transaction_item_uid": ti_uid,
+                            "ti_received_qty": new_received,
+                            "ti_bs_qty": order_qty,
+                        }
+                    )
+
+                all_received = _all_lines_fully_received(db, transaction_uid)
+                update_fields = {
+                    "transaction_in_escrow": 0 if all_received else 1,
+                }
+
+                if "transaction_return_requested" in payload:
+                    update_fields["transaction_return_requested"] = (
+                        1 if payload.get("transaction_return_requested") else 0
+                    )
+                if "transaction_return_note" in payload:
+                    update_fields["transaction_return_note"] = payload.get(
+                        "transaction_return_note"
+                    )
+                if "transaction_return_status" in payload:
+                    update_fields["transaction_return_status"] = payload.get(
+                        "transaction_return_status"
+                    )
+
+                update_response = db.update(
+                    "every_circle.transactions",
+                    {"transaction_uid": transaction_uid},
+                    update_fields,
+                )
+                if update_response.get("code") != 200:
+                    response["message"] = update_response.get(
+                        "message", "Failed to update transaction"
+                    )
+                    response["code"] = update_response.get("code", 500)
+                    return response, response["code"]
+
+                response["message"] = "Transaction updated successfully"
+                response["code"] = 200
+                response["transaction_uid"] = transaction_uid
+                response.update(update_fields)
+                response["delivery_verification_items"] = updated_lines
+                response["all_items_received"] = all_received
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in Transactions PUT (delivery verification): {str(e)}")
             print(traceback.format_exc())
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
