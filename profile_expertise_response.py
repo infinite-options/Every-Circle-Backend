@@ -1,21 +1,9 @@
 from flask import request
 from flask_restful import Resource
 from datetime import datetime
-import uuid
 
 from data_ec import connect
 
-
-def _generate_expertise_response_uid():
-    try:
-        with connect() as db:
-            uid_result = db.call(procedure="new_expertise_response_uid")
-        rows = (uid_result or {}).get("result") or []
-        if rows and rows[0].get("new_id"):
-            return rows[0]["new_id"]
-    except Exception as e:
-        print(f"new_expertise_response_uid failed, using fallback: {e}")
-    return f"175-{uuid.uuid4().hex[:12]}"
 
 
 class ProfileExpertiseResponse(Resource):
@@ -78,31 +66,37 @@ class ProfileExpertiseResponse(Resource):
                 response["code"] = 400
                 return response, 400
 
-            new_uid = _generate_expertise_response_uid()
-            expertise_response_data = {
-                "expertise_response_uid": new_uid,
-                "er_profile_expertise_id": profile_expertise_id,
-                "er_responder_id": responder_id,
-                "er_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
             with connect() as db:
-                insert_response = db.insert(
-                    "every_circle.expertise_response", expertise_response_data
-                )
+                uid_response = db.call(procedure="new_expertise_response_uid")
+                if not uid_response.get("result") or len(uid_response["result"]) == 0:
+                    response["message"] = "Failed to generate expertise response UID"
+                    response["code"] = 500
+                    return response, 500
 
-            if insert_response.get("code") != 200:
-                response["message"] = insert_response.get(
-                    "message", "Failed to insert expertise response"
-                )
-                response["code"] = insert_response.get("code", 500)
-                return response, response["code"]
+                new_expertise_response_uid = uid_response["result"][0]["new_id"]
+                print(f"Generated expertise response UID: {new_expertise_response_uid}")
 
-            response["expertise_response_uid"] = new_uid
-            response["er_datetime"] = expertise_response_data["er_datetime"]
-            response["message"] = "Expertise response recorded successfully"
-            response["code"] = 200
-            return response, 200
+                expertise_response_data = {
+                    "expertise_response_uid": new_expertise_response_uid,
+                    "er_profile_expertise_id": profile_expertise_id,
+                    "er_responder_id": responder_id,
+                    "er_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+                insert_response = db.insert("every_circle.expertise_response", expertise_response_data)
+
+                if insert_response.get("code") != 200:
+                    response["message"] = insert_response.get(
+                        "message", "Failed to insert expertise response"
+                    )
+                    response["code"] = insert_response.get("code", 500)
+                    return response, response["code"]
+
+                response["expertise_response_uid"] = new_expertise_response_uid
+                response["er_datetime"] = expertise_response_data["er_datetime"]
+                response["message"] = "Expertise response recorded successfully"
+                response["code"] = 200
+                return response, 200
 
         except Exception as e:
             print(f"Error in ProfileExpertiseResponse POST: {str(e)}")

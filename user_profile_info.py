@@ -579,11 +579,13 @@ class UserProfileInfo(Resource):
                 
                 # Get expertise info - returning all expertise entries for this profile with message response counts
                 expertise_query = """
-                    SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses
+                    SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses, COUNT(ti_bs_qty) AS expertise_sales
                     FROM every_circle.profile_expertise
                     LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
+                    LEFT JOIN every_circle.transactions_items ON ti_bs_id = profile_expertise_uid
+                    -- WHERE profile_expertise_profile_personal_id ='110-000015'
                     WHERE profile_expertise_profile_personal_id = %s
-                      AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
+                        AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
                     GROUP BY profile_expertise_uid
                 """
                 expertise_info = db.execute(expertise_query, (profile_id,))
