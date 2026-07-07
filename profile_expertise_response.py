@@ -4,6 +4,7 @@ from datetime import datetime
 import uuid
 
 from data_ec import connect
+from moderation import MODERATED_ACTIVE, get_offering
 
 
 def _generate_expertise_response_uid():
@@ -78,15 +79,26 @@ class ProfileExpertiseResponse(Resource):
                 response["code"] = 400
                 return response, 400
 
-            new_uid = _generate_expertise_response_uid()
-            expertise_response_data = {
-                "expertise_response_uid": new_uid,
-                "er_profile_expertise_id": profile_expertise_id,
-                "er_responder_id": responder_id,
-                "er_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
             with connect() as db:
+                offering = get_offering(db, profile_expertise_id)
+                if not offering:
+                    response["message"] = "Offering not found"
+                    response["code"] = 404
+                    return response, 404
+
+                if int(offering.get("profile_expertise_moderated") or 0) != MODERATED_ACTIVE:
+                    response["message"] = "Offering is not available"
+                    response["code"] = 403
+                    return response, 403
+
+                new_uid = _generate_expertise_response_uid()
+                expertise_response_data = {
+                    "expertise_response_uid": new_uid,
+                    "er_profile_expertise_id": profile_expertise_id,
+                    "er_responder_id": responder_id,
+                    "er_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
                 insert_response = db.insert(
                     "every_circle.expertise_response", expertise_response_data
                 )

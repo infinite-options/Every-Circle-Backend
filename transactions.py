@@ -7,6 +7,7 @@ import json
 
 
 from data_ec import connect, processImage
+from moderation import MODERATED_ACTIVE
 from user_path_connection import ConnectionsPath
 
 
@@ -735,6 +736,14 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response["result"][0]
+                        if (
+                            int(bs_data.get("profile_expertise_moderated") or 0)
+                            != MODERATED_ACTIVE
+                        ):
+                            response["message"] = "Offering is not available"
+                            response["code"] = 403
+                            return response, 403
+
                         tx_item["ti_bs_cost"] = _strip_currency(
                             bs_data.get("profile_expertise_cost")
                         )

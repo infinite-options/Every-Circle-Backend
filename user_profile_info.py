@@ -1,9 +1,17 @@
+import os
+
 from flask import request
 from flask_restful import Resource
 from datetime import datetime
 
-
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
+from moderation import (
+    MODERATED_PENDING_REVIEW,
+    MODERATED_TAKEN_DOWN,
+    build_offering_moderation_metadata,
+    is_offering_publicly_visible,
+    queue_offering_for_review,
+)
 
 
 _EXPERTISE_PREFIX = "profile_expertise_"
@@ -90,6 +98,7 @@ def _expertise_dict_from_payload(exp_data):
         if k.startswith(_EXPERTISE_PREFIX) and k not in (
             "profile_expertise_uid",
             "profile_expertise_profile_personal_id",
+            "profile_expertise_moderated",
         ):
             m[k] = v
     return m
@@ -166,6 +175,86 @@ def _normalize_record_uid(value):
 
 def _db_write_succeeded(res):
     return bool(res) and res.get("code") == 200
+
+
+def _viewer_context_from_request(profile_id):
+    """Resolve optional viewer identity for expertise moderation visibility."""
+    viewer_profile_uid = (request.args.get("viewer_profile_uid") or "").strip() or None
+    viewer_is_admin = _form_truthy_public(request.args.get("viewer_is_admin"))
+    is_owner_view = bool(
+        viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
+    )
+    return viewer_profile_uid, viewer_is_admin, is_owner_view
+
+
+def _filter_and_enrich_expertise_info(
+    db, expertise_rows, profile_id, viewer_profile_uid=None, viewer_is_admin=False
+):
+    """Hide moderated offerings from public viewers; attach moderation metadata for owners."""
+    if not expertise_rows:
+        return []
+
+    visible = []
+    is_owner_view = bool(
+        viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
+    )
+    for row in expertise_rows:
+        if not is_offering_publicly_visible(
+            row,
+            viewer_profile_uid=viewer_profile_uid,
+            viewer_is_admin=viewer_is_admin,
+        ):
+            continue
+        item = dict(row)
+        if is_owner_view:
+            item["moderation"] = build_offering_moderation_metadata(
+                db, item.get("profile_expertise_uid")
+            )
+        visible.append(item)
+    return visible
+
+
+def _strip_expertise_moderated_fields(expertise_info):
+    expertise_info.pop("profile_expertise_moderated", None)
+
+
+def _enforce_moderated_is_public(existing_row, expertise_info):
+    """Prevent owners from making a moderated offering public via PUT."""
+    moderated = int(existing_row.get("profile_expertise_moderated") or 0)
+    if moderated in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
+        expertise_info["profile_expertise_is_public"] = 0
+
+
+def _notify_admins_offering_resubmission(db, offering):
+    admin_emails = os.getenv("MODERATION_ADMIN_EMAILS", "")
+    if not admin_emails.strip():
+        return
+    owner_uid = offering.get("profile_expertise_profile_personal_id")
+    owner_name = "A profile owner"
+    if owner_uid:
+        owner_res = db.select(
+            "every_circle.profile_personal",
+            where={"profile_personal_uid": owner_uid},
+        )
+        owner_rows = owner_res.get("result") or []
+        if owner_rows:
+            first = owner_rows[0].get("profile_personal_first_name") or ""
+            last = owner_rows[0].get("profile_personal_last_name") or ""
+            owner_name = f"{first} {last}".strip() or owner_name
+
+    title = offering.get("profile_expertise_title") or "an offering"
+    expertise_uid = offering.get("profile_expertise_uid") or ""
+    subject = "Offering resubmitted for moderation review"
+    body = (
+        f'{owner_name} resubmitted offering "{title}" ({expertise_uid}) '
+        "for admin review after editing moderated content."
+    )
+    from ec_api import sendEmail
+
+    for email in admin_emails.split(","):
+        email = email.strip()
+        if email:
+            sendEmail(email, subject, body)
 
 
 def _form_truthy_public(value):
@@ -578,16 +667,32 @@ class UserProfileInfo(Resource):
                 response['experience_info'] = experience_info['result'] if experience_info['result'] else []
                 
                 # Get expertise info - returning all expertise entries for this profile with message response counts
-                expertise_query = """
+                viewer_profile_uid, viewer_is_admin, is_owner_view = _viewer_context_from_request(
+                    profile_id
+                )
+                moderated_filter = ""
+                if not is_owner_view and not viewer_is_admin:
+                    moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
+                expertise_query = f"""
                     SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses
                     FROM every_circle.profile_expertise
                     LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
                     WHERE profile_expertise_profile_personal_id = %s
                       AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
+                      {moderated_filter}
                     GROUP BY profile_expertise_uid
                 """
                 expertise_info = db.execute(expertise_query, (profile_id,))
-                response['expertise_info'] = expertise_info['result'] if expertise_info.get('result') else []
+                expertise_rows = (
+                    expertise_info['result'] if expertise_info.get('result') else []
+                )
+                response['expertise_info'] = _filter_and_enrich_expertise_info(
+                    db,
+                    expertise_rows,
+                    profile_id,
+                    viewer_profile_uid=viewer_profile_uid,
+                    viewer_is_admin=viewer_is_admin,
+                )
 
                 # Get education info - returning all education entries for this profile
                 education_info = db.select('every_circle.profile_education', 
@@ -1741,7 +1846,14 @@ class UserProfileInfo(Resource):
                                     )
                                     continue
 
+                                existing_expertise = expertise_exists_query['result'][0]
+                                moderated_before = int(
+                                    existing_expertise.get("profile_expertise_moderated") or 0
+                                )
+
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                _strip_expertise_moderated_fields(expertise_info)
+                                _enforce_moderated_is_public(existing_expertise, expertise_info)
                                 _apply_profile_expertise_multipart_image(
                                     db,
                                     payload,
@@ -1751,7 +1863,6 @@ class UserProfileInfo(Resource):
                                     is_create=False,
                                 )
 
-                                # Update the existing expertise
                                 if expertise_info:
                                     upd_res = db.update(
                                         'every_circle.profile_expertise',
@@ -1762,6 +1873,30 @@ class UserProfileInfo(Resource):
                                         raise RuntimeError(
                                             upd_res.get("message", "Expertise update failed")
                                         )
+
+                                    if moderated_before in (
+                                        MODERATED_TAKEN_DOWN,
+                                        MODERATED_PENDING_REVIEW,
+                                    ):
+                                        queue_result = queue_offering_for_review(
+                                            db, expertise_uid, profile_uid
+                                        )
+                                        if not queue_result.get("ok"):
+                                            raise RuntimeError(
+                                                queue_result.get(
+                                                    "message",
+                                                    "Failed to queue offering for review",
+                                                )
+                                            )
+                                        refreshed = db.select(
+                                            "every_circle.profile_expertise",
+                                            where={"profile_expertise_uid": expertise_uid},
+                                        )
+                                        refreshed_rows = refreshed.get("result") or []
+                                        if refreshed_rows:
+                                            _notify_admins_offering_resubmission(
+                                                db, refreshed_rows[0]
+                                            )
 
                                 expertise_uids.append(expertise_uid)
                             else:
@@ -1992,8 +2127,15 @@ class UserProfileInfo(Resource):
                         'every_circle.profile_expertise',
                         where={'profile_expertise_profile_personal_id': profile_uid},
                     )
-                    response['expertise_info'] = (
+                    expertise_rows = (
                         _ex_snap['result'] if _ex_snap.get('result') else []
+                    )
+                    response['expertise_info'] = _filter_and_enrich_expertise_info(
+                        db,
+                        expertise_rows,
+                        profile_uid,
+                        viewer_profile_uid=profile_uid,
+                        viewer_is_admin=False,
                     )
 
                 # Prepare the response with both updated and deleted UIDs
