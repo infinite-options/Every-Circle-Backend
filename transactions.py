@@ -9,6 +9,8 @@ from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
 from user_path_connection import ConnectionsPath
+from escrow_release import release_escrow_for_transaction, summarize_escrow_result
+from wallet_ids import EC_WALLET_ID, resolve_wallet_profile_id
 
 
 def _strip_currency(value):
@@ -1011,7 +1013,7 @@ class Transactions(Resource):
                                 )
                         known_participants.append(
                             {
-                                "tb_profile_id": "every-circle",
+                                "tb_profile_id": EC_WALLET_ID,
                                 "tb_percentage": "0.2",
                                 "tb_amount": round(0.20 * effective_bounty, 4),
                             }
@@ -1043,7 +1045,7 @@ class Transactions(Resource):
 
                         in_escrow = bool(transaction.get("transaction_in_escrow"))
 
-                        # Process known participants (buyer, recommender, every-circle)
+                        # Process known participants (buyer, recommender, ec-wallet)
                         for participant in known_participants:
                             participant_id = participant.get("tb_profile_id")
                             if not participant_id:
@@ -1106,13 +1108,14 @@ class Transactions(Resource):
                                     print("bounty_count: ", bounty_count)
 
                                     bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_id = resolve_wallet_profile_id(participant_id)
                                     wallet_response = db.execute(
                                         """
                                         SELECT *
                                         FROM every_circle.wallet
                                         WHERE wallet_profile_id = %s
                                         """,
-                                        {"wallet_profile_id": participant_id}
+                                        {"wallet_profile_id": wallet_id}
                                     )
                                     print("wallet_response: ", wallet_response)
 
@@ -1136,7 +1139,7 @@ class Transactions(Resource):
                                         # update Wallet here for KNOWN participants
                                         update_wallet_response = db.update(
                                             "every_circle.wallet",
-                                            {"wallet_profile_id": participant_id},
+                                            {"wallet_profile_id": wallet_id},
                                             wallet_updates,
                                         )
                                         print("update_wallet_response: ", update_wallet_response)
@@ -1147,7 +1150,7 @@ class Transactions(Resource):
                                         insert_wallet_response = db.insert(
                                             "every_circle.wallet",
                                             {
-                                                "wallet_profile_id": participant_id,
+                                                "wallet_profile_id": wallet_id,
                                                 "wallet_actual_balance": bounty_amount,
                                                 "wallet_pending": bounty_amount if in_escrow else 0,
                                                 "wallet_useable_balance": 0 if in_escrow else bounty_amount,
@@ -1234,13 +1237,14 @@ class Transactions(Resource):
                                     print("bounty_count: ", bounty_count)
 
                                     bounty_amount = tx_bounty["tb_amount"]
+                                    wallet_id = resolve_wallet_profile_id(participant)
                                     wallet_response = db.execute(
                                         """
                                         SELECT *
                                         FROM every_circle.wallet
                                         WHERE wallet_profile_id = %s
                                         """,
-                                        {"wallet_profile_id": participant}
+                                        {"wallet_profile_id": wallet_id}
                                     )
                                     print("wallet_response: ", wallet_response)
 
@@ -1264,7 +1268,7 @@ class Transactions(Resource):
                                         # update Wallet here for NETWORK participants
                                         update_wallet_response = db.update(
                                             "every_circle.wallet",
-                                            {"wallet_profile_id": participant},
+                                            {"wallet_profile_id": wallet_id},
                                             wallet_updates,
                                         )
                                         print("update_wallet_response: ", update_wallet_response)
@@ -1275,7 +1279,7 @@ class Transactions(Resource):
                                         insert_wallet_response = db.insert(
                                             "every_circle.wallet",
                                             {
-                                                "wallet_profile_id": participant,
+                                                "wallet_profile_id": wallet_id,
                                                 "wallet_actual_balance": bounty_amount,
                                                 "wallet_pending": bounty_amount if in_escrow else 0,
                                                 "wallet_useable_balance": 0 if in_escrow else bounty_amount,
@@ -1523,9 +1527,22 @@ class Transactions(Resource):
                     )
 
                 all_received = _all_lines_fully_received(db, transaction_uid)
-                update_fields = {
-                    "transaction_in_escrow": 0 if all_received else 1,
-                }
+                escrow_release_result = None
+                update_fields = {}
+
+                if all_received and int(tx_row.get("transaction_in_escrow") or 0) == 1:
+                    escrow_release_result = release_escrow_for_transaction(
+                        db, transaction_uid, reason="buyer_confirmed"
+                    )
+                    if escrow_release_result.get("code") != 200:
+                        response["message"] = escrow_release_result.get(
+                            "message", "Failed to release escrow"
+                        )
+                        response["code"] = escrow_release_result.get("code", 500)
+                        return response, response["code"]
+                    update_fields["transaction_in_escrow"] = 0
+                else:
+                    update_fields["transaction_in_escrow"] = 0 if all_received else 1
 
                 if "transaction_return_requested" in payload:
                     update_fields["transaction_return_requested"] = (
@@ -1540,22 +1557,27 @@ class Transactions(Resource):
                         "transaction_return_status"
                     )
 
-                update_response = db.update(
-                    "every_circle.transactions",
-                    {"transaction_uid": transaction_uid},
-                    update_fields,
-                )
-                if update_response.get("code") != 200:
-                    response["message"] = update_response.get(
-                        "message", "Failed to update transaction"
+                if update_fields:
+                    update_response = db.update(
+                        "every_circle.transactions",
+                        {"transaction_uid": transaction_uid},
+                        update_fields,
                     )
-                    response["code"] = update_response.get("code", 500)
-                    return response, response["code"]
+                    if update_response.get("code") != 200:
+                        response["message"] = update_response.get(
+                            "message", "Failed to update transaction"
+                        )
+                        response["code"] = update_response.get("code", 500)
+                        return response, response["code"]
 
                 response["message"] = "Transaction updated successfully"
                 response["code"] = 200
                 response["transaction_uid"] = transaction_uid
                 response.update(update_fields)
+                if escrow_release_result:
+                    response["escrow_release"] = summarize_escrow_result(
+                        escrow_release_result
+                    )
                 response["delivery_verification_items"] = updated_lines
                 response["all_items_received"] = all_received
                 return response, 200
