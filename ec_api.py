@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# from zappa_prebuild import exit_if_crypto_broken
-# exit_if_crypto_broken()
+from zappa_prebuild import exit_if_crypto_broken
+exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
@@ -27,7 +27,7 @@ from business import Business, Business_v2, BusinessDetails, Businesses, Busines
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
-from charges import Charges
+# from charges import Charges
 from business_budget import Business_Budget
 from business_revenue import BusinessRevenue
 from category_list import CategoryList
@@ -51,6 +51,7 @@ from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertis
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
+from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -731,6 +732,82 @@ def Lists_CRON(Resource):
 
         return response
 
+
+def _escrow_release_cron_wrapper():
+    print("\nIn Escrow Release CRON\n\n\n")
+    response = {}
+    dt = datetime.today()
+    recipients = [
+        "pmarathay@gmail.com",
+        "pmarathay@infiniteoptions.com",
+    ]
+    try:
+        response = EscrowReleaseJob.get()
+
+        if "cron fail" in response.keys():
+            raise Exception("Error in cronjob")
+
+        try:
+            subject = f"Every-Circle Escrow Release CRON — SUCCESS ({dt})"
+            body = format_escrow_release_email(response, run_dt=dt)
+
+            for recipient in recipients:
+                sendEmail(recipient, subject, body)
+
+            response["email"] = {
+                "message": f"Every-Circle Escrow Release CRON Job Email for {dt} sent!",
+                "code": 200,
+            }
+
+        except Exception:
+            response["email fail"] = {
+                "message": (
+                    f"Every-Circle Escrow Release CRON Job Email for {dt} "
+                    "could not be sent"
+                ),
+                "code": 500,
+            }
+
+    except Exception:
+        try:
+            failed_count = response.get("failed_count", 0)
+            subject = (
+                f"Every-Circle Escrow Release CRON — FAILED "
+                f"({failed_count} errors, {dt})"
+            )
+            body = format_escrow_release_email(response, run_dt=dt)
+
+            for recipient in recipients:
+                sendEmail(recipient, subject, body)
+
+            response["email"] = {
+                "message": (
+                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} sent!"
+                ),
+                "code": 201,
+            }
+
+        except Exception:
+            response["email fail"] = {
+                "message": (
+                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} "
+                    "could not be sent"
+                ),
+                "code": 500,
+            }
+
+    return response
+
+
+class EscrowReleaseCron_CLASS(Resource):
+    def get(self):
+        return _escrow_release_cron_wrapper()
+
+
+def EscrowRelease_CRON(Resource):
+    return _escrow_release_cron_wrapper()
+
+
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
@@ -741,7 +818,7 @@ api.add_resource(Businesses, "/businesses")
 api.add_resource(Ratings, "/ratings", "/ratings/<string:uid>")
 api.add_resource(Refer, "/refer-a-friend")
 api.add_resource(Lists, "/lists")
-api.add_resource(Charges, "/charges")
+# api.add_resource(Charges, "/charges")
 api.add_resource(Business_Budget, "/business-budget/<string:business_id>")
 api.add_resource(CategoryList, "/category_list/<string:uid>")
 api.add_resource(ChatbotAPI, "/api/v1/chatbot")
@@ -796,9 +873,11 @@ api.add_resource(
     "/api/v1/moderation/offerings/review-queue",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>/review",
+    "/api/v1/moderation/offerings/<string:profile_expertise_uid>/acknowledge",
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
+api.add_resource(EscrowReleaseCron_CLASS, "/api/v1/escrow_release_cron")
 
 
 class GooglePlacesInfo(Resource):

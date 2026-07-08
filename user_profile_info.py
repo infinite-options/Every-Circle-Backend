@@ -6,6 +6,7 @@ from datetime import datetime
 
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from moderation import (
+    MODERATED_ACKNOWLEDGED,
     MODERATED_PENDING_REVIEW,
     MODERATED_TAKEN_DOWN,
     build_offering_moderation_metadata,
@@ -221,7 +222,11 @@ def _strip_expertise_moderated_fields(expertise_info):
 def _enforce_moderated_is_public(existing_row, expertise_info):
     """Prevent owners from making a moderated offering public via PUT."""
     moderated = int(existing_row.get("profile_expertise_moderated") or 0)
-    if moderated in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
+    if moderated in (
+        MODERATED_TAKEN_DOWN,
+        MODERATED_PENDING_REVIEW,
+        MODERATED_ACKNOWLEDGED,
+    ):
         expertise_info["profile_expertise_is_public"] = 0
 
 

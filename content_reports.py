@@ -9,6 +9,7 @@ from data_ec import connect
 from moderation import (
     MODERATED_PENDING_REVIEW,
     TARGET_TYPE_OFFERING,
+    acknowledge_offering_takedown,
     apply_takedown_if_threshold,
     approve_offering_review,
     build_offering_moderation_metadata,
@@ -423,6 +424,63 @@ class ContentModerationReview(Resource):
 
         except Exception as e:
             print(f"Error in ContentModerationReview PUT: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def post(self, profile_expertise_uid):
+        """Owner acknowledges a rejected / taken-down offering (moderated = 3)."""
+        print("In ContentModerationReview POST (acknowledge)")
+        response = {}
+        try:
+            if not request.path.rstrip("/").endswith("/acknowledge"):
+                response["message"] = (
+                    "Use the /acknowledge endpoint to acknowledge a taken-down offering"
+                )
+                response["code"] = 400
+                return response, 400
+
+            payload = request.get_json(force=True) or {}
+            requester_profile_uid = str(
+                payload.get("profile_uid")
+                or payload.get("requester_profile_uid")
+                or ""
+            ).strip()
+
+            if not profile_expertise_uid or not requester_profile_uid:
+                response["message"] = (
+                    "profile_expertise_uid and profile_uid are required"
+                )
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                result = acknowledge_offering_takedown(
+                    db, profile_expertise_uid, requester_profile_uid
+                )
+
+            if not result.get("ok"):
+                code = result.get("code", 400)
+                response["message"] = result.get("message", "Acknowledge failed")
+                response["code"] = code
+                return response, code
+
+            response["message"] = (
+                "Offering already acknowledged"
+                if result.get("already_acknowledged")
+                else "Offering acknowledged successfully"
+            )
+            response["code"] = 200
+            response["data"] = {
+                "profile_expertise_uid": profile_expertise_uid,
+                "moderated": 3,
+                "already_acknowledged": bool(result.get("already_acknowledged")),
+            }
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in ContentModerationReview POST: {str(e)}")
             traceback.print_exc()
             response["message"] = "Internal Server Error"
             response["code"] = 500

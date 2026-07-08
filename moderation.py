@@ -9,6 +9,7 @@ load_dotenv()
 MODERATED_ACTIVE = 0
 MODERATED_TAKEN_DOWN = 1
 MODERATED_PENDING_REVIEW = 2
+MODERATED_ACKNOWLEDGED = 3
 TARGET_TYPE_OFFERING = "offering"
 
 _OFFERING_UID_PREFIX = "150"
@@ -78,6 +79,9 @@ def get_offering_owner_profile_uid(db, expertise_uid):
 
 
 def is_offering_publicly_visible(row, viewer_profile_uid=None, viewer_is_admin=False):
+    # Acknowledged (user dismissed) offerings are never returned in profile lists.
+    if _moderated_value(row) == MODERATED_ACKNOWLEDGED:
+        return False
     if viewer_is_admin:
         return True
     owner_uid = row.get("profile_expertise_profile_personal_id")
@@ -152,6 +156,8 @@ def can_offering_be_edited(db, expertise_uid, offering=None):
 
 
 def _moderation_status_label(moderated, latest_resubmission):
+    if moderated == MODERATED_ACKNOWLEDGED:
+        return "acknowledged"
     if moderated == MODERATED_PENDING_REVIEW:
         return "pending_review"
     if moderated == MODERATED_TAKEN_DOWN:
@@ -436,4 +442,62 @@ def reject_offering_review(db, target_uid, admin_uid, note=None):
         "ok": True,
         "profile_expertise_uid": target_uid,
         "rejection_note": note_text,
+    }
+
+
+def acknowledge_offering_takedown(db, target_uid, requester_profile_uid):
+    """
+    Owner acknowledges a rejected / taken-down offering.
+    Sets profile_expertise_moderated = 3 so it is no longer returned to the user.
+    """
+    offering = get_offering(db, target_uid)
+    if not offering:
+        return {"ok": False, "message": "Offering not found", "code": 404}
+
+    owner_uid = offering.get("profile_expertise_profile_personal_id")
+    if not requester_profile_uid or str(requester_profile_uid) != str(owner_uid):
+        return {
+            "ok": False,
+            "message": "Only the offering owner can acknowledge a takedown",
+            "code": 403,
+        }
+
+    moderated = _moderated_value(offering)
+    if moderated == MODERATED_ACKNOWLEDGED:
+        return {
+            "ok": True,
+            "profile_expertise_uid": target_uid,
+            "already_acknowledged": True,
+        }
+
+    if moderated != MODERATED_TAKEN_DOWN:
+        return {
+            "ok": False,
+            "message": "Only rejected / taken-down offerings can be acknowledged",
+            "code": 400,
+        }
+
+    latest = _get_latest_resubmission(db, target_uid)
+    if not latest or latest.get("resubmission_status") != "rejected":
+        return {
+            "ok": False,
+            "message": "Offering must be rejected by an admin before acknowledgment",
+            "code": 400,
+        }
+
+    mod_res = db.update(
+        _PROFILE_EXPERTISE_TABLE,
+        {"profile_expertise_uid": target_uid},
+        {
+            "profile_expertise_moderated": MODERATED_ACKNOWLEDGED,
+            "profile_expertise_is_public": 0,
+        },
+    )
+    if not _db_write_succeeded(mod_res):
+        return {"ok": False, "message": "Failed to acknowledge offering", "code": 500}
+
+    return {
+        "ok": True,
+        "profile_expertise_uid": target_uid,
+        "already_acknowledged": False,
     }
