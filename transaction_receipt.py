@@ -25,6 +25,7 @@ class TransactionReceipt(Resource):
                         ti.ti_uid,
                         ti.ti_bs_id,
                         ti.ti_bs_qty,
+                        COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
                         ti.ti_bs_cost,
                         CASE
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name

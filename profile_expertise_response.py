@@ -136,7 +136,7 @@ class ProfileExpertiseResponsesForOffering(Resource):
 
             with connect() as db:
                 query = """
-                    SELECT er.*,
+                    SELECT er.*, m.message_body,
                         responder.profile_personal_first_name AS responder_first_name,
                         responder.profile_personal_last_name AS responder_last_name,
                         responder.profile_personal_image AS responder_image,
@@ -152,6 +152,16 @@ class ProfileExpertiseResponsesForOffering(Resource):
                         ON er.er_responder_id = responder.profile_personal_uid
                     LEFT JOIN every_circle.users u
                         ON u.user_uid = responder.profile_personal_user_id
+                    LEFT JOIN every_circle.messages m
+                        ON m.message_uid = (
+                            SELECT message_uid
+                            FROM every_circle.messages
+                            WHERE message_context_response_uid = er.expertise_response_uid
+                              AND message_context_type = 'offering'
+                              AND message_context_uid = er.er_profile_expertise_id
+                            ORDER BY message_sent_at ASC
+                            LIMIT 1
+                        )
                     WHERE er.er_profile_expertise_id = %s
                     ORDER BY er.er_datetime DESC
                 """

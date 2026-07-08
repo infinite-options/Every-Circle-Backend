@@ -67,6 +67,25 @@ def _get_participant_info(uid):
         return {}
 
 
+def _optional_message_context(data):
+    """
+    Map optional POST body context fields to messages table columns.
+    Client omits empty values; only non-empty strings are persisted.
+    """
+    fields = {}
+
+    context_type = (data.get("message_context_type") or "").strip()
+    if context_type in ("offering", "seeking"):
+        fields["message_context_type"] = context_type
+
+    for col in ("message_context_uid", "message_context_response_uid"):
+        val = (data.get(col) or "").strip()
+        if val:
+            fields[col] = val
+
+    return fields
+
+
 def _get_or_create_conversation(uid_a, uid_b):
     """Return (conversation_uid, created) for the pair. Order is normalised."""
     p1, p2 = sorted([uid_a, uid_b])
@@ -357,8 +376,10 @@ class Messages(Resource):
         Query params: limit (default 50), before (ISO datetime cursor)
 
     POST /api/v1/chat/messages
-        Body: { conversation_uid, sender_uid, body }
-        Persists: message_conversation_id, message_sender_uid, message_body, message_sent_at
+        Body: { conversation_uid, sender_uid, body, message_context_type?,
+                message_context_uid?, message_context_response_uid? }
+        Persists: message_conversation_id, message_sender_uid, message_body, message_sent_at,
+                  plus any optional context columns when present
 
     PUT  /api/v1/chat/messages  or  /api/v1/chat/messages/<conversation_uid>
         Body: { message_uid, message_read_at? } — sets message_read_at (defaults to now UTC).
@@ -406,18 +427,38 @@ class Messages(Resource):
 
         msg_uid = _generate_uid_from_db("new_message_uid", "msg")
         now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        context_fields = _optional_message_context(data)
+
+        base_cols = [
+            "message_uid",
+            "message_conversation_id",
+            "message_sender_uid",
+            "message_body",
+            "message_sent_at",
+        ]
+        base_vals = [msg_uid, conv_uid, sender_uid, body, now]
+        insert_cols = base_cols + list(context_fields.keys())
+        insert_vals = base_vals + list(context_fields.values())
+        placeholders = ", ".join(["%s"] * len(insert_cols))
+        col_list = ", ".join(insert_cols)
 
         with connect() as db:
-            db.execute(
-                """
+            insert_res = db.execute(
+                f"""
                 INSERT INTO every_circle.messages
-                    (message_uid, message_conversation_id, message_sender_uid,
-                     message_body, message_sent_at, message_read_at)
-                VALUES (%s, %s, %s, %s, %s, NULL)
+                    ({col_list})
+                VALUES ({placeholders})
                 """,
-                args=(msg_uid, conv_uid, sender_uid, body, now),
+                args=tuple(insert_vals),
                 cmd="post",
             )
+            if isinstance(insert_res, dict) and insert_res.get("code") not in (None, 200):
+                # Don't advance the conversation timestamp if we failed to persist the message.
+                return {
+                    "message": insert_res.get("message", "Failed to insert message"),
+                    "code": insert_res.get("code", 500),
+                    "error": insert_res.get("error"),
+                }, insert_res.get("code", 500)
             db.execute(
                 """
                 UPDATE every_circle.conversations
