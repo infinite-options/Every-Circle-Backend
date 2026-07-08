@@ -10,72 +10,10 @@ from collections import defaultdict
 from datetime import datetime
 
 from data_ec import connect
-from wallet_ids import EC_WALLET_ID, resolve_wallet_profile_id
+from wallet_ids import EC_WALLET_ID
+from wallet_service import release_bounty_to_useable
 
 ESCROW_RELEASE_DAYS = 5
-
-
-def _get_wallet_row(db, profile_id):
-    wallet_id = resolve_wallet_profile_id(profile_id)
-    wallet_q = db.execute(
-        """
-        SELECT
-            wallet_profile_id,
-            wallet_pending,
-            wallet_useable_balance,
-            wallet_actual_balance,
-            wallet_lifetime_earning
-        FROM every_circle.wallet
-        WHERE wallet_profile_id = %s
-        """,
-        (wallet_id,),
-    )
-    wallets = wallet_q.get("result") or []
-    return wallets[0] if wallets else None
-
-
-def _apply_wallet_release(db, wallet, profile_id, amount):
-    """Update an existing wallet row; uses stored PK (may differ from bounty profile_id)."""
-    stored_id = wallet.get("wallet_profile_id")
-    pending = float(wallet.get("wallet_pending") or 0)
-    useable = float(wallet.get("wallet_useable_balance") or 0)
-    actual = float(wallet.get("wallet_actual_balance") or 0)
-    lifetime = float(wallet.get("wallet_lifetime_earning") or 0)
-
-    from_pending = min(amount, pending)
-    updates = {
-        "wallet_pending": pending - from_pending,
-        "wallet_useable_balance": useable + amount,
-    }
-
-    if amount > from_pending and actual < amount:
-        updates["wallet_actual_balance"] = actual + (amount - from_pending)
-        updates["wallet_lifetime_earning"] = lifetime + (amount - from_pending)
-
-    update_wallet = db.update(
-        "every_circle.wallet",
-        {"wallet_profile_id": stored_id},
-        updates,
-    )
-    if update_wallet.get("code") != 200:
-        return {
-            "code": update_wallet.get("code", 500),
-            "message": update_wallet.get(
-                "message", f"Failed to update wallet for {profile_id}"
-            ),
-            "wallet_profile_id": profile_id,
-            "wallet_pk": stored_id,
-        }
-
-    return {
-        "code": 200,
-        "wallet_profile_id": profile_id,
-        "wallet_pk": stored_id,
-        "bounty_total": amount,
-        "moved_to_useable": amount,
-        "from_pending": from_pending,
-        "wallet_created": False,
-    }
 
 
 def _suggested_action_for_error(message):
@@ -266,60 +204,7 @@ def _eligible_transactions_query(days):
 
 
 def _release_bounty_to_wallet(db, profile_id, amount):
-    """
-    Move escrowed bounty into wallet_useable_balance.
-
-    Creates a wallet when missing (legacy transactions). If pending is 0 but
-    bounty was never credited at purchase time, credits useable/actual balances.
-    """
-    if not profile_id or amount <= 0:
-        return {
-            "code": 200,
-            "wallet_profile_id": profile_id,
-            "bounty_total": amount,
-            "moved_to_useable": 0,
-            "wallet_created": False,
-        }
-
-    wallet = _get_wallet_row(db, profile_id)
-
-    if not wallet:
-        insert_id = resolve_wallet_profile_id(profile_id)
-        insert_result = db.insert(
-            "every_circle.wallet",
-            {
-                "wallet_profile_id": insert_id,
-                "wallet_actual_balance": amount,
-                "wallet_pending": 0,
-                "wallet_useable_balance": amount,
-                "wallet_reserve": 0,
-                "wallet_lifetime_earning": amount,
-                "wallet_lifetime_spent": 0,
-            },
-        )
-        if insert_result.get("code") != 200:
-            insert_msg = insert_result.get("message", "")
-            if "duplicate entry" in insert_msg.lower():
-                wallet = _get_wallet_row(db, profile_id)
-                if wallet:
-                    return _apply_wallet_release(db, wallet, profile_id, amount)
-            return {
-                "code": insert_result.get("code", 500),
-                "message": insert_result.get(
-                    "message", f"Failed to create wallet for {profile_id}"
-                ),
-                "wallet_profile_id": profile_id,
-            }
-        return {
-            "code": 200,
-            "wallet_profile_id": profile_id,
-            "wallet_pk": insert_id,
-            "bounty_total": amount,
-            "moved_to_useable": amount,
-            "wallet_created": True,
-        }
-
-    return _apply_wallet_release(db, wallet, profile_id, amount)
+    return release_bounty_to_useable(db, profile_id, amount)
 
 
 def release_escrow_for_transaction(db, transaction_uid, reason="auto_5_day"):

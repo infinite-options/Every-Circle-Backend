@@ -52,6 +52,7 @@ from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from escrow_release import EscrowReleaseJob, format_escrow_release_email
+from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -869,6 +870,8 @@ api.add_resource(BusinessClaim, "/api/v1/business_claim")
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
 api.add_resource(EscrowReleaseCron_CLASS, "/api/v1/escrow_release_cron")
+api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
+api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 
 
 class GooglePlacesInfo(Resource):
