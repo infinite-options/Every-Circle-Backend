@@ -11,7 +11,8 @@ from data_ec import connect, processImage
 from moderation import MODERATED_ACTIVE
 from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
-from wallet_ids import EC_WALLET_ID, resolve_wallet_profile_id
+from wallet_ids import EC_WALLET_ID
+from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
 
 
 def _strip_currency(value):
@@ -425,6 +426,18 @@ class ReturnTransaction(Resource):
                         )
                         if bins.get("code") == 200:
                             bounty_insert_count += 1
+                            reversal_abs = abs(reversal)
+                            if reversal_abs > 0:
+                                wallet_result = debit_bounty_from_wallet(
+                                    db,
+                                    br.get("tb_profile_id"),
+                                    reversal_abs,
+                                )
+                                if wallet_result.get("code") != 200:
+                                    print(
+                                        "Warning: Failed to debit wallet on return for "
+                                        f"{br.get('tb_profile_id')}: {wallet_result}"
+                                    )
 
                     response_lines.append(
                         {
@@ -657,9 +670,7 @@ class Transactions(Resource):
                     response["code"] = 500
                     return response, 500
 
-                new_transaction_uid = transaction_stored_procedure_response["result"][
-                    0
-                ]["new_id"]
+                new_transaction_uid = transaction_stored_procedure_response["result"][0]["new_id"]
                 transaction["transaction_uid"] = new_transaction_uid
                 transactions_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 transaction["transaction_datetime"] = transactions_datetime
@@ -714,9 +725,7 @@ class Transactions(Resource):
                         continue
 
                     new_transaction_item_uid = (
-                        transaction_item_stored_procedure_response["result"][0][
-                            "new_id"
-                        ]
+                        transaction_item_stored_procedure_response["result"][0]["new_id"]
                     )
                     print(
                         "new_transaction_item_uid: ",
@@ -724,6 +733,7 @@ class Transactions(Resource):
                         type(new_transaction_item_uid),
                     )
 
+                    # Load transaction item data from payload
                     tx_item = {
                         "ti_uid": new_transaction_item_uid,
                         "ti_transaction_id": new_transaction_uid,
@@ -734,7 +744,8 @@ class Transactions(Resource):
                     }
                     print("tx_item: ", tx_item)
                     ti_bs_id = tx_item.get("ti_bs_id")
-                    item_bounty_type = "per_item"
+                    # item_bounty_type = "per_item"
+                    item_bounty_type = item.get("bounty_type", "per_item")
                     is_wish_item = False
 
                     if ti_bs_id and str(ti_bs_id).startswith("250"):
@@ -788,7 +799,7 @@ class Transactions(Resource):
                             or len(bs_response["result"]) == 0
                         ):
                             response["message"] = (
-                                f"Expertise not found: {item.get('expertise_uid')}"
+                                f"Expertise not found: {item.get('profile_expertise_uid')}"
                             )
                             response["code"] = 404
                             return response, 404
@@ -822,6 +833,9 @@ class Transactions(Resource):
                         )
                         tx_item["ti_bs_return_window_days"] = bs_data.get(
                             "profile_expertise_return_window_days"
+                        )
+                        item_bounty_type = (
+                            bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
 
@@ -869,6 +883,9 @@ class Transactions(Resource):
                         )
                         tx_item["ti_bs_return_window_days"] = bs_data.get(
                             "profile_wish_return_window_days"
+                        )
+                        item_bounty_type = (
+                            bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
 
@@ -933,6 +950,7 @@ class Transactions(Resource):
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
+                    # item_bounty_type = item.get("bounty_type", "per_item")
                     if bounty_amount and float(bounty_amount) > 0:
                         quantity = item.get("quantity", 1) or 1
                         # Determine effective bounty based on type:
@@ -1117,60 +1135,18 @@ class Transactions(Resource):
                                     print("bounty_count: ", bounty_count)
 
                                     bounty_amount = tx_bounty["tb_amount"]
-                                    wallet_id = resolve_wallet_profile_id(participant_id)
-                                    wallet_response = db.execute(
-                                        """
-                                        SELECT *
-                                        FROM every_circle.wallet
-                                        WHERE wallet_profile_id = %s
-                                        """,
-                                        {"wallet_profile_id": wallet_id}
+                                    wallet_result = credit_bounty_to_wallet(
+                                        db,
+                                        participant_id,
+                                        bounty_amount,
+                                        in_escrow=in_escrow,
                                     )
-                                    print("wallet_response: ", wallet_response)
-
-                                    if wallet_response.get("code") == 200:
-                                        wallet = wallet_response.get("result")[0]
-                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
-                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
-                                        wallet_pending = wallet.get("wallet_pending") or 0
-                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
-                                        print("wallet_actual_balance: ", wallet_actual_balance)
-
-                                        wallet_updates = {
-                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
-                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
-                                        }
-                                        if in_escrow:
-                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
-                                        else:
-                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
-
-                                        # update Wallet here for KNOWN participants
-                                        update_wallet_response = db.update(
-                                            "every_circle.wallet",
-                                            {"wallet_profile_id": wallet_id},
-                                            wallet_updates,
+                                    print("wallet_result: ", wallet_result)
+                                    if wallet_result.get("code") != 200:
+                                        print(
+                                            f"Warning: Failed to update wallet for "
+                                            f"participant {participant_id}: {wallet_result}"
                                         )
-                                        print("update_wallet_response: ", update_wallet_response)
-                                        if update_wallet_response.get("code") != 200:
-                                            print(f"Warning: Failed to update wallet for participant {participant_id}: {update_wallet_response}")
-
-                                    else:
-                                        insert_wallet_response = db.insert(
-                                            "every_circle.wallet",
-                                            {
-                                                "wallet_profile_id": wallet_id,
-                                                "wallet_actual_balance": bounty_amount,
-                                                "wallet_pending": bounty_amount if in_escrow else 0,
-                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
-                                                "wallet_reserve": 0,
-                                                "wallet_lifetime_earning": bounty_amount,
-                                                "wallet_lifetime_spent": 0,
-                                            },
-                                        )
-                                        print("insert_wallet_response: ", insert_wallet_response)
-                                        if insert_wallet_response.get("code") != 200:
-                                            print(f"Warning: Failed to create wallet for participant {participant_id}: {insert_wallet_response}")
                                     
                                 else:
                                     print(
@@ -1246,60 +1222,18 @@ class Transactions(Resource):
                                     print("bounty_count: ", bounty_count)
 
                                     bounty_amount = tx_bounty["tb_amount"]
-                                    wallet_id = resolve_wallet_profile_id(participant)
-                                    wallet_response = db.execute(
-                                        """
-                                        SELECT *
-                                        FROM every_circle.wallet
-                                        WHERE wallet_profile_id = %s
-                                        """,
-                                        {"wallet_profile_id": wallet_id}
+                                    wallet_result = credit_bounty_to_wallet(
+                                        db,
+                                        participant,
+                                        bounty_amount,
+                                        in_escrow=in_escrow,
                                     )
-                                    print("wallet_response: ", wallet_response)
-
-                                    if wallet_response.get("code") == 200:
-                                        wallet = wallet_response.get("result")[0]
-                                        wallet_actual_balance = wallet.get("wallet_actual_balance") or 0
-                                        wallet_useable_balance = wallet.get("wallet_useable_balance") or 0
-                                        wallet_pending = wallet.get("wallet_pending") or 0
-                                        wallet_lifetime_earning = wallet.get("wallet_lifetime_earning") or 0
-                                        print("wallet_actual_balance: ", wallet_actual_balance)
-
-                                        wallet_updates = {
-                                            "wallet_actual_balance": wallet_actual_balance + bounty_amount,
-                                            "wallet_lifetime_earning": wallet_lifetime_earning + bounty_amount,
-                                        }
-                                        if in_escrow:
-                                            wallet_updates["wallet_pending"] = wallet_pending + bounty_amount
-                                        else:
-                                            wallet_updates["wallet_useable_balance"] = wallet_useable_balance + bounty_amount
-
-                                        # update Wallet here for NETWORK participants
-                                        update_wallet_response = db.update(
-                                            "every_circle.wallet",
-                                            {"wallet_profile_id": wallet_id},
-                                            wallet_updates,
+                                    print("wallet_result: ", wallet_result)
+                                    if wallet_result.get("code") != 200:
+                                        print(
+                                            f"Warning: Failed to update wallet for "
+                                            f"network participant {participant}: {wallet_result}"
                                         )
-                                        print("update_wallet_response: ", update_wallet_response)
-                                        if update_wallet_response.get("code") != 200:
-                                            print(f"Warning: Failed to update wallet for network participant {participant}: {update_wallet_response}")
-
-                                    else:
-                                        insert_wallet_response = db.insert(
-                                            "every_circle.wallet",
-                                            {
-                                                "wallet_profile_id": wallet_id,
-                                                "wallet_actual_balance": bounty_amount,
-                                                "wallet_pending": bounty_amount if in_escrow else 0,
-                                                "wallet_useable_balance": 0 if in_escrow else bounty_amount,
-                                                "wallet_reserve": 0,
-                                                "wallet_lifetime_earning": bounty_amount,
-                                                "wallet_lifetime_spent": 0,
-                                            },
-                                        )
-                                        print("insert_wallet_response: ", insert_wallet_response)
-                                        if insert_wallet_response.get("code") != 200:
-                                            print(f"Warning: Failed to create wallet for network participant {participant}: {insert_wallet_response}")
 
                                 else:
                                     print(
