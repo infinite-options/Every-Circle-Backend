@@ -172,7 +172,8 @@ class ContentReports(Resource):
 
             if taken_down:
                 response["message"] = (
-                    "Report submitted. This offering has been taken down due to multiple reports."
+                    "Report submitted. This offering has been taken down and "
+                    "queued for admin review due to multiple reports."
                 )
             else:
                 response["message"] = "Report submitted successfully"
@@ -180,6 +181,7 @@ class ContentReports(Resource):
             response["data"] = {
                 "report_uid": report_uid,
                 "taken_down": taken_down,
+                "queued_for_review": taken_down,
             }
             return response, 200
 
@@ -386,6 +388,13 @@ class ContentModerationReview(Resource):
                 response["code"] = 400
                 return response, 400
 
+            if action == "reject":
+                note_text = str(note or "").strip()
+                if not note_text:
+                    response["message"] = "note is required when rejecting an offering"
+                    response["code"] = 400
+                    return response, 400
+
             with connect() as db:
                 offering = get_offering(db, profile_expertise_uid)
                 if not offering:
@@ -400,8 +409,8 @@ class ContentModerationReview(Resource):
 
                 if not result.get("ok"):
                     response["message"] = result.get("message", "Review action failed")
-                    response["code"] = 500
-                    return response, 500
+                    response["code"] = 400 if action == "reject" else 500
+                    return response, response["code"]
 
             response["message"] = f"Offering {action}d successfully"
             response["code"] = 200

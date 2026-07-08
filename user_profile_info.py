@@ -9,8 +9,8 @@ from moderation import (
     MODERATED_PENDING_REVIEW,
     MODERATED_TAKEN_DOWN,
     build_offering_moderation_metadata,
+    can_offering_be_edited,
     is_offering_publicly_visible,
-    queue_offering_for_review,
 )
 
 
@@ -223,38 +223,6 @@ def _enforce_moderated_is_public(existing_row, expertise_info):
     moderated = int(existing_row.get("profile_expertise_moderated") or 0)
     if moderated in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
         expertise_info["profile_expertise_is_public"] = 0
-
-
-def _notify_admins_offering_resubmission(db, offering):
-    admin_emails = os.getenv("MODERATION_ADMIN_EMAILS", "")
-    if not admin_emails.strip():
-        return
-    owner_uid = offering.get("profile_expertise_profile_personal_id")
-    owner_name = "A profile owner"
-    if owner_uid:
-        owner_res = db.select(
-            "every_circle.profile_personal",
-            where={"profile_personal_uid": owner_uid},
-        )
-        owner_rows = owner_res.get("result") or []
-        if owner_rows:
-            first = owner_rows[0].get("profile_personal_first_name") or ""
-            last = owner_rows[0].get("profile_personal_last_name") or ""
-            owner_name = f"{first} {last}".strip() or owner_name
-
-    title = offering.get("profile_expertise_title") or "an offering"
-    expertise_uid = offering.get("profile_expertise_uid") or ""
-    subject = "Offering resubmitted for moderation review"
-    body = (
-        f'{owner_name} resubmitted offering "{title}" ({expertise_uid}) '
-        "for admin review after editing moderated content."
-    )
-    from ec_api import sendEmail
-
-    for email in admin_emails.split(","):
-        email = email.strip()
-        if email:
-            sendEmail(email, subject, body)
 
 
 def _form_truthy_public(value):
@@ -1847,9 +1815,12 @@ class UserProfileInfo(Resource):
                                     continue
 
                                 existing_expertise = expertise_exists_query['result'][0]
-                                moderated_before = int(
-                                    existing_expertise.get("profile_expertise_moderated") or 0
-                                )
+                                if not can_offering_be_edited(
+                                    db, expertise_uid, existing_expertise
+                                ):
+                                    raise RuntimeError(
+                                        "This offering cannot be edited while it is taken down"
+                                    )
 
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
                                 _strip_expertise_moderated_fields(expertise_info)
@@ -1873,30 +1844,6 @@ class UserProfileInfo(Resource):
                                         raise RuntimeError(
                                             upd_res.get("message", "Expertise update failed")
                                         )
-
-                                    if moderated_before in (
-                                        MODERATED_TAKEN_DOWN,
-                                        MODERATED_PENDING_REVIEW,
-                                    ):
-                                        queue_result = queue_offering_for_review(
-                                            db, expertise_uid, profile_uid
-                                        )
-                                        if not queue_result.get("ok"):
-                                            raise RuntimeError(
-                                                queue_result.get(
-                                                    "message",
-                                                    "Failed to queue offering for review",
-                                                )
-                                            )
-                                        refreshed = db.select(
-                                            "every_circle.profile_expertise",
-                                            where={"profile_expertise_uid": expertise_uid},
-                                        )
-                                        refreshed_rows = refreshed.get("result") or []
-                                        if refreshed_rows:
-                                            _notify_admins_offering_resubmission(
-                                                db, refreshed_rows[0]
-                                            )
 
                                 expertise_uids.append(expertise_uid)
                             else:

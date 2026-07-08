@@ -143,6 +143,24 @@ def _get_latest_resubmission(db, target_uid, status=None):
     return rows[0] if rows else None
 
 
+def can_offering_be_edited(db, expertise_uid, offering=None):
+    """Only active offerings can be edited by the owner."""
+    offering = offering or get_offering(db, expertise_uid)
+    if not offering:
+        return False
+    return _moderated_value(offering) == MODERATED_ACTIVE
+
+
+def _moderation_status_label(moderated, latest_resubmission):
+    if moderated == MODERATED_PENDING_REVIEW:
+        return "pending_review"
+    if moderated == MODERATED_TAKEN_DOWN:
+        if latest_resubmission and latest_resubmission.get("resubmission_status") == "rejected":
+            return "rejected"
+        return "taken_down"
+    return "active"
+
+
 def build_offering_moderation_metadata(db, expertise_uid):
     offering = get_offering(db, expertise_uid)
     moderated = _moderated_value(offering)
@@ -150,6 +168,8 @@ def build_offering_moderation_metadata(db, expertise_uid):
     metadata = {
         "flagCount": count_pending_flags(db, expertise_uid),
         "moderated": moderated,
+        "status": _moderation_status_label(moderated, latest),
+        "canEdit": can_offering_be_edited(db, expertise_uid, offering),
         "resubmissionStatus": None,
         "resubmissionAdminNote": None,
         "resubmissionCreatedAt": None,
@@ -159,6 +179,8 @@ def build_offering_moderation_metadata(db, expertise_uid):
         metadata["resubmissionAdminNote"] = latest.get("resubmission_admin_note")
         created_at = latest.get("resubmission_created_at")
         metadata["resubmissionCreatedAt"] = _serialize_value(created_at)
+        if latest.get("resubmission_status") == "rejected":
+            metadata["rejectionNote"] = latest.get("resubmission_admin_note")
     return metadata
 
 
@@ -175,12 +197,37 @@ def _parse_snapshot(raw):
     return raw
 
 
+def _create_pending_resubmission(db, target_uid, snapshot):
+    """Insert a pending resubmission row for admin review."""
+    pending = _get_latest_resubmission(db, target_uid, status="pending")
+    if pending:
+        return pending["resubmission_uid"]
+
+    resubmission_uid = _new_resubmission_uid(db)
+    if not resubmission_uid:
+        return None
+
+    ins_res = db.insert(
+        _CONTENT_RESUBMISSIONS_TABLE,
+        {
+            "resubmission_uid": resubmission_uid,
+            "resubmission_target_uid": target_uid,
+            "resubmission_snapshot": json.dumps(snapshot, default=str),
+            "resubmission_status": "pending",
+            "resubmission_created_at": _now_str(),
+        },
+    )
+    if not _db_write_succeeded(ins_res):
+        return None
+    return resubmission_uid
+
+
 def apply_takedown_if_threshold(db, target_uid):
     """
     If pending flag count reaches the configured threshold while the offering is
-    active, set profile_expertise_moderated = 1.
+    active, hide it from the public and queue it for admin review.
 
-    Returns True when a takedown is applied on this call.
+    Returns True when the offering is queued for review on this call.
     """
     flag_count = count_pending_flags(db, target_uid)
     if flag_count < _takedown_threshold():
@@ -192,10 +239,18 @@ def apply_takedown_if_threshold(db, target_uid):
     if _moderated_value(offering) != MODERATED_ACTIVE:
         return False
 
+    snapshot = build_expertise_snapshot(offering)
+    resubmission_uid = _create_pending_resubmission(db, target_uid, snapshot)
+    if not resubmission_uid:
+        return False
+
     upd_res = db.update(
         _PROFILE_EXPERTISE_TABLE,
         {"profile_expertise_uid": target_uid},
-        {"profile_expertise_moderated": MODERATED_TAKEN_DOWN},
+        {
+            "profile_expertise_moderated": MODERATED_PENDING_REVIEW,
+            "profile_expertise_is_public": 0,
+        },
     )
     return _db_write_succeeded(upd_res)
 
@@ -222,12 +277,19 @@ def queue_offering_for_review(db, expertise_uid, editor_profile_uid):
     if moderated not in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
         return {"ok": False, "message": "Offering is not under moderation"}
 
+    if not can_offering_be_edited(db, expertise_uid, offering):
+        return {
+            "ok": False,
+            "message": "This offering cannot be edited while it is taken down",
+        }
+
     owner_uid = offering.get("profile_expertise_profile_personal_id")
     if editor_profile_uid and str(editor_profile_uid) != str(owner_uid):
         return {"ok": False, "message": "Only the offering owner can resubmit"}
 
     snapshot = build_expertise_snapshot(offering)
     now = _now_str()
+    pending = _get_latest_resubmission(db, expertise_uid, status="pending")
 
     if pending:
         upd_res = db.update(
@@ -349,16 +411,29 @@ def reject_offering_review(db, target_uid, admin_uid, note=None):
     if _moderated_value(offering) != MODERATED_PENDING_REVIEW:
         return {"ok": False, "message": "Offering is not pending admin review"}
 
-    finalized, _ = _finalize_pending_resubmission(db, target_uid, admin_uid, note, "rejected")
+    note_text = str(note or "").strip()
+    if not note_text:
+        return {"ok": False, "message": "Admin note is required when rejecting an offering"}
+
+    finalized, _ = _finalize_pending_resubmission(
+        db, target_uid, admin_uid, note_text, "rejected"
+    )
     if not finalized:
         return {"ok": False, "message": "Failed to reject resubmission"}
 
     mod_res = db.update(
         _PROFILE_EXPERTISE_TABLE,
         {"profile_expertise_uid": target_uid},
-        {"profile_expertise_moderated": MODERATED_TAKEN_DOWN},
+        {
+            "profile_expertise_moderated": MODERATED_TAKEN_DOWN,
+            "profile_expertise_is_public": 0,
+        },
     )
     if not _db_write_succeeded(mod_res):
         return {"ok": False, "message": "Failed to reject offering"}
 
-    return {"ok": True, "profile_expertise_uid": target_uid}
+    return {
+        "ok": True,
+        "profile_expertise_uid": target_uid,
+        "rejection_note": note_text,
+    }
