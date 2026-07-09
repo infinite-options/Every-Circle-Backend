@@ -5,6 +5,24 @@ import traceback
 
 
 from data_ec import connect
+from datetime_utils import enrich_datetime_fields
+
+
+def _request_timezone():
+    return request.args.get("timezone") or request.args.get("tz")
+
+
+def _enrich_bounty_rows(rows):
+    tz_name = _request_timezone()
+    enriched = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            enriched.append(
+                enrich_datetime_fields(dict(row), "transaction_datetime", tz_name)
+            )
+        else:
+            enriched.append(row)
+    return enriched
 
 
 class BountyResults(Resource):
@@ -59,22 +77,27 @@ class BountyResults(Resource):
                         LEFT JOIN every_circle.profile_personal p ON t.transaction_profile_id = p.profile_personal_uid
                         WHERE tb_profile_id = %s
                     ) AS bounty_results
-                    GROUP BY bounty_results.ti_transaction_id, bounty_results.transaction_business_id
+                    GROUP BY bounty_results.ti_uid
                     ORDER BY bounty_results.transaction_datetime DESC
                 """
                 
                 bounty_response = db.execute(bounty_query, (profile_id,))
 
                 if bounty_response["code"] == 200:
+                    rows = _enrich_bounty_rows(bounty_response["result"])
                     response["code"] = 200
                     response["message"] = "Bounty results retrieved successfully"
-                    response["data"] = bounty_response["result"]
-                    response["total_bounties"] = len(bounty_response["result"])
+                    response["data"] = rows
+                    response["total_bounties"] = len(rows)
+                    tz_name = _request_timezone()
+                    if tz_name:
+                        response["timezone"] = tz_name
+                    response["datetime_storage"] = "UTC"
 
                     # Calculate total bounty earned
                     total_bounty = sum(
                         float(bounty["bounty_earned"])
-                        for bounty in bounty_response["result"]
+                        for bounty in rows
                     )
                     response["total_bounty_earned"] = total_bounty
 
@@ -159,17 +182,22 @@ class BusinessBountyResults(Resource):
                 bounty_response = db.execute(bounty_query, (business_id,))
 
                 if bounty_response["code"] == 200:
+                    rows = _enrich_bounty_rows(bounty_response["result"])
                     response["code"] = 200
                     response["message"] = (
                         "Business bounty results retrieved successfully"
                     )
-                    response["data"] = bounty_response["result"]
-                    response["total_bounties"] = len(bounty_response["result"])
+                    response["data"] = rows
+                    response["total_bounties"] = len(rows)
+                    tz_name = _request_timezone()
+                    if tz_name:
+                        response["timezone"] = tz_name
+                    response["datetime_storage"] = "UTC"
 
                     # Calculate total bounty paid out by business
                     total_bounty = sum(
                         float(bounty["bounty_earned"])
-                        for bounty in bounty_response["result"]
+                        for bounty in rows
                     )
                     response["total_bounty_earned"] = total_bounty
 

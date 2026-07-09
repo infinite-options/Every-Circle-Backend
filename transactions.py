@@ -13,6 +13,24 @@ from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
 from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
+from datetime_utils import utc_now_str, enrich_datetime_fields
+
+
+def _request_timezone():
+    return request.args.get("timezone") or request.args.get("tz")
+
+
+def _enrich_transaction_rows(rows):
+    tz_name = _request_timezone()
+    enriched = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            enriched.append(
+                enrich_datetime_fields(dict(row), "transaction_datetime", tz_name)
+            )
+        else:
+            enriched.append(row)
+    return enriched
 
 
 def _strip_currency(value):
@@ -440,7 +458,7 @@ class ReturnTransaction(Resource):
                     return response, 500
 
                 new_transaction_uid = new_uid_resp["result"][0]["new_id"]
-                transactions_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                transactions_datetime = utc_now_str()
 
                 new_transaction = {
                     "transaction_uid": new_transaction_uid,
@@ -724,10 +742,13 @@ class Transactions(Resource):
                 # print(f"Query result: {result}")
 
                 if result.get("code") == 200:
+                    rows = _enrich_transaction_rows(result.get("result", []))
                     response["message"] = "Transactions retrieved successfully"
                     response["code"] = 200
-                    response["data"] = result.get("result", [])
-                    response["count"] = len(result.get("result", []))
+                    response["data"] = rows
+                    response["count"] = len(rows)
+                    if _request_timezone():
+                        response["timezone"] = _request_timezone()
                 else:
                     response["message"] = "Query execution failed"
                     response["code"] = result.get("code", 500)
@@ -802,7 +823,7 @@ class Transactions(Resource):
 
                 new_transaction_uid = transaction_stored_procedure_response["result"][0]["new_id"]
                 transaction["transaction_uid"] = new_transaction_uid
-                transactions_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                transactions_datetime = utc_now_str()
                 transaction["transaction_datetime"] = transactions_datetime
 
                 # Insert transaction
@@ -1492,7 +1513,7 @@ class Transactions(Resource):
             response["code"] = 403
             return response, 403
 
-        received_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        received_at = utc_now_str()
         updated_lines = []
         seen_ti = set()
 
@@ -1773,10 +1794,13 @@ class SellerTransactions(Resource):
                 # print(f"Seller query result: {result}")
 
                 if result.get("code") == 200:
+                    rows = _enrich_transaction_rows(result.get("result", []))
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200
-                    response["data"] = result.get("result", [])
-                    response["count"] = len(result.get("result", []))
+                    response["data"] = rows
+                    response["count"] = len(rows)
+                    if _request_timezone():
+                        response["timezone"] = _request_timezone()
                 else:
                     response["message"] = "Query execution failed"
                     response["code"] = result.get("code", 500)
