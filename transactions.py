@@ -56,6 +56,136 @@ def _tax_amount_for_line(line_subtotal, ti_bs_is_taxable, ti_bs_tax_rate):
     return round(line_subtotal * rate, 4)
 
 
+CHARITY_PROFILE_ID = "charity"
+_BOUNTY_NETWORK_POOL = 0.40
+_BOUNTY_NETWORK_MAX_PERSON = 0.20
+
+
+def _fetch_connection_path(path_from, path_to):
+    """Return combined_path string or None."""
+    if not path_from or not path_to:
+        return None
+    try:
+        connections_path = ConnectionsPath()
+        network_response, network_status = connections_path.get(path_from, path_to)
+        if network_status != 200 or not network_response.get("combined_path"):
+            print(
+                f"Warning: Could not find connection path "
+                f"{path_from} -> {path_to}. Status: {network_status}, "
+                f"Response: {network_response}"
+            )
+            return None
+        combined_path = network_response["combined_path"]
+        print("network combined_path: ", combined_path)
+        return combined_path
+    except Exception as e:
+        print(f"Error getting connection path: {str(e)}")
+        return None
+
+
+def _middle_path_nodes(combined_path, seen):
+    """Nodes strictly between path endpoints, excluding known bounty recipients."""
+    if not combined_path:
+        return []
+    try:
+        uids = combined_path.split(",")
+        middle = uids[1:-1] if len(uids) > 2 else []
+        return [uid for uid in middle if uid and uid not in seen]
+    except Exception as e:
+        print(f"Error processing network path: {str(e)}")
+        return []
+
+
+def _bounty_pct_amount(effective_bounty, percentage):
+    return {
+        "tb_percentage": str(percentage),
+        "tb_amount": round(percentage * effective_bounty, 4),
+    }
+
+
+def _charity_share_is_payable(charity_amount, charity_pct):
+    """Skip charity bounty rows when there is nothing meaningful to pay."""
+    if not charity_amount or charity_amount <= 0:
+        return False
+    try:
+        return float(charity_pct) > 0
+    except (TypeError, ValueError):
+        return charity_amount > 0
+
+
+def _without_zero_charity(participants):
+    return [
+        p
+        for p in participants
+        if p.get("tb_profile_id") != CHARITY_PROFILE_ID
+        or _charity_share_is_payable(p.get("tb_amount"), p.get("tb_percentage"))
+    ]
+
+
+def _network_participants_capped(middle_uids, effective_bounty):
+    """
+    Split the 40% network pool across intermediaries; cap each at 20%.
+    Any undistributed share goes to charity.
+    """
+    pool = round(_BOUNTY_NETWORK_POOL * effective_bounty, 4)
+    max_per = round(_BOUNTY_NETWORK_MAX_PERSON * effective_bounty, 4)
+    if not middle_uids:
+        if pool <= 0:
+            return []
+        return [
+            {
+                "tb_profile_id": CHARITY_PROFILE_ID,
+                **_bounty_pct_amount(effective_bounty, _BOUNTY_NETWORK_POOL),
+            }
+        ]
+
+    per_person = min(round(pool / len(middle_uids), 4), max_per)
+    total_paid = round(per_person * len(middle_uids), 4)
+    charity_amount = round(pool - total_paid, 4)
+    person_pct = round(per_person / effective_bounty, 4) if effective_bounty else 0
+
+    participants = [
+        {
+            "tb_profile_id": uid,
+            "tb_percentage": str(person_pct),
+            "tb_amount": per_person,
+        }
+        for uid in middle_uids
+    ]
+    if charity_amount > 0:
+        charity_pct = (
+            round(charity_amount / effective_bounty, 4) if effective_bounty else 0
+        )
+        if _charity_share_is_payable(charity_amount, charity_pct):
+            participants.append(
+                {
+                    "tb_profile_id": CHARITY_PROFILE_ID,
+                    "tb_percentage": str(charity_pct),
+                    "tb_amount": charity_amount,
+                }
+            )
+    return participants
+
+
+def _network_participants_business(middle_uids, effective_bounty, seen):
+    """Legacy business network split: equal shares of 40%, pad with charity if < 2."""
+    network_result = list(middle_uids)
+    if len(network_result) < 2 and CHARITY_PROFILE_ID not in seen:
+        network_result.append(CHARITY_PROFILE_ID)
+    if not network_result:
+        return []
+    network_percentage = _BOUNTY_NETWORK_POOL / len(network_result)
+    return _without_zero_charity(
+        [
+            {
+                "tb_profile_id": uid,
+                **_bounty_pct_amount(effective_bounty, network_percentage),
+            }
+            for uid in network_result
+        ]
+    )
+
+
 def _get_authenticated_profile_id():
     try:
         verify_jwt_in_request(optional=True)
@@ -970,32 +1100,8 @@ class Transactions(Resource):
 
                         recommender_profile_id = item.get("recommender_profile_id")
                         if not recommender_profile_id:
-                            # print("Warning: No recommender_profile_id provided, skipping bounty processing")
-                            # continue
                             print("Warning: No recommender_profile_id provided")
                             recommender_profile_id = payload.get("profile_id")
-
-                        # Find connection path between buyer and recommender
-                        try:
-                            connections_path = ConnectionsPath()
-                            network_response, network_status = connections_path.get(
-                                payload.get("profile_id"), recommender_profile_id
-                            )
-
-                            if network_status != 200 or not network_response.get(
-                                "combined_path"
-                            ):
-                                print(
-                                    f"Warning: Could not find connection path. Status: {network_status}, Response: {network_response}"
-                                )
-                                # Continue without network path, but still process known participants
-                                combined_path = None
-                            else:
-                                combined_path = network_response["combined_path"]
-                                print("network combined_path: ", combined_path)
-                        except Exception as e:
-                            print(f"Error getting connection path: {str(e)}")
-                            combined_path = None
 
                         profile_id = payload.get("profile_id")
                         buyer_is_recommender = (
@@ -1003,72 +1109,101 @@ class Transactions(Resource):
                             and recommender_profile_id
                             and profile_id == recommender_profile_id
                         )
-                        known_participants = []
-                        if buyer_is_recommender:
-                            known_participants.append(
-                                {
-                                    "tb_profile_id": profile_id,
-                                    "tb_percentage": "0.4",
-                                    "tb_amount": round(0.40 * effective_bounty, 4),
-                                }
+                        is_expertise_item = (
+                            ti_bs_id and str(ti_bs_id).startswith("150")
+                        )
+
+                        if is_expertise_item:
+                            seller_profile_id = (
+                                bs_data.get("profile_expertise_profile_personal_id")
+                                or payload.get("business_id")
                             )
+                            path_from, path_to = seller_profile_id, profile_id
                         elif is_wish_item:
-                            if recommender_profile_id:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": recommender_profile_id,
-                                        "tb_percentage": "0.4",
-                                        "tb_amount": round(0.40 * effective_bounty, 4),
-                                    }
-                                )
+                            path_from, path_to = profile_id, recommender_profile_id
                         else:
+                            path_from, path_to = profile_id, recommender_profile_id
+
+                        combined_path = _fetch_connection_path(path_from, path_to)
+
+                        known_participants = []
+                        if is_expertise_item:
                             if profile_id:
                                 known_participants.append(
                                     {
                                         "tb_profile_id": profile_id,
-                                        "tb_percentage": "0.2",
-                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                        **_bounty_pct_amount(effective_bounty, 0.40),
                                     }
                                 )
-                            if recommender_profile_id:
+                        elif is_wish_item:
+                            if buyer_is_recommender:
+                                if profile_id:
+                                    known_participants.append(
+                                        {
+                                            "tb_profile_id": profile_id,
+                                            **_bounty_pct_amount(effective_bounty, 0.40),
+                                        }
+                                    )
+                            else:
+                                if profile_id:
+                                    known_participants.append(
+                                        {
+                                            "tb_profile_id": profile_id,
+                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                        }
+                                    )
+                                if recommender_profile_id:
+                                    known_participants.append(
+                                        {
+                                            "tb_profile_id": recommender_profile_id,
+                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                        }
+                                    )
+                        else:
+                            if buyer_is_recommender:
                                 known_participants.append(
                                     {
-                                        "tb_profile_id": recommender_profile_id,
-                                        "tb_percentage": "0.2",
-                                        "tb_amount": round(0.20 * effective_bounty, 4),
+                                        "tb_profile_id": profile_id,
+                                        **_bounty_pct_amount(effective_bounty, 0.40),
                                     }
                                 )
+                            else:
+                                if profile_id:
+                                    known_participants.append(
+                                        {
+                                            "tb_profile_id": profile_id,
+                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                        }
+                                    )
+                                if recommender_profile_id:
+                                    known_participants.append(
+                                        {
+                                            "tb_profile_id": recommender_profile_id,
+                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                        }
+                                    )
                         known_participants.append(
                             {
                                 "tb_profile_id": EC_WALLET_ID,
-                                "tb_percentage": "0.2",
-                                "tb_amount": round(0.20 * effective_bounty, 4),
+                                **_bounty_pct_amount(effective_bounty, 0.20),
                             }
                         )
                         seen = {
-                            p["tb_profile_id"] for p in known_participants if p["tb_profile_id"]
+                            p["tb_profile_id"]
+                            for p in known_participants
+                            if p["tb_profile_id"]
                         }
 
-                        # Process network path if available
-                        network_result = []
-                        network_percentage = 0
-                        if combined_path:
-                            try:
-                                uids = combined_path.split(",")
-                                # Extract middle elements (excluding the first and last)
-                                # Also exclude anyone already in known_participants to avoid double-paying
-                                middle = uids[1:-1] if len(uids) > 2 else []
-                                network_result = [u for u in middle if u not in seen]
-                                if len(network_result) < 2:
-                                    if "charity" not in seen:
-                                        network_result.append("charity")
-                                print("network_result: ", network_result)
-
-                                if len(network_result) > 0:
-                                    network_percentage = 0.40 / len(network_result)
-                            except Exception as e:
-                                print(f"Error processing network path: {str(e)}")
-                                network_result = []
+                        middle_nodes = _middle_path_nodes(combined_path, seen)
+                        if is_expertise_item or is_wish_item:
+                            network_participants = _network_participants_capped(
+                                middle_nodes, effective_bounty
+                            )
+                        else:
+                            network_participants = _network_participants_business(
+                                middle_nodes, effective_bounty, seen
+                            )
+                        print("network_participants: ", network_participants)
 
                         in_escrow = bool(transaction.get("transaction_in_escrow"))
 
@@ -1159,11 +1294,12 @@ class Transactions(Resource):
                                 continue
 
                         # Process network participants
-                        for participant in network_result:
-                            if not participant:
+                        for participant in network_participants:
+                            participant_id = participant.get("tb_profile_id")
+                            if not participant_id:
                                 continue
 
-                            print(f"Processing network participant: {participant}")
+                            print(f"Processing network participant: {participant_id}")
 
                             try:
                                 transaction_bounty_stored_procedure_response = db.call(
@@ -1181,7 +1317,7 @@ class Transactions(Resource):
                                     == 0
                                 ):
                                     print(
-                                        f"Warning: Failed to generate bounty UID for network participant: {participant}"
+                                        f"Warning: Failed to generate bounty UID for network participant: {participant_id}"
                                     )
                                     continue
 
@@ -1196,15 +1332,12 @@ class Transactions(Resource):
                                     type(new_transaction_bounty_uid),
                                 )
 
-                                # Create new dictionary for each bounty to avoid data leakage
                                 tx_bounty = {
                                     "tb_uid": new_transaction_bounty_uid,
                                     "tb_ti_id": new_transaction_item_uid,
-                                    "tb_profile_id": participant,
-                                    "tb_percentage": str(network_percentage),
-                                    "tb_amount": round(
-                                        network_percentage * effective_bounty, 4
-                                    ),
+                                    "tb_profile_id": participant_id,
+                                    "tb_percentage": participant["tb_percentage"],
+                                    "tb_amount": participant["tb_amount"],
                                 }
                                 print("tx_bounty: ", tx_bounty)
 
@@ -1224,7 +1357,7 @@ class Transactions(Resource):
                                     bounty_amount = tx_bounty["tb_amount"]
                                     wallet_result = credit_bounty_to_wallet(
                                         db,
-                                        participant,
+                                        participant_id,
                                         bounty_amount,
                                         in_escrow=in_escrow,
                                     )
@@ -1232,16 +1365,16 @@ class Transactions(Resource):
                                     if wallet_result.get("code") != 200:
                                         print(
                                             f"Warning: Failed to update wallet for "
-                                            f"network participant {participant}: {wallet_result}"
+                                            f"network participant {participant_id}: {wallet_result}"
                                         )
 
                                 else:
                                     print(
-                                        f"Warning: Failed to insert bounty for network participant {participant}: {bounty_response}"
+                                        f"Warning: Failed to insert bounty for network participant {participant_id}: {bounty_response}"
                                     )
                             except Exception as e:
                                 print(
-                                    f"Error processing bounty for network participant {participant}: {str(e)}"
+                                    f"Error processing bounty for network participant {participant_id}: {str(e)}"
                                 )
                                 continue
 
