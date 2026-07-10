@@ -51,6 +51,74 @@ def _to_float(value):
         return 0.0
 
 
+def _build_selected_options(item):
+    """Normalize selected service options from checkout payload."""
+    selected = item.get("selected_choices") or {}
+    labels = item.get("selected_choice_labels") or {}
+    choice_items = item.get("selected_choice_items") or []
+
+    options = []
+    if choice_items:
+        for opt in choice_items:
+            group = (opt.get("groupTitle") or opt.get("group_title") or "").strip()
+            options.append(
+                {
+                    "group_title": group,
+                    "bso_uid": selected.get(group),
+                    "label": opt.get("label") or labels.get(group),
+                    "extra_cost": _to_float(opt.get("extra_cost")),
+                }
+            )
+    elif selected:
+        for group, bso_uid in selected.items():
+            options.append(
+                {
+                    "group_title": group,
+                    "bso_uid": bso_uid,
+                    "label": labels.get(group),
+                    "extra_cost": 0.0,
+                }
+            )
+    return options or None
+
+
+def _selected_options_json(item):
+    options = _build_selected_options(item)
+    return json.dumps(options) if options else None
+
+
+def _apply_item_options_to_tx_item(tx_item, item, ti_bs_id):
+    """Persist selected options, special instructions, and line price from checkout."""
+    selected_json = _selected_options_json(item)
+    if selected_json:
+        tx_item["ti_selected_options"] = selected_json
+
+    special = (item.get("special_instructions") or "").strip()
+    if special:
+        tx_item["ti_special_instructions"] = special
+
+    if item.get("choices_extra_cost") is not None:
+        tx_item["ti_choices_extra_cost"] = _to_float(item.get("choices_extra_cost"))
+
+    unit_price = item.get("unit_price")
+    if unit_price is not None and ti_bs_id and str(ti_bs_id).startswith("250"):
+        tx_item["ti_bs_cost"] = _strip_currency(unit_price)
+
+
+def _parse_selected_options_field(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return []
+
+
 def _bounty_scale_for_line(return_qty, original_qty):
     """Scale bounty reversal for a partial line return (return_qty / original_qty)."""
     if original_qty <= 0:
@@ -391,7 +459,8 @@ class ReturnTransaction(Resource):
                         """
                         SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bs_qty, ti_bs_cost,
                                ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
-                               ti_bs_refund_policy, ti_bs_return_window_days
+                               ti_bs_refund_policy, ti_bs_return_window_days,
+                               ti_selected_options, ti_special_instructions, ti_choices_extra_cost
                         FROM every_circle.transactions_items
                         WHERE ti_uid = %s AND ti_transaction_id = %s
                         """,
@@ -519,6 +588,16 @@ class ReturnTransaction(Resource):
                             "ti_bs_return_window_days"
                         ),
                     }
+                    if ti_row.get("ti_selected_options") is not None:
+                        tx_item["ti_selected_options"] = ti_row.get("ti_selected_options")
+                    if ti_row.get("ti_special_instructions"):
+                        tx_item["ti_special_instructions"] = ti_row.get(
+                            "ti_special_instructions"
+                        )
+                    if ti_row.get("ti_choices_extra_cost") is not None:
+                        tx_item["ti_choices_extra_cost"] = ti_row.get(
+                            "ti_choices_extra_cost"
+                        )
 
                     ti_insert = db.insert(
                         "every_circle.transactions_items", tx_item
@@ -1051,6 +1130,8 @@ class Transactions(Resource):
                     else:
                         print("ti_bs_id is not a valid ID")
                         continue
+
+                    _apply_item_options_to_tx_item(tx_item, item, ti_bs_id)
 
                     # # Get other item details from business services table using parameterized query
                     # bs_query = """
