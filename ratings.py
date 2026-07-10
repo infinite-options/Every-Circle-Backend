@@ -9,6 +9,36 @@ from data_ec import connect, uploadImage, s3, processImage
 from user_path_connection import ConnectionsPath
 
 
+def _rating_has_image(rating):
+    receipt_url = rating.get('rating_receipt_url')
+    if receipt_url:
+        return True
+
+    images_url = rating.get('rating_images_url')
+    if not images_url:
+        return False
+
+    if isinstance(images_url, list):
+        return bool(images_url)
+
+    if isinstance(images_url, str):
+        stripped = images_url.strip()
+        if not stripped or stripped in ('[]', 'null', 'None'):
+            return False
+        try:
+            return bool(json.loads(stripped))
+        except (json.JSONDecodeError, TypeError):
+            return True
+
+    return bool(images_url)
+
+
+def _rating_is_verified(rating):
+    if rating.get('ratings_transaction_id'):
+        return True
+    return _rating_has_image(rating)
+
+
 class Ratings(Resource):
     def get(self, uid):
         print("In Ratings GET")
@@ -40,16 +70,9 @@ class Ratings(Resource):
             # Add is_verified and circle_num_nodes for each rating
             for rating in response['result']:
                 profile_id = rating.get('rating_profile_id')
-                business_id = rating.get('rating_business_id')
+                rating['is_verified'] = _rating_is_verified(rating)
 
                 with connect() as db2:
-                    # is_verified check
-                    transaction_check = db2.select('transactions', where={
-                        'transaction_profile_id': profile_id,
-                        'transaction_business_id': business_id
-                    })
-                    rating['is_verified'] = bool(transaction_check.get('result'))
-
                     # circle_num_nodes lookup - use same connection
                     rating['circle_num_nodes'] = None
                     print(f"🔍 viewer_uid={viewer_uid}, profile_id={profile_id}")
@@ -249,6 +272,10 @@ class Ratings(Resource):
                 # payload['rating_rating_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 rating_payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+                transaction_uid = payload.pop('transaction_uid', None)
+                if transaction_uid:
+                    rating_payload['ratings_transaction_id'] = transaction_uid
+
                 processImage(key, rating_payload)
 
                 response = db.insert('every_circle.ratings', rating_payload)
@@ -342,6 +369,9 @@ class Ratings(Resource):
                     response['code'] = 404
                     return response, 404
                 payload.pop('responding_profile_uid', None)
+                transaction_uid = payload.pop('transaction_uid', None)
+                if transaction_uid:
+                    payload['ratings_transaction_id'] = transaction_uid
                 processImage(key, payload)
                 
                 payload['rating_updated_at_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
