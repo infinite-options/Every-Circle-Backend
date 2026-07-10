@@ -1,7 +1,22 @@
 from flask_restful import Resource
 from flask import request
+import json
+
 from data_ec import connect
 
+
+def _parse_selected_options_field(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return []
 
 
 class TransactionReceipt(Resource):
@@ -27,6 +42,9 @@ class TransactionReceipt(Resource):
                         ti.ti_bs_qty,
                         COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
                         ti.ti_bs_cost,
+                        ti.ti_choices_extra_cost,
+                        ti.ti_special_instructions,
+                        ti.ti_selected_options,
                         CASE
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
@@ -84,17 +102,19 @@ class TransactionReceipt(Resource):
 
                 if result.get('code') == 200:
                     rows = result.get('result', [])
-                    # Parse available_options JSON string if returned as string
-                    import json as _json
                     for row in rows:
                         raw = row.get('available_options')
                         if isinstance(raw, str):
                             try:
-                                row['available_options'] = _json.loads(raw)
+                                row['available_options'] = json.loads(raw)
                             except Exception:
                                 row['available_options'] = []
                         elif raw is None:
                             row['available_options'] = []
+
+                        row['selected_options'] = _parse_selected_options_field(
+                            row.pop('ti_selected_options', None)
+                        )
 
                     response['message'] = 'Transaction receipt retrieved successfully'
                     response['code'] = 200
