@@ -9,10 +9,16 @@ Mutations (PUT transactions, decline returns) stay on existing endpoints.
 """
 
 from flask_restful import Resource
+from flask import request
 
 from transactions import Transactions, SellerTransactions
 from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
+from datetime_utils import enrich_datetime_fields
+
+
+def _request_timezone():
+    return request.args.get("timezone") or request.args.get("tz")
 
 
 def _merge_body_status(body, status):
@@ -22,6 +28,31 @@ def _merge_body_status(body, status):
     out = dict(body)
     out.setdefault("code", status if status is not None else out.get("code"))
     return out
+
+
+def _enrich_section_datetimes(body, field="transaction_datetime"):
+    """Ensure nested account-screen lists expose UTC (+ optional local) datetimes."""
+    if not isinstance(body, dict):
+        return body
+
+    tz_name = _request_timezone()
+    data = body.get("data")
+    if not isinstance(data, list):
+        return body
+
+    enriched = []
+    for row in data:
+        if isinstance(row, dict):
+            enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
+        else:
+            enriched.append(row)
+
+    body = dict(body)
+    body["data"] = enriched
+    if tz_name:
+        body["timezone"] = tz_name
+    body["datetime_storage"] = "UTC"
+    return body
 
 
 class AccountScreenPersonal(Resource):
@@ -41,6 +72,10 @@ class AccountScreenPersonal(Resource):
         purchases_body, purchases_status = Transactions().get(profile_id)
         bounty_body, bounty_status = BountyResults().get(profile_id)
         seller_body, seller_status = SellerTransactions().get(profile_id)
+
+        purchases_body = _enrich_section_datetimes(purchases_body)
+        bounty_body = _enrich_section_datetimes(bounty_body)
+        seller_body = _enrich_section_datetimes(seller_body)
 
         return (
             {
@@ -70,6 +105,9 @@ class AccountScreenBusiness(Resource):
         seller_body, seller_status = SellerTransactions().get(business_uid)
         bounty_body, bounty_status = BusinessBountyResults().get(business_uid)
         info_body, info_status = BusinessInfo().get(business_uid)
+
+        seller_body = _enrich_section_datetimes(seller_body)
+        bounty_body = _enrich_section_datetimes(bounty_body)
 
         return (
             {
