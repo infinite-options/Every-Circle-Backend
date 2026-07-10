@@ -1016,6 +1016,14 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response["result"][0]
+                        if (
+                            int(bs_data.get("profile_wish_moderated") or 0)
+                            != MODERATED_ACTIVE
+                        ):
+                            response["message"] = "Seeking post is not available"
+                            response["code"] = 403
+                            return response, 403
+
                         tx_item["ti_bs_cost"] = _strip_currency(
                             bs_data.get("profile_wish_cost")
                         )

@@ -10,8 +10,11 @@ from moderation import (
     MODERATED_PENDING_REVIEW,
     MODERATED_TAKEN_DOWN,
     build_offering_moderation_metadata,
+    build_wish_moderation_metadata,
     can_offering_be_edited,
+    can_wish_be_edited,
     is_offering_publicly_visible,
+    is_wish_publicly_visible,
 )
 
 
@@ -155,6 +158,7 @@ def _wish_dict_from_payload(wish_data):
         if k.startswith(_WISH_PREFIX) and k not in (
             "profile_wish_uid",
             "profile_wish_profile_personal_id",
+            "profile_wish_moderated",
         ):
             m[k] = v
     return m
@@ -215,6 +219,33 @@ def _filter_and_enrich_expertise_info(
     return visible
 
 
+def _filter_and_enrich_wish_info(
+    db, wish_rows, profile_id, viewer_profile_uid=None, viewer_is_admin=False
+):
+    """Hide moderated seeking posts from public viewers; attach moderation metadata for owners."""
+    if not wish_rows:
+        return []
+
+    visible = []
+    is_owner_view = bool(
+        viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
+    )
+    for row in wish_rows:
+        if not is_wish_publicly_visible(
+            row,
+            viewer_profile_uid=viewer_profile_uid,
+            viewer_is_admin=viewer_is_admin,
+        ):
+            continue
+        item = dict(row)
+        if is_owner_view:
+            item["moderation"] = build_wish_moderation_metadata(
+                db, item.get("profile_wish_uid")
+            )
+        visible.append(item)
+    return visible
+
+
 def _strip_expertise_moderated_fields(expertise_info):
     expertise_info.pop("profile_expertise_moderated", None)
 
@@ -228,6 +259,21 @@ def _enforce_moderated_is_public(existing_row, expertise_info):
         MODERATED_ACKNOWLEDGED,
     ):
         expertise_info["profile_expertise_is_public"] = 0
+
+
+def _strip_wish_moderated_fields(wish_info):
+    wish_info.pop("profile_wish_moderated", None)
+
+
+def _enforce_wish_moderated_is_public(existing_row, wish_info):
+    """Prevent owners from making a moderated seeking post public via PUT."""
+    moderated = int(existing_row.get("profile_wish_moderated") or 0)
+    if moderated in (
+        MODERATED_TAKEN_DOWN,
+        MODERATED_PENDING_REVIEW,
+        MODERATED_ACKNOWLEDGED,
+    ):
+        wish_info["profile_wish_is_public"] = 0
 
 
 def _form_truthy_public(value):
@@ -677,15 +723,26 @@ class UserProfileInfo(Resource):
                 response['education_info'] = education_info['result'] if education_info['result'] else []
 
                 # Get wishes info - returning all wishes entries for this profile with response counts
-                wishes_query = """
+                wish_moderated_filter = ""
+                if not is_owner_view and not viewer_is_admin:
+                    wish_moderated_filter = " AND COALESCE(profile_wish_moderated, 0) = 0"
+                wishes_query = f"""
                     SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
                     FROM every_circle.profile_wish
                     LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
                     WHERE profile_wish_profile_personal_id = %s
+                      {wish_moderated_filter}
                     GROUP BY profile_wish_uid
                 """
                 wishes_info = db.execute(wishes_query, (profile_id,))
-                response['wishes_info'] = wishes_info['result'] if wishes_info.get('result') else []
+                wish_rows = wishes_info['result'] if wishes_info.get('result') else []
+                response['wishes_info'] = _filter_and_enrich_wish_info(
+                    db,
+                    wish_rows,
+                    profile_id,
+                    viewer_profile_uid=viewer_profile_uid,
+                    viewer_is_admin=viewer_is_admin,
+                )
 
                 # print("Get 3")
 
@@ -1239,6 +1296,7 @@ class UserProfileInfo(Resource):
             updated_uids = {}
             deleted_uids = {}
             expertise_payload_refresh = False
+            wishes_payload_refresh = False
 
             with connect() as db:
                 # Check if the profile exists
@@ -1884,6 +1942,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         wishes_data = json.loads(payload.pop('wishes_info'))
+                        wishes_payload_refresh = True
                         wishes_uids = []
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
@@ -1906,7 +1965,15 @@ class UserProfileInfo(Resource):
                                     print(f"Warning: Wish {wish_uid} not found for profile {profile_uid}")
                                     continue
 
+                                existing_wish = wish_exists_query['result'][0]
+                                if not can_wish_be_edited(db, wish_uid, existing_wish):
+                                    raise RuntimeError(
+                                        "This seeking post cannot be edited while it is taken down"
+                                    )
+
                                 wish_info.update(_wish_dict_from_payload(wish_data))
+                                _strip_wish_moderated_fields(wish_info)
+                                _enforce_wish_moderated_is_public(existing_wish, wish_info)
                                 _apply_profile_wish_multipart_image(
                                     db,
                                     payload,
@@ -2080,6 +2147,29 @@ class UserProfileInfo(Resource):
                     response['expertise_info'] = _filter_and_enrich_expertise_info(
                         db,
                         expertise_rows,
+                        profile_uid,
+                        viewer_profile_uid=profile_uid,
+                        viewer_is_admin=False,
+                    )
+
+                if wishes_payload_refresh:
+                    _wish_snap = db.execute(
+                        """
+                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
+                        FROM every_circle.profile_wish
+                        LEFT JOIN every_circle.wish_response
+                               ON wr_profile_wish_id = profile_wish_uid
+                        WHERE profile_wish_profile_personal_id = %s
+                        GROUP BY profile_wish_uid
+                        """,
+                        (profile_uid,),
+                    )
+                    wish_rows = (
+                        _wish_snap['result'] if _wish_snap.get('result') else []
+                    )
+                    response['wishes_info'] = _filter_and_enrich_wish_info(
+                        db,
+                        wish_rows,
                         profile_uid,
                         viewer_profile_uid=profile_uid,
                         viewer_is_admin=False,

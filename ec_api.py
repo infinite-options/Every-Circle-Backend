@@ -57,7 +57,7 @@ from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from feedback import Feedback
-from content_reports import ContentReports, ContentModerationReview
+from content_reports import ContentReports, ContentModerationReview, SeekingContentModerationReview
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
 from profile_views import ProfileViews
@@ -875,6 +875,13 @@ api.add_resource(
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>/review",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>/acknowledge",
+)
+api.add_resource(
+    SeekingContentModerationReview,
+    "/api/v1/moderation/seeking/review-queue",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>/review",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>/acknowledge",
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")

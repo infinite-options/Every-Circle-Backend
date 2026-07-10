@@ -9,13 +9,21 @@ from data_ec import connect
 from moderation import (
     MODERATED_PENDING_REVIEW,
     TARGET_TYPE_OFFERING,
+    TARGET_TYPE_SEEKING,
     acknowledge_offering_takedown,
-    apply_takedown_if_threshold,
+    acknowledge_wish_takedown,
+    apply_content_takedown_if_threshold,
     approve_offering_review,
+    approve_wish_review,
     build_offering_moderation_metadata,
+    build_wish_moderation_metadata,
     get_offering,
     get_offering_owner_profile_uid,
+    get_wish,
+    get_wish_owner_profile_uid,
     reject_offering_review,
+    reject_wish_review,
+    resolve_content_target,
 )
 
 _CONTENT_REPORTS_TABLE = "every_circle.content_reports"
@@ -110,7 +118,7 @@ def _get_latest_resubmission(db, target_uid):
 
 class ContentReports(Resource):
     def post(self):
-        """Submit a content flag against an offering."""
+        """Submit a content flag against an offering or seeking post."""
         print("In ContentReports POST")
         response = {}
         try:
@@ -128,20 +136,26 @@ class ContentReports(Resource):
                 return response, 400
 
             with connect() as db:
-                offering = get_offering(db, target_uid)
-                if not offering:
-                    response["message"] = "Offering not found"
+                target_type, target_row = resolve_content_target(db, target_uid)
+                if not target_row:
+                    response["message"] = "Content not found"
                     response["code"] = 404
                     return response, 404
 
-                owner_uid = get_offering_owner_profile_uid(db, target_uid)
+                if target_type == TARGET_TYPE_OFFERING:
+                    owner_uid = get_offering_owner_profile_uid(db, target_uid)
+                    content_label = "offering"
+                else:
+                    owner_uid = get_wish_owner_profile_uid(db, target_uid)
+                    content_label = "seeking post"
+
                 if owner_uid and str(reporter_profile_uid) == str(owner_uid):
-                    response["message"] = "You cannot report your own offering"
+                    response["message"] = f"You cannot report your own {content_label}"
                     response["code"] = 403
                     return response, 403
 
                 if _report_exists(db, reporter_profile_uid, target_uid):
-                    response["message"] = "You have already reported this offering"
+                    response["message"] = f"You have already reported this {content_label}"
                     response["code"] = 409
                     return response, 409
 
@@ -157,7 +171,7 @@ class ContentReports(Resource):
                         "report_uid": report_uid,
                         "report_reporter_profile_uid": reporter_profile_uid,
                         "report_target_uid": target_uid,
-                        "report_target_type": TARGET_TYPE_OFFERING,
+                        "report_target_type": target_type,
                         "report_reason_category": reason_category[:50],
                         "report_reason_text": reason_text,
                         "report_status": "pending",
@@ -169,11 +183,11 @@ class ContentReports(Resource):
                     response["code"] = 500
                     return response, 500
 
-                taken_down = apply_takedown_if_threshold(db, target_uid)
+                taken_down = apply_content_takedown_if_threshold(db, target_uid)
 
             if taken_down:
                 response["message"] = (
-                    "Report submitted. This offering has been taken down and "
+                    f"Report submitted. This {content_label} has been taken down and "
                     "queued for admin review due to multiple reports."
                 )
             else:
@@ -481,6 +495,198 @@ class ContentModerationReview(Resource):
 
         except Exception as e:
             print(f"Error in ContentModerationReview POST: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+
+class SeekingContentModerationReview(Resource):
+    def get(self, profile_wish_uid=None):
+        """Review queue or single seeking post moderation detail."""
+        print("In SeekingContentModerationReview GET")
+        response = {}
+        try:
+            with connect() as db:
+                if not profile_wish_uid or profile_wish_uid == "review-queue":
+                    query = """
+                        SELECT pw.*,
+                               pp.profile_personal_first_name AS owner_first_name,
+                               pp.profile_personal_last_name AS owner_last_name
+                        FROM every_circle.profile_wish pw
+                        LEFT JOIN every_circle.profile_personal pp
+                               ON pp.profile_personal_uid = pw.profile_wish_profile_personal_id
+                        WHERE pw.profile_wish_moderated = %s
+                          AND EXISTS (
+                              SELECT 1
+                              FROM every_circle.content_resubmissions cr
+                              WHERE cr.resubmission_target_uid = pw.profile_wish_uid
+                                AND cr.resubmission_status = 'pending'
+                          )
+                        ORDER BY pw.profile_wish_uid ASC
+                    """
+                    result = db.execute(query, (MODERATED_PENDING_REVIEW,))
+                    rows = result.get("result") or []
+                    queue = []
+                    for row in rows:
+                        item = {k: _serialize_datetime(v) for k, v in row.items()}
+                        wish_uid = row.get("profile_wish_uid")
+                        item["moderation"] = build_wish_moderation_metadata(db, wish_uid)
+                        queue.append(item)
+
+                    response["message"] = "Review queue retrieved successfully"
+                    response["code"] = 200
+                    response["result"] = queue
+                    return response, 200
+
+                wish = get_wish(db, profile_wish_uid)
+                if not wish:
+                    response["message"] = "Seeking post not found"
+                    response["code"] = 404
+                    return response, 404
+
+                latest_resubmission = _get_latest_resubmission(db, profile_wish_uid)
+                resubmission_data = None
+                if latest_resubmission:
+                    resubmission_data = {
+                        key: _serialize_datetime(value)
+                        for key, value in latest_resubmission.items()
+                    }
+                    resubmission_data["resubmission_snapshot"] = _parse_snapshot(
+                        latest_resubmission.get("resubmission_snapshot")
+                    )
+
+                response["message"] = "Seeking moderation detail retrieved successfully"
+                response["code"] = 200
+                response["data"] = {
+                    "seeking": {k: _serialize_datetime(v) for k, v in wish.items()},
+                    "pendingFlags": _get_pending_flags_for_target(db, profile_wish_uid),
+                    "moderation": build_wish_moderation_metadata(db, profile_wish_uid),
+                    "latestResubmission": resubmission_data,
+                }
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in SeekingContentModerationReview GET: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def put(self, profile_wish_uid):
+        """Admin approves or rejects a moderated seeking post resubmission."""
+        print("In SeekingContentModerationReview PUT")
+        response = {}
+        try:
+            if not request.path.rstrip("/").endswith("/review"):
+                response["message"] = "Use the /review endpoint to submit a moderation decision"
+                response["code"] = 400
+                return response, 400
+
+            payload = request.get_json(force=True) or {}
+            action = str(payload.get("action", "")).strip().lower()
+            admin_uid = str(payload.get("admin_uid", "")).strip()
+            note = payload.get("note")
+
+            if not profile_wish_uid or action not in ("approve", "reject"):
+                response["message"] = (
+                    "profile_wish_uid and action ('approve' or 'reject') are required"
+                )
+                response["code"] = 400
+                return response, 400
+
+            if action == "reject":
+                note_text = str(note or "").strip()
+                if not note_text:
+                    response["message"] = "note is required when rejecting a seeking post"
+                    response["code"] = 400
+                    return response, 400
+
+            with connect() as db:
+                wish = get_wish(db, profile_wish_uid)
+                if not wish:
+                    response["message"] = "Seeking post not found"
+                    response["code"] = 404
+                    return response, 404
+
+                if action == "approve":
+                    result = approve_wish_review(db, profile_wish_uid, admin_uid, note)
+                else:
+                    result = reject_wish_review(db, profile_wish_uid, admin_uid, note)
+
+                if not result.get("ok"):
+                    response["message"] = result.get("message", "Review action failed")
+                    response["code"] = 400 if action == "reject" else 500
+                    return response, response["code"]
+
+            response["message"] = f"Seeking post {action}d successfully"
+            response["code"] = 200
+            response["data"] = {
+                "profile_wish_uid": profile_wish_uid,
+                "action": action,
+                "admin_uid": admin_uid or None,
+            }
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in SeekingContentModerationReview PUT: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def post(self, profile_wish_uid):
+        """Owner acknowledges a rejected / taken-down seeking post (moderated = 3)."""
+        print("In SeekingContentModerationReview POST (acknowledge)")
+        response = {}
+        try:
+            if not request.path.rstrip("/").endswith("/acknowledge"):
+                response["message"] = (
+                    "Use the /acknowledge endpoint to acknowledge a taken-down seeking post"
+                )
+                response["code"] = 400
+                return response, 400
+
+            payload = request.get_json(force=True) or {}
+            requester_profile_uid = str(
+                payload.get("profile_uid")
+                or payload.get("requester_profile_uid")
+                or ""
+            ).strip()
+
+            if not profile_wish_uid or not requester_profile_uid:
+                response["message"] = (
+                    "profile_wish_uid and profile_uid are required"
+                )
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                result = acknowledge_wish_takedown(
+                    db, profile_wish_uid, requester_profile_uid
+                )
+
+            if not result.get("ok"):
+                code = result.get("code", 400)
+                response["message"] = result.get("message", "Acknowledge failed")
+                response["code"] = code
+                return response, code
+
+            response["message"] = (
+                "Seeking post already acknowledged"
+                if result.get("already_acknowledged")
+                else "Seeking post acknowledged successfully"
+            )
+            response["code"] = 200
+            response["data"] = {
+                "profile_wish_uid": profile_wish_uid,
+                "moderated": 3,
+                "already_acknowledged": bool(result.get("already_acknowledged")),
+            }
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in SeekingContentModerationReview POST: {str(e)}")
             traceback.print_exc()
             response["message"] = "Internal Server Error"
             response["code"] = 500
