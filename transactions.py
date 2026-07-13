@@ -541,6 +541,8 @@ class ReturnTransaction(Resource):
                     "transaction_fees": f"{-refund_fees:.4f}",
                     "transaction_in_escrow": 0,
                     "transaction_return_note": return_note,
+                    "transaction_type": "return",
+                    "transaction_original_uid": original_tx_uid,
                 }
 
                 tx_insert = db.insert("every_circle.transactions", new_transaction)
@@ -576,6 +578,7 @@ class ReturnTransaction(Resource):
                     tx_item = {
                         "ti_uid": new_ti_uid,
                         "ti_transaction_id": new_transaction_uid,
+                        "ti_original_ti_uid": line["original_ti_uid"],
                         "ti_bs_id": ti_bs_id,
                         "ti_bs_qty": neg_qty,
                         "ti_bs_cost": ti_row.get("ti_bs_cost"),
@@ -701,6 +704,7 @@ class ReturnTransaction(Resource):
                 response["code"] = 200
                 response["return_transaction_uid"] = new_transaction_uid
                 response["original_transaction_uid"] = original_tx_uid
+                response["order_uid"] = original_tx_uid
                 response["refund_breakdown"] = {
                     "subtotal": round(refund_subtotal, 4),
                     "taxes": round(refund_tax, 4),
@@ -746,6 +750,9 @@ class Transactions(Resource):
                 query = """
                     SELECT
                     t.transaction_uid,
+                    COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
+                    COALESCE(t.transaction_type, 'sale') AS transaction_type,
+                    (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                     t.transaction_datetime,
                     t.transaction_total,
                     t.transaction_taxes,
@@ -885,6 +892,7 @@ class Transactions(Resource):
                 "transaction_in_escrow": (
                     1 if payload.get("transaction_in_escrow") else 0
                 ),
+                "transaction_type": "sale",
             }
 
             with connect() as db:
@@ -1785,6 +1793,9 @@ class SellerTransactions(Resource):
                 query = """
                     SELECT
                         t.transaction_uid,
+                        COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
+                        COALESCE(t.transaction_type, 'sale') AS transaction_type,
+                        (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                         t.transaction_datetime,
                         t.transaction_total,
                         t.transaction_taxes,

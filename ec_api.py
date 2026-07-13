@@ -50,6 +50,7 @@ from profile_wish import ProfileWishInfo, ProfileWishResponse
 from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertiseResponsesForOffering
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
+from order_detail import OrderDetail
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
@@ -829,6 +830,7 @@ api.add_resource(TagGeneratorAPI, '/api/v1/taggenerator')
 api.add_resource(UserProfileInfo, '/api/v1/userprofileinfo', '/api/v1/userprofileinfo/<string:uid>')
 api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<string:uid>')
 # Static paths must register before `/api/v1/transactions/<profile_id>` so `return` is not captured as profile_id.
+api.add_resource(OrderDetail, '/api/v1/orders/<string:transaction_uid>')
 api.add_resource(ReturnTransaction, '/api/v1/transactions/return')
 api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
