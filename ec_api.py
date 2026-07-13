@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from zappa_prebuild import exit_if_crypto_broken
-exit_if_crypto_broken()
+# from zappa_prebuild import exit_if_crypto_broken
+# exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
@@ -57,7 +57,12 @@ from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from feedback import Feedback
-from content_reports import ContentReports, ContentModerationReview, SeekingContentModerationReview
+from content_reports import (
+    ContentReports,
+    ContentModerationReview,
+    SeekingContentModerationReview,
+    UserModerationReview,
+)
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
 from profile_views import ProfileViews
@@ -882,6 +887,13 @@ api.add_resource(
     "/api/v1/moderation/seeking/<string:profile_wish_uid>",
     "/api/v1/moderation/seeking/<string:profile_wish_uid>/review",
     "/api/v1/moderation/seeking/<string:profile_wish_uid>/acknowledge",
+)
+api.add_resource(
+    UserModerationReview,
+    "/api/v1/moderation/users/review-queue",
+    "/api/v1/moderation/users/<string:profile_personal_uid>",
+    "/api/v1/moderation/users/<string:profile_personal_uid>/review",
+    "/api/v1/moderation/users/<string:profile_personal_uid>/acknowledge",
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")

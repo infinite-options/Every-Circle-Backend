@@ -8,7 +8,7 @@ import json
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
-from moderation import MODERATED_ACTIVE
+from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interaction
 from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
@@ -1043,6 +1043,12 @@ class Transactions(Resource):
                             response["code"] = 403
                             return response, 403
 
+                        owner_uid = bs_data.get("profile_expertise_profile_personal_id")
+                        if not is_owner_available_for_public_interaction(db, owner_uid):
+                            response["message"] = "Offering is not available"
+                            response["code"] = 403
+                            return response, 403
+
                         tx_item["ti_bs_cost"] = _strip_currency(
                             bs_data.get("profile_expertise_cost")
                         )
@@ -1099,6 +1105,12 @@ class Transactions(Resource):
                             int(bs_data.get("profile_wish_moderated") or 0)
                             != MODERATED_ACTIVE
                         ):
+                            response["message"] = "Seeking post is not available"
+                            response["code"] = 403
+                            return response, 403
+
+                        owner_uid = bs_data.get("profile_wish_profile_personal_id")
+                        if not is_owner_available_for_public_interaction(db, owner_uid):
                             response["message"] = "Seeking post is not available"
                             response["code"] = 403
                             return response, 403

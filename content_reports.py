@@ -10,18 +10,24 @@ from moderation import (
     MODERATED_PENDING_REVIEW,
     TARGET_TYPE_OFFERING,
     TARGET_TYPE_SEEKING,
+    TARGET_TYPE_USER,
     acknowledge_offering_takedown,
+    acknowledge_user_takedown,
     acknowledge_wish_takedown,
     apply_content_takedown_if_threshold,
     approve_offering_review,
+    approve_user_review,
     approve_wish_review,
     build_offering_moderation_metadata,
+    build_user_moderation_metadata,
     build_wish_moderation_metadata,
     get_offering,
     get_offering_owner_profile_uid,
+    get_user,
     get_wish,
     get_wish_owner_profile_uid,
     reject_offering_review,
+    reject_user_review,
     reject_wish_review,
     resolve_content_target,
 )
@@ -118,7 +124,7 @@ def _get_latest_resubmission(db, target_uid):
 
 class ContentReports(Resource):
     def post(self):
-        """Submit a content flag against an offering or seeking post."""
+        """Submit a content flag against an offering, seeking post, or user profile."""
         print("In ContentReports POST")
         response = {}
         try:
@@ -145,9 +151,12 @@ class ContentReports(Resource):
                 if target_type == TARGET_TYPE_OFFERING:
                     owner_uid = get_offering_owner_profile_uid(db, target_uid)
                     content_label = "offering"
-                else:
+                elif target_type == TARGET_TYPE_SEEKING:
                     owner_uid = get_wish_owner_profile_uid(db, target_uid)
                     content_label = "seeking post"
+                else:
+                    owner_uid = target_uid
+                    content_label = "user profile"
 
                 if owner_uid and str(reporter_profile_uid) == str(owner_uid):
                     response["message"] = f"You cannot report your own {content_label}"
@@ -687,6 +696,197 @@ class SeekingContentModerationReview(Resource):
 
         except Exception as e:
             print(f"Error in SeekingContentModerationReview POST: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+
+class UserModerationReview(Resource):
+    def get(self, profile_personal_uid=None):
+        """Review queue or single user profile moderation detail."""
+        print("In UserModerationReview GET")
+        response = {}
+        try:
+            with connect() as db:
+                if not profile_personal_uid or profile_personal_uid == "review-queue":
+                    query = """
+                        SELECT pp.*,
+                               u.user_email_id AS owner_email
+                        FROM every_circle.profile_personal pp
+                        LEFT JOIN every_circle.users u
+                               ON u.user_uid = pp.profile_personal_user_id
+                        WHERE pp.profile_personal_moderated = %s
+                          AND EXISTS (
+                              SELECT 1
+                              FROM every_circle.content_resubmissions cr
+                              WHERE cr.resubmission_target_uid = pp.profile_personal_uid
+                                AND cr.resubmission_status = 'pending'
+                          )
+                        ORDER BY pp.profile_personal_uid ASC
+                    """
+                    result = db.execute(query, (MODERATED_PENDING_REVIEW,))
+                    rows = result.get("result") or []
+                    queue = []
+                    for row in rows:
+                        item = {k: _serialize_datetime(v) for k, v in row.items()}
+                        profile_uid = row.get("profile_personal_uid")
+                        item["moderation"] = build_user_moderation_metadata(db, profile_uid)
+                        queue.append(item)
+
+                    response["message"] = "Review queue retrieved successfully"
+                    response["code"] = 200
+                    response["result"] = queue
+                    return response, 200
+
+                user = get_user(db, profile_personal_uid)
+                if not user:
+                    response["message"] = "User profile not found"
+                    response["code"] = 404
+                    return response, 404
+
+                latest_resubmission = _get_latest_resubmission(db, profile_personal_uid)
+                resubmission_data = None
+                if latest_resubmission:
+                    resubmission_data = {
+                        key: _serialize_datetime(value)
+                        for key, value in latest_resubmission.items()
+                    }
+                    resubmission_data["resubmission_snapshot"] = _parse_snapshot(
+                        latest_resubmission.get("resubmission_snapshot")
+                    )
+
+                response["message"] = "User moderation detail retrieved successfully"
+                response["code"] = 200
+                response["data"] = {
+                    "user": {k: _serialize_datetime(v) for k, v in user.items()},
+                    "pendingFlags": _get_pending_flags_for_target(db, profile_personal_uid),
+                    "moderation": build_user_moderation_metadata(db, profile_personal_uid),
+                    "latestResubmission": resubmission_data,
+                }
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in UserModerationReview GET: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def put(self, profile_personal_uid):
+        """Admin approves or rejects a moderated user profile resubmission."""
+        print("In UserModerationReview PUT")
+        response = {}
+        try:
+            if not request.path.rstrip("/").endswith("/review"):
+                response["message"] = "Use the /review endpoint to submit a moderation decision"
+                response["code"] = 400
+                return response, 400
+
+            payload = request.get_json(force=True) or {}
+            action = str(payload.get("action", "")).strip().lower()
+            admin_uid = str(payload.get("admin_uid", "")).strip()
+            note = payload.get("note")
+
+            if not profile_personal_uid or action not in ("approve", "reject"):
+                response["message"] = (
+                    "profile_personal_uid and action ('approve' or 'reject') are required"
+                )
+                response["code"] = 400
+                return response, 400
+
+            if action == "reject":
+                note_text = str(note or "").strip()
+                if not note_text:
+                    response["message"] = "note is required when rejecting a user profile"
+                    response["code"] = 400
+                    return response, 400
+
+            with connect() as db:
+                user = get_user(db, profile_personal_uid)
+                if not user:
+                    response["message"] = "User profile not found"
+                    response["code"] = 404
+                    return response, 404
+
+                if action == "approve":
+                    result = approve_user_review(db, profile_personal_uid, admin_uid, note)
+                else:
+                    result = reject_user_review(db, profile_personal_uid, admin_uid, note)
+
+                if not result.get("ok"):
+                    response["message"] = result.get("message", "Review action failed")
+                    response["code"] = 400 if action == "reject" else 500
+                    return response, response["code"]
+
+            response["message"] = f"User profile {action}d successfully"
+            response["code"] = 200
+            response["data"] = {
+                "profile_personal_uid": profile_personal_uid,
+                "action": action,
+                "admin_uid": admin_uid or None,
+            }
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in UserModerationReview PUT: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+    def post(self, profile_personal_uid):
+        """Owner acknowledges a rejected / taken-down user profile (moderated = 3)."""
+        print("In UserModerationReview POST (acknowledge)")
+        response = {}
+        try:
+            if not request.path.rstrip("/").endswith("/acknowledge"):
+                response["message"] = (
+                    "Use the /acknowledge endpoint to acknowledge a taken-down user profile"
+                )
+                response["code"] = 400
+                return response, 400
+
+            payload = request.get_json(force=True) or {}
+            requester_profile_uid = str(
+                payload.get("profile_uid")
+                or payload.get("requester_profile_uid")
+                or ""
+            ).strip()
+
+            if not profile_personal_uid or not requester_profile_uid:
+                response["message"] = (
+                    "profile_personal_uid and profile_uid are required"
+                )
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                result = acknowledge_user_takedown(
+                    db, profile_personal_uid, requester_profile_uid
+                )
+
+            if not result.get("ok"):
+                code = result.get("code", 400)
+                response["message"] = result.get("message", "Acknowledge failed")
+                response["code"] = code
+                return response, code
+
+            response["message"] = (
+                "User profile already acknowledged"
+                if result.get("already_acknowledged")
+                else "User profile acknowledged successfully"
+            )
+            response["code"] = 200
+            response["data"] = {
+                "profile_personal_uid": profile_personal_uid,
+                "moderated": 3,
+                "already_acknowledged": bool(result.get("already_acknowledged")),
+            }
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in UserModerationReview POST: {str(e)}")
             traceback.print_exc()
             response["message"] = "Internal Server Error"
             response["code"] = 500

@@ -10,9 +10,12 @@ from moderation import (
     MODERATED_PENDING_REVIEW,
     MODERATED_TAKEN_DOWN,
     build_offering_moderation_metadata,
+    build_user_moderation_metadata,
     build_wish_moderation_metadata,
     can_offering_be_edited,
+    can_user_profile_be_edited,
     can_wish_be_edited,
+    get_user_moderated_value,
     is_offering_publicly_visible,
     is_wish_publicly_visible,
 )
@@ -193,11 +196,19 @@ def _viewer_context_from_request(profile_id):
 
 
 def _filter_and_enrich_expertise_info(
-    db, expertise_rows, profile_id, viewer_profile_uid=None, viewer_is_admin=False
+    db,
+    expertise_rows,
+    profile_id,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+    owner_moderated=None,
 ):
     """Hide moderated offerings from public viewers; attach moderation metadata for owners."""
     if not expertise_rows:
         return []
+
+    if owner_moderated is None:
+        owner_moderated = get_user_moderated_value(db, profile_id)
 
     visible = []
     is_owner_view = bool(
@@ -208,6 +219,7 @@ def _filter_and_enrich_expertise_info(
             row,
             viewer_profile_uid=viewer_profile_uid,
             viewer_is_admin=viewer_is_admin,
+            owner_moderated=owner_moderated,
         ):
             continue
         item = dict(row)
@@ -220,11 +232,19 @@ def _filter_and_enrich_expertise_info(
 
 
 def _filter_and_enrich_wish_info(
-    db, wish_rows, profile_id, viewer_profile_uid=None, viewer_is_admin=False
+    db,
+    wish_rows,
+    profile_id,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+    owner_moderated=None,
 ):
     """Hide moderated seeking posts from public viewers; attach moderation metadata for owners."""
     if not wish_rows:
         return []
+
+    if owner_moderated is None:
+        owner_moderated = get_user_moderated_value(db, profile_id)
 
     visible = []
     is_owner_view = bool(
@@ -235,6 +255,7 @@ def _filter_and_enrich_wish_info(
             row,
             viewer_profile_uid=viewer_profile_uid,
             viewer_is_admin=viewer_is_admin,
+            owner_moderated=owner_moderated,
         ):
             continue
         item = dict(row)
@@ -244,6 +265,21 @@ def _filter_and_enrich_wish_info(
             )
         visible.append(item)
     return visible
+
+
+def _enrich_personal_info_for_owner(db, personal_info, profile_id, is_owner_view):
+    """Attach user moderation metadata on login / owner profile views."""
+    if not personal_info or not is_owner_view:
+        return personal_info
+
+    enriched = dict(personal_info)
+    enriched.pop("profile_personal_moderated", None)
+    enriched["moderation"] = build_user_moderation_metadata(db, profile_id)
+    return enriched
+
+
+def _strip_personal_moderated_fields(personal_info):
+    personal_info.pop("profile_personal_moderated", None)
 
 
 def _strip_expertise_moderated_fields(expertise_info):
@@ -595,6 +631,7 @@ class UserProfileInfo(Resource):
 
                 if uid[:3] == "110":
                     print("Profile UID Passed")
+                    is_self_lookup = False
                     # Check if the profile exists
                     profile_response = db.select('every_circle.profile_personal', where={'profile_personal_uid': uid})
                     if not profile_response['result']:
@@ -620,6 +657,7 @@ class UserProfileInfo(Resource):
                     
 
                 else:
+                    is_self_lookup = True
             
                     if uid[:3] == "100":
                         print("User UID Passed")
@@ -665,7 +703,54 @@ class UserProfileInfo(Resource):
                     profile_id = profile_response['result'][0]['profile_personal_uid']
                     print("Profile UID: ", profile_id)
 
-                response['personal_info'] = profile_response['result'][0]
+                viewer_profile_uid, viewer_is_admin, _ = _viewer_context_from_request(
+                    profile_id
+                )
+                is_owner_view = is_self_lookup or bool(
+                    viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
+                )
+                owner_moderated = get_user_moderated_value(db, profile_id)
+
+                # Taken down (1), pending review (2), and acknowledged (3): do not return
+                # the profile to other users. Acknowledged (3) also hides the profile from
+                # the owner (same as dismissed content) — only moderation status is returned.
+                if not viewer_is_admin:
+                    if (
+                        not is_owner_view
+                        and owner_moderated
+                        in (
+                            MODERATED_TAKEN_DOWN,
+                            MODERATED_PENDING_REVIEW,
+                            MODERATED_ACKNOWLEDGED,
+                        )
+                    ):
+                        response["message"] = "Profile not available"
+                        response["code"] = 404
+                        return response, 404
+
+                    if is_owner_view and owner_moderated == MODERATED_ACKNOWLEDGED:
+                        response["message"] = "Profile acknowledged"
+                        response["code"] = 200
+                        response["personal_info"] = {
+                            "profile_personal_uid": profile_id,
+                            "moderation": build_user_moderation_metadata(db, profile_id),
+                        }
+                        response["user_email"] = email_id
+                        response["links_info"] = []
+                        response["experience_info"] = []
+                        response["expertise_info"] = []
+                        response["education_info"] = []
+                        response["wishes_info"] = []
+                        response["ratings_info"] = []
+                        response["business_info"] = []
+                        return response, 200
+
+                response['personal_info'] = _enrich_personal_info_for_owner(
+                    db,
+                    profile_response['result'][0],
+                    profile_id,
+                    is_owner_view,
+                )
                 response['user_email'] = email_id
                 # print("Get 1")
                 # return profile_response['result'][0], 200
@@ -688,34 +773,54 @@ class UserProfileInfo(Resource):
                 response['experience_info'] = experience_info['result'] if experience_info['result'] else []
                 
                 # Get expertise info - returning all expertise entries for this profile with message response counts
-                viewer_profile_uid, viewer_is_admin, is_owner_view = _viewer_context_from_request(
-                    profile_id
-                )
-                moderated_filter = ""
-                if not is_owner_view and not viewer_is_admin:
-                    moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
-                expertise_query = f"""
-                    SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses, COUNT(ti_bs_qty) AS expertise_sales
-                    FROM every_circle.profile_expertise
-                    LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
-                    LEFT JOIN every_circle.transactions_items ON ti_bs_id = profile_expertise_uid
-                    -- WHERE profile_expertise_profile_personal_id ='110-000015'
-                    WHERE profile_expertise_profile_personal_id = %s
-                      AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
-                      {moderated_filter}
-                    GROUP BY profile_expertise_uid
-                """
-                expertise_info = db.execute(expertise_query, (profile_id,))
-                expertise_rows = (
-                    expertise_info['result'] if expertise_info.get('result') else []
-                )
-                response['expertise_info'] = _filter_and_enrich_expertise_info(
-                    db,
-                    expertise_rows,
-                    profile_id,
-                    viewer_profile_uid=viewer_profile_uid,
-                    viewer_is_admin=viewer_is_admin,
-                )
+                # When the profile owner is pending_review / taken_down, hide offerings from
+                # other users. When acknowledged (3), hide from everyone including the owner.
+                # Offering/seeking moderation rows are never changed — filter-only.
+                owner_content_hidden = False
+                if not viewer_is_admin:
+                    if owner_moderated == MODERATED_ACKNOWLEDGED:
+                        owner_content_hidden = True
+                    elif (
+                        not is_owner_view
+                        and owner_moderated
+                        in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW)
+                    ):
+                        owner_content_hidden = True
+                if owner_content_hidden:
+                    response['expertise_info'] = []
+                else:
+                    moderated_filter = ""
+                    if not is_owner_view and not viewer_is_admin:
+                        moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
+                    expertise_query = f"""
+                        SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses, COUNT(ti_bs_qty) AS expertise_sales
+                        FROM every_circle.profile_expertise
+                        LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
+                        LEFT JOIN every_circle.transactions_items ON ti_bs_id = profile_expertise_uid
+                        -- WHERE profile_expertise_profile_personal_id ='110-000015'
+                        WHERE profile_expertise_profile_personal_id = %s
+                          AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
+                          {moderated_filter}
+                        GROUP BY profile_expertise_uid
+                    """
+                    expertise_info = db.execute(expertise_query, (profile_id,))
+                    expertise_rows = (
+                        expertise_info['result'] if expertise_info.get('result') else []
+                    )
+                    # Self-lookup via user_uid/email has no viewer_profile_uid query param;
+                    # treat the profile owner as the viewer so pending_review/taken_down
+                    # content remains visible to them (acknowledged is still hidden above).
+                    effective_viewer_uid = (
+                        profile_id if is_owner_view else viewer_profile_uid
+                    )
+                    response['expertise_info'] = _filter_and_enrich_expertise_info(
+                        db,
+                        expertise_rows,
+                        profile_id,
+                        viewer_profile_uid=effective_viewer_uid,
+                        viewer_is_admin=viewer_is_admin,
+                        owner_moderated=owner_moderated,
+                    )
 
                 # Get education info - returning all education entries for this profile
                 education_info = db.select('every_circle.profile_education', 
@@ -723,26 +828,33 @@ class UserProfileInfo(Resource):
                 response['education_info'] = education_info['result'] if education_info['result'] else []
 
                 # Get wishes info - returning all wishes entries for this profile with response counts
-                wish_moderated_filter = ""
-                if not is_owner_view and not viewer_is_admin:
-                    wish_moderated_filter = " AND COALESCE(profile_wish_moderated, 0) = 0"
-                wishes_query = f"""
-                    SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
-                    FROM every_circle.profile_wish
-                    LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
-                    WHERE profile_wish_profile_personal_id = %s
-                      {wish_moderated_filter}
-                    GROUP BY profile_wish_uid
-                """
-                wishes_info = db.execute(wishes_query, (profile_id,))
-                wish_rows = wishes_info['result'] if wishes_info.get('result') else []
-                response['wishes_info'] = _filter_and_enrich_wish_info(
-                    db,
-                    wish_rows,
-                    profile_id,
-                    viewer_profile_uid=viewer_profile_uid,
-                    viewer_is_admin=viewer_is_admin,
-                )
+                if owner_content_hidden:
+                    response['wishes_info'] = []
+                else:
+                    wish_moderated_filter = ""
+                    if not is_owner_view and not viewer_is_admin:
+                        wish_moderated_filter = " AND COALESCE(profile_wish_moderated, 0) = 0"
+                    wishes_query = f"""
+                        SELECT profile_wish.*, COUNT(wr_profile_wish_id) AS wish_responses
+                        FROM every_circle.profile_wish
+                        LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+                        WHERE profile_wish_profile_personal_id = %s
+                          {wish_moderated_filter}
+                        GROUP BY profile_wish_uid
+                    """
+                    wishes_info = db.execute(wishes_query, (profile_id,))
+                    wish_rows = wishes_info['result'] if wishes_info.get('result') else []
+                    effective_viewer_uid = (
+                        profile_id if is_owner_view else viewer_profile_uid
+                    )
+                    response['wishes_info'] = _filter_and_enrich_wish_info(
+                        db,
+                        wish_rows,
+                        profile_id,
+                        viewer_profile_uid=effective_viewer_uid,
+                        viewer_is_admin=viewer_is_admin,
+                        owner_moderated=owner_moderated,
+                    )
 
                 # print("Get 3")
 
@@ -1542,6 +1654,12 @@ class UserProfileInfo(Resource):
 
                 if personal_info:
                     # Process profile image if provided
+                    existing_profile = profile_exists_query['result'][0]
+                    if not can_user_profile_be_edited(db, profile_uid, existing_profile):
+                        raise RuntimeError(
+                            "This profile cannot be edited while it is under moderation"
+                        )
+                    _strip_personal_moderated_fields(personal_info)
                     # if 'profile_image' in personal_info:
                     
                     

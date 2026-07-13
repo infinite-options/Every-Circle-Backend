@@ -12,11 +12,14 @@ MODERATED_PENDING_REVIEW = 2
 MODERATED_ACKNOWLEDGED = 3
 TARGET_TYPE_OFFERING = "offering"
 TARGET_TYPE_SEEKING = "seeking"
+TARGET_TYPE_USER = "user"
 
 _OFFERING_UID_PREFIX = "150"
 _WISH_UID_PREFIX = "160"
+_PROFILE_UID_PREFIX = "110"
 _PROFILE_EXPERTISE_TABLE = "every_circle.profile_expertise"
 _PROFILE_WISH_TABLE = "every_circle.profile_wish"
+_PROFILE_PERSONAL_TABLE = "every_circle.profile_personal"
 _CONTENT_REPORTS_TABLE = "every_circle.content_reports"
 _CONTENT_RESUBMISSIONS_TABLE = "every_circle.content_resubmissions"
 
@@ -81,13 +84,51 @@ def get_offering_owner_profile_uid(db, expertise_uid):
     return row.get("profile_expertise_profile_personal_id")
 
 
-def is_offering_publicly_visible(row, viewer_profile_uid=None, viewer_is_admin=False):
+def _owner_profile_hides_content_from_viewer(
+    owner_moderated,
+    owner_uid,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+):
+    """
+    Hide a profile owner's offerings/seekings when the account is
+    pending_review (2), taken_down (1), or acknowledged (3).
+    Does not change offering/seeking moderation rows — filter-only.
+
+    - pending_review / taken_down: hidden from other users; owner may still see them
+    - acknowledged: hidden from everyone (including the owner), same as content ack
+    """
+    if viewer_is_admin:
+        return False
+    moderated = int(owner_moderated or 0)
+    if moderated == MODERATED_ACKNOWLEDGED:
+        return True
+    if moderated in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
+        if viewer_profile_uid and str(viewer_profile_uid) == str(owner_uid):
+            return False
+        return True
+    return False
+
+
+def is_offering_publicly_visible(
+    row,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+    owner_moderated=None,
+):
     # Acknowledged (user dismissed) offerings are never returned in profile lists.
     if _moderated_value(row) == MODERATED_ACKNOWLEDGED:
         return False
     if viewer_is_admin:
         return True
     owner_uid = row.get("profile_expertise_profile_personal_id")
+    if owner_moderated is not None and _owner_profile_hides_content_from_viewer(
+        owner_moderated,
+        owner_uid,
+        viewer_profile_uid=viewer_profile_uid,
+        viewer_is_admin=viewer_is_admin,
+    ):
+        return False
     if viewer_profile_uid and str(viewer_profile_uid) == str(owner_uid):
         return True
     return _moderated_value(row) == MODERATED_ACTIVE
@@ -507,7 +548,7 @@ def acknowledge_offering_takedown(db, target_uid, requester_profile_uid):
 
 
 def resolve_content_target(db, target_uid):
-    """Return (target_type, row) for an offering or seeking UID, else (None, None)."""
+    """Return (target_type, row) for an offering, seeking, or user UID, else (None, None)."""
     target_uid = str(target_uid or "").strip()
     if target_uid.startswith(_OFFERING_UID_PREFIX):
         row = get_offering(db, target_uid)
@@ -515,16 +556,21 @@ def resolve_content_target(db, target_uid):
     if target_uid.startswith(_WISH_UID_PREFIX):
         row = get_wish(db, target_uid)
         return (TARGET_TYPE_SEEKING, row) if row else (None, None)
+    if target_uid.startswith(_PROFILE_UID_PREFIX):
+        row = get_user(db, target_uid)
+        return (TARGET_TYPE_USER, row) if row else (None, None)
     return None, None
 
 
 def apply_content_takedown_if_threshold(db, target_uid):
-    """Apply takedown when flag threshold is reached for offering or seeking content."""
+    """Apply takedown when flag threshold is reached for offering, seeking, or user content."""
     target_type, _ = resolve_content_target(db, target_uid)
     if target_type == TARGET_TYPE_OFFERING:
         return apply_takedown_if_threshold(db, target_uid)
     if target_type == TARGET_TYPE_SEEKING:
         return apply_wish_takedown_if_threshold(db, target_uid)
+    if target_type == TARGET_TYPE_USER:
+        return apply_user_takedown_if_threshold(db, target_uid)
     return False
 
 
@@ -553,12 +599,24 @@ def get_wish_owner_profile_uid(db, wish_uid):
     return row.get("profile_wish_profile_personal_id")
 
 
-def is_wish_publicly_visible(row, viewer_profile_uid=None, viewer_is_admin=False):
+def is_wish_publicly_visible(
+    row,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+    owner_moderated=None,
+):
     if _wish_moderated_value(row) == MODERATED_ACKNOWLEDGED:
         return False
     if viewer_is_admin:
         return True
     owner_uid = row.get("profile_wish_profile_personal_id")
+    if owner_moderated is not None and _owner_profile_hides_content_from_viewer(
+        owner_moderated,
+        owner_uid,
+        viewer_profile_uid=viewer_profile_uid,
+        viewer_is_admin=viewer_is_admin,
+    ):
+        return False
     if viewer_profile_uid and str(viewer_profile_uid) == str(owner_uid):
         return True
     return _wish_moderated_value(row) == MODERATED_ACTIVE
@@ -860,5 +918,311 @@ def acknowledge_wish_takedown(db, target_uid, requester_profile_uid):
     return {
         "ok": True,
         "profile_wish_uid": target_uid,
+        "already_acknowledged": False,
+    }
+
+
+def _user_moderated_value(row):
+    if not row:
+        return MODERATED_ACTIVE
+    return int(row.get("profile_personal_moderated") or 0)
+
+
+def get_user(db, profile_uid):
+    profile_uid = str(profile_uid or "").strip()
+    if not profile_uid.startswith(_PROFILE_UID_PREFIX):
+        return None
+    res = db.select(
+        _PROFILE_PERSONAL_TABLE,
+        where={"profile_personal_uid": profile_uid},
+    )
+    rows = res.get("result") or []
+    return rows[0] if rows else None
+
+
+def get_user_moderated_value(db, profile_uid):
+    return _user_moderated_value(get_user(db, profile_uid))
+
+
+def is_owner_available_for_public_interaction(db, owner_profile_uid):
+    """Return False when the profile owner account is not active for public actions."""
+    return get_user_moderated_value(db, owner_profile_uid) == MODERATED_ACTIVE
+
+
+def build_user_snapshot(row):
+    """JSON-serializable profile fields for content_resubmissions snapshots."""
+    if not row:
+        return {}
+
+    snapshot = {
+        "uid": row.get("profile_personal_uid"),
+        "firstName": row.get("profile_personal_first_name"),
+        "lastName": row.get("profile_personal_last_name"),
+        "emailIsPublic": row.get("profile_personal_email_is_public"),
+        "phoneNumber": row.get("profile_personal_phone_number"),
+        "phoneNumberIsPublic": row.get("profile_personal_phone_number_is_public"),
+        "city": row.get("profile_personal_city"),
+        "state": row.get("profile_personal_state"),
+        "country": row.get("profile_personal_country"),
+        "locationIsPublic": row.get("profile_personal_location_is_public"),
+        "latitude": _serialize_value(row.get("profile_personal_latitude")),
+        "longitude": _serialize_value(row.get("profile_personal_longitude")),
+        "image": row.get("profile_personal_image"),
+        "imageIsPublic": row.get("profile_personal_image_is_public"),
+        "tagLine": row.get("profile_personal_tag_line"),
+        "tagLineIsPublic": row.get("profile_personal_tag_line_is_public"),
+        "shortBio": row.get("profile_personal_short_bio"),
+        "shortBioIsPublic": row.get("profile_personal_short_bio_is_public"),
+        "resume": row.get("profile_personal_resume"),
+        "resumeIsPublic": row.get("profile_personal_resume_is_public"),
+    }
+    return {k: v for k, v in snapshot.items() if v is not None}
+
+
+def can_user_profile_be_edited(db, profile_uid, user=None):
+    """Only active user profiles can be edited by the owner."""
+    user = user or get_user(db, profile_uid)
+    if not user:
+        return False
+    return _user_moderated_value(user) == MODERATED_ACTIVE
+
+
+def build_user_moderation_metadata(db, profile_uid):
+    user = get_user(db, profile_uid)
+    moderated = _user_moderated_value(user)
+    latest = _get_latest_resubmission(db, profile_uid)
+    metadata = {
+        "flagCount": count_pending_flags(db, profile_uid),
+        "moderated": moderated,
+        "status": _moderation_status_label(moderated, latest),
+        "canEdit": can_user_profile_be_edited(db, profile_uid, user),
+        "resubmissionStatus": None,
+        "resubmissionAdminNote": None,
+        "resubmissionCreatedAt": None,
+    }
+    if latest:
+        metadata["resubmissionStatus"] = latest.get("resubmission_status")
+        metadata["resubmissionAdminNote"] = latest.get("resubmission_admin_note")
+        created_at = latest.get("resubmission_created_at")
+        metadata["resubmissionCreatedAt"] = _serialize_value(created_at)
+        if latest.get("resubmission_status") == "rejected":
+            metadata["rejectionNote"] = latest.get("resubmission_admin_note")
+    return metadata
+
+
+def apply_user_takedown_if_threshold(db, target_uid):
+    """
+    If pending flag count reaches the configured threshold while the user profile is
+    active, queue it for admin review without changing offering/seeking moderation.
+    """
+    flag_count = count_pending_flags(db, target_uid)
+    if flag_count < _takedown_threshold():
+        return False
+
+    user = get_user(db, target_uid)
+    if not user:
+        return False
+    if _user_moderated_value(user) != MODERATED_ACTIVE:
+        return False
+
+    snapshot = build_user_snapshot(user)
+    resubmission_uid = _create_pending_resubmission(db, target_uid, snapshot)
+    if not resubmission_uid:
+        return False
+
+    upd_res = db.update(
+        _PROFILE_PERSONAL_TABLE,
+        {"profile_personal_uid": target_uid},
+        {"profile_personal_moderated": MODERATED_PENDING_REVIEW},
+    )
+    return _db_write_succeeded(upd_res)
+
+
+def queue_user_for_review(db, profile_uid, editor_profile_uid):
+    """Queue an edited moderated user profile for admin review."""
+    user = get_user(db, profile_uid)
+    if not user:
+        return {"ok": False, "message": "User profile not found"}
+
+    moderated = _user_moderated_value(user)
+    if moderated not in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW):
+        return {"ok": False, "message": "User profile is not under moderation"}
+
+    if not can_user_profile_be_edited(db, profile_uid, user):
+        return {
+            "ok": False,
+            "message": "This profile cannot be edited while it is taken down",
+        }
+
+    if editor_profile_uid and str(editor_profile_uid) != str(profile_uid):
+        return {"ok": False, "message": "Only the profile owner can resubmit"}
+
+    snapshot = build_user_snapshot(user)
+    now = _now_str()
+    pending = _get_latest_resubmission(db, profile_uid, status="pending")
+
+    if pending:
+        upd_res = db.update(
+            _CONTENT_RESUBMISSIONS_TABLE,
+            {"resubmission_uid": pending["resubmission_uid"]},
+            {
+                "resubmission_snapshot": json.dumps(snapshot, default=str),
+                "resubmission_created_at": now,
+                "resubmission_reviewed_at": None,
+                "resubmission_reviewed_by": None,
+                "resubmission_admin_note": None,
+            },
+        )
+        if not _db_write_succeeded(upd_res):
+            return {
+                "ok": False,
+                "message": upd_res.get("message", "Failed to update resubmission"),
+            }
+        resubmission_uid = pending["resubmission_uid"]
+    else:
+        resubmission_uid = _new_resubmission_uid(db)
+        if not resubmission_uid:
+            return {"ok": False, "message": "Failed to generate resubmission UID"}
+        ins_res = db.insert(
+            _CONTENT_RESUBMISSIONS_TABLE,
+            {
+                "resubmission_uid": resubmission_uid,
+                "resubmission_target_uid": profile_uid,
+                "resubmission_snapshot": json.dumps(snapshot, default=str),
+                "resubmission_status": "pending",
+                "resubmission_created_at": now,
+            },
+        )
+        if not _db_write_succeeded(ins_res):
+            return {
+                "ok": False,
+                "message": ins_res.get("message", "Failed to create resubmission"),
+            }
+
+    mod_res = db.update(
+        _PROFILE_PERSONAL_TABLE,
+        {"profile_personal_uid": profile_uid},
+        {"profile_personal_moderated": MODERATED_PENDING_REVIEW},
+    )
+    if not _db_write_succeeded(mod_res):
+        return {"ok": False, "message": "Failed to queue user profile for review"}
+
+    return {
+        "ok": True,
+        "resubmission_uid": resubmission_uid,
+        "snapshot": snapshot,
+    }
+
+
+def approve_user_review(db, target_uid, admin_uid, note=None):
+    user = get_user(db, target_uid)
+    if not user:
+        return {"ok": False, "message": "User profile not found"}
+    if _user_moderated_value(user) != MODERATED_PENDING_REVIEW:
+        return {"ok": False, "message": "User profile is not pending admin review"}
+
+    finalized, _ = _finalize_pending_resubmission(
+        db, target_uid, admin_uid, note, "approved"
+    )
+    if not finalized:
+        return {"ok": False, "message": "Failed to approve resubmission"}
+
+    mod_res = db.update(
+        _PROFILE_PERSONAL_TABLE,
+        {"profile_personal_uid": target_uid},
+        {"profile_personal_moderated": MODERATED_ACTIVE},
+    )
+    if not _db_write_succeeded(mod_res):
+        return {"ok": False, "message": "Failed to restore user profile"}
+
+    _dismiss_pending_reports(db, target_uid)
+    return {"ok": True, "profile_personal_uid": target_uid}
+
+
+def reject_user_review(db, target_uid, admin_uid, note=None):
+    user = get_user(db, target_uid)
+    if not user:
+        return {"ok": False, "message": "User profile not found"}
+    if _user_moderated_value(user) != MODERATED_PENDING_REVIEW:
+        return {"ok": False, "message": "User profile is not pending admin review"}
+
+    note_text = str(note or "").strip()
+    if not note_text:
+        return {
+            "ok": False,
+            "message": "Admin note is required when rejecting a user profile",
+        }
+
+    finalized, _ = _finalize_pending_resubmission(
+        db, target_uid, admin_uid, note_text, "rejected"
+    )
+    if not finalized:
+        return {"ok": False, "message": "Failed to reject resubmission"}
+
+    mod_res = db.update(
+        _PROFILE_PERSONAL_TABLE,
+        {"profile_personal_uid": target_uid},
+        {"profile_personal_moderated": MODERATED_TAKEN_DOWN},
+    )
+    if not _db_write_succeeded(mod_res):
+        return {"ok": False, "message": "Failed to reject user profile"}
+
+    return {
+        "ok": True,
+        "profile_personal_uid": target_uid,
+        "rejection_note": note_text,
+    }
+
+
+def acknowledge_user_takedown(db, target_uid, requester_profile_uid):
+    """
+    Owner acknowledges a rejected / taken-down user profile.
+    Sets profile_personal_moderated = 3 so offerings/seekings are no longer returned.
+    """
+    user = get_user(db, target_uid)
+    if not user:
+        return {"ok": False, "message": "User profile not found", "code": 404}
+
+    if not requester_profile_uid or str(requester_profile_uid) != str(target_uid):
+        return {
+            "ok": False,
+            "message": "Only the profile owner can acknowledge a takedown",
+            "code": 403,
+        }
+
+    moderated = _user_moderated_value(user)
+    if moderated == MODERATED_ACKNOWLEDGED:
+        return {
+            "ok": True,
+            "profile_personal_uid": target_uid,
+            "already_acknowledged": True,
+        }
+
+    if moderated != MODERATED_TAKEN_DOWN:
+        return {
+            "ok": False,
+            "message": "Only rejected / taken-down profiles can be acknowledged",
+            "code": 400,
+        }
+
+    latest = _get_latest_resubmission(db, target_uid)
+    if not latest or latest.get("resubmission_status") != "rejected":
+        return {
+            "ok": False,
+            "message": "Profile must be rejected by an admin before acknowledgment",
+            "code": 400,
+        }
+
+    mod_res = db.update(
+        _PROFILE_PERSONAL_TABLE,
+        {"profile_personal_uid": target_uid},
+        {"profile_personal_moderated": MODERATED_ACKNOWLEDGED},
+    )
+    if not _db_write_succeeded(mod_res):
+        return {"ok": False, "message": "Failed to acknowledge user profile", "code": 500}
+
+    return {
+        "ok": True,
+        "profile_personal_uid": target_uid,
         "already_acknowledged": False,
     }

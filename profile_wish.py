@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime
 import json
 from data_ec import connect
+from moderation import MODERATED_ACTIVE, get_wish, is_owner_available_for_public_interaction
 
 class ProfileWishInfo(Resource):
     # def get(self, query):
@@ -111,6 +112,23 @@ class ProfileWishInfo(Resource):
             responder_note = payload.get('responder_note')
             
             with connect() as db:
+                wish = get_wish(db, profile_wish_id)
+                if not wish:
+                    response['message'] = 'Seeking post not found'
+                    response['code'] = 404
+                    return response, 404
+
+                if int(wish.get("profile_wish_moderated") or 0) != MODERATED_ACTIVE:
+                    response['message'] = 'Seeking post is not available'
+                    response['code'] = 403
+                    return response, 403
+
+                owner_uid = wish.get("profile_wish_profile_personal_id")
+                if not is_owner_available_for_public_interaction(db, owner_uid):
+                    response['message'] = 'Seeking post is not available'
+                    response['code'] = 403
+                    return response, 403
+
                 # Generate new wish response UID
                 wish_response_stored_procedure_response = db.call(procedure='new_wish_response_uid')
                 
