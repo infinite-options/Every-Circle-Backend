@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from zappa_prebuild import exit_if_crypto_broken
-exit_if_crypto_broken()
+# from zappa_prebuild import exit_if_crypto_broken
+# exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data

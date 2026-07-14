@@ -165,6 +165,13 @@ def _set_if_present(target, src, db_key, client_key):
         target[db_key] = src[client_key]
 
 
+def _normalize_coordinate_fields(personal_info):
+    """Blank latitude/longitude strings must store as NULL, not "" (which parses to NaN client-side)."""
+    for coord_field in ("profile_personal_latitude", "profile_personal_longitude"):
+        if personal_info.get(coord_field) == "":
+            personal_info[coord_field] = None
+
+
 def _normalize_record_uid(value):
     """Treat missing/blank UID as absent so PUT creates rows instead of update-by-empty-id."""
     if value is None:
@@ -840,11 +847,12 @@ class UserProfileInfo(Resource):
                     'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
                     'profile_personal_phone_number', 'profile_personal_phone_number_is_public', 
                     'profile_personal_city', 'profile_personal_state', 'profile_personal_country',
-                    'profile_personal_location_is_public', 'profile_personal_latitude', 'profile_personal_longitude', 
-                    'profile_personal_image', 'profile_personal_image_is_public', 'profile_personal_tag_line', 
-                    'profile_personal_tag_line_is_public', 'profile_personal_short_bio', 
-                    'profile_personal_short_bio_is_public', 'profile_personal_resume', 
-                    'profile_personal_resume_is_public', 'profile_personal_notification_preference', 
+                    'profile_personal_location_is_public', 'profile_personal_latitude', 'profile_personal_longitude',
+                    'profile_personal_home_address',
+                    'profile_personal_image', 'profile_personal_image_is_public', 'profile_personal_tag_line',
+                    'profile_personal_tag_line_is_public', 'profile_personal_short_bio',
+                    'profile_personal_short_bio_is_public', 'profile_personal_resume',
+                    'profile_personal_resume_is_public', 'profile_personal_notification_preference',
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
@@ -854,7 +862,8 @@ class UserProfileInfo(Resource):
                 for field in personal_info_fields:
                     if field in payload:
                         personal_info[field] = payload.pop(field)
-                
+                _normalize_coordinate_fields(personal_info)
+
                 # Process profile image if provided
                 if 'profile_image' in request.files:
                     payload_images = {}
@@ -1394,9 +1403,10 @@ class UserProfileInfo(Resource):
                 personal_info_fields = [
                     'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
                     'profile_personal_phone_number', 'profile_personal_phone_number_is_public', 
-                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country','profile_personal_location_is_public', 
-                    'profile_personal_latitude', 'profile_personal_longitude', 
-                    'profile_personal_image', 'profile_personal_image_is_public', 
+                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country','profile_personal_location_is_public',
+                    'profile_personal_latitude', 'profile_personal_longitude',
+                    'profile_personal_home_address',
+                    'profile_personal_image', 'profile_personal_image_is_public',
                     'profile_personal_tag_line', 'profile_personal_tag_line_is_public', 
                     'profile_personal_short_bio', 'profile_personal_short_bio_is_public', 
                     'profile_personal_resume', 'profile_personal_resume_is_public', 
@@ -1412,7 +1422,8 @@ class UserProfileInfo(Resource):
                 for field in personal_info_fields:
                     if field in payload:
                         personal_info[field] = payload.pop(field)
-                
+                _normalize_coordinate_fields(personal_info)
+
                 print("Remaining payload fields: ", payload)
                 
                 # if 'profile_image' in request.files or 'delete_profile_image' in payload:
