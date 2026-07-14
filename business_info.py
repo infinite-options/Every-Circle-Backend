@@ -1926,7 +1926,12 @@ class BusinessInfo(Resource):
                                     service_images.append(image_url)
 
                 if bs_image_url_value is None and service_images:
-                    bs_image_url_value = json.dumps(service_images)
+                    # Match update path: single URL as plain string, multi as JSON array
+                    bs_image_url_value = (
+                        json.dumps(service_images)
+                        if len(service_images) > 1
+                        else service_images[0]
+                    )
                 elif bs_image_url_value is None and not service_images:
                     bs_image_url_value = None
 
