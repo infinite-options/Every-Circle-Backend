@@ -3,6 +3,11 @@ from flask import request
 import json
 
 from data_ec import connect
+from transaction_shipping import (
+    load_shipping_for_transaction,
+    shipping_payload_from_row,
+    fulfillment_fields_from_row,
+)
 
 
 def _parse_selected_options_field(raw):
@@ -45,6 +50,12 @@ class TransactionReceipt(Resource):
                         ti.ti_choices_extra_cost,
                         ti.ti_special_instructions,
                         ti.ti_selected_options,
+                        COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+                        COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
+                        ti.ti_shipped_at,
+                        ti.ti_tracking_carrier,
+                        ti.ti_tracking_number,
+                        ti.ti_fulfillment_note,
                         CASE
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
@@ -115,10 +126,16 @@ class TransactionReceipt(Resource):
                         row['selected_options'] = _parse_selected_options_field(
                             row.pop('ti_selected_options', None)
                         )
+                        row.update(fulfillment_fields_from_row(row))
+
+                    shipping = shipping_payload_from_row(
+                        load_shipping_for_transaction(db, transaction_uid)
+                    )
 
                     response['message'] = 'Transaction receipt retrieved successfully'
                     response['code'] = 200
                     response['data'] = rows
+                    response.update(shipping)
                     return response, 200
                 else:
                     response['message'] = result.get('message', 'Error retrieving transaction receipt')

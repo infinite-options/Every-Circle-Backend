@@ -14,6 +14,17 @@ from escrow_release import release_escrow_for_transaction, summarize_escrow_resu
 from wallet_ids import EC_WALLET_ID
 from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
 from datetime_utils import utc_now_str, enrich_datetime_fields
+from transaction_shipping import (
+    normalize_shipping_address,
+    insert_transaction_shipping,
+    attach_shipping_to_transaction_rows,
+    apply_order_fulfillment_summary,
+    fulfillment_list_summary_sql,
+    FULFILLMENT_STATUS_NOT_SHIPPED,
+    FULFILLMENT_STATUS_IN_TRANSIT,
+    FULFILLMENT_STATUS_DELIVERED,
+    SELLER_FULFILLMENT_STATUSES,
+)
 
 
 def _request_timezone():
@@ -290,7 +301,12 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
     """Resolve a line item by ti_uid first, then ti_bs_id (same pattern as returns)."""
     ti_q = db.execute(
         """
-        SELECT ti_uid, ti_bs_id, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
+        SELECT ti_uid, ti_bs_id, ti_bs_qty,
+               COALESCE(ti_received_qty, 0) AS ti_received_qty,
+               COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+               COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
+               ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
+               ti_fulfillment_note
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s AND ti_uid = %s
         """,
@@ -302,7 +318,12 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
 
     ti_q = db.execute(
         """
-        SELECT ti_uid, ti_bs_id, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
+        SELECT ti_uid, ti_bs_id, ti_bs_qty,
+               COALESCE(ti_received_qty, 0) AS ti_received_qty,
+               COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+               COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
+               ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
+               ti_fulfillment_note
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s AND ti_bs_id = %s
         """,
@@ -746,8 +767,10 @@ class Transactions(Resource):
                 return response, 400
 
             with connect() as db:
+                fulfillment_summary = fulfillment_list_summary_sql("ti")
                 # Execute query with parameterized profile_id for security
-                query = """
+                query = (
+                    """
                     SELECT
                     t.transaction_uid,
                     COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
@@ -789,7 +812,8 @@ class Transactions(Resource):
                         SEPARATOR ', '
                     ) AS purchased_item,
                     SUM(ti.ti_bs_qty) AS ti_bs_qty,
-                    MIN(ti.ti_uid) AS ti_uid
+                    MIN(ti.ti_uid) AS ti_uid,
+                    __FULFILLMENT_SUMMARY__
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                     ON t.transaction_uid = ti.ti_transaction_id
@@ -822,6 +846,7 @@ class Transactions(Resource):
                     purchase_type
                     ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
+                ).replace("__FULFILLMENT_SUMMARY__", fulfillment_summary)
 
                 print(f"Executing query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
@@ -829,6 +854,8 @@ class Transactions(Resource):
 
                 if result.get("code") == 200:
                     rows = _enrich_transaction_rows(result.get("result", []))
+                    rows = attach_shipping_to_transaction_rows(db, rows)
+                    rows = apply_order_fulfillment_summary(rows)
                     response["message"] = "Transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
@@ -836,7 +863,9 @@ class Transactions(Resource):
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
                 else:
-                    response["message"] = "Query execution failed"
+                    response["message"] = result.get(
+                        "message", "Query execution failed"
+                    )
                     response["code"] = result.get("code", 500)
                     response["error"] = result.get("error", "Unknown error")
                     return response, response["code"]
@@ -879,6 +908,14 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
             print("No Missing Fields")
+
+            shipping_fields, shipping_error = normalize_shipping_address(
+                payload.get("shipping_address")
+            )
+            if shipping_error:
+                response["message"] = shipping_error
+                response["code"] = 400
+                return response, 400
 
             # Extract required fields from payload
             transaction = {
@@ -927,6 +964,23 @@ class Transactions(Resource):
                     return response, response["code"]
 
                 response["transaction"] = transaction_response
+                response["transaction_uid"] = new_transaction_uid
+
+                if shipping_fields:
+                    shipping_response = insert_transaction_shipping(
+                        db, new_transaction_uid, shipping_fields
+                    )
+                    print("transaction_shipping post response: ", shipping_response)
+                    if shipping_response.get("code") != 200:
+                        response["message"] = shipping_response.get(
+                            "message", "Failed to insert shipping address"
+                        )
+                        response["code"] = shipping_response.get("code", 500)
+                        return response, response["code"]
+                    response["ts_uid"] = shipping_response.get("ts_uid")
+                    response["shipping_address"] = shipping_response.get(
+                        "shipping_address"
+                    )
 
                 # Enter Data in Transactions_ItemsTable
                 print("items: ", payload.get("items"))
@@ -1132,6 +1186,9 @@ class Transactions(Resource):
                         continue
 
                     _apply_item_options_to_tx_item(tx_item, item, ti_bs_id)
+
+                    if shipping_fields:
+                        tx_item["ti_fulfillment_status"] = FULFILLMENT_STATUS_NOT_SHIPPED
 
                     # # Get other item details from business services table using parameterized query
                     # bs_query = """
@@ -1519,10 +1576,16 @@ class Transactions(Resource):
 
             transaction_uid = payload.get("transaction_uid")
             delivery_items = payload.get("delivery_verification_items")
+            fulfillment_updates = payload.get("fulfillment_updates")
 
             if delivery_items is not None:
                 return self._put_delivery_verification(
                     transaction_uid, payload, delivery_items
+                )
+
+            if fulfillment_updates is not None:
+                return self._put_fulfillment_updates(
+                    transaction_uid, payload, fulfillment_updates
                 )
 
             update_fields = {}
@@ -1574,6 +1637,249 @@ class Transactions(Resource):
 
         except Exception as e:
             print(f"Error in Transactions PUT: {str(e)}")
+            print(traceback.format_exc())
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+            return response, 500
+
+    def _put_fulfillment_updates(
+        self, transaction_uid, payload, fulfillment_updates
+    ):
+        """Seller marks line items shipped / updates tracking (ti_fulfillment_*)."""
+        response = {}
+
+        if not isinstance(fulfillment_updates, list) or len(fulfillment_updates) == 0:
+            response["message"] = "fulfillment_updates must be a non-empty list"
+            response["code"] = 400
+            return response, 400
+
+        seller_id = (
+            payload.get("seller_id")
+            or payload.get("business_uid")
+            or payload.get("business_id")
+            or payload.get("profile_id")
+            or _get_authenticated_profile_id()
+        )
+        if not seller_id:
+            response["message"] = (
+                "seller_id, business_uid, or authenticated seller identity is required"
+            )
+            response["code"] = 403
+            return response, 403
+
+        seller_id = str(seller_id)
+        seen_ti = set()
+        updated_lines = []
+        shipped_at = utc_now_str()
+
+        try:
+            with connect() as db:
+                tx_row_q = db.execute(
+                    """
+                    SELECT transaction_uid, transaction_business_id,
+                           COALESCE(transaction_type, 'sale') AS transaction_type
+                    FROM every_circle.transactions
+                    WHERE transaction_uid = %s
+                    """,
+                    (transaction_uid,),
+                )
+                tx_rows = tx_row_q.get("result") or []
+                if not tx_rows:
+                    response["message"] = "Transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                tx_row = tx_rows[0]
+                if (tx_row.get("transaction_type") or "sale") != "sale":
+                    response["message"] = (
+                        "Fulfillment can only be updated on a sale transaction"
+                    )
+                    response["code"] = 400
+                    return response, 400
+
+                if str(tx_row.get("transaction_business_id") or "") != seller_id:
+                    response["message"] = (
+                        "Caller is not the seller on this transaction"
+                    )
+                    response["code"] = 403
+                    return response, 403
+
+                for entry in fulfillment_updates:
+                    if not isinstance(entry, dict):
+                        response["message"] = (
+                            "Each fulfillment_updates entry must be an object"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    item_uid = entry.get("transaction_item_uid")
+                    status = (
+                        str(entry.get("fulfillment_status") or "").strip().lower()
+                    )
+
+                    if not item_uid:
+                        response["message"] = (
+                            "Each entry requires transaction_item_uid"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if item_uid in seen_ti:
+                        response["message"] = (
+                            f"Duplicate transaction_item_uid: {item_uid}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    seen_ti.add(item_uid)
+
+                    if status not in SELLER_FULFILLMENT_STATUSES:
+                        response["message"] = (
+                            f"Invalid fulfillment_status for {item_uid}. "
+                            f"Allowed: {', '.join(sorted(SELLER_FULFILLMENT_STATUSES))}"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    ti_row = _resolve_transaction_item(
+                        db, transaction_uid, item_uid
+                    )
+                    if not ti_row:
+                        response["message"] = (
+                            f"Transaction item not found on this sale: {item_uid}"
+                        )
+                        response["code"] = 404
+                        return response, 404
+
+                    ti_uid = ti_row.get("ti_uid")
+                    order_qty = int(ti_row.get("ti_bs_qty") or 0)
+                    current_shipped = int(ti_row.get("ti_shipped_qty") or 0)
+                    remaining_to_ship = max(order_qty - current_shipped, 0)
+                    current_status = (
+                        ti_row.get("ti_fulfillment_status") or "not_required"
+                    )
+                    if current_status == "not_required":
+                        response["message"] = (
+                            f"Item {ti_uid} does not require shipping "
+                            f"(fulfillment_status=not_required)"
+                        )
+                        response["code"] = 400
+                        return response, 400
+                    if current_status == FULFILLMENT_STATUS_DELIVERED:
+                        response["message"] = (
+                            f"Item {ti_uid} is already delivered and cannot be updated"
+                        )
+                        response["code"] = 400
+                        return response, 400
+
+                    if status == FULFILLMENT_STATUS_NOT_SHIPPED:
+                        new_shipped_qty = 0
+                    elif "shipped_quantity" in entry:
+                        try:
+                            ship_qty = int(entry.get("shipped_quantity"))
+                        except (TypeError, ValueError):
+                            ship_qty = -1
+                        if ship_qty < 1:
+                            response["message"] = (
+                                f"Invalid shipped_quantity for item {item_uid}"
+                            )
+                            response["code"] = 400
+                            return response, 400
+                        if ship_qty > remaining_to_ship:
+                            response["message"] = (
+                                f"shipped_quantity exceeds remaining qty for {item_uid} "
+                                f"(remaining: {remaining_to_ship})"
+                            )
+                            response["code"] = 400
+                            return response, 400
+                        new_shipped_qty = current_shipped + ship_qty
+                    elif status == FULFILLMENT_STATUS_IN_TRANSIT:
+                        # Default: ship all remaining units
+                        if remaining_to_ship < 1 and current_shipped < order_qty:
+                            response["message"] = (
+                                f"No remaining quantity to ship for {item_uid}"
+                            )
+                            response["code"] = 400
+                            return response, 400
+                        new_shipped_qty = (
+                            order_qty if remaining_to_ship >= 1 else current_shipped
+                        )
+                    else:
+                        new_shipped_qty = current_shipped
+
+                    tracking_carrier = entry.get("tracking_carrier")
+                    if tracking_carrier is not None:
+                        tracking_carrier = str(tracking_carrier).strip() or None
+                    elif "tracking_carrier" not in entry:
+                        tracking_carrier = ti_row.get("ti_tracking_carrier")
+
+                    tracking_number = entry.get("tracking_number")
+                    if tracking_number is not None:
+                        tracking_number = str(tracking_number).strip() or None
+                    elif "tracking_number" not in entry:
+                        tracking_number = ti_row.get("ti_tracking_number")
+
+                    fulfillment_note = entry.get("fulfillment_note")
+                    if fulfillment_note is not None:
+                        fulfillment_note = str(fulfillment_note).strip() or None
+                    elif "fulfillment_note" not in entry:
+                        fulfillment_note = ti_row.get("ti_fulfillment_note")
+
+                    new_shipped_at = ti_row.get("ti_shipped_at")
+                    if status == FULFILLMENT_STATUS_IN_TRANSIT and not new_shipped_at:
+                        new_shipped_at = shipped_at
+                    if status == FULFILLMENT_STATUS_NOT_SHIPPED:
+                        new_shipped_at = None
+
+                    ti_update = db.execute(
+                        """
+                        UPDATE every_circle.transactions_items
+                        SET ti_fulfillment_status = %s,
+                            ti_shipped_qty = %s,
+                            ti_shipped_at = %s,
+                            ti_tracking_carrier = %s,
+                            ti_tracking_number = %s,
+                            ti_fulfillment_note = %s
+                        WHERE ti_uid = %s AND ti_transaction_id = %s
+                        """,
+                        (
+                            status,
+                            new_shipped_qty,
+                            new_shipped_at,
+                            tracking_carrier,
+                            tracking_number,
+                            fulfillment_note,
+                            ti_uid,
+                            transaction_uid,
+                        ),
+                        "post",
+                    )
+                    if ti_update.get("code") != 200:
+                        response["message"] = ti_update.get(
+                            "message", "Failed to update transaction item fulfillment"
+                        )
+                        response["code"] = ti_update.get("code", 500)
+                        return response, response["code"]
+
+                    updated_lines.append(
+                        {
+                            "transaction_item_uid": ti_uid,
+                            "fulfillment_status": status,
+                            "shipped_quantity": new_shipped_qty,
+                            "ti_bs_qty": order_qty,
+                            "shipped_at": new_shipped_at,
+                            "tracking_carrier": tracking_carrier,
+                            "tracking_number": tracking_number,
+                            "fulfillment_note": fulfillment_note,
+                        }
+                    )
+
+                response["message"] = "Fulfillment updated successfully"
+                response["code"] = 200
+                response["transaction_uid"] = transaction_uid
+                response["fulfillment_updates"] = updated_lines
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in Transactions PUT (fulfillment): {str(e)}")
             print(traceback.format_exc())
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
@@ -1687,16 +1993,43 @@ class Transactions(Resource):
                         return response, 400
 
                     new_received = current_received + received_qty
-                    ti_update = db.execute(
-                        """
-                        UPDATE every_circle.transactions_items
-                        SET ti_received_qty = %s,
-                            ti_received_at = %s
-                        WHERE ti_uid = %s AND ti_transaction_id = %s
-                        """,
-                        (new_received, received_at, ti_uid, transaction_uid),
-                        "post",
+                    current_status = (
+                        ti_row.get("ti_fulfillment_status") or "not_required"
                     )
+                    set_delivered = new_received >= order_qty and current_status in (
+                        FULFILLMENT_STATUS_NOT_SHIPPED,
+                        FULFILLMENT_STATUS_IN_TRANSIT,
+                    )
+
+                    if set_delivered:
+                        ti_update = db.execute(
+                            """
+                            UPDATE every_circle.transactions_items
+                            SET ti_received_qty = %s,
+                                ti_received_at = %s,
+                                ti_fulfillment_status = %s
+                            WHERE ti_uid = %s AND ti_transaction_id = %s
+                            """,
+                            (
+                                new_received,
+                                received_at,
+                                FULFILLMENT_STATUS_DELIVERED,
+                                ti_uid,
+                                transaction_uid,
+                            ),
+                            "post",
+                        )
+                    else:
+                        ti_update = db.execute(
+                            """
+                            UPDATE every_circle.transactions_items
+                            SET ti_received_qty = %s,
+                                ti_received_at = %s
+                            WHERE ti_uid = %s AND ti_transaction_id = %s
+                            """,
+                            (new_received, received_at, ti_uid, transaction_uid),
+                            "post",
+                        )
                     if ti_update.get("code") != 200:
                         response["message"] = ti_update.get(
                             "message", "Failed to update transaction item"
@@ -1704,13 +2037,14 @@ class Transactions(Resource):
                         response["code"] = ti_update.get("code", 500)
                         return response, response["code"]
 
-                    updated_lines.append(
-                        {
-                            "transaction_item_uid": ti_uid,
-                            "ti_received_qty": new_received,
-                            "ti_bs_qty": order_qty,
-                        }
-                    )
+                    line_out = {
+                        "transaction_item_uid": ti_uid,
+                        "ti_received_qty": new_received,
+                        "ti_bs_qty": order_qty,
+                    }
+                    if set_delivered:
+                        line_out["fulfillment_status"] = FULFILLMENT_STATUS_DELIVERED
+                    updated_lines.append(line_out)
 
                 all_received = _all_lines_fully_received(db, transaction_uid)
                 escrow_release_result = None
@@ -1789,8 +2123,10 @@ class SellerTransactions(Resource):
                 return response, 400
 
             with connect() as db:
+                fulfillment_summary = fulfillment_list_summary_sql("ti")
                 # Execute query to get transactions
-                query = """
+                query = (
+                    """
                     SELECT
                         t.transaction_uid,
                         COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
@@ -1836,6 +2172,7 @@ class SellerTransactions(Resource):
                         SUM(ti.ti_bs_qty) AS ti_bs_qty,
                         MIN(ti.ti_uid) AS ti_uid,
                         MIN(ti.ti_bs_cost) AS unit_price,
+                        __FULFILLMENT_SUMMARY__,
                         MIN(buyer_pp.profile_personal_first_name) AS buyer_first_name,
                         MIN(buyer_pp.profile_personal_last_name) AS buyer_last_name,
                         MIN(buyer_u.user_email_id) AS buyer_email,
@@ -1880,6 +2217,7 @@ class SellerTransactions(Resource):
                     purchase_type
                     ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
+                ).replace("__FULFILLMENT_SUMMARY__", fulfillment_summary)
 
                 print(f"Executing seller query for profile_id: {profile_id}")
                 result = db.execute(query, (profile_id,))
@@ -1887,6 +2225,8 @@ class SellerTransactions(Resource):
 
                 if result.get("code") == 200:
                     rows = _enrich_transaction_rows(result.get("result", []))
+                    rows = attach_shipping_to_transaction_rows(db, rows)
+                    rows = apply_order_fulfillment_summary(rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
@@ -1894,7 +2234,9 @@ class SellerTransactions(Resource):
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
                 else:
-                    response["message"] = "Query execution failed"
+                    response["message"] = result.get(
+                        "message", "Query execution failed"
+                    )
                     response["code"] = result.get("code", 500)
                     response["error"] = result.get("error", "Unknown error")
                     return response, response["code"]
