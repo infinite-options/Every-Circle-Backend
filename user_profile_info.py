@@ -9,6 +9,7 @@ from moderation import (
     MODERATED_ACKNOWLEDGED,
     MODERATED_PENDING_REVIEW,
     MODERATED_TAKEN_DOWN,
+    build_business_moderation_metadata,
     build_offering_moderation_metadata,
     build_user_moderation_metadata,
     build_wish_moderation_metadata,
@@ -262,6 +263,39 @@ def _filter_and_enrich_wish_info(
         if is_owner_view:
             item["moderation"] = build_wish_moderation_metadata(
                 db, item.get("profile_wish_uid")
+            )
+        visible.append(item)
+    return visible
+
+
+def _filter_and_enrich_business_info(db, business_rows, is_owner_view, viewer_is_admin=False):
+    """
+    Hide moderated businesses from non-owner viewers; attach moderation metadata
+    (and let the owner still see them) so the owner's own profile can show the same
+    pending_review / taken_down status banner used for offerings and seeking posts.
+
+    - acknowledged (3): hidden from everyone, including the owner
+    - pending_review (2) / taken_down (1): hidden from other viewers; owner still sees
+      the row with a "moderation" object attached
+    """
+    if not business_rows:
+        return []
+
+    visible = []
+    for row in business_rows:
+        moderated = int(row.get("business_moderated") or 0)
+        if moderated == MODERATED_ACKNOWLEDGED and not viewer_is_admin:
+            continue
+        if (
+            moderated in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW)
+            and not is_owner_view
+            and not viewer_is_admin
+        ):
+            continue
+        item = dict(row)
+        if is_owner_view or viewer_is_admin:
+            item["moderation"] = build_business_moderation_metadata(
+                db, item.get("business_uid")
             )
         visible.append(item)
     return visible
@@ -892,6 +926,7 @@ class UserProfileInfo(Resource):
                             b.business_profile_img,
                             b.business_profile_img_is_public,
                             b.business_cc_fee_payer,
+                            b.business_moderated,
                             bu.bu_uid,
                             bu.bu_role,
                             bu.bu_individual_business_is_public
@@ -904,7 +939,10 @@ class UserProfileInfo(Resource):
                 # print("business_info query:", business_info)
                 business_result = db.execute(business_info)
                 # print("business_result:", business_result)
-                response['business_info'] = business_result['result'] if business_result['result'] else []
+                business_rows = business_result['result'] if business_result['result'] else []
+                response['business_info'] = _filter_and_enrich_business_info(
+                    db, business_rows, is_owner_view, viewer_is_admin
+                )
 
                 # print("Get 4")
                 

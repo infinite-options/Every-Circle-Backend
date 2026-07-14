@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# from zappa_prebuild import exit_if_crypto_broken
-# exit_if_crypto_broken()
+from zappa_prebuild import exit_if_crypto_broken
+exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
@@ -62,6 +62,7 @@ from content_reports import (
     ContentModerationReview,
     SeekingContentModerationReview,
     UserModerationReview,
+    BusinessModerationReview,
 )
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
@@ -894,6 +895,13 @@ api.add_resource(
     "/api/v1/moderation/users/<string:profile_personal_uid>",
     "/api/v1/moderation/users/<string:profile_personal_uid>/review",
     "/api/v1/moderation/users/<string:profile_personal_uid>/acknowledge",
+)
+api.add_resource(
+    BusinessModerationReview,
+    "/api/v1/moderation/businesses/review-queue",
+    "/api/v1/moderation/businesses/<string:business_uid>",
+    "/api/v1/moderation/businesses/<string:business_uid>/review",
+    "/api/v1/moderation/businesses/<string:business_uid>/acknowledge",
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
