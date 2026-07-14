@@ -140,29 +140,64 @@ def _get_recipient_uid(conversation_uid, sender_uid):
         return None
 
 
+def _is_blocked(blocker_uid, blocked_uid):
+    """True if blocker_uid has specifically blocked blocked_uid (one direction only)."""
+    try:
+        with connect() as db:
+            rows = db.execute(
+                "SELECT 1 FROM every_circle.blocked_users WHERE blocker_uid = %s AND blocked_uid = %s LIMIT 1",
+                args=(blocker_uid, blocked_uid),
+            )
+        return bool(rows.get("result"))
+    except Exception as e:
+        print(f"_is_blocked error: {e}")
+        return False
+
+
 def _recipient_has_messages_disabled(sender_uid, recipient_uid):
     """
     True if recipient_uid has blocked sender_uid, or has globally turned off messages.
+    Drives the "Messages turned off by {name}" banner shown to sender_uid — only true when
+    the OTHER person cut sender_uid off, not merely because sender_uid blocked them.
     Only enforced for personal (110-) recipients — business recipients are out of scope.
     """
     if not recipient_uid or recipient_uid[:3] != "110":
         return False
     try:
+        if _is_blocked(recipient_uid, sender_uid):
+            return True
         with connect() as db:
-            blocked = db.execute(
-                "SELECT 1 FROM every_circle.blocked_users WHERE blocker_uid = %s AND blocked_uid = %s LIMIT 1",
-                args=(recipient_uid, sender_uid),
-            )
-            if blocked.get("result"):
-                return True
             muted = db.execute(
                 "SELECT profile_personal_messages_off FROM every_circle.profile_personal WHERE profile_personal_uid = %s",
                 args=(recipient_uid,),
             )
-            row = (muted.get("result") or [{}])[0]
-            return bool(row.get("profile_personal_messages_off"))
+        row = (muted.get("result") or [{}])[0]
+        return bool(row.get("profile_personal_messages_off"))
     except Exception as e:
         print(f"_recipient_has_messages_disabled error: {e}")
+        return False
+
+
+def _should_suppress_new_message_notification(sender_uid, recipient_uid):
+    """
+    True if the real-time "new message" notification should be suppressed — either party has
+    blocked the other (blocking cuts off notifications both ways, unlike the one-directional
+    "Messages turned off" banner above), or recipient_uid has globally muted messages.
+    """
+    if not recipient_uid or recipient_uid[:3] != "110":
+        return False
+    if _is_blocked(recipient_uid, sender_uid) or _is_blocked(sender_uid, recipient_uid):
+        return True
+    try:
+        with connect() as db:
+            muted = db.execute(
+                "SELECT profile_personal_messages_off FROM every_circle.profile_personal WHERE profile_personal_uid = %s",
+                args=(recipient_uid,),
+            )
+        row = (muted.get("result") or [{}])[0]
+        return bool(row.get("profile_personal_messages_off"))
+    except Exception as e:
+        print(f"_should_suppress_new_message_notification error: {e}")
         return False
 
 
@@ -582,9 +617,12 @@ class Messages(Resource):
             )
 
         recipient_uid = _get_recipient_uid(conv_uid, sender_uid)
+        # One-directional — drives the "Messages turned off by {name}" banner on sender_uid's own screen.
         recipient_disabled = _recipient_has_messages_disabled(sender_uid, recipient_uid)
+        # Bidirectional — a block in either direction still suppresses the real-time notification.
+        suppress_notification = recipient_disabled or _should_suppress_new_message_notification(sender_uid, recipient_uid)
 
-        if not recipient_disabled:
+        if not suppress_notification:
             # Look up sender name + image for the notification preview (handles 110- and 200- UIDs)
             sender_name  = "Someone"
             sender_image = None
