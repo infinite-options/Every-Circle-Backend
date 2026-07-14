@@ -172,6 +172,16 @@ def _normalize_coordinate_fields(personal_info):
             personal_info[coord_field] = None
 
 
+def _stamp_messages_off_timestamp(personal_info):
+    """
+    When the global "turn off messages" flag is being switched on, record the server time it
+    happened. Chat message history filtering uses this cutoff so only messages sent AFTER
+    muting are hidden from the recipient — earlier messages remain visible on both sides.
+    """
+    if str(personal_info.get('profile_personal_messages_off')) in ('1', 'True', 'true'):
+        personal_info['profile_personal_messages_off_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
 def _normalize_record_uid(value):
     """Treat missing/blank UID as absent so PUT creates rows instead of update-by-empty-id."""
     if value is None:
@@ -854,6 +864,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_short_bio_is_public', 'profile_personal_resume',
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference',
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
+                    'profile_personal_messages_off',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
@@ -863,6 +874,7 @@ class UserProfileInfo(Resource):
                     if field in payload:
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
+                _stamp_messages_off_timestamp(personal_info)
 
                 # Process profile image if provided
                 if 'profile_image' in request.files:
@@ -1411,6 +1423,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_short_bio', 'profile_personal_short_bio_is_public', 
                     'profile_personal_resume', 'profile_personal_resume_is_public', 
                     'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
+                    'profile_personal_messages_off',
                     'profile_personal_experience_is_public',
                     'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public',
@@ -1423,6 +1436,7 @@ class UserProfileInfo(Resource):
                     if field in payload:
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
+                _stamp_messages_off_timestamp(personal_info)
 
                 print("Remaining payload fields: ", payload)
                 

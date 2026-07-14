@@ -57,6 +57,7 @@ from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
+from blocking import BlockedUsers
 from feedback import Feedback
 from content_reports import ContentReports, ContentModerationReview
 from request_logging_middleware import register_request_logging
@@ -858,6 +859,7 @@ api.add_resource(NearbyLocation,  '/api/v1/nearby/location')
 api.add_resource(NearbyUsers,     '/api/v1/nearby/<string:profile_uid>')
 api.add_resource(Conversations,   '/api/v1/chat/conversations', '/api/v1/chat/conversations/<string:profile_uid>')
 api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/messages/<string:conversation_uid>')
+api.add_resource(BlockedUsers,    '/api/v1/blocked-users', '/api/v1/blocked-users/<string:blocker_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
 api.add_resource(BusinessDetails, '/api/v1/business_details')

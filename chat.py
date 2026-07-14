@@ -119,44 +119,122 @@ def _get_or_create_conversation(uid_a, uid_b):
     return conv_uid, True
 
 
-def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sender_image, body, sent_at):
+def _get_recipient_uid(conversation_uid, sender_uid):
+    """Return the participant in conversation_uid who is NOT sender_uid."""
+    try:
+        with connect() as db:
+            conv_resp = db.execute(
+                """
+                SELECT participant_a_uid, participant_b_uid
+                FROM every_circle.conversations
+                WHERE conversation_uid = %s
+                """,
+                args=(conversation_uid,),
+            )
+        conv = (conv_resp.get("result") or [{}])[0]
+        if conv.get("participant_a_uid") == sender_uid:
+            return conv.get("participant_b_uid")
+        return conv.get("participant_a_uid")
+    except Exception as e:
+        print(f"Could not find recipient for {conversation_uid}: {e}")
+        return None
+
+
+def _recipient_has_messages_disabled(sender_uid, recipient_uid):
+    """
+    True if recipient_uid has blocked sender_uid, or has globally turned off messages.
+    Only enforced for personal (110-) recipients — business recipients are out of scope.
+    """
+    if not recipient_uid or recipient_uid[:3] != "110":
+        return False
+    try:
+        with connect() as db:
+            blocked = db.execute(
+                "SELECT 1 FROM every_circle.blocked_users WHERE blocker_uid = %s AND blocked_uid = %s LIMIT 1",
+                args=(recipient_uid, sender_uid),
+            )
+            if blocked.get("result"):
+                return True
+            muted = db.execute(
+                "SELECT profile_personal_messages_off FROM every_circle.profile_personal WHERE profile_personal_uid = %s",
+                args=(recipient_uid,),
+            )
+            row = (muted.get("result") or [{}])[0]
+            return bool(row.get("profile_personal_messages_off"))
+    except Exception as e:
+        print(f"_recipient_has_messages_disabled error: {e}")
+        return False
+
+
+def _hidden_after_cutoff(sender_uid, recipient_uid):
+    """
+    Earliest timestamp (string, comparable to message_sent_at) after which sender_uid's messages
+    should be hidden from recipient_uid — because recipient_uid blocked sender_uid, and/or muted
+    all messages globally, at that point in time. Returns None if nothing should be hidden.
+    Messages sent BEFORE this cutoff remain visible to both sides.
+    """
+    if not recipient_uid or recipient_uid[:3] != "110":
+        return None
+    try:
+        with connect() as db:
+            blocked = db.execute(
+                "SELECT created_at FROM every_circle.blocked_users WHERE blocker_uid = %s AND blocked_uid = %s LIMIT 1",
+                args=(recipient_uid, sender_uid),
+            )
+            blocked_row = (blocked.get("result") or [None])[0]
+            block_cutoff = str(blocked_row["created_at"]) if blocked_row and blocked_row.get("created_at") else None
+
+            muted = db.execute(
+                "SELECT profile_personal_messages_off, profile_personal_messages_off_at FROM every_circle.profile_personal WHERE profile_personal_uid = %s",
+                args=(recipient_uid,),
+            )
+            row = (muted.get("result") or [{}])[0]
+            mute_cutoff = (
+                str(row["profile_personal_messages_off_at"])
+                if row.get("profile_personal_messages_off") and row.get("profile_personal_messages_off_at")
+                else None
+            )
+
+            cutoffs = [c for c in (block_cutoff, mute_cutoff) if c]
+            return min(cutoffs) if cutoffs else None
+    except Exception as e:
+        print(f"_hidden_after_cutoff error: {e}")
+        return None
+
+
+def _latest_visible_message(conversation_uid, viewer_uid, cutoff):
+    """Most recent message in conversation_uid that viewer_uid is still allowed to see as a preview."""
+    try:
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT message_body, message_sent_at, message_sender_uid
+                FROM every_circle.messages
+                WHERE message_conversation_id = %s
+                  AND (message_sender_uid = %s OR message_sent_at < %s)
+                ORDER BY message_sent_at DESC
+                LIMIT 1
+                """,
+                args=(conversation_uid, viewer_uid, cutoff),
+            )
+        result = rows.get("result") or []
+        return result[0] if result else None
+    except Exception as e:
+        print(f"_latest_visible_message error: {e}")
+        return None
+
+
+def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sender_image, body, sent_at, recipient_uid):
     """
     Publish a new-message event to:
       1. chat::<conversation_uid>  — for the ChatScreen real-time feed
       2. /<recipient_uid>          — for the unread-dot / notification banner
     """
-
-    # import ably
-    # import asyncio
-
     try:
-        # import ably
-        # import asyncio
-
         api_key = os.getenv("ABLY_API_KEY", "")
         if not api_key:
             print("ABLY_API_KEY not set — skipping chat publish")
             return
-
-        # Find the recipient (the participant who is NOT the sender)
-        recipient_uid = None
-        try:
-            with connect() as db:
-                conv_resp = db.execute(
-                    """
-                    SELECT participant_a_uid, participant_b_uid
-                    FROM every_circle.conversations
-                    WHERE conversation_uid = %s
-                    """,
-                    args=(conversation_uid,),
-                )
-            conv = (conv_resp.get("result") or [{}])[0]
-            if conv.get("participant_a_uid") == sender_uid:
-                recipient_uid = conv.get("participant_b_uid")
-            else:
-                recipient_uid = conv.get("participant_a_uid")
-        except Exception as e:
-            print(f"Could not find recipient for notification: {e}")
 
         async def _pub():
             async with ably.AblyRest(api_key) as client:
@@ -364,8 +442,22 @@ class Conversations(Resource):
             )
         conversations = rows.get("result") or []
 
-        # Enrich each conversation with the other participant's profile
-        result = []
+        # If the shown last-message preview came from someone the viewer has since blocked/muted,
+        # replace it with the latest message the viewer is still allowed to see (or blank it out).
+        for conv in conversations:
+            a = conv.get("participant_a_uid")
+            b = conv.get("participant_b_uid")
+            other_uid = b if a == profile_uid else a
+            last_sender = conv.get("message_sender_uid")
+            last_sent_at = conv.get("message_sent_at")
+            if not other_uid or last_sender != other_uid or not last_sent_at:
+                continue
+            cutoff = _hidden_after_cutoff(other_uid, profile_uid)
+            if cutoff and str(last_sent_at) >= cutoff:
+                visible = _latest_visible_message(conv.get("conversation_uid"), profile_uid, cutoff)
+                conv["message_body"] = visible.get("message_body") if visible else None
+                conv["message_sent_at"] = visible.get("message_sent_at") if visible else None
+                conv["message_sender_uid"] = visible.get("message_sender_uid") if visible else None
 
         return {"message": "Success", "code": 200, "result": conversations}, 200
 
@@ -389,9 +481,10 @@ class Messages(Resource):
     def get(self, conversation_uid):
         limit = int(request.args.get("limit", 50))
         before = request.args.get("before")
+        viewer_uid = request.args.get("viewer_uid")
 
         query = """
-            SELECT * 
+            SELECT *
             FROM every_circle.messages
             -- WHERE message_conversation_id = '800-000002'
             WHERE message_conversation_id = %s
@@ -411,7 +504,26 @@ class Messages(Resource):
             rows = db.execute(query, args=tuple(args))
             messages = rows.get("result") or []
 
-        return {"message": "Success", "code": 200, "result": messages}, 200
+        recipient_messages_disabled = False
+        if viewer_uid:
+            other_uid = _get_recipient_uid(conversation_uid, viewer_uid)
+            # Does the OTHER participant block/mute ME — drives the "Messages turned off" banner on my own sent messages.
+            recipient_messages_disabled = _recipient_has_messages_disabled(viewer_uid, other_uid)
+            # Do I block/mute the OTHER participant — if so, hide only their messages sent AFTER that
+            # point; anything from before the block/mute stays visible on both sides.
+            hidden_cutoff = _hidden_after_cutoff(other_uid, viewer_uid)
+            if hidden_cutoff:
+                messages = [
+                    m for m in messages
+                    if m.get("message_sender_uid") == viewer_uid or str(m.get("message_sent_at") or "") < hidden_cutoff
+                ]
+
+        return {
+            "message": "Success",
+            "code": 200,
+            "result": messages,
+            "recipient_messages_disabled": recipient_messages_disabled,
+        }, 200
 
     def post(self):
         data = request.get_json(silent=True) or {}
@@ -469,17 +581,21 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        # Look up sender name + image for the notification preview (handles 110- and 200- UIDs)
-        sender_name  = "Someone"
-        sender_image = None
-        try:
-            info = _get_participant_info(sender_uid)
-            sender_name  = (f"{info.get('first_name') or ''} {info.get('last_name') or ''}").strip() or "Someone"
-            sender_image = info.get("image")
-        except Exception:
-            pass
+        recipient_uid = _get_recipient_uid(conv_uid, sender_uid)
+        recipient_disabled = _recipient_has_messages_disabled(sender_uid, recipient_uid)
 
-        _publish_message(conv_uid, msg_uid, sender_uid, sender_name, sender_image, body, now)
+        if not recipient_disabled:
+            # Look up sender name + image for the notification preview (handles 110- and 200- UIDs)
+            sender_name  = "Someone"
+            sender_image = None
+            try:
+                info = _get_participant_info(sender_uid)
+                sender_name  = (f"{info.get('first_name') or ''} {info.get('last_name') or ''}").strip() or "Someone"
+                sender_image = info.get("image")
+            except Exception:
+                pass
+
+            _publish_message(conv_uid, msg_uid, sender_uid, sender_name, sender_image, body, now, recipient_uid)
 
         return {
             "message": "Message sent",
@@ -487,6 +603,7 @@ class Messages(Resource):
             "message_uid": msg_uid,
             "sent_at": now,
             "message_sent_at": now,
+            "recipient_messages_disabled": recipient_disabled,
         }, 200
 
     def put(self, conversation_uid=None):
