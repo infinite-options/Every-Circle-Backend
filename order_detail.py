@@ -14,6 +14,7 @@ from transaction_shipping import (
     shipping_payload_from_row,
     fulfillment_fields_from_row,
 )
+from transactions import _load_return_request, _pair_for_sale, _status_payload
 
 
 def _request_timezone():
@@ -353,9 +354,28 @@ class OrderDetail(Resource):
                 shipping = shipping_payload_from_row(
                     load_shipping_for_transaction(db, order_uid)
                 )
+                pending_return = _load_return_request(db, order_uid)
+                return_status, refund_status = _pair_for_sale(sale, pending_return)
+                status_fields = _status_payload(return_status, refund_status)
+                pending_return_payload = None
+                if pending_return:
+                    pending_return_payload = {
+                        "note": pending_return.get("trr_note"),
+                        "estimated_total": pending_return.get("trr_estimated_total"),
+                        "items": pending_return.get("items") or [],
+                        "return_transaction_uid": pending_return.get(
+                            "trr_return_transaction_uid"
+                        ),
+                        "stripe_refund_id": pending_return.get("trr_stripe_refund_id"),
+                        "created_at": pending_return.get("trr_created_at"),
+                        "updated_at": pending_return.get("trr_updated_at"),
+                        **status_fields,
+                    }
 
                 sale_payload = dict(sale)
                 sale_payload["lines"] = sale_lines
+                sale_payload["pending_return"] = pending_return_payload
+                sale_payload.update(status_fields)
                 sale_payload.update(shipping)
 
                 payload = {
@@ -364,7 +384,9 @@ class OrderDetail(Resource):
                     "resolved_from_return_uid": resolved_from_return_uid,
                     "sale": sale_payload,
                     "returns": returns,
+                    "pending_return": pending_return_payload,
                     "summary": _build_summary(sale, returns),
+                    **status_fields,
                     **shipping,
                 }
 
