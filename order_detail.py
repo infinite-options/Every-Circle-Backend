@@ -9,6 +9,11 @@ from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from transaction_receipt import _parse_selected_options_field
+from transaction_shipping import (
+    load_shipping_for_transaction,
+    shipping_payload_from_row,
+    fulfillment_fields_from_row,
+)
 
 
 def _request_timezone():
@@ -156,6 +161,12 @@ def _load_sale_lines(db, order_uid):
             ti.ti_choices_extra_cost,
             ti.ti_special_instructions,
             ti.ti_selected_options,
+            COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+            COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
+            ti.ti_shipped_at,
+            ti.ti_tracking_carrier,
+            ti.ti_tracking_number,
+            ti.ti_fulfillment_note,
             {name_case} AS item_name,
             COALESCE((
                 SELECT SUM(ABS(rti.ti_bs_qty))
@@ -199,6 +210,7 @@ def _load_sale_lines(db, order_uid):
             "selected_options": _parse_selected_options_field(
                 row.get("ti_selected_options")
             ),
+            **fulfillment_fields_from_row(row),
         }
         lines.append(line)
     return lines
@@ -338,9 +350,13 @@ class OrderDetail(Resource):
 
                 sale_lines = _load_sale_lines(db, order_uid)
                 returns = _load_return_transactions(db, order_uid)
+                shipping = shipping_payload_from_row(
+                    load_shipping_for_transaction(db, order_uid)
+                )
 
                 sale_payload = dict(sale)
                 sale_payload["lines"] = sale_lines
+                sale_payload.update(shipping)
 
                 payload = {
                     "order_uid": order_uid,
@@ -349,6 +365,7 @@ class OrderDetail(Resource):
                     "sale": sale_payload,
                     "returns": returns,
                     "summary": _build_summary(sale, returns),
+                    **shipping,
                 }
 
                 tz_name = _request_timezone()
