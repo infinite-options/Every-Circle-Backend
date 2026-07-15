@@ -2804,6 +2804,233 @@ class Transactions(Resource):
             return response, 500
 
 
+def _batch_order_bounty_paid(db, transaction_uids):
+    """Sum of all bounty rows on a sale (what the business paid out)."""
+    uids = [u for u in (transaction_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT ti.ti_transaction_id AS transaction_uid,
+               COALESCE(SUM(tb.tb_amount), 0) AS order_bounty_paid
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        WHERE ti.ti_transaction_id IN ({placeholders})
+        GROUP BY ti.ti_transaction_id
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        out[row.get("transaction_uid")] = round(_to_float(row.get("order_bounty_paid")), 4)
+    return out
+
+
+def _batch_return_requests(db, transaction_uids):
+    """Load return-request rows keyed by sale transaction_uid."""
+    uids = [u for u in (transaction_uids or []) if u]
+    if not uids:
+        return {}
+    _ensure_return_requests_table(db)
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
+               trr_status, trr_return_status, trr_refund_status,
+               trr_estimated_total, trr_return_transaction_uid,
+               trr_stripe_refund_id, trr_created_at, trr_updated_at
+        FROM every_circle.transaction_return_requests
+        WHERE trr_transaction_uid IN ({placeholders})
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        try:
+            row["items"] = json.loads(row.get("trr_items_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["items"] = []
+        if row.get("trr_return_status") or row.get("trr_refund_status"):
+            rs, fs = _normalize_status_pair(
+                row.get("trr_return_status"),
+                row.get("trr_refund_status"),
+            )
+        else:
+            rs, fs = _normalize_status_pair(row.get("trr_status"), None)
+        row["return_status"] = rs
+        row["refund_status"] = fs
+        out[row.get("trr_transaction_uid")] = row
+    return out
+
+
+def _line_bounty_totals(db, ti_uids):
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT tb_ti_id, COALESCE(SUM(tb_amount), 0) AS line_bounty
+        FROM every_circle.transactions_bounty
+        WHERE tb_ti_id IN ({placeholders})
+        GROUP BY tb_ti_id
+        """,
+        tuple(uids),
+    )
+    return {
+        row.get("tb_ti_id"): _to_float(row.get("line_bounty"))
+        for row in (q.get("result") or [])
+    }
+
+
+def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
+    """Scale original line bounty by return_quantity / original qty."""
+    if not items_payload:
+        return 0.0
+    ti_uids = [e.get("transaction_item_uid") for e in items_payload if e.get("transaction_item_uid")]
+    line_bounties = _line_bounty_totals(db, ti_uids)
+    total = 0.0
+    for entry in items_payload:
+        ti_uid = entry.get("transaction_item_uid")
+        if not ti_uid:
+            continue
+        try:
+            rq = int(entry.get("return_quantity"))
+        except (TypeError, ValueError):
+            continue
+        if rq < 1:
+            continue
+        ti_q = db.execute(
+            """
+            SELECT ti_bs_qty
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s AND ti_transaction_id = %s
+            """,
+            (ti_uid, order_uid),
+        )
+        ti_rows = ti_q.get("result") or []
+        if not ti_rows:
+            continue
+        original_qty = int(ti_rows[0].get("ti_bs_qty") or 0)
+        scale = _bounty_scale_for_line(rq, original_qty)
+        if scale is None:
+            continue
+        total += line_bounties.get(ti_uid, 0.0) * scale
+    return round(total, 4)
+
+
+def _pending_return_payload_for_sale(db, sale_row, pending):
+    """Build pending_return object for a seller sale row."""
+    if not pending:
+        return None
+
+    order_uid = sale_row.get("transaction_uid")
+    rs, fs = _pair_for_sale(sale_row, pending)
+    status_fields = _status_payload(rs, fs)
+    items = pending.get("items") or []
+
+    estimated_refund = None
+    if items:
+        ok, _err, ctx = _validate_and_price_return_items(db, order_uid, items)
+        if ok:
+            refund_meta = _refund_breakdown_from_context(sale_row, ctx)
+            estimated_refund = {
+                "subtotal": refund_meta["subtotal"],
+                "taxes": refund_meta["taxes"],
+                "fees_allocated": refund_meta["fees_allocated"],
+                "total_customer_credit": refund_meta["total_customer_credit"],
+                "fee_allocation_ratio": refund_meta["fee_allocation_ratio"],
+                "original_order_subtotal": refund_meta["original_order_subtotal"],
+            }
+        else:
+            # Fallback to stored estimate when live pricing fails
+            stored = _to_float(pending.get("trr_estimated_total"))
+            if stored:
+                estimated_refund = {
+                    "subtotal": None,
+                    "taxes": None,
+                    "fees_allocated": None,
+                    "total_customer_credit": round(stored, 4),
+                }
+
+    bounty_to_reclaim = _bounty_to_reclaim_for_items(db, order_uid, items)
+
+    return {
+        "note": pending.get("trr_note"),
+        "items": items,
+        "estimated_refund": estimated_refund,
+        "bounty_to_reclaim": bounty_to_reclaim,
+        "return_transaction_uid": pending.get("trr_return_transaction_uid"),
+        "stripe_refund_id": pending.get("trr_stripe_refund_id"),
+        "created_at": pending.get("trr_created_at"),
+        "updated_at": pending.get("trr_updated_at"),
+        **status_fields,
+    }
+
+
+def _enrich_seller_transaction_rows(db, rows):
+    """
+    Attach order_bounty_paid + return/refund status + pending_return summary
+    for the business Account Screen tables.
+    """
+    if not rows:
+        return rows
+
+    sale_uids = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tx_type = (row.get("transaction_type") or "sale").lower()
+        is_return = bool(row.get("is_return")) or tx_type == "return"
+        if is_return:
+            uid = row.get("order_uid") or row.get("transaction_original_uid")
+        else:
+            uid = row.get("transaction_uid")
+        if uid:
+            sale_uids.append(uid)
+
+    bounty_map = _batch_order_bounty_paid(db, sale_uids)
+    return_req_map = _batch_return_requests(db, sale_uids)
+
+    enriched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+
+        out = dict(row)
+        tx_type = (out.get("transaction_type") or "sale").lower()
+        is_return = bool(out.get("is_return")) or tx_type == "return"
+        if is_return:
+            sale_uid = out.get("order_uid") or out.get("transaction_original_uid")
+        else:
+            sale_uid = out.get("transaction_uid")
+
+        out["order_bounty_paid"] = bounty_map.get(sale_uid, 0.0)
+
+        pending = return_req_map.get(sale_uid) if sale_uid else None
+        rs, fs = _pair_for_sale(out, pending)
+        if rs or fs:
+            out.update(_status_payload(rs, fs))
+        else:
+            out.setdefault("return_status", None)
+            out.setdefault("refund_status", None)
+            out.setdefault("transaction_refund_status", None)
+            out.setdefault("display_status", None)
+
+        if not is_return:
+            out["pending_return"] = _pending_return_payload_for_sale(db, out, pending)
+        else:
+            out["pending_return"] = None
+            # On return ledger rows, expose magnitude of customer credit
+            out["refund_amount"] = abs(_to_float(out.get("transaction_total")))
+
+        enriched.append(out)
+
+    return enriched
+
+
 class SellerTransactions(Resource):
 
     def get(self, profile_id=None):
@@ -2828,6 +3055,7 @@ class SellerTransactions(Resource):
                         (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                         t.transaction_datetime,
                         t.transaction_total,
+                        t.transaction_amount,
                         t.transaction_taxes,
                         t.transaction_fees,
                         t.transaction_business_id AS seller_id,
@@ -2921,12 +3149,14 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = _enrich_seller_transaction_rows(db, rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
                     response["count"] = len(rows)
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
+                    response["datetime_storage"] = "UTC"
                 else:
                     response["message"] = result.get(
                         "message", "Query execution failed"
