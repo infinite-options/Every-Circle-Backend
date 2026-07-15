@@ -22,6 +22,12 @@ class SearchReferral(Resource):
             parts = [part for part in query.split() if part]
             search_term = f"%{query}%"
 
+            tagline_bio_clauses = [
+                "(profile_personal_tag_line_is_public = 1 AND LOWER(COALESCE(profile_personal_tag_line, '')) LIKE LOWER(%s))",
+                "(profile_personal_short_bio_is_public = 1 AND LOWER(COALESCE(profile_personal_short_bio, '')) LIKE LOWER(%s))",
+            ]
+            tagline_bio_params = [search_term, search_term]
+
             if len(parts) >= 2:
                 first_pattern = f"%{parts[0]}%"
                 last_pattern = f"%{' '.join(parts[1:])}%"
@@ -59,6 +65,9 @@ class SearchReferral(Resource):
                 ]
                 params = [search_term, search_term, search_term, search_term]
 
+            where_clauses += tagline_bio_clauses
+            params += tagline_bio_params
+
             search_query = f"""
                 SELECT 
                     profile_personal_uid,
@@ -81,10 +90,15 @@ class SearchReferral(Resource):
                         THEN profile_personal_state 
                         ELSE NULL 
                     END as profile_personal_state,
-                    CASE WHEN profile_personal_image_is_public = 1 
-                        THEN profile_personal_image 
-                        ELSE NULL 
-                    END as profile_personal_image
+                    CASE WHEN profile_personal_image_is_public = 1
+                        THEN profile_personal_image
+                        ELSE NULL
+                    END as profile_personal_image,
+                    CASE WHEN profile_personal_tag_line_is_public = 1
+                        THEN profile_personal_tag_line
+                        ELSE NULL
+                    END as profile_personal_tag_line,
+                    profile_personal_tag_line_is_public
                 FROM every_circle.profile_personal
                 LEFT JOIN every_circle.users u ON profile_personal_user_id = user_uid
                 WHERE {' OR '.join(where_clauses)}
