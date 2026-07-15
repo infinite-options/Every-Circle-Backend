@@ -42,6 +42,7 @@ from transactions import (
     SellerTransactions,
     DeclinedReturns,
     ReturnTransaction,
+    ConfirmReturnTransaction,
 )
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
@@ -59,7 +60,13 @@ from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
 from blocking import BlockedUsers
 from feedback import Feedback
-from content_reports import ContentReports, ContentModerationReview
+from content_reports import (
+    ContentReports,
+    ContentModerationReview,
+    SeekingContentModerationReview,
+    UserModerationReview,
+    BusinessModerationReview,
+)
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
 from profile_views import ProfileViews
@@ -833,6 +840,7 @@ api.add_resource(BusinessInfo, '/api/v1/businessinfo','/api/v1/businessinfo/<str
 # Static paths must register before `/api/v1/transactions/<profile_id>` so `return` is not captured as profile_id.
 api.add_resource(OrderDetail, '/api/v1/orders/<string:transaction_uid>')
 api.add_resource(ReturnTransaction, '/api/v1/transactions/return')
+api.add_resource(ConfirmReturnTransaction, '/api/v1/transactions/return/confirm')
 api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<string:profile_id>')
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
@@ -879,6 +887,27 @@ api.add_resource(
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>/review",
     "/api/v1/moderation/offerings/<string:profile_expertise_uid>/acknowledge",
+)
+api.add_resource(
+    SeekingContentModerationReview,
+    "/api/v1/moderation/seeking/review-queue",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>/review",
+    "/api/v1/moderation/seeking/<string:profile_wish_uid>/acknowledge",
+)
+api.add_resource(
+    UserModerationReview,
+    "/api/v1/moderation/users/review-queue",
+    "/api/v1/moderation/users/<string:profile_personal_uid>",
+    "/api/v1/moderation/users/<string:profile_personal_uid>/review",
+    "/api/v1/moderation/users/<string:profile_personal_uid>/acknowledge",
+)
+api.add_resource(
+    BusinessModerationReview,
+    "/api/v1/moderation/businesses/review-queue",
+    "/api/v1/moderation/businesses/<string:business_uid>",
+    "/api/v1/moderation/businesses/<string:business_uid>/review",
+    "/api/v1/moderation/businesses/<string:business_uid>/acknowledge",
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")

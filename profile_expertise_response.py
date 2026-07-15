@@ -4,7 +4,7 @@ from datetime import datetime
 import uuid
 
 from data_ec import connect
-from moderation import MODERATED_ACTIVE, get_offering
+from moderation import MODERATED_ACTIVE, get_offering, is_owner_available_for_public_interaction
 
 
 def _generate_expertise_response_uid():
@@ -87,6 +87,12 @@ class ProfileExpertiseResponse(Resource):
                     return response, 404
 
                 if int(offering.get("profile_expertise_moderated") or 0) != MODERATED_ACTIVE:
+                    response["message"] = "Offering is not available"
+                    response["code"] = 403
+                    return response, 403
+
+                owner_uid = offering.get("profile_expertise_profile_personal_id")
+                if not is_owner_available_for_public_interaction(db, owner_uid):
                     response["message"] = "Offering is not available"
                     response["code"] = 403
                     return response, 403

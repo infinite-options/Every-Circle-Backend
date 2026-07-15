@@ -1,14 +1,16 @@
 from aiohttp import payload
 from flask_restful import Resource
 from datetime import datetime
+import os
 import traceback
 from flask import request, jsonify
 import json
+import requests as http_requests
 
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
-from moderation import MODERATED_ACTIVE
+from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interaction
 from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
@@ -25,6 +27,80 @@ from transaction_shipping import (
     FULFILLMENT_STATUS_DELIVERED,
     SELLER_FULFILLMENT_STATUSES,
 )
+
+# Return logistics (item physical state)
+RETURN_STATUS_RETURNING = "returning"  # buyer initiated return
+RETURN_STATUS_RETURNED = "returned"  # seller received the item
+
+# Refund / money state
+REFUND_STATUS_PENDING = "pending"  # buyer waiting for money
+REFUND_STATUS_REFUNDED = "refunded"  # money returned
+REFUND_STATUS_REJECTED = "rejected"  # seller/admin will not refund
+
+_RETURN_REQUESTS_TABLE_READY = False
+
+
+def _display_return_status(return_status, refund_status):
+    """FE label: e.g. 'Returning - Pending'."""
+    r = (return_status or "").strip().capitalize()
+    f = (refund_status or "").strip().capitalize()
+    if r and f:
+        return f"{r} - {f}"
+    return r or f or None
+
+
+def _normalize_status_pair(return_status=None, refund_status=None):
+    """
+    Normalize legacy single-field values into (return_status, refund_status).
+
+    Legacy:
+      pending/declined/accepted/refunded/resolved
+    Current:
+      return_status: returning | returned
+      refund_status: pending | refunded | rejected
+    """
+    rs = (return_status or "").strip().lower()
+    fs = (refund_status or "").strip().lower()
+
+    if rs in (RETURN_STATUS_RETURNING, RETURN_STATUS_RETURNED) and fs in (
+        REFUND_STATUS_PENDING,
+        REFUND_STATUS_REFUNDED,
+        REFUND_STATUS_REJECTED,
+    ):
+        return rs, fs
+
+    legacy = {
+        "pending": (RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING),
+        "declined": (RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED),
+        "accepted": (RETURN_STATUS_RETURNED, REFUND_STATUS_PENDING),
+        "refunded": (RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED),
+        "resolved": (RETURN_STATUS_RETURNED, REFUND_STATUS_REJECTED),
+        "rejected": (RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED),
+        "returning": (RETURN_STATUS_RETURNING, fs or REFUND_STATUS_PENDING),
+        "returned": (RETURN_STATUS_RETURNED, fs or REFUND_STATUS_PENDING),
+    }
+    if rs in legacy:
+        return legacy[rs]
+
+    if fs in (
+        REFUND_STATUS_PENDING,
+        REFUND_STATUS_REFUNDED,
+        REFUND_STATUS_REJECTED,
+    ):
+        return rs or RETURN_STATUS_RETURNING, fs
+
+    return None, None
+
+
+def _status_payload(return_status, refund_status):
+    rs, fs = _normalize_status_pair(return_status, refund_status)
+    return {
+        "return_status": rs,
+        "refund_status": fs,
+        "transaction_return_status": rs,  # logistics (aligned with FE Return column)
+        "transaction_refund_status": fs,  # money (aligned with FE Received column)
+        "display_status": _display_return_status(rs, fs),
+    }
 
 
 def _request_timezone():
@@ -348,28 +424,763 @@ def _all_lines_fully_received(db, transaction_uid):
     return int(rows[0].get("incomplete_count") or 0) == 0 if rows else False
 
 
+def _ensure_return_requests_table(db):
+    """Create pending-return side table once per process if missing."""
+    global _RETURN_REQUESTS_TABLE_READY
+    if _RETURN_REQUESTS_TABLE_READY:
+        return
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS every_circle.transaction_return_requests (
+            trr_transaction_uid VARCHAR(64) NOT NULL,
+            trr_profile_id VARCHAR(64) NOT NULL,
+            trr_items_json MEDIUMTEXT NOT NULL,
+            trr_note TEXT NULL,
+            trr_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            trr_return_status VARCHAR(32) NOT NULL DEFAULT 'returning',
+            trr_refund_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            trr_estimated_total DECIMAL(18,4) NULL,
+            trr_return_transaction_uid VARCHAR(64) NULL,
+            trr_stripe_refund_id VARCHAR(128) NULL,
+            trr_created_at DATETIME NOT NULL,
+            trr_updated_at DATETIME NOT NULL,
+            PRIMARY KEY (trr_transaction_uid)
+        )
+        """,
+        cmd="post",
+    )
+    # Older table installs may lack the dual-status columns.
+    db.execute(
+        """
+        ALTER TABLE every_circle.transaction_return_requests
+        ADD COLUMN trr_return_status VARCHAR(32) NULL
+        """,
+        cmd="post",
+    )
+    db.execute(
+        """
+        ALTER TABLE every_circle.transaction_return_requests
+        ADD COLUMN trr_refund_status VARCHAR(32) NULL
+        """,
+        cmd="post",
+    )
+    _RETURN_REQUESTS_TABLE_READY = True
+
+
+def _already_returned_qty(db, order_uid, ti_uid):
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(ABS(rti.ti_bs_qty)), 0) AS returned_qty
+        FROM every_circle.transactions_items rti
+        INNER JOIN every_circle.transactions rt
+            ON rti.ti_transaction_id = rt.transaction_uid
+        WHERE rt.transaction_original_uid = %s
+          AND COALESCE(rt.transaction_type, 'return') = 'return'
+          AND rti.ti_original_ti_uid = %s
+        """,
+        (order_uid, ti_uid),
+    )
+    rows = q.get("result") or []
+    return int(_to_float(rows[0].get("returned_qty"))) if rows else 0
+
+
+def _load_sale_for_return(db, transaction_uid):
+    tx_row_q = db.execute(
+        """
+        SELECT transaction_uid, transaction_profile_id, transaction_business_id,
+               transaction_stripe_pi, transaction_total, transaction_amount,
+               transaction_taxes, transaction_fees,
+               transaction_return_requested, transaction_return_status,
+               transaction_return_note, transaction_return_seller_note,
+               COALESCE(transaction_type, 'sale') AS transaction_type
+        FROM every_circle.transactions
+        WHERE transaction_uid = %s
+        """,
+        (transaction_uid,),
+    )
+    rows = tx_row_q.get("result") or []
+    return rows[0] if rows else None
+
+
+def _validate_and_price_return_items(db, original_tx_uid, items_payload):
+    """
+    Validate return lines and compute refund breakdown.
+    Returns (ok, error_dict_or_None, context_dict_or_None).
+    """
+    if not isinstance(items_payload, list) or len(items_payload) == 0:
+        return False, {
+            "message": "transaction_return_items must be a non-empty list",
+            "code": 400,
+        }, None
+
+    subtotal_q = db.execute(
+        """
+        SELECT COALESCE(SUM(CAST(ti_bs_cost AS DECIMAL(18,6)) * ti_bs_qty), 0)
+            AS order_subtotal
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        """,
+        (original_tx_uid,),
+    )
+    order_subtotal_rows = subtotal_q.get("result") or []
+    order_subtotal = _to_float(
+        order_subtotal_rows[0].get("order_subtotal") if order_subtotal_rows else 0
+    )
+
+    refund_subtotal = 0.0
+    refund_tax = 0.0
+    lines_processed = []
+    seen_ti = set()
+
+    for entry in items_payload:
+        ti_uid = entry.get("transaction_item_uid")
+        try:
+            rq = int(entry.get("return_quantity"))
+        except (TypeError, ValueError):
+            rq = -1
+
+        if not ti_uid:
+            return False, {
+                "message": "Each entry requires transaction_item_uid",
+                "code": 400,
+            }, None
+        if rq < 1:
+            return False, {
+                "message": f"Invalid return_quantity for item {ti_uid}",
+                "code": 400,
+            }, None
+        if ti_uid in seen_ti:
+            return False, {
+                "message": f"Duplicate transaction_item_uid: {ti_uid}",
+                "code": 400,
+            }, None
+        seen_ti.add(ti_uid)
+
+        ti_q = db.execute(
+            """
+            SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bs_qty, ti_bs_cost,
+                   ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
+                   ti_bs_refund_policy, ti_bs_return_window_days,
+                   ti_selected_options, ti_special_instructions, ti_choices_extra_cost
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s AND ti_transaction_id = %s
+            """,
+            (ti_uid, original_tx_uid),
+        )
+        ti_rows = ti_q.get("result") or []
+        if not ti_rows:
+            return False, {
+                "message": f"Transaction item not found on this sale: {ti_uid}",
+                "code": 404,
+            }, None
+
+        ti_row = ti_rows[0]
+        original_qty = int(ti_row.get("ti_bs_qty") or 0)
+        already_returned = _already_returned_qty(db, original_tx_uid, ti_uid)
+        remaining = original_qty - already_returned
+        if rq > remaining:
+            return False, {
+                "message": (
+                    f"return_quantity exceeds remaining returnable qty for {ti_uid} "
+                    f"(requested {rq}, remaining {remaining})"
+                ),
+                "code": 400,
+            }, None
+
+        unit_cost = _to_float(ti_row.get("ti_bs_cost"))
+        scale = _bounty_scale_for_line(rq, original_qty)
+        if scale is None:
+            return False, {
+                "message": (
+                    f"return_quantity must be between 1 and {original_qty} for {ti_uid}"
+                ),
+                "code": 400,
+            }, None
+
+        line_subtotal = round(unit_cost * rq, 4)
+        line_tax = _tax_amount_for_line(
+            line_subtotal,
+            ti_row.get("ti_bs_is_taxable"),
+            ti_row.get("ti_bs_tax_rate"),
+        )
+        refund_subtotal += line_subtotal
+        refund_tax += line_tax
+
+        lines_processed.append(
+            {
+                "original_ti_uid": ti_uid,
+                "ti_bs_id": ti_row.get("ti_bs_id"),
+                "return_quantity": rq,
+                "original_quantity": original_qty,
+                "already_returned": already_returned,
+                "unit_cost": unit_cost,
+                "line_subtotal": line_subtotal,
+                "line_tax": line_tax,
+                "snapshot": ti_row,
+            }
+        )
+
+    return True, None, {
+        "order_subtotal": order_subtotal,
+        "refund_subtotal": refund_subtotal,
+        "refund_tax": refund_tax,
+        "lines_processed": lines_processed,
+    }
+
+
+def _refund_breakdown_from_context(orig_tx, ctx):
+    order_subtotal = ctx["order_subtotal"]
+    refund_subtotal = ctx["refund_subtotal"]
+    refund_tax = ctx["refund_tax"]
+    orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
+    fee_ratio = refund_subtotal / order_subtotal if order_subtotal > 0 else 0.0
+    refund_fees = round(orig_fees * fee_ratio, 4)
+    refund_grand = round(refund_subtotal + refund_tax + refund_fees, 4)
+    return {
+        "subtotal": round(refund_subtotal, 4),
+        "taxes": round(refund_tax, 4),
+        "fees_allocated": round(refund_fees, 4),
+        "total_customer_credit": round(refund_grand, 4),
+        "fee_allocation_ratio": round(fee_ratio, 6),
+        "original_order_subtotal": round(order_subtotal, 4),
+        "refund_fees": refund_fees,
+        "refund_grand": refund_grand,
+        "fee_ratio": fee_ratio,
+    }
+
+
+def _stripe_secret_key():
+    mode = (
+        os.getenv("STRIPE_MODE")
+        or os.getenv("stripe_mode")
+        or os.getenv("RDS_DB")
+        or "dev"
+    ).lower()
+    if mode in ("prod", "production", "live"):
+        return os.getenv("stripe_secret_live_key")
+    return os.getenv("stripe_secret_test_key") or os.getenv("stripe_secret_live_key")
+
+
+def _issue_stripe_refund(payment_intent_id, amount_dollars, metadata=None):
+    """
+    Create a Stripe refund against a PaymentIntent.
+    Returns dict with ok/skipped/error and refund_id when available.
+    """
+    if not payment_intent_id:
+        return {"ok": False, "skipped": True, "message": "No Stripe payment intent on sale"}
+
+    secret = _stripe_secret_key()
+    if not secret:
+        return {
+            "ok": False,
+            "skipped": True,
+            "message": "Stripe secret key not configured",
+        }
+
+    amount_cents = int(round(abs(_to_float(amount_dollars)) * 100))
+    if amount_cents < 1:
+        return {"ok": False, "skipped": True, "message": "Refund amount too small"}
+
+    data = {
+        "payment_intent": payment_intent_id,
+        "amount": str(amount_cents),
+    }
+    if metadata:
+        for i, (k, v) in enumerate(metadata.items()):
+            if v is None:
+                continue
+            data[f"metadata[{k}]"] = str(v)
+
+    try:
+        resp = http_requests.post(
+            "https://api.stripe.com/v1/refunds",
+            data=data,
+            auth=(secret, ""),
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "skipped": False, "message": f"Stripe request failed: {e}"}
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        return {
+            "ok": False,
+            "skipped": False,
+            "message": body.get("error", {}).get("message")
+            if isinstance(body.get("error"), dict)
+            else body.get("error") or f"Stripe HTTP {resp.status_code}",
+            "stripe_status": resp.status_code,
+            "stripe_response": body,
+        }
+
+    return {
+        "ok": True,
+        "skipped": False,
+        "refund_id": body.get("id"),
+        "stripe_status": resp.status_code,
+        "stripe_response": body,
+    }
+
+
+def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
+    """Insert negative sale + reverse bounties. Returns (ok, error_or_None, result_dict)."""
+    original_tx_uid = orig_tx.get("transaction_uid")
+    lines_processed = ctx["lines_processed"]
+    refund_grand = refund_meta["refund_grand"]
+    refund_subtotal = refund_meta["subtotal"]
+    refund_tax = refund_meta["taxes"]
+    refund_fees = refund_meta["refund_fees"]
+    fee_ratio = refund_meta["fee_ratio"]
+    order_subtotal = refund_meta["original_order_subtotal"]
+
+    new_uid_resp = db.call(procedure="new_transaction_uid")
+    if not new_uid_resp.get("result") or len(new_uid_resp["result"]) == 0:
+        return False, {
+            "message": "Failed to generate return transaction UID",
+            "code": 500,
+        }, None
+
+    new_transaction_uid = new_uid_resp["result"][0]["new_id"]
+    transactions_datetime = utc_now_str()
+
+    new_transaction = {
+        "transaction_uid": new_transaction_uid,
+        "transaction_datetime": transactions_datetime,
+        "transaction_profile_id": orig_tx.get("transaction_profile_id"),
+        "transaction_business_id": orig_tx.get("transaction_business_id"),
+        "transaction_stripe_pi": orig_tx.get("transaction_stripe_pi"),
+        "transaction_total": f"{-refund_grand:.4f}",
+        "transaction_amount": f"{-refund_subtotal:.4f}",
+        "transaction_taxes": f"{-refund_tax:.4f}",
+        "transaction_fees": f"{-refund_fees:.4f}",
+        "transaction_in_escrow": 0,
+        "transaction_return_note": return_note,
+        "transaction_type": "return",
+        "transaction_original_uid": original_tx_uid,
+    }
+
+    tx_insert = db.insert("every_circle.transactions", new_transaction)
+    if tx_insert.get("code") != 200:
+        return False, {
+            "message": tx_insert.get("message", "Failed to insert return transaction"),
+            "code": tx_insert.get("code", 500),
+        }, None
+
+    bounty_insert_count = 0
+    item_insert_count = 0
+    response_lines = []
+
+    for line in lines_processed:
+        ti_row = line["snapshot"]
+        rq = line["return_quantity"]
+        original_qty = line["original_quantity"]
+        ti_bs_id = ti_row.get("ti_bs_id")
+
+        ti_uid_resp = db.call(procedure="new_transaction_item_uid")
+        if not ti_uid_resp.get("result") or len(ti_uid_resp["result"]) == 0:
+            return False, {
+                "message": "Failed to generate return line item UID",
+                "code": 500,
+            }, None
+
+        new_ti_uid = ti_uid_resp["result"][0]["new_id"]
+        neg_qty = -int(rq)
+
+        tx_item = {
+            "ti_uid": new_ti_uid,
+            "ti_transaction_id": new_transaction_uid,
+            "ti_original_ti_uid": line["original_ti_uid"],
+            "ti_bs_id": ti_bs_id,
+            "ti_bs_qty": neg_qty,
+            "ti_bs_cost": ti_row.get("ti_bs_cost"),
+            "ti_bs_cost_currency": ti_row.get("ti_bs_cost_currency"),
+            "ti_bs_sku": ti_row.get("ti_bs_sku"),
+            "ti_bs_is_taxable": ti_row.get("ti_bs_is_taxable"),
+            "ti_bs_tax_rate": ti_row.get("ti_bs_tax_rate"),
+            "ti_bs_refund_policy": ti_row.get("ti_bs_refund_policy"),
+            "ti_bs_return_window_days": ti_row.get("ti_bs_return_window_days"),
+        }
+        if ti_row.get("ti_selected_options") is not None:
+            tx_item["ti_selected_options"] = ti_row.get("ti_selected_options")
+        if ti_row.get("ti_special_instructions"):
+            tx_item["ti_special_instructions"] = ti_row.get(
+                "ti_special_instructions"
+            )
+        if ti_row.get("ti_choices_extra_cost") is not None:
+            tx_item["ti_choices_extra_cost"] = ti_row.get("ti_choices_extra_cost")
+
+        ti_insert = db.insert("every_circle.transactions_items", tx_item)
+        if ti_insert.get("code") != 200:
+            return False, {
+                "message": ti_insert.get(
+                    "message", "Failed to insert return transaction item"
+                ),
+                "code": ti_insert.get("code", 500),
+            }, None
+        item_insert_count += 1
+
+        scale = _bounty_scale_for_line(rq, original_qty) or 0.0
+        bounty_q = db.execute(
+            """
+            SELECT tb_uid, tb_profile_id, tb_percentage, tb_amount
+            FROM every_circle.transactions_bounty
+            WHERE tb_ti_id = %s
+            """,
+            (line["original_ti_uid"],),
+        )
+        bounty_rows = bounty_q.get("result") or []
+
+        for br in bounty_rows:
+            raw_amt = _to_float(br.get("tb_amount"))
+            reversal = round(-scale * raw_amt, 4)
+            if reversal == 0:
+                continue
+
+            bounty_uid_resp = db.call(procedure="new_transaction_bounty_uid")
+            if not bounty_uid_resp.get("result") or len(bounty_uid_resp["result"]) == 0:
+                print("Warning: Failed to generate bounty UID for reversal")
+                continue
+
+            new_tb_uid = bounty_uid_resp["result"][0]["new_id"]
+            tx_bounty = {
+                "tb_uid": new_tb_uid,
+                "tb_ti_id": new_ti_uid,
+                "tb_profile_id": br.get("tb_profile_id"),
+                "tb_percentage": br.get("tb_percentage"),
+                "tb_amount": reversal,
+            }
+            bins = db.insert("every_circle.transactions_bounty", tx_bounty)
+            if bins.get("code") == 200:
+                bounty_insert_count += 1
+                reversal_abs = abs(reversal)
+                if reversal_abs > 0:
+                    wallet_result = debit_bounty_from_wallet(
+                        db,
+                        br.get("tb_profile_id"),
+                        reversal_abs,
+                    )
+                    if wallet_result.get("code") != 200:
+                        print(
+                            "Warning: Failed to debit wallet on return for "
+                            f"{br.get('tb_profile_id')}: {wallet_result}"
+                        )
+
+        response_lines.append(
+            {
+                "original_transaction_item_uid": line["original_ti_uid"],
+                "new_transaction_item_uid": new_ti_uid,
+                "return_quantity": rq,
+                "line_subtotal": line["line_subtotal"],
+                "line_tax": line["line_tax"],
+            }
+        )
+
+    return True, None, {
+        "return_transaction_uid": new_transaction_uid,
+        "original_transaction_uid": original_tx_uid,
+        "order_uid": original_tx_uid,
+        "refund_breakdown": {
+            "subtotal": round(refund_subtotal, 4),
+            "taxes": round(refund_tax, 4),
+            "fees_allocated": round(refund_fees, 4),
+            "total_customer_credit": round(refund_grand, 4),
+            "fee_allocation_ratio": round(fee_ratio, 6),
+            "original_order_subtotal": round(order_subtotal, 4),
+        },
+        "ledger_amounts_negative": {
+            "transaction_total": new_transaction["transaction_total"],
+            "transaction_amount": new_transaction["transaction_amount"],
+            "transaction_taxes": new_transaction["transaction_taxes"],
+            "transaction_fees": new_transaction["transaction_fees"],
+        },
+        "transaction_items_created": item_insert_count,
+        "bounty_reversal_rows_created": bounty_insert_count,
+        "lines": response_lines,
+    }
+
+
+def _load_return_request(db, transaction_uid):
+    _ensure_return_requests_table(db)
+    q = db.execute(
+        """
+        SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
+               trr_status, trr_return_status, trr_refund_status,
+               trr_estimated_total, trr_return_transaction_uid,
+               trr_stripe_refund_id, trr_created_at, trr_updated_at
+        FROM every_circle.transaction_return_requests
+        WHERE trr_transaction_uid = %s
+        """,
+        (transaction_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        # Fallback if ALTER columns are not yet visible to SELECT
+        q = db.execute(
+            """
+            SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
+                   trr_status, trr_estimated_total, trr_return_transaction_uid,
+                   trr_stripe_refund_id, trr_created_at, trr_updated_at
+            FROM every_circle.transaction_return_requests
+            WHERE trr_transaction_uid = %s
+            """,
+            (transaction_uid,),
+        )
+        rows = q.get("result") or []
+        if not rows:
+            return None
+    row = rows[0]
+    try:
+        row["items"] = json.loads(row.get("trr_items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        row["items"] = []
+
+    if row.get("trr_return_status") or row.get("trr_refund_status"):
+        rs, fs = _normalize_status_pair(
+            row.get("trr_return_status"),
+            row.get("trr_refund_status"),
+        )
+    else:
+        rs, fs = _normalize_status_pair(row.get("trr_status"), None)
+    row["return_status"] = rs
+    row["refund_status"] = fs
+    return row
+
+
+def _pair_for_sale(orig_tx, pending=None):
+    """Resolve current (return_status, refund_status) for a sale + optional request row."""
+    if pending:
+        rs, fs = _normalize_status_pair(
+            pending.get("return_status") or pending.get("trr_return_status"),
+            pending.get("refund_status") or pending.get("trr_refund_status"),
+        )
+        if rs and fs:
+            return rs, fs
+        rs, fs = _normalize_status_pair(pending.get("trr_status"), None)
+        if rs and fs:
+            return rs, fs
+    return _normalize_status_pair(orig_tx.get("transaction_return_status"), None)
+
+
+def _upsert_return_request(
+    db,
+    transaction_uid,
+    profile_id,
+    items_payload,
+    note,
+    return_status,
+    refund_status,
+    estimated_total,
+):
+    _ensure_return_requests_table(db)
+    now = utc_now_str()
+    items_json = json.dumps(items_payload)
+    existing = _load_return_request(db, transaction_uid)
+    fields = {
+        "trr_profile_id": profile_id,
+        "trr_items_json": items_json,
+        "trr_note": note,
+        "trr_status": refund_status,  # money status (legacy column name)
+        "trr_return_status": return_status,
+        "trr_refund_status": refund_status,
+        "trr_estimated_total": estimated_total,
+        "trr_return_transaction_uid": None,
+        "trr_stripe_refund_id": None,
+        "trr_updated_at": now,
+    }
+    if existing:
+        return db.update(
+            "every_circle.transaction_return_requests",
+            {"trr_transaction_uid": transaction_uid},
+            fields,
+        )
+    fields.update(
+        {
+            "trr_transaction_uid": transaction_uid,
+            "trr_created_at": now,
+        }
+    )
+    return db.insert("every_circle.transaction_return_requests", fields)
+
+
+def _update_return_statuses(
+    db,
+    transaction_uid,
+    return_status,
+    refund_status,
+    *,
+    return_requested=None,
+    return_note=None,
+    seller_note=None,
+    return_transaction_uid=None,
+    stripe_refund_id=None,
+):
+    tx_fields = {"transaction_return_status": return_status}
+    if return_requested is not None:
+        tx_fields["transaction_return_requested"] = return_requested
+    if return_note is not None:
+        tx_fields["transaction_return_note"] = return_note
+    if seller_note is not None:
+        tx_fields["transaction_return_seller_note"] = seller_note
+    db.update(
+        "every_circle.transactions",
+        {"transaction_uid": transaction_uid},
+        tx_fields,
+    )
+
+    _ensure_return_requests_table(db)
+    req_fields = {
+        "trr_status": refund_status,
+        "trr_return_status": return_status,
+        "trr_refund_status": refund_status,
+        "trr_updated_at": utc_now_str(),
+    }
+    if return_transaction_uid is not None:
+        req_fields["trr_return_transaction_uid"] = return_transaction_uid
+    if stripe_refund_id is not None:
+        req_fields["trr_stripe_refund_id"] = stripe_refund_id
+    db.update(
+        "every_circle.transaction_return_requests",
+        {"trr_transaction_uid": transaction_uid},
+        req_fields,
+    )
+
+
+def _finalize_pending_return(db, original_tx_uid, seller_note=None):
+    """
+    Seller/admin confirmation: item received (Returned) then ledger + Stripe.
+    Flow: Returning-Pending → Returned-Pending → Returned-Refunded|Rejected
+    Returns (http_body, http_status).
+    """
+    orig_tx = _load_sale_for_return(db, original_tx_uid)
+    if not orig_tx:
+        return {"message": "Original transaction not found", "code": 404}, 404
+
+    if (orig_tx.get("transaction_type") or "sale") != "sale":
+        return {
+            "message": "Returns can only be confirmed against a sale transaction",
+            "code": 400,
+        }, 400
+
+    pending = _load_return_request(db, original_tx_uid)
+    return_status, refund_status = _pair_for_sale(orig_tx, pending)
+
+    if refund_status == REFUND_STATUS_REFUNDED:
+        return {
+            "message": "Return already refunded",
+            "code": 409,
+            **_status_payload(return_status, refund_status),
+        }, 409
+    if (
+        return_status == RETURN_STATUS_RETURNED
+        and refund_status == REFUND_STATUS_REJECTED
+    ):
+        return {
+            "message": "Return was rejected; cannot refund",
+            "code": 409,
+            **_status_payload(return_status, refund_status),
+        }, 409
+
+    if not pending or not pending.get("items"):
+        return {
+            "message": "No pending return request found for this transaction",
+            "code": 404,
+        }, 404
+
+    # Must be Returning-Pending, or Returning-Rejected (admin override), or Returned-Pending
+    allowed = (
+        (RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING),
+        (RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED),
+        (RETURN_STATUS_RETURNED, REFUND_STATUS_PENDING),
+    )
+    if (return_status, refund_status) not in allowed:
+        return {
+            "message": (
+                "Return is not awaiting confirmation "
+                f"(status={_display_return_status(return_status, refund_status)})"
+            ),
+            "code": 409,
+            **_status_payload(return_status, refund_status),
+        }, 409
+
+    items_payload = pending["items"]
+    return_note = pending.get("trr_note")
+
+    # Step: Returned - Pending (seller received item)
+    _update_return_statuses(
+        db,
+        original_tx_uid,
+        RETURN_STATUS_RETURNED,
+        REFUND_STATUS_PENDING,
+        return_requested=1,
+        return_note=return_note,
+        seller_note=seller_note,
+    )
+
+    ok, err, ctx = _validate_and_price_return_items(
+        db, original_tx_uid, items_payload
+    )
+    if not ok:
+        return err, err.get("code", 400)
+
+    refund_meta = _refund_breakdown_from_context(orig_tx, ctx)
+    ledger_ok, ledger_err, ledger_result = _create_return_ledger(
+        db, orig_tx, ctx, refund_meta, return_note
+    )
+    if not ledger_ok:
+        return ledger_err, ledger_err.get("code", 500)
+
+    stripe_result = _issue_stripe_refund(
+        orig_tx.get("transaction_stripe_pi"),
+        refund_meta["refund_grand"],
+        metadata={
+            "order_uid": original_tx_uid,
+            "return_transaction_uid": ledger_result["return_transaction_uid"],
+        },
+    )
+
+    final_refund_status = (
+        REFUND_STATUS_REFUNDED if stripe_result.get("ok") else REFUND_STATUS_REJECTED
+    )
+    _update_return_statuses(
+        db,
+        original_tx_uid,
+        RETURN_STATUS_RETURNED,
+        final_refund_status,
+        return_requested=0 if final_refund_status == REFUND_STATUS_REFUNDED else 1,
+        return_note=return_note,
+        seller_note=seller_note,
+        return_transaction_uid=ledger_result["return_transaction_uid"],
+        stripe_refund_id=stripe_result.get("refund_id"),
+    )
+
+    response = {
+        "message": (
+            "Item received and refund issued"
+            if stripe_result.get("ok")
+            else "Item received; refund not completed (Rejected)"
+        ),
+        "code": 200,
+        **_status_payload(RETURN_STATUS_RETURNED, final_refund_status),
+        "stripe_refund": {
+            "ok": bool(stripe_result.get("ok")),
+            "skipped": bool(stripe_result.get("skipped")),
+            "refund_id": stripe_result.get("refund_id"),
+            "message": stripe_result.get("message"),
+        },
+    }
+    response.update(ledger_result)
+    return response, 200
+
+
 class ReturnTransaction(Resource):
     """
-    POST: record a return as a negative sale (new transaction + negative line items + bounty reversals).
-
-    Required from Front End:
-      - profile_id: buyer profile (must match original transaction_profile_id).
-      - transaction_uid: original sale to return against.
-      - transaction_return_items: [{ "transaction_item_uid": "<ti_uid>", "return_quantity": <int> }, ...]
-
-    Optional from Front End:
-      - transaction_return_note
-      - transaction_return_requested / transaction_return_status (updates original tx metadata after success)
-
-    Loaded from DB (not required from FE):
-      - Original transaction row (seller, buyer, stripe PI, historical taxes/fees).
-      - Each transactions_items row (ti_bs_cost, qty, tax flags, ti_bs_id).
-      - transactions_bounty rows per original ti_uid for reversal amounts.
-
-    Still missing / follow-ups:
-      - Cumulative returned qty per line (needs column or ledger query) to block over-returning.
-      - Stripe Refund API call + storing refund id (money movement).
-      - Restocking via BusinessServicePurchase inverse when applicable.
+    POST: buyer requests a return → status Returning - Pending.
+    Does NOT write the return ledger or refund via Stripe.
+    Seller confirms receipt via ConfirmReturnTransaction → Returned - *.
     """
 
     def post(self):
@@ -386,6 +1197,7 @@ class ReturnTransaction(Resource):
             profile_id = payload.get("profile_id")
             original_tx_uid = payload.get("transaction_uid")
             items_payload = payload.get("transaction_return_items") or []
+            return_note = payload.get("transaction_return_note")
 
             if not profile_id:
                 response["message"] = "profile_id is required"
@@ -395,33 +1207,19 @@ class ReturnTransaction(Resource):
                 response["message"] = "transaction_uid is required"
                 response["code"] = 400
                 return response, 400
-            if not isinstance(items_payload, list) or len(items_payload) == 0:
-                response["message"] = (
-                    "transaction_return_items must be a non-empty list"
-                )
-                response["code"] = 400
-                return response, 400
-
-            return_note = payload.get("transaction_return_note")
 
             with connect() as db:
-                tx_row_q = db.execute(
-                    """
-                    SELECT transaction_uid, transaction_profile_id, transaction_business_id,
-                           transaction_stripe_pi, transaction_total, transaction_amount,
-                           transaction_taxes, transaction_fees
-                    FROM every_circle.transactions
-                    WHERE transaction_uid = %s
-                    """,
-                    (original_tx_uid,),
-                )
-                tx_rows = tx_row_q.get("result") or []
-                if not tx_rows:
+                orig_tx = _load_sale_for_return(db, original_tx_uid)
+                if not orig_tx:
                     response["message"] = "Original transaction not found"
                     response["code"] = 404
                     return response, 404
 
-                orig_tx = tx_rows[0]
+                if (orig_tx.get("transaction_type") or "sale") != "sale":
+                    response["message"] = "Returns can only be requested for sale transactions"
+                    response["code"] = 400
+                    return response, 400
+
                 if orig_tx.get("transaction_profile_id") != profile_id:
                     response["message"] = (
                         "profile_id does not match the buyer on this transaction"
@@ -429,325 +1227,201 @@ class ReturnTransaction(Resource):
                     response["code"] = 403
                     return response, 403
 
-                subtotal_q = db.execute(
-                    """
-                    SELECT COALESCE(SUM(CAST(ti_bs_cost AS DECIMAL(18,6)) * ti_bs_qty), 0) AS order_subtotal
-                    FROM every_circle.transactions_items
-                    WHERE ti_transaction_id = %s
-                    """,
-                    (original_tx_uid,),
-                )
-                order_subtotal_rows = subtotal_q.get("result") or []
-                order_subtotal = _to_float(
-                    order_subtotal_rows[0].get("order_subtotal")
-                    if order_subtotal_rows
-                    else 0
-                )
+                pending = _load_return_request(db, original_tx_uid)
+                cur_return, cur_refund = _pair_for_sale(orig_tx, pending)
 
-                refund_subtotal = 0.0
-                refund_tax = 0.0
-                lines_processed = []
-
-                seen_ti = set()
-                for entry in items_payload:
-                    ti_uid = entry.get("transaction_item_uid")
-                    try:
-                        rq = int(entry.get("return_quantity"))
-                    except (TypeError, ValueError):
-                        rq = -1
-
-                    if not ti_uid:
-                        response["message"] = (
-                            "Each entry requires transaction_item_uid"
-                        )
-                        response["code"] = 400
-                        return response, 400
-                    if rq < 1:
-                        response["message"] = (
-                            f"Invalid return_quantity for item {ti_uid}"
-                        )
-                        response["code"] = 400
-                        return response, 400
-                    if ti_uid in seen_ti:
-                        response["message"] = (
-                            f"Duplicate transaction_item_uid: {ti_uid}"
-                        )
-                        response["code"] = 400
-                        return response, 400
-                    seen_ti.add(ti_uid)
-
-                    ti_q = db.execute(
-                        """
-                        SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bs_qty, ti_bs_cost,
-                               ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
-                               ti_bs_refund_policy, ti_bs_return_window_days,
-                               ti_selected_options, ti_special_instructions, ti_choices_extra_cost
-                        FROM every_circle.transactions_items
-                        WHERE ti_uid = %s AND ti_transaction_id = %s
-                        """,
-                        (ti_uid, original_tx_uid),
-                    )
-                    ti_rows = ti_q.get("result") or []
-                    if not ti_rows:
-                        response["message"] = (
-                            f"Transaction item not found on this sale: {ti_uid}"
-                        )
-                        response["code"] = 404
-                        return response, 404
-
-                    ti_row = ti_rows[0]
-                    original_qty = int(ti_row.get("ti_bs_qty") or 0)
-                    unit_cost = _to_float(ti_row.get("ti_bs_cost"))
-                    scale = _bounty_scale_for_line(rq, original_qty)
-                    if scale is None:
-                        response["message"] = (
-                            f"return_quantity must be between 1 and {original_qty} for {ti_uid}"
-                        )
-                        response["code"] = 400
-                        return response, 400
-
-                    line_subtotal = round(unit_cost * rq, 4)
-                    line_tax = _tax_amount_for_line(
-                        line_subtotal,
-                        ti_row.get("ti_bs_is_taxable"),
-                        ti_row.get("ti_bs_tax_rate"),
-                    )
-                    refund_subtotal += line_subtotal
-                    refund_tax += line_tax
-
-                    lines_processed.append(
-                        {
-                            "original_ti_uid": ti_uid,
-                            "ti_bs_id": ti_row.get("ti_bs_id"),
-                            "return_quantity": rq,
-                            "original_quantity": original_qty,
-                            "unit_cost": unit_cost,
-                            "line_subtotal": line_subtotal,
-                            "line_tax": line_tax,
-                            "snapshot": ti_row,
-                        }
-                    )
-
-                orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
-                fee_ratio = (
-                    refund_subtotal / order_subtotal
-                    if order_subtotal > 0
-                    else 0.0
-                )
-                refund_fees = round(orig_fees * fee_ratio, 4)
-
-                refund_grand = round(refund_subtotal + refund_tax + refund_fees, 4)
-
-                new_uid_resp = db.call(procedure="new_transaction_uid")
                 if (
-                    not new_uid_resp.get("result")
-                    or len(new_uid_resp["result"]) == 0
+                    cur_return == RETURN_STATUS_RETURNING
+                    and cur_refund == REFUND_STATUS_PENDING
                 ):
-                    response["message"] = "Failed to generate return transaction UID"
-                    response["code"] = 500
-                    return response, 500
-
-                new_transaction_uid = new_uid_resp["result"][0]["new_id"]
-                transactions_datetime = utc_now_str()
-
-                new_transaction = {
-                    "transaction_uid": new_transaction_uid,
-                    "transaction_datetime": transactions_datetime,
-                    "transaction_profile_id": orig_tx.get("transaction_profile_id"),
-                    "transaction_business_id": orig_tx.get("transaction_business_id"),
-                    "transaction_stripe_pi": orig_tx.get("transaction_stripe_pi"),
-                    "transaction_total": f"{-refund_grand:.4f}",
-                    "transaction_amount": f"{-refund_subtotal:.4f}",
-                    "transaction_taxes": f"{-refund_tax:.4f}",
-                    "transaction_fees": f"{-refund_fees:.4f}",
-                    "transaction_in_escrow": 0,
-                    "transaction_return_note": return_note,
-                    "transaction_type": "return",
-                    "transaction_original_uid": original_tx_uid,
-                }
-
-                tx_insert = db.insert("every_circle.transactions", new_transaction)
-                if tx_insert.get("code") != 200:
-                    response["message"] = tx_insert.get(
-                        "message", "Failed to insert return transaction"
+                    response["message"] = (
+                        "A return is already in progress (Returning - Pending)"
                     )
-                    response["code"] = tx_insert.get("code", 500)
+                    response["code"] = 409
+                    response.update(_status_payload(cur_return, cur_refund))
+                    return response, 409
+
+                if cur_refund == REFUND_STATUS_REFUNDED or (
+                    cur_return == RETURN_STATUS_RETURNED
+                    and cur_refund == REFUND_STATUS_PENDING
+                ):
+                    response["message"] = (
+                        "Return already finalized or awaiting refund "
+                        f"({_display_return_status(cur_return, cur_refund)})"
+                    )
+                    response["code"] = 409
+                    response.update(_status_payload(cur_return, cur_refund))
+                    return response, 409
+
+                ok, err, ctx = _validate_and_price_return_items(
+                    db, original_tx_uid, items_payload
+                )
+                if not ok:
+                    return err, err.get("code", 400)
+
+                refund_meta = _refund_breakdown_from_context(orig_tx, ctx)
+                upsert = _upsert_return_request(
+                    db,
+                    original_tx_uid,
+                    profile_id,
+                    items_payload,
+                    return_note,
+                    RETURN_STATUS_RETURNING,
+                    REFUND_STATUS_PENDING,
+                    refund_meta["total_customer_credit"],
+                )
+                if upsert.get("code") != 200:
+                    response["message"] = upsert.get(
+                        "message", "Failed to save return request"
+                    )
+                    response["code"] = upsert.get("code", 500)
                     return response, response["code"]
 
-                bounty_insert_count = 0
-                item_insert_count = 0
-                response_lines = []
+                _update_return_statuses(
+                    db,
+                    original_tx_uid,
+                    RETURN_STATUS_RETURNING,
+                    REFUND_STATUS_PENDING,
+                    return_requested=1,
+                    return_note=return_note,
+                )
 
-                for line in lines_processed:
-                    ti_row = line["snapshot"]
-                    rq = line["return_quantity"]
-                    original_qty = line["original_quantity"]
-                    ti_bs_id = ti_row.get("ti_bs_id")
-
-                    ti_uid_resp = db.call(procedure="new_transaction_item_uid")
-                    if (
-                        not ti_uid_resp.get("result")
-                        or len(ti_uid_resp["result"]) == 0
-                    ):
-                        response["message"] = "Failed to generate return line item UID"
-                        response["code"] = 500
-                        return response, 500
-
-                    new_ti_uid = ti_uid_resp["result"][0]["new_id"]
-                    neg_qty = -int(rq)
-
-                    tx_item = {
-                        "ti_uid": new_ti_uid,
-                        "ti_transaction_id": new_transaction_uid,
-                        "ti_original_ti_uid": line["original_ti_uid"],
-                        "ti_bs_id": ti_bs_id,
-                        "ti_bs_qty": neg_qty,
-                        "ti_bs_cost": ti_row.get("ti_bs_cost"),
-                        "ti_bs_cost_currency": ti_row.get("ti_bs_cost_currency"),
-                        "ti_bs_sku": ti_row.get("ti_bs_sku"),
-                        "ti_bs_is_taxable": ti_row.get("ti_bs_is_taxable"),
-                        "ti_bs_tax_rate": ti_row.get("ti_bs_tax_rate"),
-                        "ti_bs_refund_policy": ti_row.get("ti_bs_refund_policy"),
-                        "ti_bs_return_window_days": ti_row.get(
-                            "ti_bs_return_window_days"
-                        ),
-                    }
-                    if ti_row.get("ti_selected_options") is not None:
-                        tx_item["ti_selected_options"] = ti_row.get("ti_selected_options")
-                    if ti_row.get("ti_special_instructions"):
-                        tx_item["ti_special_instructions"] = ti_row.get(
-                            "ti_special_instructions"
-                        )
-                    if ti_row.get("ti_choices_extra_cost") is not None:
-                        tx_item["ti_choices_extra_cost"] = ti_row.get(
-                            "ti_choices_extra_cost"
-                        )
-
-                    ti_insert = db.insert(
-                        "every_circle.transactions_items", tx_item
-                    )
-                    if ti_insert.get("code") != 200:
-                        response["message"] = ti_insert.get(
-                            "message", "Failed to insert return transaction item"
-                        )
-                        response["code"] = ti_insert.get("code", 500)
-                        return response, response["code"]
-                    item_insert_count += 1
-
-                    scale = _bounty_scale_for_line(rq, original_qty)
-                    if scale is None:
-                        scale = 0.0
-
-                    bounty_q = db.execute(
-                        """
-                        SELECT tb_uid, tb_profile_id, tb_percentage, tb_amount
-                        FROM every_circle.transactions_bounty
-                        WHERE tb_ti_id = %s
-                        """,
-                        (line["original_ti_uid"],),
-                    )
-                    bounty_rows = bounty_q.get("result") or []
-
-                    for br in bounty_rows:
-                        raw_amt = _to_float(br.get("tb_amount"))
-                        reversal = round(-scale * raw_amt, 4)
-                        if reversal == 0:
-                            continue
-
-                        bounty_uid_resp = db.call(procedure="new_transaction_bounty_uid")
-                        if (
-                            not bounty_uid_resp.get("result")
-                            or len(bounty_uid_resp["result"]) == 0
-                        ):
-                            print(
-                                "Warning: Failed to generate bounty UID for reversal"
-                            )
-                            continue
-
-                        new_tb_uid = bounty_uid_resp["result"][0]["new_id"]
-                        tx_bounty = {
-                            "tb_uid": new_tb_uid,
-                            "tb_ti_id": new_ti_uid,
-                            "tb_profile_id": br.get("tb_profile_id"),
-                            "tb_percentage": br.get("tb_percentage"),
-                            "tb_amount": reversal,
-                        }
-                        bins = db.insert(
-                            "every_circle.transactions_bounty", tx_bounty
-                        )
-                        if bins.get("code") == 200:
-                            bounty_insert_count += 1
-                            reversal_abs = abs(reversal)
-                            if reversal_abs > 0:
-                                wallet_result = debit_bounty_from_wallet(
-                                    db,
-                                    br.get("tb_profile_id"),
-                                    reversal_abs,
-                                )
-                                if wallet_result.get("code") != 200:
-                                    print(
-                                        "Warning: Failed to debit wallet on return for "
-                                        f"{br.get('tb_profile_id')}: {wallet_result}"
-                                    )
-
-                    response_lines.append(
-                        {
-                            "original_transaction_item_uid": line[
-                                "original_ti_uid"
-                            ],
-                            "new_transaction_item_uid": new_ti_uid,
-                            "return_quantity": rq,
-                            "line_subtotal": line["line_subtotal"],
-                            "line_tax": line["line_tax"],
-                        }
-                    )
-
-                update_original = {}
-                if "transaction_return_requested" in payload:
-                    update_original["transaction_return_requested"] = (
-                        1 if payload.get("transaction_return_requested") else 0
-                    )
-                if "transaction_return_status" in payload:
-                    update_original["transaction_return_status"] = payload.get(
-                        "transaction_return_status"
-                    )
-                if return_note is not None:
-                    update_original["transaction_return_note"] = return_note
-
-                if update_original:
-                    db.update(
-                        "every_circle.transactions",
-                        {"transaction_uid": original_tx_uid},
-                        update_original,
-                    )
-
-                response["message"] = "Return transaction recorded successfully"
+                response["message"] = (
+                    "Return requested successfully (Returning - Pending)"
+                )
                 response["code"] = 200
-                response["return_transaction_uid"] = new_transaction_uid
                 response["original_transaction_uid"] = original_tx_uid
                 response["order_uid"] = original_tx_uid
-                response["refund_breakdown"] = {
-                    "subtotal": round(refund_subtotal, 4),
-                    "taxes": round(refund_tax, 4),
-                    "fees_allocated": round(refund_fees, 4),
-                    "total_customer_credit": round(refund_grand, 4),
-                    "fee_allocation_ratio": round(fee_ratio, 6),
-                    "original_order_subtotal": round(order_subtotal, 4),
+                response["transaction_return_requested"] = 1
+                response.update(
+                    _status_payload(RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING)
+                )
+                response["estimated_refund_breakdown"] = {
+                    "subtotal": refund_meta["subtotal"],
+                    "taxes": refund_meta["taxes"],
+                    "fees_allocated": refund_meta["fees_allocated"],
+                    "total_customer_credit": refund_meta["total_customer_credit"],
+                    "fee_allocation_ratio": refund_meta["fee_allocation_ratio"],
+                    "original_order_subtotal": refund_meta["original_order_subtotal"],
                 }
-                response["ledger_amounts_negative"] = {
-                    "transaction_total": new_transaction["transaction_total"],
-                    "transaction_amount": new_transaction["transaction_amount"],
-                    "transaction_taxes": new_transaction["transaction_taxes"],
-                    "transaction_fees": new_transaction["transaction_fees"],
-                }
-                response["transaction_items_created"] = item_insert_count
-                response["bounty_reversal_rows_created"] = bounty_insert_count
-                response["lines"] = response_lines
-
+                response["transaction_return_items"] = items_payload
+                response["next_step"] = (
+                    "Seller confirms item receipt via "
+                    "PUT /api/v1/transactions/return/confirm"
+                )
                 return response, 200
 
         except Exception as e:
             print(f"Error in ReturnTransaction POST: {str(e)}")
+            print(traceback.format_exc())
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
+            return response, 500
+
+
+class ConfirmReturnTransaction(Resource):
+    """
+    PUT: seller confirms returned goods received → Returned - Pending, then
+         issues ledger + Stripe → Returned - Refunded|Rejected
+         or rejects the return request → Returning - Rejected.
+
+    Required:
+      - transaction_uid (original sale)
+      - seller_id (must match transaction_business_id)
+
+    Optional:
+      - action: "confirm" (default) | "decline"
+      - transaction_return_seller_note
+    """
+
+    def put(self):
+        print("In ConfirmReturnTransaction PUT")
+        response = {}
+
+        try:
+            payload = request.get_json()
+            if not payload:
+                response["message"] = "Request body is required"
+                response["code"] = 400
+                return response, 400
+
+            transaction_uid = payload.get("transaction_uid")
+            seller_id = (
+                payload.get("seller_id")
+                or payload.get("business_uid")
+                or payload.get("transaction_business_id")
+            )
+            action = (payload.get("action") or "confirm").lower()
+            seller_note = payload.get("transaction_return_seller_note")
+
+            if not transaction_uid:
+                response["message"] = "transaction_uid is required"
+                response["code"] = 400
+                return response, 400
+            if not seller_id:
+                response["message"] = "seller_id is required"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                orig_tx = _load_sale_for_return(db, transaction_uid)
+                if not orig_tx:
+                    response["message"] = "Original transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                if str(orig_tx.get("transaction_business_id")) != str(seller_id):
+                    response["message"] = (
+                        "seller_id does not match the seller on this transaction"
+                    )
+                    response["code"] = 403
+                    return response, 403
+
+                pending = _load_return_request(db, transaction_uid)
+                cur_return, cur_refund = _pair_for_sale(orig_tx, pending)
+
+                if action in ("decline", "reject"):
+                    if not (
+                        cur_return == RETURN_STATUS_RETURNING
+                        and cur_refund == REFUND_STATUS_PENDING
+                    ):
+                        response["message"] = (
+                            "Only Returning - Pending returns can be rejected "
+                            f"(status={_display_return_status(cur_return, cur_refund)})"
+                        )
+                        response["code"] = 409
+                        response.update(_status_payload(cur_return, cur_refund))
+                        return response, 409
+
+                    _update_return_statuses(
+                        db,
+                        transaction_uid,
+                        RETURN_STATUS_RETURNING,
+                        REFUND_STATUS_REJECTED,
+                        return_requested=1,
+                        seller_note=seller_note,
+                    )
+                    response["message"] = "Return rejected (Returning - Rejected)"
+                    response["code"] = 200
+                    response["transaction_uid"] = transaction_uid
+                    response.update(
+                        _status_payload(
+                            RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED
+                        )
+                    )
+                    return response, 200
+
+                if action != "confirm":
+                    response["message"] = "action must be 'confirm' or 'decline'"
+                    response["code"] = 400
+                    return response, 400
+
+                return _finalize_pending_return(
+                    db, transaction_uid, seller_note=seller_note
+                )
+
+        except Exception as e:
+            print(f"Error in ConfirmReturnTransaction PUT: {str(e)}")
             print(traceback.format_exc())
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
@@ -1105,6 +1779,12 @@ class Transactions(Resource):
                             response["code"] = 403
                             return response, 403
 
+                        owner_uid = bs_data.get("profile_expertise_profile_personal_id")
+                        if not is_owner_available_for_public_interaction(db, owner_uid):
+                            response["message"] = "Offering is not available"
+                            response["code"] = 403
+                            return response, 403
+
                         tx_item["ti_bs_cost"] = _strip_currency(
                             bs_data.get("profile_expertise_cost")
                         )
@@ -1157,6 +1837,20 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response["result"][0]
+                        if (
+                            int(bs_data.get("profile_wish_moderated") or 0)
+                            != MODERATED_ACTIVE
+                        ):
+                            response["message"] = "Seeking post is not available"
+                            response["code"] = 403
+                            return response, 403
+
+                        owner_uid = bs_data.get("profile_wish_profile_personal_id")
+                        if not is_owner_available_for_public_interaction(db, owner_uid):
+                            response["message"] = "Seeking post is not available"
+                            response["code"] = 403
+                            return response, 403
+
                         tx_item["ti_bs_cost"] = _strip_currency(
                             bs_data.get("profile_wish_cost")
                         )
@@ -2110,6 +2804,233 @@ class Transactions(Resource):
             return response, 500
 
 
+def _batch_order_bounty_paid(db, transaction_uids):
+    """Sum of all bounty rows on a sale (what the business paid out)."""
+    uids = [u for u in (transaction_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT ti.ti_transaction_id AS transaction_uid,
+               COALESCE(SUM(tb.tb_amount), 0) AS order_bounty_paid
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        WHERE ti.ti_transaction_id IN ({placeholders})
+        GROUP BY ti.ti_transaction_id
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        out[row.get("transaction_uid")] = round(_to_float(row.get("order_bounty_paid")), 4)
+    return out
+
+
+def _batch_return_requests(db, transaction_uids):
+    """Load return-request rows keyed by sale transaction_uid."""
+    uids = [u for u in (transaction_uids or []) if u]
+    if not uids:
+        return {}
+    _ensure_return_requests_table(db)
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
+               trr_status, trr_return_status, trr_refund_status,
+               trr_estimated_total, trr_return_transaction_uid,
+               trr_stripe_refund_id, trr_created_at, trr_updated_at
+        FROM every_circle.transaction_return_requests
+        WHERE trr_transaction_uid IN ({placeholders})
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        try:
+            row["items"] = json.loads(row.get("trr_items_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["items"] = []
+        if row.get("trr_return_status") or row.get("trr_refund_status"):
+            rs, fs = _normalize_status_pair(
+                row.get("trr_return_status"),
+                row.get("trr_refund_status"),
+            )
+        else:
+            rs, fs = _normalize_status_pair(row.get("trr_status"), None)
+        row["return_status"] = rs
+        row["refund_status"] = fs
+        out[row.get("trr_transaction_uid")] = row
+    return out
+
+
+def _line_bounty_totals(db, ti_uids):
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT tb_ti_id, COALESCE(SUM(tb_amount), 0) AS line_bounty
+        FROM every_circle.transactions_bounty
+        WHERE tb_ti_id IN ({placeholders})
+        GROUP BY tb_ti_id
+        """,
+        tuple(uids),
+    )
+    return {
+        row.get("tb_ti_id"): _to_float(row.get("line_bounty"))
+        for row in (q.get("result") or [])
+    }
+
+
+def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
+    """Scale original line bounty by return_quantity / original qty."""
+    if not items_payload:
+        return 0.0
+    ti_uids = [e.get("transaction_item_uid") for e in items_payload if e.get("transaction_item_uid")]
+    line_bounties = _line_bounty_totals(db, ti_uids)
+    total = 0.0
+    for entry in items_payload:
+        ti_uid = entry.get("transaction_item_uid")
+        if not ti_uid:
+            continue
+        try:
+            rq = int(entry.get("return_quantity"))
+        except (TypeError, ValueError):
+            continue
+        if rq < 1:
+            continue
+        ti_q = db.execute(
+            """
+            SELECT ti_bs_qty
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s AND ti_transaction_id = %s
+            """,
+            (ti_uid, order_uid),
+        )
+        ti_rows = ti_q.get("result") or []
+        if not ti_rows:
+            continue
+        original_qty = int(ti_rows[0].get("ti_bs_qty") or 0)
+        scale = _bounty_scale_for_line(rq, original_qty)
+        if scale is None:
+            continue
+        total += line_bounties.get(ti_uid, 0.0) * scale
+    return round(total, 4)
+
+
+def _pending_return_payload_for_sale(db, sale_row, pending):
+    """Build pending_return object for a seller sale row."""
+    if not pending:
+        return None
+
+    order_uid = sale_row.get("transaction_uid")
+    rs, fs = _pair_for_sale(sale_row, pending)
+    status_fields = _status_payload(rs, fs)
+    items = pending.get("items") or []
+
+    estimated_refund = None
+    if items:
+        ok, _err, ctx = _validate_and_price_return_items(db, order_uid, items)
+        if ok:
+            refund_meta = _refund_breakdown_from_context(sale_row, ctx)
+            estimated_refund = {
+                "subtotal": refund_meta["subtotal"],
+                "taxes": refund_meta["taxes"],
+                "fees_allocated": refund_meta["fees_allocated"],
+                "total_customer_credit": refund_meta["total_customer_credit"],
+                "fee_allocation_ratio": refund_meta["fee_allocation_ratio"],
+                "original_order_subtotal": refund_meta["original_order_subtotal"],
+            }
+        else:
+            # Fallback to stored estimate when live pricing fails
+            stored = _to_float(pending.get("trr_estimated_total"))
+            if stored:
+                estimated_refund = {
+                    "subtotal": None,
+                    "taxes": None,
+                    "fees_allocated": None,
+                    "total_customer_credit": round(stored, 4),
+                }
+
+    bounty_to_reclaim = _bounty_to_reclaim_for_items(db, order_uid, items)
+
+    return {
+        "note": pending.get("trr_note"),
+        "items": items,
+        "estimated_refund": estimated_refund,
+        "bounty_to_reclaim": bounty_to_reclaim,
+        "return_transaction_uid": pending.get("trr_return_transaction_uid"),
+        "stripe_refund_id": pending.get("trr_stripe_refund_id"),
+        "created_at": pending.get("trr_created_at"),
+        "updated_at": pending.get("trr_updated_at"),
+        **status_fields,
+    }
+
+
+def _enrich_seller_transaction_rows(db, rows):
+    """
+    Attach order_bounty_paid + return/refund status + pending_return summary
+    for the business Account Screen tables.
+    """
+    if not rows:
+        return rows
+
+    sale_uids = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tx_type = (row.get("transaction_type") or "sale").lower()
+        is_return = bool(row.get("is_return")) or tx_type == "return"
+        if is_return:
+            uid = row.get("order_uid") or row.get("transaction_original_uid")
+        else:
+            uid = row.get("transaction_uid")
+        if uid:
+            sale_uids.append(uid)
+
+    bounty_map = _batch_order_bounty_paid(db, sale_uids)
+    return_req_map = _batch_return_requests(db, sale_uids)
+
+    enriched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+
+        out = dict(row)
+        tx_type = (out.get("transaction_type") or "sale").lower()
+        is_return = bool(out.get("is_return")) or tx_type == "return"
+        if is_return:
+            sale_uid = out.get("order_uid") or out.get("transaction_original_uid")
+        else:
+            sale_uid = out.get("transaction_uid")
+
+        out["order_bounty_paid"] = bounty_map.get(sale_uid, 0.0)
+
+        pending = return_req_map.get(sale_uid) if sale_uid else None
+        rs, fs = _pair_for_sale(out, pending)
+        if rs or fs:
+            out.update(_status_payload(rs, fs))
+        else:
+            out.setdefault("return_status", None)
+            out.setdefault("refund_status", None)
+            out.setdefault("transaction_refund_status", None)
+            out.setdefault("display_status", None)
+
+        if not is_return:
+            out["pending_return"] = _pending_return_payload_for_sale(db, out, pending)
+        else:
+            out["pending_return"] = None
+            # On return ledger rows, expose magnitude of customer credit
+            out["refund_amount"] = abs(_to_float(out.get("transaction_total")))
+
+        enriched.append(out)
+
+    return enriched
+
+
 class SellerTransactions(Resource):
 
     def get(self, profile_id=None):
@@ -2134,6 +3055,7 @@ class SellerTransactions(Resource):
                         (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                         t.transaction_datetime,
                         t.transaction_total,
+                        t.transaction_amount,
                         t.transaction_taxes,
                         t.transaction_fees,
                         t.transaction_business_id AS seller_id,
@@ -2227,12 +3149,14 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = _enrich_seller_transaction_rows(db, rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
                     response["count"] = len(rows)
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
+                    response["datetime_storage"] = "UTC"
                 else:
                     response["message"] = result.get(
                         "message", "Query execution failed"
@@ -2259,8 +3183,9 @@ class DeclinedReturns(Resource):
 
         try:
             with connect() as db:
+                _ensure_return_requests_table(db)
                 query = """
-                    SELECT 
+                    SELECT
                         t.transaction_uid,
                         t.transaction_profile_id,
                         t.transaction_business_id,
@@ -2268,23 +3193,35 @@ class DeclinedReturns(Resource):
                         t.transaction_return_status,
                         t.transaction_return_seller_note,
                         t.transaction_datetime,
+                        COALESCE(r.trr_return_status, t.transaction_return_status) AS return_status,
+                        COALESCE(r.trr_refund_status, r.trr_status, 'rejected') AS refund_status,
                         CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS buyer_name,
                         b.business_name AS seller_name
                     FROM every_circle.transactions t
-                    LEFT JOIN every_circle.profile_personal p 
+                    LEFT JOIN every_circle.transaction_return_requests r
+                        ON r.trr_transaction_uid = t.transaction_uid
+                    LEFT JOIN every_circle.profile_personal p
                         ON p.profile_personal_uid = t.transaction_profile_id
-                    LEFT JOIN every_circle.business b 
+                    LEFT JOIN every_circle.business b
                         ON b.business_uid = t.transaction_business_id
-                    WHERE t.transaction_return_status = 'declined'
+                    WHERE COALESCE(r.trr_refund_status, r.trr_status, t.transaction_return_status)
+                          IN ('rejected', 'declined')
                     ORDER BY t.transaction_datetime DESC
                 """
                 result = db.execute(query)
                 print("DeclinedReturns query result:", result)
 
                 if result.get("code") == 200:
-                    response["message"] = "Declined returns retrieved successfully"
+                    rows = result.get("result", []) or []
+                    for row in rows:
+                        rs, fs = _normalize_status_pair(
+                            row.get("return_status") or row.get("transaction_return_status"),
+                            row.get("refund_status"),
+                        )
+                        row.update(_status_payload(rs, fs))
+                    response["message"] = "Rejected returns retrieved successfully"
                     response["code"] = 200
-                    response["data"] = result.get("result", [])
+                    response["data"] = rows
                 else:
                     response["message"] = "Query execution failed"
                     response["code"] = result.get("code", 500)
@@ -2303,48 +3240,75 @@ class DeclinedReturns(Resource):
         print("In DeclinedReturns PUT")
         response = {}
 
- 
         try:
             data = request.get_json()
             transaction_uid = data.get("transaction_uid")
             seller_note = data.get("transaction_return_seller_note", "")
- 
+
             if not transaction_uid:
                 response["message"] = "transaction_uid is required"
                 response["code"] = 400
                 return response, 400
- 
+
             action = data.get("action", "decline")
 
             with connect() as db:
                 if action == "resolve":
                     favor = data.get("resolved_in_favor_of", "seller")
-                    # buyer wins = treat same as accepted (triggers refund display)
-                    # seller wins = resolved (clears red highlight)
-                    status = "accepted" if favor == "buyer" else "resolved"
-                    update_fields = {"transaction_return_status": status}
-                else:
-                    update_fields = {
-                        "transaction_return_status": "declined",
-                        "transaction_return_seller_note": seller_note,
-                    }
+                    if favor == "buyer":
+                        # Buyer wins dispute → Returned - Refunded (or Rejected if Stripe fails)
+                        body, status_code = _finalize_pending_return(
+                            db,
+                            transaction_uid,
+                            seller_note=seller_note or None,
+                        )
+                        if status_code == 200:
+                            body["message"] = (
+                                "Return resolved in buyer's favor; refund finalized"
+                            )
+                        return body, status_code
 
-                print("DeclinedReturns PUT update_fields:", update_fields)
-                result = db.update(
-                    "every_circle.transactions",
-                    {"transaction_uid": transaction_uid},
-                    update_fields,
-                )
-                print("DeclinedReturns PUT result:", result)
-
-                if result.get("code") == 200:
-                    response["message"] = "Return declined successfully" if action == "decline" else "Return resolved successfully"
+                    # Seller wins → Returned - Rejected (or keep Returning - Rejected)
+                    pending = _load_return_request(db, transaction_uid)
+                    orig_tx = _load_sale_for_return(db, transaction_uid) or {}
+                    cur_return, _cur_refund = _pair_for_sale(orig_tx, pending)
+                    final_return = (
+                        RETURN_STATUS_RETURNED
+                        if cur_return == RETURN_STATUS_RETURNED
+                        else RETURN_STATUS_RETURNING
+                    )
+                    _update_return_statuses(
+                        db,
+                        transaction_uid,
+                        final_return,
+                        REFUND_STATUS_REJECTED,
+                        return_requested=0,
+                        seller_note=seller_note or None,
+                    )
+                    response["message"] = (
+                        f"Return resolved in seller's favor "
+                        f"({_display_return_status(final_return, REFUND_STATUS_REJECTED)})"
+                    )
                     response["code"] = 200
-                else:
-                    response["message"] = "Failed to update transaction"
-                    response["code"] = result.get("code", 500)
-                    return response, response["code"]
+                    response.update(
+                        _status_payload(final_return, REFUND_STATUS_REJECTED)
+                    )
+                    return response, 200
 
+                # Default action: mark rejected (Returning - Rejected)
+                _update_return_statuses(
+                    db,
+                    transaction_uid,
+                    RETURN_STATUS_RETURNING,
+                    REFUND_STATUS_REJECTED,
+                    return_requested=1,
+                    seller_note=seller_note or None,
+                )
+                response["message"] = "Return rejected (Returning - Rejected)"
+                response["code"] = 200
+                response.update(
+                    _status_payload(RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED)
+                )
                 return response, 200
 
         except Exception as e:
@@ -2353,4 +3317,3 @@ class DeclinedReturns(Resource):
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
             return response, 500
-   
