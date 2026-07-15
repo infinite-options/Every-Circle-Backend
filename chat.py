@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import ably
 import asyncio
+from nearby import RELATIONSHIP_MAP
 
 load_dotenv()
 
@@ -154,12 +155,11 @@ def _is_blocked(blocker_uid, blocked_uid):
         return False
 
 
-def _recipient_has_messages_disabled(sender_uid, recipient_uid):
+def _blocked_or_muted(sender_uid, recipient_uid):
     """
     True if recipient_uid has blocked sender_uid, or has globally turned off messages.
-    Drives the "Messages turned off by {name}" banner shown to sender_uid — only true when
-    the OTHER person cut sender_uid off, not merely because sender_uid blocked them.
-    Only enforced for personal (110-) recipients — business recipients are out of scope.
+    Deterministic and one-directional — the OTHER person specifically cut sender_uid off,
+    not merely because sender_uid blocked them.
     """
     if not recipient_uid or recipient_uid[:3] != "110":
         return False
@@ -174,8 +174,51 @@ def _recipient_has_messages_disabled(sender_uid, recipient_uid):
         row = (muted.get("result") or [{}])[0]
         return bool(row.get("profile_personal_messages_off"))
     except Exception as e:
-        print(f"_recipient_has_messages_disabled error: {e}")
+        print(f"_blocked_or_muted error: {e}")
         return False
+
+
+def _privacy_excludes(sender_uid, recipient_uid):
+    """True if recipient_uid's Messages Privacy "Can Message Me" audience setting excludes sender_uid."""
+    if not recipient_uid or recipient_uid[:3] != "110":
+        return False
+    try:
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT profile_personal_messages_receive_from, profile_personal_messages_receive_types
+                FROM every_circle.profile_personal WHERE profile_personal_uid = %s
+                """,
+                args=(recipient_uid,),
+            )
+        row = (rows.get("result") or [{}])[0]
+        receive_from = row.get("profile_personal_messages_receive_from") or "all_circles"
+        return not _audience_allows(recipient_uid, sender_uid, receive_from, row.get("profile_personal_messages_receive_types"))
+    except Exception as e:
+        print(f"_privacy_excludes error: {e}")
+        return False
+
+
+def _recipient_has_messages_disabled(sender_uid, recipient_uid):
+    """
+    Drives the "{name} has messages turned off" banner shown to sender_uid, the person who
+    would be sending. True if recipient_uid has blocked/muted sender_uid, or recipient_uid's
+    Messages Privacy setting excludes sender_uid.
+
+    Suppressed when sender_uid has themselves explicitly blocked recipient_uid: sender_uid
+    already has their own "You've blocked" indicator, and telling them "recipient_uid has
+    messages turned off" would be misleading — the reason messaging isn't flowing here is
+    sender_uid's own block, not anything recipient_uid did.
+
+    Deliberately NOT suppressed just because recipient_uid also happens to be excluded by
+    sender_uid's own (often just-default) Messages Privacy setting — "All Circle Members" is
+    the default for every account, so two strangers who haven't connected via circles yet will
+    almost always exclude each other this way. That's still an accurate statement for each of
+    them individually (neither can currently message the other), so both may correctly see it.
+    """
+    if _is_blocked(sender_uid, recipient_uid):
+        return False
+    return _blocked_or_muted(sender_uid, recipient_uid) or _privacy_excludes(sender_uid, recipient_uid)
 
 
 def _should_suppress_new_message_notification(sender_uid, recipient_uid):
@@ -199,6 +242,55 @@ def _should_suppress_new_message_notification(sender_uid, recipient_uid):
     except Exception as e:
         print(f"_should_suppress_new_message_notification error: {e}")
         return False
+
+
+def _circle_relationship_types(owner_uid, related_uid):
+    """circle_relationship values owner_uid has recorded for related_uid (empty list if none)."""
+    try:
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT circle_relationship FROM every_circle.circles
+                WHERE circle_profile_id = %s AND circle_related_person_id = %s
+                  AND circle_relationship IS NOT NULL AND circle_relationship != ''
+                """,
+                args=(owner_uid, related_uid),
+            )
+        return [r["circle_relationship"] for r in (rows.get("result") or [])]
+    except Exception as e:
+        print(f"_circle_relationship_types error: {e}")
+        return []
+
+
+def _audience_allows(owner_uid, other_uid, audience, audience_types_csv):
+    """
+    True if owner_uid's Messages Privacy audience setting permits other_uid, based on
+    owner_uid's own recorded circles. Mirrors nearby.py's _consent_clause SQL in Python form.
+    """
+    if audience == "everyone":
+        return True
+    relationships = _circle_relationship_types(owner_uid, other_uid)
+    if audience == "all_circles":
+        return len(relationships) > 0
+    if audience == "specific":
+        allowed = {t.strip() for t in (audience_types_csv or "").split(",") if t.strip()}
+        allowed_db_values = {RELATIONSHIP_MAP.get(t, t) for t in allowed}
+        return any(rel in allowed_db_values for rel in relationships)
+    return True
+
+
+def _messages_privacy_violation(sender_uid, recipient_uid):
+    """
+    Returns an error message string if the recipient's "Can Message Me" Messages Privacy
+    setting blocks sender_uid, or None if sending is permitted. There is no sender-side
+    restriction — everyone can always attempt to message anyone; only the recipient's own
+    audience setting can block it. Only enforced when both accounts are personal (110-).
+    """
+    if not sender_uid or sender_uid[:3] != "110" or not recipient_uid or recipient_uid[:3] != "110":
+        return None
+    if _privacy_excludes(sender_uid, recipient_uid):
+        return "This person's message privacy settings don't allow you to message them."
+    return None
 
 
 def _hidden_after_cutoff(sender_uid, recipient_uid):
@@ -572,6 +664,11 @@ class Messages(Resource):
                 "code": 400,
             }, 400
 
+        recipient_uid_for_privacy = _get_recipient_uid(conv_uid, sender_uid)
+        privacy_violation = _messages_privacy_violation(sender_uid, recipient_uid_for_privacy)
+        if privacy_violation:
+            return {"message": privacy_violation, "code": 403, "recipient_messages_disabled": True}, 403
+
         msg_uid = _generate_uid_from_db("new_message_uid", "msg")
         now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         context_fields = _optional_message_context(data)
@@ -616,7 +713,7 @@ class Messages(Resource):
                 cmd="post",
             )
 
-        recipient_uid = _get_recipient_uid(conv_uid, sender_uid)
+        recipient_uid = recipient_uid_for_privacy
         # One-directional — drives the "Messages turned off by {name}" banner on sender_uid's own screen.
         recipient_disabled = _recipient_has_messages_disabled(sender_uid, recipient_uid)
         # Bidirectional — a block in either direction still suppresses the real-time notification.

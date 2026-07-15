@@ -865,6 +865,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_resume_is_public', 'profile_personal_notification_preference',
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
+                    'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
@@ -1424,6 +1425,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_resume', 'profile_personal_resume_is_public', 
                     'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
+                    'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
                     'profile_personal_experience_is_public',
                     'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public',
