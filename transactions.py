@@ -661,11 +661,29 @@ def _stripe_secret_key():
     return os.getenv("stripe_secret_test_key") or os.getenv("stripe_secret_live_key")
 
 
+def _normalize_stripe_payment_intent_id(raw):
+    """
+    Accept a PaymentIntent id (pi_…) or a client secret (pi_…_secret_…).
+    Returns the pi_… id, or None if empty/invalid.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if "_secret_" in value:
+        value = value.split("_secret_", 1)[0].strip()
+    if not value.startswith("pi_"):
+        return None
+    return value
+
+
 def _issue_stripe_refund(payment_intent_id, amount_dollars, metadata=None):
     """
     Create a Stripe refund against a PaymentIntent.
     Returns dict with ok/skipped/error and refund_id when available.
     """
+    payment_intent_id = _normalize_stripe_payment_intent_id(payment_intent_id)
     if not payment_intent_id:
         return {"ok": False, "skipped": True, "message": "No Stripe payment intent on sale"}
 
@@ -1049,11 +1067,14 @@ def _update_return_statuses(
     )
 
 
-def _finalize_pending_return(db, original_tx_uid, seller_note=None):
+def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refund_from_client=None):
     """
     Seller/admin confirmation: item received (Returned) then ledger + Stripe.
     Flow: Returning-Pending → Returned-Pending → Returned-Refunded|Rejected
     Returns (http_body, http_status).
+
+    If stripe_refund_from_client is provided (FE already called IO-Payments createRefund),
+    use that result instead of calling Stripe from this backend.
     """
     orig_tx = _load_sale_for_return(db, original_tx_uid)
     if not orig_tx:
@@ -1133,14 +1154,26 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None):
     if not ledger_ok:
         return ledger_err, ledger_err.get("code", 500)
 
-    stripe_result = _issue_stripe_refund(
-        orig_tx.get("transaction_stripe_pi"),
-        refund_meta["refund_grand"],
-        metadata={
-            "order_uid": original_tx_uid,
-            "return_transaction_uid": ledger_result["return_transaction_uid"],
-        },
-    )
+    # Prefer FE / IO-Payments createRefund result when provided (keys live on IO-Payments).
+    if isinstance(stripe_refund_from_client, dict) and (
+        "ok" in stripe_refund_from_client
+        or stripe_refund_from_client.get("refund_id")
+    ):
+        stripe_result = {
+            "ok": bool(stripe_refund_from_client.get("ok")),
+            "skipped": bool(stripe_refund_from_client.get("skipped")),
+            "refund_id": stripe_refund_from_client.get("refund_id"),
+            "message": stripe_refund_from_client.get("message"),
+        }
+    else:
+        stripe_result = _issue_stripe_refund(
+            orig_tx.get("transaction_stripe_pi"),
+            refund_meta["refund_grand"],
+            metadata={
+                "order_uid": original_tx_uid,
+                "return_transaction_uid": ledger_result["return_transaction_uid"],
+            },
+        )
 
     final_refund_status = (
         REFUND_STATUS_REFUNDED if stripe_result.get("ok") else REFUND_STATUS_REJECTED
@@ -1171,9 +1204,22 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None):
             "refund_id": stripe_result.get("refund_id"),
             "message": stripe_result.get("message"),
         },
+        "seller_note": seller_note,
+        "refund_business_code_hint": _refund_business_code_from_note(seller_note),
     }
     response.update(ledger_result)
     return response, 200
+
+
+def _refund_business_code_from_note(seller_note):
+    """
+    Map seller confirm note → IO-Payments business_code.
+    ECTEST / PMTEST → test Stripe account; else EC (live). Explicit EC/PM also accepted.
+    """
+    n = (seller_note or "").strip().upper()
+    if n in ("ECTEST", "PMTEST", "EC", "PM"):
+        return n
+    return "EC"
 
 
 class ReturnTransaction(Resource):
@@ -1330,8 +1376,10 @@ class ConfirmReturnTransaction(Resource):
       - seller_id (must match transaction_business_id)
 
     Optional:
-      - action: "confirm" (default) | "decline"
+      - action: "confirm" (default) | "decline" | "set_refund_status"
       - transaction_return_seller_note
+      - refund_status (for set_refund_status): refunded | stripe_fail | rejected
+      - stripe_refund / stripe_refund_id (optional; FE createRefund result)
     """
 
     def put(self):
@@ -1411,13 +1459,106 @@ class ConfirmReturnTransaction(Resource):
                     )
                     return response, 200
 
-                if action != "confirm":
-                    response["message"] = "action must be 'confirm' or 'decline'"
+                if action in ("set_refund_status", "set_status"):
+                    # FE may ask to persist stripe_fail OR refunded after confirm
+                    # (e.g. IO-Payments createRefund succeeded but local Stripe path skipped).
+                    requested = (
+                        payload.get("refund_status")
+                        or payload.get("transaction_refund_status")
+                        or ""
+                    ).strip().lower()
+                    if cur_return != RETURN_STATUS_RETURNED:
+                        response["message"] = (
+                            "set_refund_status requires return already confirmed "
+                            f"(status={_display_return_status(cur_return, cur_refund)})"
+                        )
+                        response["code"] = 409
+                        response.update(_status_payload(cur_return, cur_refund))
+                        return response, 409
+
+                    if requested in ("refunded",):
+                        stripe_refund_id = (
+                            payload.get("stripe_refund_id")
+                            or (
+                                payload.get("stripe_refund")
+                                if isinstance(payload.get("stripe_refund"), dict)
+                                else {}
+                            ).get("refund_id")
+                        )
+                        _update_return_statuses(
+                            db,
+                            transaction_uid,
+                            RETURN_STATUS_RETURNED,
+                            REFUND_STATUS_REFUNDED,
+                            return_requested=0,
+                            seller_note=seller_note,
+                            stripe_refund_id=stripe_refund_id,
+                        )
+                        response["message"] = "Refund status updated to refunded"
+                        response["code"] = 200
+                        response["transaction_uid"] = transaction_uid
+                        response.update(
+                            _status_payload(
+                                RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED
+                            )
+                        )
+                        if stripe_refund_id:
+                            response["stripe_refund"] = {
+                                "ok": True,
+                                "skipped": False,
+                                "refund_id": stripe_refund_id,
+                            }
+                        return response, 200
+
+                    if requested in ("stripe_fail", "stripe_failed", "cc_issue", "rejected"):
+                        _update_return_statuses(
+                            db,
+                            transaction_uid,
+                            RETURN_STATUS_RETURNED,
+                            REFUND_STATUS_REJECTED,
+                            return_requested=1,
+                            seller_note=seller_note,
+                        )
+                        response["message"] = "Refund status updated"
+                        response["code"] = 200
+                        response["transaction_uid"] = transaction_uid
+                        response.update(
+                            _status_payload(
+                                RETURN_STATUS_RETURNED, REFUND_STATUS_REJECTED
+                            )
+                        )
+                        # FE display alias for Stripe/CC failure
+                        response["refund_status"] = "stripe_fail"
+                        response["transaction_refund_status"] = "stripe_fail"
+                        response["display_status"] = "Returned - CC Issue"
+                        return response, 200
+                    response["message"] = (
+                        "refund_status must be refunded, stripe_fail, rejected, or equivalent"
+                    )
                     response["code"] = 400
                     return response, 400
 
+                if action != "confirm":
+                    response["message"] = "action must be 'confirm', 'decline', or 'set_refund_status'"
+                    response["code"] = 400
+                    return response, 400
+
+                stripe_from_client = payload.get("stripe_refund")
+                if not isinstance(stripe_from_client, dict) and payload.get(
+                    "stripe_refund_id"
+                ):
+                    stripe_from_client = {
+                        "ok": True,
+                        "skipped": False,
+                        "refund_id": payload.get("stripe_refund_id"),
+                        "message": "Refund id provided by client",
+                    }
+
                 return _finalize_pending_return(
-                    db, transaction_uid, seller_note=seller_note
+                    db,
+                    transaction_uid,
+                    seller_note=seller_note,
+                    stripe_refund_from_client=stripe_from_client,
                 )
 
         except Exception as e:
@@ -1595,7 +1736,10 @@ class Transactions(Resource):
             transaction = {
                 "transaction_profile_id": payload.get("profile_id"),
                 "transaction_business_id": payload.get("business_id"),
-                "transaction_stripe_pi": payload.get("stripe_payment_intent"),
+                # Always store pi_… (never a client secret) so refunds can use this field
+                "transaction_stripe_pi": _normalize_stripe_payment_intent_id(
+                    payload.get("stripe_payment_intent")
+                ),
                 "transaction_total": payload.get("total_amount_paid"),
                 "transaction_amount": payload.get("total_costs"),
                 "transaction_taxes": payload.get("total_taxes"),
