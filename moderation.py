@@ -69,6 +69,36 @@ def count_pending_flags(db, target_uid):
     return int(rows[0].get("flag_count") or 0)
 
 
+def get_owner_visible_reports(db, target_uid):
+    """
+    Category/message per report for the content owner (never exposes the reporter).
+
+    Intentionally not filtered to report_status = 'pending': once an admin reviews
+    the content, its reports may be dismissed while the takedown itself persists
+    (taken_down / acknowledged), so the owner should still see which flags led to it.
+    """
+    query = """
+        SELECT report_uid,
+               report_reason_category,
+               report_reason_text,
+               report_created_at
+        FROM every_circle.content_reports
+        WHERE report_target_uid = %s
+        ORDER BY report_created_at ASC
+    """
+    res = db.execute(query, (target_uid,))
+    rows = res.get("result") or []
+    return [
+        {
+            "reportUid": row.get("report_uid"),
+            "category": row.get("report_reason_category"),
+            "message": row.get("report_reason_text"),
+            "createdAt": _serialize_value(row.get("report_created_at")),
+        }
+        for row in rows
+    ]
+
+
 def get_offering(db, expertise_uid):
     expertise_uid = str(expertise_uid or "").strip()
     if not expertise_uid.startswith(_OFFERING_UID_PREFIX):
@@ -224,6 +254,7 @@ def build_offering_moderation_metadata(db, expertise_uid):
         "moderated": moderated,
         "status": _moderation_status_label(moderated, latest),
         "canEdit": can_offering_be_edited(db, expertise_uid, offering),
+        "reports": get_owner_visible_reports(db, expertise_uid),
         "resubmissionStatus": None,
         "resubmissionAdminNote": None,
         "resubmissionCreatedAt": None,
@@ -680,6 +711,7 @@ def build_wish_moderation_metadata(db, wish_uid):
         "moderated": moderated,
         "status": _moderation_status_label(moderated, latest),
         "canEdit": can_wish_be_edited(db, wish_uid, wish),
+        "reports": get_owner_visible_reports(db, wish_uid),
         "resubmissionStatus": None,
         "resubmissionAdminNote": None,
         "resubmissionCreatedAt": None,
@@ -1005,6 +1037,7 @@ def build_user_moderation_metadata(db, profile_uid):
         "moderated": moderated,
         "status": _moderation_status_label(moderated, latest),
         "canEdit": can_user_profile_be_edited(db, profile_uid, user),
+        "reports": get_owner_visible_reports(db, profile_uid),
         "resubmissionStatus": None,
         "resubmissionAdminNote": None,
         "resubmissionCreatedAt": None,
@@ -1344,6 +1377,7 @@ def build_business_moderation_metadata(db, business_uid):
         "moderated": moderated,
         "status": _moderation_status_label(moderated, latest),
         "canEdit": can_business_be_edited(db, business_uid, business),
+        "reports": get_owner_visible_reports(db, business_uid),
         "resubmissionStatus": None,
         "resubmissionAdminNote": None,
         "resubmissionCreatedAt": None,
