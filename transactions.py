@@ -432,6 +432,7 @@ def _ensure_return_requests_table(db):
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS every_circle.transaction_return_requests (
+            trr_uid VARCHAR(64) NOT NULL,
             trr_transaction_uid VARCHAR(64) NOT NULL,
             trr_profile_id VARCHAR(64) NOT NULL,
             trr_items_json MEDIUMTEXT NOT NULL,
@@ -444,27 +445,56 @@ def _ensure_return_requests_table(db):
             trr_stripe_refund_id VARCHAR(128) NULL,
             trr_created_at DATETIME NOT NULL,
             trr_updated_at DATETIME NOT NULL,
-            PRIMARY KEY (trr_transaction_uid)
+            PRIMARY KEY (trr_uid),
+            KEY idx_trr_transaction_uid (trr_transaction_uid)
         )
         """,
         cmd="post",
     )
-    # Older table installs may lack the dual-status columns.
-    db.execute(
-        """
-        ALTER TABLE every_circle.transaction_return_requests
-        ADD COLUMN trr_return_status VARCHAR(32) NULL
-        """,
-        cmd="post",
-    )
-    db.execute(
-        """
-        ALTER TABLE every_circle.transaction_return_requests
-        ADD COLUMN trr_refund_status VARCHAR(32) NULL
-        """,
-        cmd="post",
-    )
+    # Older table installs may lack columns / still use sale-uid PK.
+    for ddl in (
+        "ALTER TABLE every_circle.transaction_return_requests ADD COLUMN trr_uid VARCHAR(64) NULL",
+        "ALTER TABLE every_circle.transaction_return_requests ADD COLUMN trr_return_status VARCHAR(32) NULL",
+        "ALTER TABLE every_circle.transaction_return_requests ADD COLUMN trr_refund_status VARCHAR(32) NULL",
+    ):
+        db.execute(ddl, cmd="post")
     _RETURN_REQUESTS_TABLE_READY = True
+
+
+def _new_trr_uid(db):
+    """Allocate trr_uid via transaction_return_requests_uid stored procedure."""
+    uid_resp = db.call(procedure="every_circle.transaction_return_requests_uid")
+    if not uid_resp.get("result") or len(uid_resp["result"]) == 0:
+        return None
+    return uid_resp["result"][0].get("new_id")
+
+
+def _hydrate_return_request_row(row):
+    """Parse items JSON + normalize dual status onto a request row."""
+    if not row:
+        return None
+    try:
+        row["items"] = json.loads(row.get("trr_items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        row["items"] = []
+    if row.get("trr_return_status") or row.get("trr_refund_status"):
+        rs, fs = _normalize_status_pair(
+            row.get("trr_return_status"),
+            row.get("trr_refund_status"),
+        )
+    else:
+        rs, fs = _normalize_status_pair(row.get("trr_status"), None)
+    row["return_status"] = rs
+    row["refund_status"] = fs
+    return row
+
+
+_TRR_SELECT_COLS = """
+    trr_uid, trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
+    trr_status, trr_return_status, trr_refund_status,
+    trr_estimated_total, trr_return_transaction_uid,
+    trr_stripe_refund_id, trr_created_at, trr_updated_at
+"""
 
 
 def _already_returned_qty(db, order_uid, ti_uid):
@@ -482,6 +512,23 @@ def _already_returned_qty(db, order_uid, ti_uid):
     )
     rows = q.get("result") or []
     return int(_to_float(rows[0].get("returned_qty"))) if rows else 0
+
+
+def _reserved_return_qty(db, order_uid, ti_uid, exclude_trr_uid=None):
+    """Qty already claimed by other open return requests on this sale."""
+    open_reqs = _load_open_return_requests(db, order_uid)
+    reserved = 0
+    for req in open_reqs:
+        if exclude_trr_uid and req.get("trr_uid") == exclude_trr_uid:
+            continue
+        for entry in req.get("items") or []:
+            if entry.get("transaction_item_uid") != ti_uid:
+                continue
+            try:
+                reserved += int(entry.get("return_quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+    return reserved
 
 
 def _load_sale_for_return(db, transaction_uid):
@@ -502,10 +549,15 @@ def _load_sale_for_return(db, transaction_uid):
     return rows[0] if rows else None
 
 
-def _validate_and_price_return_items(db, original_tx_uid, items_payload):
+def _validate_and_price_return_items(
+    db, original_tx_uid, items_payload, exclude_trr_uid=None
+):
     """
     Validate return lines and compute refund breakdown.
     Returns (ok, error_dict_or_None, context_dict_or_None).
+
+    exclude_trr_uid: when confirming an existing request, do not count that
+    request's own reserved qty against itself.
     """
     if not isinstance(items_payload, list) or len(items_payload) == 0:
         return False, {
@@ -577,7 +629,13 @@ def _validate_and_price_return_items(db, original_tx_uid, items_payload):
         ti_row = ti_rows[0]
         original_qty = int(ti_row.get("ti_bs_qty") or 0)
         already_returned = _already_returned_qty(db, original_tx_uid, ti_uid)
-        remaining = original_qty - already_returned
+        reserved = _reserved_return_qty(
+            db,
+            original_tx_uid,
+            ti_uid,
+            exclude_trr_uid=exclude_trr_uid,
+        )
+        remaining = original_qty - already_returned - reserved
         if rq > remaining:
             return False, {
                 "message": (
@@ -921,51 +979,112 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
     }
 
 
-def _load_return_request(db, transaction_uid):
+def _load_return_request_by_uid(db, trr_uid):
+    if not trr_uid:
+        return None
     _ensure_return_requests_table(db)
     q = db.execute(
-        """
-        SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
-               trr_status, trr_return_status, trr_refund_status,
-               trr_estimated_total, trr_return_transaction_uid,
-               trr_stripe_refund_id, trr_created_at, trr_updated_at
+        f"""
+        SELECT {_TRR_SELECT_COLS}
+        FROM every_circle.transaction_return_requests
+        WHERE trr_uid = %s
+        """,
+        (trr_uid,),
+    )
+    rows = q.get("result") or []
+    return _hydrate_return_request_row(rows[0]) if rows else None
+
+
+def _load_return_requests_for_sale(db, transaction_uid):
+    """All return-request rows for a sale, newest first."""
+    if not transaction_uid:
+        return []
+    _ensure_return_requests_table(db)
+    q = db.execute(
+        f"""
+        SELECT {_TRR_SELECT_COLS}
         FROM every_circle.transaction_return_requests
         WHERE trr_transaction_uid = %s
+        ORDER BY trr_created_at DESC, trr_updated_at DESC
         """,
         (transaction_uid,),
     )
-    rows = q.get("result") or []
-    if not rows:
-        # Fallback if ALTER columns are not yet visible to SELECT
-        q = db.execute(
-            """
-            SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
-                   trr_status, trr_estimated_total, trr_return_transaction_uid,
-                   trr_stripe_refund_id, trr_created_at, trr_updated_at
-            FROM every_circle.transaction_return_requests
-            WHERE trr_transaction_uid = %s
-            """,
-            (transaction_uid,),
-        )
-        rows = q.get("result") or []
-        if not rows:
-            return None
-    row = rows[0]
-    try:
-        row["items"] = json.loads(row.get("trr_items_json") or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        row["items"] = []
+    return [
+        _hydrate_return_request_row(row)
+        for row in (q.get("result") or [])
+        if row
+    ]
 
-    if row.get("trr_return_status") or row.get("trr_refund_status"):
-        rs, fs = _normalize_status_pair(
-            row.get("trr_return_status"),
-            row.get("trr_refund_status"),
-        )
-    else:
-        rs, fs = _normalize_status_pair(row.get("trr_status"), None)
-    row["return_status"] = rs
-    row["refund_status"] = fs
-    return row
+
+def _is_open_return(return_status, refund_status):
+    """True when a return wave is in flight (awaiting seller/refund action)."""
+    return (return_status, refund_status) in (
+        (RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING),
+        (RETURN_STATUS_RETURNED, REFUND_STATUS_PENDING),
+    )
+
+
+def _load_open_return_requests(db, transaction_uid):
+    """Open (in-flight) return requests for a sale, newest first."""
+    return [
+        req
+        for req in _load_return_requests_for_sale(db, transaction_uid)
+        if _is_open_return(req.get("return_status"), req.get("refund_status"))
+    ]
+
+
+def _load_return_request(db, transaction_uid):
+    """
+    Back-compat: prefer the newest open request for a sale; else newest any.
+    Prefer _load_return_request_by_uid / _load_open_return_requests for new code.
+    """
+    open_reqs = _load_open_return_requests(db, transaction_uid)
+    if open_reqs:
+        return open_reqs[0]
+    all_reqs = _load_return_requests_for_sale(db, transaction_uid)
+    return all_reqs[0] if all_reqs else None
+
+
+def _resolve_return_request(db, transaction_uid, trr_uid=None):
+    """
+    Resolve which request to act on.
+    If trr_uid given, load it (must belong to sale).
+    Else if exactly one open request, use it.
+    Else if multiple open, require trr_uid.
+    """
+    if trr_uid:
+        req = _load_return_request_by_uid(db, trr_uid)
+        if not req:
+            return None, {
+                "message": f"Return request not found: {trr_uid}",
+                "code": 404,
+            }
+        if transaction_uid and req.get("trr_transaction_uid") != transaction_uid:
+            return None, {
+                "message": "trr_uid does not belong to this transaction_uid",
+                "code": 400,
+            }
+        return req, None
+
+    open_reqs = _load_open_return_requests(db, transaction_uid)
+    if len(open_reqs) == 1:
+        return open_reqs[0], None
+    if len(open_reqs) > 1:
+        return None, {
+            "message": (
+                "Multiple open return requests; pass trr_uid to select one"
+            ),
+            "code": 400,
+            "open_trr_uids": [r.get("trr_uid") for r in open_reqs],
+        }
+    # Fall back to newest closed request (legacy single-row callers)
+    req = _load_return_request(db, transaction_uid)
+    if not req:
+        return None, {
+            "message": "No pending return request found for this transaction",
+            "code": 404,
+        }
+    return req, None
 
 
 def _pair_for_sale(orig_tx, pending=None):
@@ -983,7 +1102,7 @@ def _pair_for_sale(orig_tx, pending=None):
     return _normalize_status_pair(orig_tx.get("transaction_return_status"), None)
 
 
-def _upsert_return_request(
+def _insert_return_request(
     db,
     transaction_uid,
     profile_id,
@@ -993,62 +1112,57 @@ def _upsert_return_request(
     refund_status,
     estimated_total,
 ):
+    """
+    Insert a new return-request row with a fresh trr_uid.
+    Multiple open requests per sale are allowed.
+    """
     _ensure_return_requests_table(db)
+    trr_uid = _new_trr_uid(db)
+    if not trr_uid:
+        return {
+            "code": 500,
+            "message": "Failed to generate return request UID",
+        }, None
+
     now = utc_now_str()
-    items_json = json.dumps(items_payload)
-    existing = _load_return_request(db, transaction_uid)
     fields = {
+        "trr_uid": trr_uid,
+        "trr_transaction_uid": transaction_uid,
         "trr_profile_id": profile_id,
-        "trr_items_json": items_json,
+        "trr_items_json": json.dumps(items_payload),
         "trr_note": note,
-        "trr_status": refund_status,  # money status (legacy column name)
+        "trr_status": refund_status,
         "trr_return_status": return_status,
         "trr_refund_status": refund_status,
         "trr_estimated_total": estimated_total,
         "trr_return_transaction_uid": None,
         "trr_stripe_refund_id": None,
+        "trr_created_at": now,
         "trr_updated_at": now,
     }
-    if existing:
-        return db.update(
-            "every_circle.transaction_return_requests",
-            {"trr_transaction_uid": transaction_uid},
-            fields,
-        )
-    fields.update(
-        {
-            "trr_transaction_uid": transaction_uid,
-            "trr_created_at": now,
-        }
-    )
-    return db.insert("every_circle.transaction_return_requests", fields)
+    result = db.insert("every_circle.transaction_return_requests", fields)
+    return result, trr_uid
 
 
-def _update_return_statuses(
+def _sale_has_other_open_returns(db, transaction_uid, exclude_trr_uid=None):
+    for req in _load_open_return_requests(db, transaction_uid):
+        if exclude_trr_uid and req.get("trr_uid") == exclude_trr_uid:
+            continue
+        return True
+    return False
+
+
+def _update_return_request_row(
     db,
-    transaction_uid,
+    trr_uid,
     return_status,
     refund_status,
     *,
-    return_requested=None,
-    return_note=None,
-    seller_note=None,
     return_transaction_uid=None,
     stripe_refund_id=None,
 ):
-    tx_fields = {"transaction_return_status": return_status}
-    if return_requested is not None:
-        tx_fields["transaction_return_requested"] = return_requested
-    if return_note is not None:
-        tx_fields["transaction_return_note"] = return_note
-    if seller_note is not None:
-        tx_fields["transaction_return_seller_note"] = seller_note
-    db.update(
-        "every_circle.transactions",
-        {"transaction_uid": transaction_uid},
-        tx_fields,
-    )
-
+    if not trr_uid:
+        return
     _ensure_return_requests_table(db)
     req_fields = {
         "trr_status": refund_status,
@@ -1062,12 +1176,68 @@ def _update_return_statuses(
         req_fields["trr_stripe_refund_id"] = stripe_refund_id
     db.update(
         "every_circle.transaction_return_requests",
-        {"trr_transaction_uid": transaction_uid},
+        {"trr_uid": trr_uid},
         req_fields,
     )
 
 
-def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refund_from_client=None):
+def _update_return_statuses(
+    db,
+    transaction_uid,
+    return_status,
+    refund_status,
+    *,
+    trr_uid=None,
+    return_requested=None,
+    return_note=None,
+    seller_note=None,
+    return_transaction_uid=None,
+    stripe_refund_id=None,
+):
+    """
+    Update the targeted return-request row (by trr_uid) and sale summary fields.
+    """
+    req_return_status = return_status
+    req_refund_status = refund_status
+
+    sale_return_status = return_status
+    sale_return_requested = return_requested
+    if sale_return_requested == 0 and _sale_has_other_open_returns(
+        db, transaction_uid, exclude_trr_uid=trr_uid
+    ):
+        sale_return_requested = 1
+        sale_return_status = RETURN_STATUS_RETURNING
+
+    tx_fields = {"transaction_return_status": sale_return_status}
+    if sale_return_requested is not None:
+        tx_fields["transaction_return_requested"] = sale_return_requested
+    if return_note is not None:
+        tx_fields["transaction_return_note"] = return_note
+    if seller_note is not None:
+        tx_fields["transaction_return_seller_note"] = seller_note
+    db.update(
+        "every_circle.transactions",
+        {"transaction_uid": transaction_uid},
+        tx_fields,
+    )
+
+    _update_return_request_row(
+        db,
+        trr_uid,
+        req_return_status,
+        req_refund_status,
+        return_transaction_uid=return_transaction_uid,
+        stripe_refund_id=stripe_refund_id,
+    )
+
+
+def _finalize_pending_return(
+    db,
+    original_tx_uid,
+    seller_note=None,
+    stripe_refund_from_client=None,
+    trr_uid=None,
+):
     """
     Seller/admin confirmation: item received (Returned) then ledger + Stripe.
     Flow: Returning-Pending → Returned-Pending → Returned-Refunded|Rejected
@@ -1086,13 +1256,18 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
             "code": 400,
         }, 400
 
-    pending = _load_return_request(db, original_tx_uid)
+    pending, resolve_err = _resolve_return_request(db, original_tx_uid, trr_uid)
+    if resolve_err:
+        return resolve_err, resolve_err.get("code", 400)
+
+    trr_uid = pending.get("trr_uid")
     return_status, refund_status = _pair_for_sale(orig_tx, pending)
 
     if refund_status == REFUND_STATUS_REFUNDED:
         return {
             "message": "Return already refunded",
             "code": 409,
+            "trr_uid": trr_uid,
             **_status_payload(return_status, refund_status),
         }, 409
     if (
@@ -1102,16 +1277,17 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
         return {
             "message": "Return was rejected; cannot refund",
             "code": 409,
+            "trr_uid": trr_uid,
             **_status_payload(return_status, refund_status),
         }, 409
 
-    if not pending or not pending.get("items"):
+    if not pending.get("items"):
         return {
             "message": "No pending return request found for this transaction",
             "code": 404,
+            "trr_uid": trr_uid,
         }, 404
 
-    # Must be Returning-Pending, or Returning-Rejected (admin override), or Returned-Pending
     allowed = (
         (RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING),
         (RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED),
@@ -1124,25 +1300,26 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
                 f"(status={_display_return_status(return_status, refund_status)})"
             ),
             "code": 409,
+            "trr_uid": trr_uid,
             **_status_payload(return_status, refund_status),
         }, 409
 
     items_payload = pending["items"]
     return_note = pending.get("trr_note")
 
-    # Step: Returned - Pending (seller received item)
     _update_return_statuses(
         db,
         original_tx_uid,
         RETURN_STATUS_RETURNED,
         REFUND_STATUS_PENDING,
+        trr_uid=trr_uid,
         return_requested=1,
         return_note=return_note,
         seller_note=seller_note,
     )
 
     ok, err, ctx = _validate_and_price_return_items(
-        db, original_tx_uid, items_payload
+        db, original_tx_uid, items_payload, exclude_trr_uid=trr_uid
     )
     if not ok:
         return err, err.get("code", 400)
@@ -1154,7 +1331,6 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
     if not ledger_ok:
         return ledger_err, ledger_err.get("code", 500)
 
-    # Prefer FE / IO-Payments createRefund result when provided (keys live on IO-Payments).
     if isinstance(stripe_refund_from_client, dict) and (
         "ok" in stripe_refund_from_client
         or stripe_refund_from_client.get("refund_id")
@@ -1171,6 +1347,7 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
             refund_meta["refund_grand"],
             metadata={
                 "order_uid": original_tx_uid,
+                "trr_uid": trr_uid,
                 "return_transaction_uid": ledger_result["return_transaction_uid"],
             },
         )
@@ -1183,6 +1360,7 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
         original_tx_uid,
         RETURN_STATUS_RETURNED,
         final_refund_status,
+        trr_uid=trr_uid,
         return_requested=0 if final_refund_status == REFUND_STATUS_REFUNDED else 1,
         return_note=return_note,
         seller_note=seller_note,
@@ -1197,6 +1375,7 @@ def _finalize_pending_return(db, original_tx_uid, seller_note=None, stripe_refun
             else "Item received; refund not completed (Rejected)"
         ),
         "code": 200,
+        "trr_uid": trr_uid,
         **_status_payload(RETURN_STATUS_RETURNED, final_refund_status),
         "stripe_refund": {
             "ok": bool(stripe_result.get("ok")),
@@ -1224,9 +1403,12 @@ def _refund_business_code_from_note(seller_note):
 
 class ReturnTransaction(Resource):
     """
-    POST: buyer requests a return → status Returning - Pending.
+    POST: buyer requests a return → creates a new trr_uid row (Returning - Pending).
     Does NOT write the return ledger or refund via Stripe.
-    Seller confirms receipt via ConfirmReturnTransaction → Returned - *.
+    Seller confirms via ConfirmReturnTransaction (pass trr_uid) → Returned - *.
+
+    Multiple concurrent open requests on the same sale are allowed as long as
+    remaining returnable qty (ledger + other open reservations) is sufficient.
     """
 
     def post(self):
@@ -1273,32 +1455,6 @@ class ReturnTransaction(Resource):
                     response["code"] = 403
                     return response, 403
 
-                pending = _load_return_request(db, original_tx_uid)
-                cur_return, cur_refund = _pair_for_sale(orig_tx, pending)
-
-                if (
-                    cur_return == RETURN_STATUS_RETURNING
-                    and cur_refund == REFUND_STATUS_PENDING
-                ):
-                    response["message"] = (
-                        "A return is already in progress (Returning - Pending)"
-                    )
-                    response["code"] = 409
-                    response.update(_status_payload(cur_return, cur_refund))
-                    return response, 409
-
-                if cur_refund == REFUND_STATUS_REFUNDED or (
-                    cur_return == RETURN_STATUS_RETURNED
-                    and cur_refund == REFUND_STATUS_PENDING
-                ):
-                    response["message"] = (
-                        "Return already finalized or awaiting refund "
-                        f"({_display_return_status(cur_return, cur_refund)})"
-                    )
-                    response["code"] = 409
-                    response.update(_status_payload(cur_return, cur_refund))
-                    return response, 409
-
                 ok, err, ctx = _validate_and_price_return_items(
                     db, original_tx_uid, items_payload
                 )
@@ -1306,7 +1462,7 @@ class ReturnTransaction(Resource):
                     return err, err.get("code", 400)
 
                 refund_meta = _refund_breakdown_from_context(orig_tx, ctx)
-                upsert = _upsert_return_request(
+                insert_result, trr_uid = _insert_return_request(
                     db,
                     original_tx_uid,
                     profile_id,
@@ -1316,11 +1472,11 @@ class ReturnTransaction(Resource):
                     REFUND_STATUS_PENDING,
                     refund_meta["total_customer_credit"],
                 )
-                if upsert.get("code") != 200:
-                    response["message"] = upsert.get(
+                if not trr_uid or insert_result.get("code") != 200:
+                    response["message"] = insert_result.get(
                         "message", "Failed to save return request"
                     )
-                    response["code"] = upsert.get("code", 500)
+                    response["code"] = insert_result.get("code", 500)
                     return response, response["code"]
 
                 _update_return_statuses(
@@ -1328,6 +1484,7 @@ class ReturnTransaction(Resource):
                     original_tx_uid,
                     RETURN_STATUS_RETURNING,
                     REFUND_STATUS_PENDING,
+                    trr_uid=trr_uid,
                     return_requested=1,
                     return_note=return_note,
                 )
@@ -1336,8 +1493,10 @@ class ReturnTransaction(Resource):
                     "Return requested successfully (Returning - Pending)"
                 )
                 response["code"] = 200
+                response["trr_uid"] = trr_uid
                 response["original_transaction_uid"] = original_tx_uid
                 response["order_uid"] = original_tx_uid
+                response["transaction_uid"] = original_tx_uid
                 response["transaction_return_requested"] = 1
                 response.update(
                     _status_payload(RETURN_STATUS_RETURNING, REFUND_STATUS_PENDING)
@@ -1353,7 +1512,7 @@ class ReturnTransaction(Resource):
                 response["transaction_return_items"] = items_payload
                 response["next_step"] = (
                     "Seller confirms item receipt via "
-                    "PUT /api/v1/transactions/return/confirm"
+                    "PUT /api/v1/transactions/return/confirm with trr_uid"
                 )
                 return response, 200
 
@@ -1375,6 +1534,9 @@ class ConfirmReturnTransaction(Resource):
       - transaction_uid (original sale)
       - seller_id (must match transaction_business_id)
 
+    Recommended:
+      - trr_uid (required when multiple open returns exist on the sale)
+
     Optional:
       - action: "confirm" (default) | "decline" | "set_refund_status"
       - transaction_return_seller_note
@@ -1394,6 +1556,7 @@ class ConfirmReturnTransaction(Resource):
                 return response, 400
 
             transaction_uid = payload.get("transaction_uid")
+            trr_uid = payload.get("trr_uid") or payload.get("return_request_uid")
             seller_id = (
                 payload.get("seller_id")
                 or payload.get("business_uid")
@@ -1425,7 +1588,13 @@ class ConfirmReturnTransaction(Resource):
                     response["code"] = 403
                     return response, 403
 
-                pending = _load_return_request(db, transaction_uid)
+                pending, resolve_err = _resolve_return_request(
+                    db, transaction_uid, trr_uid
+                )
+                if resolve_err:
+                    return resolve_err, resolve_err.get("code", 400)
+
+                trr_uid = pending.get("trr_uid")
                 cur_return, cur_refund = _pair_for_sale(orig_tx, pending)
 
                 if action in ("decline", "reject"):
@@ -1438,6 +1607,7 @@ class ConfirmReturnTransaction(Resource):
                             f"(status={_display_return_status(cur_return, cur_refund)})"
                         )
                         response["code"] = 409
+                        response["trr_uid"] = trr_uid
                         response.update(_status_payload(cur_return, cur_refund))
                         return response, 409
 
@@ -1446,12 +1616,14 @@ class ConfirmReturnTransaction(Resource):
                         transaction_uid,
                         RETURN_STATUS_RETURNING,
                         REFUND_STATUS_REJECTED,
+                        trr_uid=trr_uid,
                         return_requested=1,
                         seller_note=seller_note,
                     )
                     response["message"] = "Return rejected (Returning - Rejected)"
                     response["code"] = 200
                     response["transaction_uid"] = transaction_uid
+                    response["trr_uid"] = trr_uid
                     response.update(
                         _status_payload(
                             RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED
@@ -1460,8 +1632,6 @@ class ConfirmReturnTransaction(Resource):
                     return response, 200
 
                 if action in ("set_refund_status", "set_status"):
-                    # FE may ask to persist stripe_fail OR refunded after confirm
-                    # (e.g. IO-Payments createRefund succeeded but local Stripe path skipped).
                     requested = (
                         payload.get("refund_status")
                         or payload.get("transaction_refund_status")
@@ -1473,6 +1643,7 @@ class ConfirmReturnTransaction(Resource):
                             f"(status={_display_return_status(cur_return, cur_refund)})"
                         )
                         response["code"] = 409
+                        response["trr_uid"] = trr_uid
                         response.update(_status_payload(cur_return, cur_refund))
                         return response, 409
 
@@ -1490,6 +1661,7 @@ class ConfirmReturnTransaction(Resource):
                             transaction_uid,
                             RETURN_STATUS_RETURNED,
                             REFUND_STATUS_REFUNDED,
+                            trr_uid=trr_uid,
                             return_requested=0,
                             seller_note=seller_note,
                             stripe_refund_id=stripe_refund_id,
@@ -1497,6 +1669,7 @@ class ConfirmReturnTransaction(Resource):
                         response["message"] = "Refund status updated to refunded"
                         response["code"] = 200
                         response["transaction_uid"] = transaction_uid
+                        response["trr_uid"] = trr_uid
                         response.update(
                             _status_payload(
                                 RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED
@@ -1516,18 +1689,19 @@ class ConfirmReturnTransaction(Resource):
                             transaction_uid,
                             RETURN_STATUS_RETURNED,
                             REFUND_STATUS_REJECTED,
+                            trr_uid=trr_uid,
                             return_requested=1,
                             seller_note=seller_note,
                         )
                         response["message"] = "Refund status updated"
                         response["code"] = 200
                         response["transaction_uid"] = transaction_uid
+                        response["trr_uid"] = trr_uid
                         response.update(
                             _status_payload(
                                 RETURN_STATUS_RETURNED, REFUND_STATUS_REJECTED
                             )
                         )
-                        # FE display alias for Stripe/CC failure
                         response["refund_status"] = "stripe_fail"
                         response["transaction_refund_status"] = "stripe_fail"
                         response["display_status"] = "Returned - CC Issue"
@@ -1559,6 +1733,7 @@ class ConfirmReturnTransaction(Resource):
                     transaction_uid,
                     seller_note=seller_note,
                     stripe_refund_from_client=stripe_from_client,
+                    trr_uid=trr_uid,
                 )
 
         except Exception as e:
@@ -2972,7 +3147,10 @@ def _batch_order_bounty_paid(db, transaction_uids):
 
 
 def _batch_return_requests(db, transaction_uids):
-    """Load return-request rows keyed by sale transaction_uid."""
+    """
+    Load return-request rows keyed by sale transaction_uid.
+    Value is a list of hydrated requests (newest first).
+    """
     uids = [u for u in (transaction_uids or []) if u]
     if not uids:
         return {}
@@ -2980,31 +3158,18 @@ def _batch_return_requests(db, transaction_uids):
     placeholders = ", ".join(["%s"] * len(uids))
     q = db.execute(
         f"""
-        SELECT trr_transaction_uid, trr_profile_id, trr_items_json, trr_note,
-               trr_status, trr_return_status, trr_refund_status,
-               trr_estimated_total, trr_return_transaction_uid,
-               trr_stripe_refund_id, trr_created_at, trr_updated_at
+        SELECT {_TRR_SELECT_COLS}
         FROM every_circle.transaction_return_requests
         WHERE trr_transaction_uid IN ({placeholders})
+        ORDER BY trr_created_at DESC, trr_updated_at DESC
         """,
         tuple(uids),
     )
     out = {}
     for row in q.get("result") or []:
-        try:
-            row["items"] = json.loads(row.get("trr_items_json") or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            row["items"] = []
-        if row.get("trr_return_status") or row.get("trr_refund_status"):
-            rs, fs = _normalize_status_pair(
-                row.get("trr_return_status"),
-                row.get("trr_refund_status"),
-            )
-        else:
-            rs, fs = _normalize_status_pair(row.get("trr_status"), None)
-        row["return_status"] = rs
-        row["refund_status"] = fs
-        out[row.get("trr_transaction_uid")] = row
+        hydrated = _hydrate_return_request_row(row)
+        sale_uid = hydrated.get("trr_transaction_uid")
+        out.setdefault(sale_uid, []).append(hydrated)
     return out
 
 
@@ -3065,18 +3230,24 @@ def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
 
 
 def _pending_return_payload_for_sale(db, sale_row, pending):
-    """Build pending_return object for a seller sale row."""
+    """Build pending_return object for a seller sale / synthetic return row."""
     if not pending:
         return None
 
-    order_uid = sale_row.get("transaction_uid")
+    order_uid = (
+        sale_row.get("order_uid")
+        or sale_row.get("transaction_uid")
+        or pending.get("trr_transaction_uid")
+    )
     rs, fs = _pair_for_sale(sale_row, pending)
     status_fields = _status_payload(rs, fs)
     items = pending.get("items") or []
 
     estimated_refund = None
     if items:
-        ok, _err, ctx = _validate_and_price_return_items(db, order_uid, items)
+        ok, _err, ctx = _validate_and_price_return_items(
+            db, order_uid, items, exclude_trr_uid=pending.get("trr_uid")
+        )
         if ok:
             refund_meta = _refund_breakdown_from_context(sale_row, ctx)
             estimated_refund = {
@@ -3088,7 +3259,6 @@ def _pending_return_payload_for_sale(db, sale_row, pending):
                 "original_order_subtotal": refund_meta["original_order_subtotal"],
             }
         else:
-            # Fallback to stored estimate when live pricing fails
             stored = _to_float(pending.get("trr_estimated_total"))
             if stored:
                 estimated_refund = {
@@ -3101,6 +3271,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending):
     bounty_to_reclaim = _bounty_to_reclaim_for_items(db, order_uid, items)
 
     return {
+        "trr_uid": pending.get("trr_uid"),
         "note": pending.get("trr_note"),
         "items": items,
         "estimated_refund": estimated_refund,
@@ -3113,10 +3284,64 @@ def _pending_return_payload_for_sale(db, sale_row, pending):
     }
 
 
+def _synthetic_pending_return_row(db, sale_row, pending):
+    """Seller ORDERS line for an open return request (no ledger yet)."""
+    order_uid = sale_row.get("transaction_uid")
+    pending_payload = _pending_return_payload_for_sale(db, sale_row, pending)
+    credit = 0.0
+    if pending_payload and pending_payload.get("estimated_refund"):
+        credit = _to_float(
+            pending_payload["estimated_refund"].get("total_customer_credit")
+        )
+    elif pending.get("trr_estimated_total") is not None:
+        credit = _to_float(pending.get("trr_estimated_total"))
+
+    rs, fs = _pair_for_sale(sale_row, pending)
+    status_fields = _status_payload(rs, fs)
+    item_names = []
+    for entry in pending.get("items") or []:
+        name = (
+            entry.get("item_name")
+            or entry.get("bs_service_name")
+            or entry.get("transaction_item_uid")
+        )
+        if name:
+            item_names.append(str(name))
+
+    return {
+        "transaction_uid": pending.get("trr_uid"),
+        "trr_uid": pending.get("trr_uid"),
+        "order_uid": order_uid,
+        "transaction_original_uid": order_uid,
+        "transaction_type": "return",
+        "is_return": True,
+        "is_pending_return": True,
+        "transaction_datetime": pending.get("trr_created_at")
+        or sale_row.get("transaction_datetime"),
+        "transaction_total": f"{-abs(credit):.4f}",
+        "transaction_amount": None,
+        "transaction_taxes": None,
+        "transaction_fees": None,
+        "seller_id": sale_row.get("seller_id") or sale_row.get("transaction_business_id"),
+        "transaction_profile_id": sale_row.get("transaction_profile_id"),
+        "transaction_in_escrow": 0,
+        "transaction_return_requested": 1,
+        "transaction_return_note": pending.get("trr_note"),
+        "purchased_item": ", ".join(item_names) if item_names else None,
+        "order_bounty_paid": sale_row.get("order_bounty_paid", 0.0),
+        "pending_return": pending_payload,
+        "refund_amount": abs(credit),
+        **status_fields,
+    }
+
+
 def _enrich_seller_transaction_rows(db, rows):
     """
     Attach order_bounty_paid + return/refund status + pending_return summary
     for the business Account Screen tables.
+
+    Also injects a synthetic Return row for each open return request that does
+    not yet have a ledger transaction (so sellers see Returning - Pending).
     """
     if not rows:
         return rows
@@ -3137,7 +3362,16 @@ def _enrich_seller_transaction_rows(db, rows):
     bounty_map = _batch_order_bounty_paid(db, sale_uids)
     return_req_map = _batch_return_requests(db, sale_uids)
 
+    # Map ledger return_transaction_uid -> request (for completed return rows)
+    ledger_to_req = {}
+    for reqs in return_req_map.values():
+        for req in reqs:
+            ledger_uid = req.get("trr_return_transaction_uid")
+            if ledger_uid:
+                ledger_to_req[ledger_uid] = req
+
     enriched = []
+    sales_by_uid = {}
     for row in rows:
         if not isinstance(row, dict):
             enriched.append(row)
@@ -3152,25 +3386,70 @@ def _enrich_seller_transaction_rows(db, rows):
             sale_uid = out.get("transaction_uid")
 
         out["order_bounty_paid"] = bounty_map.get(sale_uid, 0.0)
+        reqs = return_req_map.get(sale_uid) or []
+        open_reqs = [
+            r
+            for r in reqs
+            if _is_open_return(r.get("return_status"), r.get("refund_status"))
+        ]
 
-        pending = return_req_map.get(sale_uid) if sale_uid else None
-        rs, fs = _pair_for_sale(out, pending)
-        if rs or fs:
-            out.update(_status_payload(rs, fs))
-        else:
-            out.setdefault("return_status", None)
-            out.setdefault("refund_status", None)
-            out.setdefault("transaction_refund_status", None)
-            out.setdefault("display_status", None)
-
-        if not is_return:
-            out["pending_return"] = _pending_return_payload_for_sale(db, out, pending)
-        else:
+        if is_return:
+            linked = ledger_to_req.get(out.get("transaction_uid"))
+            if linked:
+                rs, fs = _pair_for_sale(out, linked)
+                out.update(_status_payload(rs, fs))
+                out["trr_uid"] = linked.get("trr_uid")
+            else:
+                # Historical return ledger without linked request row
+                out.update(
+                    _status_payload(RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED)
+                )
             out["pending_return"] = None
-            # On return ledger rows, expose magnitude of customer credit
+            out["is_pending_return"] = False
             out["refund_amount"] = abs(_to_float(out.get("transaction_total")))
+        else:
+            sales_by_uid[sale_uid] = out
+            if open_reqs:
+                # Sale keeps fulfillment columns; expose open requests separately
+                out["pending_returns"] = [
+                    _pending_return_payload_for_sale(db, out, r) for r in open_reqs
+                ]
+                out["pending_return"] = out["pending_returns"][0]
+                rs, fs = _pair_for_sale(out, open_reqs[0])
+                out.update(_status_payload(rs, fs))
+            else:
+                out["pending_returns"] = []
+                out["pending_return"] = None
+                rs, fs = _pair_for_sale(out, None)
+                if rs or fs:
+                    out.update(_status_payload(rs, fs))
+                else:
+                    out.setdefault("return_status", None)
+                    out.setdefault("refund_status", None)
+                    out.setdefault("transaction_refund_status", None)
+                    out.setdefault("display_status", None)
 
         enriched.append(out)
+
+    # Inject synthetic Return lines for open requests (seller ORDERS visibility)
+    synthetic = []
+    for sale_uid, sale_row in sales_by_uid.items():
+        for req in return_req_map.get(sale_uid) or []:
+            if not _is_open_return(req.get("return_status"), req.get("refund_status")):
+                continue
+            if req.get("trr_return_transaction_uid"):
+                continue
+            synthetic.append(_synthetic_pending_return_row(db, sale_row, req))
+
+    if synthetic:
+        enriched.extend(synthetic)
+        enriched.sort(
+            key=lambda r: (
+                str(r.get("transaction_datetime") or ""),
+                str(r.get("transaction_uid") or ""),
+            ),
+            reverse=True,
+        )
 
     return enriched
 
@@ -3337,6 +3616,7 @@ class DeclinedReturns(Resource):
                         t.transaction_return_status,
                         t.transaction_return_seller_note,
                         t.transaction_datetime,
+                        r.trr_uid,
                         COALESCE(r.trr_return_status, t.transaction_return_status) AS return_status,
                         COALESCE(r.trr_refund_status, r.trr_status, 'rejected') AS refund_status,
                         CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS buyer_name,
@@ -3387,6 +3667,7 @@ class DeclinedReturns(Resource):
         try:
             data = request.get_json()
             transaction_uid = data.get("transaction_uid")
+            trr_uid = data.get("trr_uid") or data.get("return_request_uid")
             seller_note = data.get("transaction_return_seller_note", "")
 
             if not transaction_uid:
@@ -3400,11 +3681,11 @@ class DeclinedReturns(Resource):
                 if action == "resolve":
                     favor = data.get("resolved_in_favor_of", "seller")
                     if favor == "buyer":
-                        # Buyer wins dispute → Returned - Refunded (or Rejected if Stripe fails)
                         body, status_code = _finalize_pending_return(
                             db,
                             transaction_uid,
                             seller_note=seller_note or None,
+                            trr_uid=trr_uid,
                         )
                         if status_code == 200:
                             body["message"] = (
@@ -3412,8 +3693,12 @@ class DeclinedReturns(Resource):
                             )
                         return body, status_code
 
-                    # Seller wins → Returned - Rejected (or keep Returning - Rejected)
-                    pending = _load_return_request(db, transaction_uid)
+                    pending, resolve_err = _resolve_return_request(
+                        db, transaction_uid, trr_uid
+                    )
+                    if resolve_err:
+                        return resolve_err, resolve_err.get("code", 400)
+                    trr_uid = pending.get("trr_uid")
                     orig_tx = _load_sale_for_return(db, transaction_uid) or {}
                     cur_return, _cur_refund = _pair_for_sale(orig_tx, pending)
                     final_return = (
@@ -3426,6 +3711,7 @@ class DeclinedReturns(Resource):
                         transaction_uid,
                         final_return,
                         REFUND_STATUS_REJECTED,
+                        trr_uid=trr_uid,
                         return_requested=0,
                         seller_note=seller_note or None,
                     )
@@ -3434,22 +3720,31 @@ class DeclinedReturns(Resource):
                         f"({_display_return_status(final_return, REFUND_STATUS_REJECTED)})"
                     )
                     response["code"] = 200
+                    response["trr_uid"] = trr_uid
                     response.update(
                         _status_payload(final_return, REFUND_STATUS_REJECTED)
                     )
                     return response, 200
 
-                # Default action: mark rejected (Returning - Rejected)
+                pending, resolve_err = _resolve_return_request(
+                    db, transaction_uid, trr_uid
+                )
+                if resolve_err:
+                    return resolve_err, resolve_err.get("code", 400)
+                trr_uid = pending.get("trr_uid")
+
                 _update_return_statuses(
                     db,
                     transaction_uid,
                     RETURN_STATUS_RETURNING,
                     REFUND_STATUS_REJECTED,
+                    trr_uid=trr_uid,
                     return_requested=1,
                     seller_note=seller_note or None,
                 )
                 response["message"] = "Return rejected (Returning - Rejected)"
                 response["code"] = 200
+                response["trr_uid"] = trr_uid
                 response.update(
                     _status_payload(RETURN_STATUS_RETURNING, REFUND_STATUS_REJECTED)
                 )
