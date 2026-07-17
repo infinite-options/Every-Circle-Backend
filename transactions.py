@@ -1763,11 +1763,13 @@ class Transactions(Resource):
                     """
                     SELECT
                     t.transaction_uid,
+                    t.transaction_original_uid,
                     COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
                     COALESCE(t.transaction_type, 'sale') AS transaction_type,
                     (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                     t.transaction_datetime,
                     t.transaction_total,
+                    t.transaction_amount,
                     t.transaction_taxes,
                     t.transaction_fees,
                     t.transaction_profile_id,
@@ -1846,12 +1848,14 @@ class Transactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = _enrich_list_transaction_rows(db, rows)
                     response["message"] = "Transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
                     response["count"] = len(rows)
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
+                    response["datetime_storage"] = "UTC"
                 else:
                     response["message"] = result.get(
                         "message", "Query execution failed"
@@ -3284,8 +3288,48 @@ def _pending_return_payload_for_sale(db, sale_row, pending):
     }
 
 
+def _sale_item_names_by_ti(db, order_uid, ti_uids):
+    """Map sale transaction_item_uid → human item name for pending return rows."""
+    uids = [u for u in (ti_uids or []) if u]
+    if not order_uid or not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT
+            ti.ti_uid,
+            ti.ti_bs_id,
+            CASE
+                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                ELSE ti.ti_bs_id
+            END AS item_name
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.business_services bs
+            ON ti.ti_bs_id = bs.bs_uid
+        LEFT JOIN every_circle.profile_expertise pe
+            ON ti.ti_bs_id = pe.profile_expertise_uid
+        LEFT JOIN every_circle.wish_response wr
+            ON ti.ti_bs_id = wr.wish_response_uid
+        LEFT JOIN every_circle.profile_wish pw
+            ON wr.wr_profile_wish_id = pw.profile_wish_uid
+        WHERE ti.ti_transaction_id = %s
+          AND ti.ti_uid IN ({placeholders})
+        """,
+        tuple([order_uid] + uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        out[row.get("ti_uid")] = {
+            "item_name": row.get("item_name"),
+            "ti_bs_id": row.get("ti_bs_id"),
+        }
+    return out
+
+
 def _synthetic_pending_return_row(db, sale_row, pending):
-    """Seller ORDERS line for an open return request (no ledger yet)."""
+    """Account-list line for an open return request (no ledger yet)."""
     order_uid = sale_row.get("transaction_uid")
     pending_payload = _pending_return_payload_for_sale(db, sale_row, pending)
     credit = 0.0
@@ -3298,15 +3342,36 @@ def _synthetic_pending_return_row(db, sale_row, pending):
 
     rs, fs = _pair_for_sale(sale_row, pending)
     status_fields = _status_payload(rs, fs)
+
+    items = pending.get("items") or []
+    ti_uids = [e.get("transaction_item_uid") for e in items if e.get("transaction_item_uid")]
+    name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
+
     item_names = []
-    for entry in pending.get("items") or []:
+    return_lines = []
+    qty_total = 0
+    for entry in items:
+        ti_uid = entry.get("transaction_item_uid")
+        try:
+            rq = int(entry.get("return_quantity") or 0)
+        except (TypeError, ValueError):
+            rq = 0
+        qty_total += abs(rq)
+        looked_up = name_map.get(ti_uid) or {}
         name = (
             entry.get("item_name")
             or entry.get("bs_service_name")
-            or entry.get("transaction_item_uid")
+            or looked_up.get("item_name")
         )
         if name:
             item_names.append(str(name))
+        return_lines.append(
+            {
+                "ti_uid": ti_uid,
+                "item_name": name,
+                "return_quantity": abs(rq),
+            }
+        )
 
     return {
         "transaction_uid": pending.get("trr_uid"),
@@ -3323,11 +3388,16 @@ def _synthetic_pending_return_row(db, sale_row, pending):
         "transaction_taxes": None,
         "transaction_fees": None,
         "seller_id": sale_row.get("seller_id") or sale_row.get("transaction_business_id"),
+        "business_name": sale_row.get("business_name"),
         "transaction_profile_id": sale_row.get("transaction_profile_id"),
         "transaction_in_escrow": 0,
         "transaction_return_requested": 1,
         "transaction_return_note": pending.get("trr_note"),
         "purchased_item": ", ".join(item_names) if item_names else None,
+        "ti_bs_qty": qty_total,
+        "return_lines": return_lines,
+        "lines": return_lines,
+        "return_quantity_total": qty_total,
         "order_bounty_paid": sale_row.get("order_bounty_paid", 0.0),
         "pending_return": pending_payload,
         "refund_amount": abs(credit),
@@ -3335,18 +3405,118 @@ def _synthetic_pending_return_row(db, sale_row, pending):
     }
 
 
-def _enrich_seller_transaction_rows(db, rows):
+def _batch_return_lines(db, return_tx_uids):
     """
-    Attach order_bounty_paid + return/refund status + pending_return summary
-    for the business Account Screen tables.
+    Load return ledger line items keyed by return transaction_uid.
+    Each line: item name, qty (signed negative), abs qty, cost, original sale ti uid.
+    """
+    uids = [u for u in (return_tx_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT
+            ti.ti_transaction_id AS return_transaction_uid,
+            ti.ti_uid,
+            ti.ti_original_ti_uid,
+            ti.ti_bs_id,
+            ti.ti_bs_qty,
+            ti.ti_bs_cost,
+            CASE
+                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                ELSE ti.ti_bs_id
+            END AS item_name
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.business_services bs
+            ON ti.ti_bs_id = bs.bs_uid
+        LEFT JOIN every_circle.profile_expertise pe
+            ON ti.ti_bs_id = pe.profile_expertise_uid
+        LEFT JOIN every_circle.wish_response wr
+            ON ti.ti_bs_id = wr.wish_response_uid
+        LEFT JOIN every_circle.profile_wish pw
+            ON wr.wr_profile_wish_id = pw.profile_wish_uid
+        WHERE ti.ti_transaction_id IN ({placeholders})
+        ORDER BY ti.ti_uid
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        tx_uid = row.get("return_transaction_uid")
+        qty = int(_to_float(row.get("ti_bs_qty")))
+        out.setdefault(tx_uid, []).append(
+            {
+                "ti_uid": row.get("ti_uid"),
+                "ti_original_ti_uid": row.get("ti_original_ti_uid"),
+                "ti_bs_id": row.get("ti_bs_id"),
+                "item_name": row.get("item_name"),
+                "quantity": qty,
+                "return_quantity": abs(qty),
+                "unit_cost": _to_float(row.get("ti_bs_cost")),
+            }
+        )
+    return out
 
-    Also injects a synthetic Return row for each open return request that does
-    not yet have a ledger transaction (so sellers see Returning - Pending).
+
+def _normalize_completed_return_row(out, linked_req=None, return_lines=None):
+    """Ensure completed reverse-txn rows have FE-stable return fields."""
+    out["transaction_type"] = "return"
+    out["is_return"] = True
+    out["is_pending_return"] = False
+    out["order_uid"] = (
+        out.get("order_uid")
+        or out.get("transaction_original_uid")
+        or out.get("transaction_uid")
+    )
+    if out.get("transaction_original_uid") is None and out.get("order_uid"):
+        out["transaction_original_uid"] = out.get("order_uid")
+
+    if linked_req:
+        rs, fs = _pair_for_sale(out, linked_req)
+        out.update(_status_payload(rs, fs))
+        out["trr_uid"] = linked_req.get("trr_uid")
+    else:
+        # Historical ledger with no linked request row
+        if not out.get("return_status") and not out.get("refund_status"):
+            out.update(
+                _status_payload(RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED)
+            )
+
+    lines = return_lines or []
+    out["return_lines"] = lines
+    out["lines"] = lines
+    if lines and not out.get("purchased_item"):
+        out["purchased_item"] = ", ".join(
+            str(l.get("item_name") or l.get("ti_bs_id") or "")
+            for l in lines
+            if l.get("item_name") or l.get("ti_bs_id")
+        )
+    qty_sum = sum(int(l.get("return_quantity") or 0) for l in lines)
+    if qty_sum and out.get("ti_bs_qty") is None:
+        out["ti_bs_qty"] = -qty_sum
+    out["return_quantity_total"] = qty_sum or abs(int(_to_float(out.get("ti_bs_qty"))))
+    out["refund_amount"] = abs(_to_float(out.get("transaction_total")))
+    out["pending_return"] = None
+    return out
+
+
+def _enrich_list_transaction_rows(db, rows):
+    """
+    Attach return/refund status + pending_return summary for Account Screen lists
+    (personal purchases and business seller_transactions).
+
+    Ensures completed reverse return transactions appear as first-class Return rows
+    with order_uid, negative total, item lines, and returned/refunded statuses.
+    Also injects synthetic Return rows for open (not yet confirmed) requests.
     """
     if not rows:
         return rows
 
     sale_uids = []
+    return_tx_uids = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -3354,6 +3524,8 @@ def _enrich_seller_transaction_rows(db, rows):
         is_return = bool(row.get("is_return")) or tx_type == "return"
         if is_return:
             uid = row.get("order_uid") or row.get("transaction_original_uid")
+            if row.get("transaction_uid"):
+                return_tx_uids.append(row.get("transaction_uid"))
         else:
             uid = row.get("transaction_uid")
         if uid:
@@ -3361,8 +3533,8 @@ def _enrich_seller_transaction_rows(db, rows):
 
     bounty_map = _batch_order_bounty_paid(db, sale_uids)
     return_req_map = _batch_return_requests(db, sale_uids)
+    return_lines_map = _batch_return_lines(db, return_tx_uids)
 
-    # Map ledger return_transaction_uid -> request (for completed return rows)
     ledger_to_req = {}
     for reqs in return_req_map.values():
         for req in reqs:
@@ -3395,22 +3567,16 @@ def _enrich_seller_transaction_rows(db, rows):
 
         if is_return:
             linked = ledger_to_req.get(out.get("transaction_uid"))
-            if linked:
-                rs, fs = _pair_for_sale(out, linked)
-                out.update(_status_payload(rs, fs))
-                out["trr_uid"] = linked.get("trr_uid")
-            else:
-                # Historical return ledger without linked request row
-                out.update(
-                    _status_payload(RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED)
-                )
-            out["pending_return"] = None
-            out["is_pending_return"] = False
-            out["refund_amount"] = abs(_to_float(out.get("transaction_total")))
+            out = _normalize_completed_return_row(
+                out,
+                linked_req=linked,
+                return_lines=return_lines_map.get(out.get("transaction_uid")) or [],
+            )
         else:
+            out["is_return"] = False
+            out["is_pending_return"] = False
             sales_by_uid[sale_uid] = out
             if open_reqs:
-                # Sale keeps fulfillment columns; expose open requests separately
                 out["pending_returns"] = [
                     _pending_return_payload_for_sale(db, out, r) for r in open_reqs
                 ]
@@ -3431,7 +3597,6 @@ def _enrich_seller_transaction_rows(db, rows):
 
         enriched.append(out)
 
-    # Inject synthetic Return lines for open requests (seller ORDERS visibility)
     synthetic = []
     for sale_uid, sale_row in sales_by_uid.items():
         for req in return_req_map.get(sale_uid) or []:
@@ -3454,6 +3619,11 @@ def _enrich_seller_transaction_rows(db, rows):
     return enriched
 
 
+# Back-compat alias used by seller path
+def _enrich_seller_transaction_rows(db, rows):
+    return _enrich_list_transaction_rows(db, rows)
+
+
 class SellerTransactions(Resource):
 
     def get(self, profile_id=None):
@@ -3473,6 +3643,7 @@ class SellerTransactions(Resource):
                     """
                     SELECT
                         t.transaction_uid,
+                        t.transaction_original_uid,
                         COALESCE(t.transaction_original_uid, t.transaction_uid) AS order_uid,
                         COALESCE(t.transaction_type, 'sale') AS transaction_type,
                         (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
@@ -3572,7 +3743,7 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
-                    rows = _enrich_seller_transaction_rows(db, rows)
+                    rows = _enrich_list_transaction_rows(db, rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200
                     response["data"] = rows
