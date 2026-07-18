@@ -173,19 +173,33 @@ def attach_shipping_to_transaction_rows(db, rows):
     """
     Attach requires_shipping / shipping_address / ts_uid onto list rows.
 
-    Uses order_uid when present so return rows inherit the original sale address.
+    Uses trr_transaction_uid / transaction_original_uid so return rows inherit
+    the original sale address.
     """
     if not rows:
         return rows
 
-    order_uids = [
-        row.get("order_uid") or row.get("transaction_uid") for row in rows
-    ]
+    def _sale_key(row):
+        if not isinstance(row, dict):
+            return None
+        return (
+            row.get("trr_transaction_uid")
+            or row.get("transaction_original_uid")
+            or row.get("transaction_uid")
+        )
+
+    order_uids = [_sale_key(row) for row in rows]
     shipping_map = load_shipping_by_order_uids(db, order_uids)
     for row in rows:
         if not isinstance(row, dict):
             continue
-        key = row.get("order_uid") or row.get("transaction_uid")
+        key = _sale_key(row)
+        if not key:
+            print(
+                "Error: attach_shipping_to_transaction_rows could not resolve "
+                f"parent sale uid for transaction_uid={row.get('transaction_uid')!r}"
+            )
+            continue
         row.update(shipping_payload_from_row(shipping_map.get(key)))
     return rows
 
@@ -213,6 +227,39 @@ SELLER_FULFILLMENT_STATUSES = frozenset(
         FULFILLMENT_STATUS_IN_TRANSIT,
     }
 )
+
+# Column limits for shipment history fields on transactions_items
+TI_TRACKING_CARRIER_MAX_LEN = 64
+TI_TRACKING_NUMBER_MAX_LEN = 128
+
+
+def append_fulfillment_field(
+    existing, new_value, *, separator=" | ", max_len=None
+):
+    """
+    Append a new shipment detail onto an existing value for partial shipments.
+
+    - Empty/whitespace new_value → keep existing unchanged
+    - Empty existing → store new_value
+    - Identical segment already present → keep existing (no duplicate append)
+    - Otherwise join with separator; if max_len is set and exceeded, keep the
+      newest portion (right side) so latest tracking info is retained
+    """
+    existing_s = (str(existing).strip() if existing is not None else "") or ""
+    new_s = (str(new_value).strip() if new_value is not None else "") or ""
+    if not new_s:
+        return existing_s or None
+    if not existing_s:
+        merged = new_s
+    else:
+        parts = [p.strip() for p in existing_s.split(separator) if p.strip()]
+        if new_s in parts:
+            merged = existing_s
+        else:
+            merged = f"{existing_s}{separator}{new_s}"
+    if max_len is not None and len(merged) > max_len:
+        merged = merged[-max_len:]
+    return merged or None
 
 
 def fulfillment_fields_from_row(row):

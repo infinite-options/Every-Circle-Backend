@@ -19,6 +19,8 @@ from transactions import (
     _load_open_return_requests,
     _pair_for_sale,
     _status_payload,
+    _remaining_to_ship_qty,
+    _is_cancel_unshipped_request,
 )
 
 
@@ -125,8 +127,6 @@ def _load_sale_header(db, order_uid):
             transaction_in_escrow,
             transaction_return_requested,
             transaction_return_note,
-            transaction_return_status,
-            transaction_return_seller_note,
             COALESCE(transaction_type, 'sale') AS transaction_type
         FROM every_circle.transactions
         WHERE transaction_uid = %s
@@ -202,6 +202,14 @@ def _load_sale_lines(db, order_uid):
     for row in lines_q.get("result") or []:
         order_qty = int(row.get("ti_bs_qty") or 0)
         returned_qty = int(row.get("returned_qty") or 0)
+        shipped_qty = int(row.get("ti_shipped_qty") or 0)
+        remaining_to_ship = _remaining_to_ship_qty(
+            db,
+            order_uid,
+            row.get("ti_uid"),
+            order_qty,
+            shipped_qty,
+        )
         line = {
             "ti_uid": row.get("ti_uid"),
             "ti_bs_id": row.get("ti_bs_id"),
@@ -209,6 +217,7 @@ def _load_sale_lines(db, order_uid):
             "ti_received_qty": int(row.get("ti_received_qty") or 0),
             "returned_qty": returned_qty,
             "remaining_qty": max(order_qty - returned_qty, 0),
+            "remaining_to_ship": remaining_to_ship,
             "ti_bs_cost": row.get("ti_bs_cost"),
             "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
             "ti_special_instructions": row.get("ti_special_instructions"),
@@ -370,15 +379,26 @@ class OrderDetail(Resource):
                     if not req:
                         return None
                     rs, fs = _pair_for_sale(sale, req)
+                    cancel_flag = _is_cancel_unshipped_request(req)
                     return {
                         "trr_uid": req.get("trr_uid"),
-                        "note": req.get("trr_note"),
+                        "note": req.get("trr_note") or req.get("note"),
+                        "seller_note": req.get("trr_seller_note")
+                        or req.get("seller_note"),
                         "estimated_total": req.get("trr_estimated_total"),
+                        "transaction_item_uid": req.get("transaction_item_uid")
+                        or req.get("trr_ti_uid"),
+                        "return_quantity": req.get("return_quantity")
+                        if req.get("return_quantity") is not None
+                        else req.get("trr_return_quantity"),
                         "items": req.get("items") or [],
                         "return_transaction_uid": req.get("trr_return_transaction_uid"),
                         "stripe_refund_id": req.get("trr_stripe_refund_id"),
                         "created_at": req.get("trr_created_at"),
                         "updated_at": req.get("trr_updated_at"),
+                        "cancel_unshipped": cancel_flag,
+                        "pre_ship_cancel": cancel_flag,
+                        "is_cancel_before_ship": cancel_flag,
                         **_status_payload(rs, fs),
                     }
 
@@ -393,6 +413,14 @@ class OrderDetail(Resource):
                 sale_payload["lines"] = sale_lines
                 sale_payload["pending_return"] = pending_return_payload
                 sale_payload["pending_returns"] = pending_returns_payload
+                # Prefer return-request fields over legacy sale columns.
+                if pending_return_payload:
+                    sale_payload["transaction_return_note"] = pending_return_payload.get(
+                        "note"
+                    )
+                    sale_payload["transaction_return_seller_note"] = (
+                        pending_return_payload.get("seller_note")
+                    )
                 sale_payload.update(status_fields)
                 sale_payload.update(shipping)
 
