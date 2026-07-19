@@ -1,6 +1,6 @@
 from aiohttp import payload
 from flask_restful import Resource
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import os
 import traceback
 from flask import request, jsonify
@@ -15,7 +15,7 @@ from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
 from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
-from datetime_utils import utc_now_str, enrich_datetime_fields
+from datetime_utils import utc_now_str, enrich_datetime_fields, parse_stored_datetime
 from transaction_shipping import (
     normalize_shipping_address,
     insert_transaction_shipping,
@@ -53,6 +53,88 @@ _VALID_REFUND_STATUSES = (
 )
 
 _RETURN_REQUESTS_TABLE_READY = False
+_RETURN_ELIGIBILITY_COLUMNS_READY = False
+
+RETURN_INELIGIBLE_NOT_RETURNABLE = "Not returnable"
+RETURN_INELIGIBLE_OUTSIDE_WINDOW = "Outside return window"
+
+
+def _ensure_return_eligibility_columns(db):
+    """Add ti_bs_is_returnable on transactions_items when missing."""
+    global _RETURN_ELIGIBILITY_COLUMNS_READY
+    if _RETURN_ELIGIBILITY_COLUMNS_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_bs_is_returnable TINYINT(1) NULL DEFAULT 1",
+        cmd="post",
+    )
+    _RETURN_ELIGIBILITY_COLUMNS_READY = True
+
+
+def _as_returnable_flag(value, default=True):
+    """Interpret 0/1/true/false; NULL/empty uses default (legacy lines = returnable)."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+def _normalize_is_returnable(value, default=1):
+    """Snapshot value for ti_bs_is_returnable (0 or 1)."""
+    return 1 if _as_returnable_flag(value, default=bool(default)) else 0
+
+
+def line_return_eligibility(ti_row, now=None):
+    """
+    Compute return eligibility for a sale line from snapshotted policy fields.
+
+    Returns dict with:
+      return_eligible (bool)
+      return_ineligible_reason ("Not returnable" | "Outside return window" | None)
+      ti_bs_is_returnable (0|1)
+      ti_bs_return_window_days
+    """
+    is_returnable_raw = ti_row.get("ti_bs_is_returnable")
+    is_returnable = _as_returnable_flag(is_returnable_raw, default=True)
+    window_days = ti_row.get("ti_bs_return_window_days")
+
+    result = {
+        "ti_bs_is_returnable": 1 if is_returnable else 0,
+        "ti_bs_return_window_days": window_days,
+        "return_eligible": True,
+        "return_ineligible_reason": None,
+    }
+
+    if not is_returnable:
+        result["return_eligible"] = False
+        result["return_ineligible_reason"] = RETURN_INELIGIBLE_NOT_RETURNABLE
+        return result
+
+    received_at = parse_stored_datetime(ti_row.get("ti_received_at"))
+    if received_at is None or window_days is None or str(window_days).strip() == "":
+        return result
+
+    try:
+        days = int(window_days)
+    except (TypeError, ValueError):
+        return result
+
+    now = now or datetime.now(timezone.utc)
+    deadline = received_at + timedelta(days=days)
+    if now > deadline:
+        result["return_eligible"] = False
+        result["return_ineligible_reason"] = RETURN_INELIGIBLE_OUTSIDE_WINDOW
+
+    return result
 
 
 def _display_return_status(return_status, refund_status):
@@ -744,7 +826,8 @@ def _load_sale_for_return(db, transaction_uid):
 
 
 def _validate_and_price_return_items(
-    db, original_tx_uid, items_payload, exclude_trr_uid=None
+    db, original_tx_uid, items_payload, exclude_trr_uid=None,
+    enforce_return_eligibility=True,
 ):
     """
     Validate return lines and compute refund breakdown.
@@ -753,7 +836,12 @@ def _validate_and_price_return_items(
     exclude_trr_uid: when confirming an existing request, do not count that
     request's (or batch's) own reserved qty against itself. Accepts one uid
     or a list/set of uids for multi-item wave confirm.
+
+    enforce_return_eligibility: when True (create-return), reject lines that
+    are not returnable or outside the snapshotted return window.
     """
+    _ensure_return_eligibility_columns(db)
+
     if not isinstance(items_payload, list) or len(items_payload) == 0:
         return False, {
             "message": "transaction_return_items must be a non-empty list",
@@ -807,8 +895,9 @@ def _validate_and_price_return_items(
             """
             SELECT ti_uid, ti_transaction_id, ti_bs_id, ti_bso_id, ti_bs_qty, ti_bs_cost,
                    ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
-                   ti_bs_refund_policy, ti_bs_return_window_days,
-                   ti_selected_options, ti_special_instructions, ti_choices_extra_cost
+                   ti_bs_refund_policy, ti_bs_return_window_days, ti_bs_is_returnable,
+                   ti_received_at, ti_selected_options, ti_special_instructions,
+                   ti_choices_extra_cost
             FROM every_circle.transactions_items
             WHERE ti_uid = %s AND ti_transaction_id = %s
             """,
@@ -822,6 +911,23 @@ def _validate_and_price_return_items(
             }, None
 
         ti_row = ti_rows[0]
+        if enforce_return_eligibility:
+            eligibility = line_return_eligibility(ti_row)
+            if not eligibility["return_eligible"]:
+                reason = eligibility["return_ineligible_reason"]
+                if reason == RETURN_INELIGIBLE_NOT_RETURNABLE:
+                    message = "Item is not returnable"
+                elif reason == RETURN_INELIGIBLE_OUTSIDE_WINDOW:
+                    message = "Item is outside the return window"
+                else:
+                    message = "Item is not eligible for return"
+                return False, {
+                    "message": message,
+                    "code": 422,
+                    "transaction_item_uid": ti_uid,
+                    "return_ineligible_reason": reason,
+                }, None
+
         original_qty = int(ti_row.get("ti_bs_qty") or 0)
         already_returned = _already_returned_qty(db, original_tx_uid, ti_uid)
         reserved = _reserved_return_qty(
@@ -1074,6 +1180,9 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
             "ti_bs_tax_rate": ti_row.get("ti_bs_tax_rate"),
             "ti_bs_refund_policy": ti_row.get("ti_bs_refund_policy"),
             "ti_bs_return_window_days": ti_row.get("ti_bs_return_window_days"),
+            "ti_bs_is_returnable": _normalize_is_returnable(
+                ti_row.get("ti_bs_is_returnable")
+            ),
         }
         if ti_row.get("ti_bso_id"):
             tx_item["ti_bso_id"] = ti_row.get("ti_bso_id")
@@ -1760,7 +1869,11 @@ def _finalize_pending_return(
     )
 
     ok, err, ctx = _validate_and_price_return_items(
-        db, original_tx_uid, items_payload, exclude_trr_uid=batch_uids
+        db,
+        original_tx_uid,
+        items_payload,
+        exclude_trr_uid=batch_uids,
+        enforce_return_eligibility=False,
     )
     if not ok:
         return err, err.get("code", 400)
@@ -2530,6 +2643,7 @@ class Transactions(Resource):
                 print("items: ", payload.get("items"))
                 items_count = 0
                 bounty_count = 0
+                _ensure_return_eligibility_columns(db)
 
                 for item in payload.get("items", []):
                     print(item)
@@ -2614,6 +2728,9 @@ class Transactions(Resource):
                         tx_item["ti_bs_return_window_days"] = bs_data.get(
                             "bs_return_window_days"
                         )
+                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
+                            bs_data.get("bs_is_returnable")
+                        )
                         item_bounty_type = (
                             bs_data.get("bs_bounty_type", "per_item") or "per_item"
                         )
@@ -2675,6 +2792,9 @@ class Transactions(Resource):
                         )
                         tx_item["ti_bs_return_window_days"] = bs_data.get(
                             "profile_expertise_return_window_days"
+                        )
+                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
+                            bs_data.get("profile_expertise_is_returnable")
                         )
                         item_bounty_type = (
                             bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
@@ -2739,6 +2859,9 @@ class Transactions(Resource):
                         )
                         tx_item["ti_bs_return_window_days"] = bs_data.get(
                             "profile_wish_return_window_days"
+                        )
+                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
+                            bs_data.get("profile_wish_is_returnable")
                         )
                         item_bounty_type = (
                             bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
@@ -3818,7 +3941,11 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
     estimated_refund = None
     if items:
         ok, _err, ctx = _validate_and_price_return_items(
-            db, order_uid, items, exclude_trr_uid=pending.get("trr_uid")
+            db,
+            order_uid,
+            items,
+            exclude_trr_uid=pending.get("trr_uid"),
+            enforce_return_eligibility=False,
         )
         if ok:
             refund_meta = _refund_breakdown_from_context(sale_row, ctx)

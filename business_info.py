@@ -59,8 +59,10 @@ def _normalize_business_cc_fee_payer(value):
 #
 # Frontend-only keys (never DB columns) are removed in _derive_business_service_fields:
 #   bs_qty_unlimited, bs_available_quantity, bs_free_shipping, bs_buyer_pays_shipping,
-#   bs_cc_fee_payer, bs_condition_type, bs_condition_detail
-# They are mapped into bs_quantity, bs_shipping, bs_condition when possible.
+#   bs_cc_fee_payer, bs_condition_type, bs_condition_detail,
+#   is_returnable, return_window_days (aliases → bs_*)
+# They are mapped into bs_quantity, bs_shipping, bs_condition, bs_is_returnable,
+# bs_return_window_days when possible.
 #
 # If you add new API fields, either add a DB column and list it here, or strip/map
 # them in _derive_business_service_fields so they never reach _prepare.
@@ -79,6 +81,7 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
         "bs_discount_allowed",
         "bs_refund_policy",
         "bs_return_window_days",
+        "bs_is_returnable",
         "bs_image_url",
         "bs_image_url_is_public",
         "bs_display_order",
@@ -95,6 +98,21 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
         "bs_condition",
     }
 )
+
+_BS_RETURNABLE_COLUMN_READY = False
+
+
+def _ensure_business_service_returnable_column(db):
+    """Add bs_is_returnable when missing (older installs)."""
+    global _BS_RETURNABLE_COLUMN_READY
+    if _BS_RETURNABLE_COLUMN_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.business_services "
+        "ADD COLUMN bs_is_returnable TINYINT(1) NULL DEFAULT 1",
+        cmd="post",
+    )
+    _BS_RETURNABLE_COLUMN_READY = True
 
 
 def _truthy_flag(x):
@@ -123,8 +141,30 @@ def _derive_business_service_fields(service_data):
         "bs_cc_fee_payer",
         "bs_condition_type",
         "bs_condition_detail",
+        "is_returnable",
+        "return_window_days",
     )
     legacy = {k: service_data.pop(k, None) for k in legacy_keys}
+
+    # --- bs_is_returnable / bs_return_window_days (FE aliases) ---
+    if "bs_is_returnable" not in service_data and legacy.get("is_returnable") not in (
+        None,
+        "",
+    ):
+        service_data["bs_is_returnable"] = 1 if _truthy_flag(legacy["is_returnable"]) else 0
+    elif "bs_is_returnable" in service_data and service_data["bs_is_returnable"] not in (
+        None,
+        "",
+    ):
+        service_data["bs_is_returnable"] = (
+            1 if _truthy_flag(service_data["bs_is_returnable"]) else 0
+        )
+
+    if (
+        "bs_return_window_days" not in service_data
+        or service_data.get("bs_return_window_days") in (None, "")
+    ) and legacy.get("return_window_days") not in (None, ""):
+        service_data["bs_return_window_days"] = legacy["return_window_days"]
 
     # --- bs_quantity ---
     raw_q = service_data.get("bs_quantity")
@@ -996,6 +1036,7 @@ class BusinessInfo(Resource):
                         if not isinstance(services_data, list):
                             raise ValueError("business_services must be a JSON array")
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        _ensure_business_service_returnable_column(db)
 
                         # Process each service entry
                         for idx, service_data in enumerate(services_data):
@@ -1876,6 +1917,7 @@ class BusinessInfo(Resource):
             # import json
             services = json.loads(services_str)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _ensure_business_service_returnable_column(db)
 
             for idx, service in enumerate(services):
                 derived_input = dict(service)
@@ -1954,6 +1996,7 @@ class BusinessInfo(Resource):
                     "bs_discount_allowed": service.get("bs_discount_allowed", 0),
                     "bs_refund_policy": service.get("bs_refund_policy"),
                     "bs_return_window_days": service.get("bs_return_window_days"),
+                    "bs_is_returnable": service.get("bs_is_returnable", service.get("is_returnable")),
                     "bs_image_url": bs_image_url_value,
                     "bs_display_order": service.get("bs_display_order"),
                     "bs_tags": service.get("bs_tags"),
@@ -1985,7 +2028,13 @@ class BusinessInfo(Resource):
                     )
 
                 _derive_business_service_fields(derived_input)
-                for k in ("bs_quantity", "bs_shipping", "bs_condition"):
+                for k in (
+                    "bs_quantity",
+                    "bs_shipping",
+                    "bs_condition",
+                    "bs_is_returnable",
+                    "bs_return_window_days",
+                ):
                     if k in derived_input:
                         service_data[k] = derived_input[k]
 

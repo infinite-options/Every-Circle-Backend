@@ -30,6 +30,26 @@ _WISH_S3_PREFIX = "profile_wish"
 _EXPERIENCE_S3_PREFIX = "profile_experience"
 _EDUCATION_S3_PREFIX = "profile_education"
 
+_OFFERING_RETURNABLE_COLUMNS_READY = False
+
+
+def _ensure_offering_returnable_columns(db):
+    """Add is_returnable on expertise/wish offerings when missing."""
+    global _OFFERING_RETURNABLE_COLUMNS_READY
+    if _OFFERING_RETURNABLE_COLUMNS_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.profile_expertise "
+        "ADD COLUMN profile_expertise_is_returnable TINYINT(1) NULL DEFAULT 1",
+        cmd="post",
+    )
+    db.execute(
+        "ALTER TABLE every_circle.profile_wish "
+        "ADD COLUMN profile_wish_is_returnable TINYINT(1) NULL DEFAULT 1",
+        cmd="post",
+    )
+    _OFFERING_RETURNABLE_COLUMNS_READY = True
+
 
 def _delete_expertise_s3_assets(expertise_uid):
     try:
@@ -82,6 +102,7 @@ def _expertise_dict_from_payload(exp_data):
     _set_if_present(m, exp_data, "profile_expertise_tax_rate", "taxRate")
     _set_if_present(m, exp_data, "profile_expertise_refund_policy", "refundPolicy")
     _set_if_present(m, exp_data, "profile_expertise_return_window_days", "returnWindowDays")
+    _set_if_present(m, exp_data, "profile_expertise_is_returnable", "isReturnable")
     if "startDateTime" in exp_data:
         m["profile_expertise_start"] = exp_data["startDateTime"]
     elif "start" in exp_data:
@@ -138,6 +159,7 @@ def _wish_dict_from_payload(wish_data):
     _set_if_present(m, wish_data, "profile_wish_tax_rate", "taxRate")
     _set_if_present(m, wish_data, "profile_wish_refund_policy", "refundPolicy")
     _set_if_present(m, wish_data, "profile_wish_return_window_days", "returnWindowDays")
+    _set_if_present(m, wish_data, "profile_wish_is_returnable", "isReturnable")
     if "startDateTime" in wish_data:
         m["profile_wish_start"] = wish_data["startDateTime"]
     elif "start" in wish_data:
@@ -1190,6 +1212,7 @@ class UserProfileInfo(Resource):
                         import json
                         expertises_data = json.loads(payload.pop('expertises'))
                         print("expertise data: ", expertises_data)
+                        _ensure_offering_returnable_columns(db)
                         
                         # Process each expertise entry (multipart: profile_expertise_image_0, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
@@ -1240,6 +1263,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         wishes_data = json.loads(payload.pop('wishes'))
+                        _ensure_offering_returnable_columns(db)
                         print("wishes data: ", wishes_data)
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
@@ -2032,6 +2056,7 @@ class UserProfileInfo(Resource):
                         expertises_data = json.loads(payload.pop('expertise_info'))
                         expertise_payload_refresh = True
                         expertise_uids = []
+                        _ensure_offering_returnable_columns(db)
                         
                         # Process each expertise entry (multipart files: profile_expertise_image_0, _1, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
@@ -2127,6 +2152,7 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_payload_refresh = True
                         wishes_uids = []
+                        _ensure_offering_returnable_columns(db)
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
                         for wish_idx, wish_data in enumerate(wishes_data):

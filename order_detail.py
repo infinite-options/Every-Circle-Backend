@@ -21,6 +21,8 @@ from transactions import (
     _status_payload,
     _remaining_to_ship_qty,
     _is_cancel_unshipped_request,
+    _ensure_return_eligibility_columns,
+    line_return_eligibility,
 )
 
 
@@ -155,6 +157,7 @@ def _line_name_case_sql():
 
 
 def _load_sale_lines(db, order_uid):
+    _ensure_return_eligibility_columns(db)
     name_case = _line_name_case_sql()
     lines_q = db.execute(
         f"""
@@ -163,10 +166,13 @@ def _load_sale_lines(db, order_uid):
             ti.ti_bs_id,
             ti.ti_bs_qty,
             COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
+            ti.ti_received_at,
             ti.ti_bs_cost,
             ti.ti_choices_extra_cost,
             ti.ti_special_instructions,
             ti.ti_selected_options,
+            ti.ti_bs_is_returnable,
+            ti.ti_bs_return_window_days,
             COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
             COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
             ti.ti_shipped_at,
@@ -210,6 +216,7 @@ def _load_sale_lines(db, order_uid):
             order_qty,
             shipped_qty,
         )
+        eligibility = line_return_eligibility(row)
         line = {
             "ti_uid": row.get("ti_uid"),
             "ti_bs_id": row.get("ti_bs_id"),
@@ -225,6 +232,10 @@ def _load_sale_lines(db, order_uid):
             "selected_options": _parse_selected_options_field(
                 row.get("ti_selected_options")
             ),
+            "ti_bs_is_returnable": eligibility["ti_bs_is_returnable"],
+            "ti_bs_return_window_days": eligibility["ti_bs_return_window_days"],
+            "return_eligible": eligibility["return_eligible"],
+            "return_ineligible_reason": eligibility["return_ineligible_reason"],
             **fulfillment_fields_from_row(row),
         }
         lines.append(line)
