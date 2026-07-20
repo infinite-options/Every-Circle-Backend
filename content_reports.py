@@ -92,6 +92,7 @@ def _report_exists(db, reporter_profile_uid, target_uid):
         FROM every_circle.content_reports
         WHERE report_reporter_profile_uid = %s
           AND report_target_uid = %s
+          AND report_status = 'pending'
         LIMIT 1
     """
     res = db.execute(query, (reporter_profile_uid, target_uid))

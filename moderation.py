@@ -73,9 +73,8 @@ def get_owner_visible_reports(db, target_uid):
     """
     Category/message per report for the content owner (never exposes the reporter).
 
-    Intentionally not filtered to report_status = 'pending': once an admin reviews
-    the content, its reports may be dismissed while the takedown itself persists
-    (taken_down / acknowledged), so the owner should still see which flags led to it.
+    Only pending reports are returned so dismissed flags (e.g. after admin
+    approval) are not shown while content is under review or taken down.
     """
     query = """
         SELECT report_uid,
@@ -84,6 +83,7 @@ def get_owner_visible_reports(db, target_uid):
                report_created_at
         FROM every_circle.content_reports
         WHERE report_target_uid = %s
+          AND report_status = 'pending'
         ORDER BY report_created_at ASC
     """
     res = db.execute(query, (target_uid,))
