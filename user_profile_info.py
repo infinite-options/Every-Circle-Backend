@@ -945,8 +945,10 @@ class UserProfileInfo(Resource):
                 # Get business info - returning all business entries for this profile
                 # business_info = db.select('every_circle.profile_has_business',
                 #                          where={'profile_business_profile_personal_id': profile_id})
+                # One row per business: duplicate business_user memberships for the
+                # same user+business would otherwise inflate business_info.
                 business_info = f"""
-                        SELECT -- * 
+                        SELECT
                             b.business_uid,
                             b.business_name,
                             b.business_phone_number,
@@ -970,10 +972,15 @@ class UserProfileInfo(Resource):
                             bu.bu_role,
                             bu.bu_individual_business_is_public
                         FROM every_circle.business b
-                        LEFT JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
-                        LEFT JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
-                        -- WHERE p.profile_personal_uid = '110-000015'
-                        WHERE p.profile_personal_uid = '{profile_id}';
+                        INNER JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
+                        INNER JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
+                        WHERE p.profile_personal_uid = '{profile_id}'
+                          AND bu.bu_uid = (
+                              SELECT MIN(bu2.bu_uid)
+                              FROM every_circle.business_user bu2
+                              WHERE bu2.bu_business_id = bu.bu_business_id
+                                AND bu2.bu_user_id = bu.bu_user_id
+                          )
                     """
                 # print("business_info query:", business_info)
                 business_result = db.execute(business_info)

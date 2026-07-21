@@ -506,264 +506,320 @@ class BusinessInfo(Resource):
                     response["code"] = 400
                     return response, 400
 
-                business_look_up_query = None
-                if business_google_id:
-                    business_look_up_query = db.select(
-                        "every_circle.business",
-                        where={"business_google_id": business_google_id},
+                # Serialize creates for the same google_id/name so concurrent
+                # double-POSTs cannot both pass the existence check.
+                lock_key = (business_google_id or business_name or "").strip()
+                lock_name = f"biz_create:{lock_key[:50]}"
+                create_lock_held = False
+                try:
+                    lock_resp = db.execute(
+                        "SELECT GET_LOCK(%s, 60) AS got_lock",
+                        (lock_name,),
                     )
-                elif business_name:
-                    business_look_up_query = db.select(
-                        "every_circle.business", where={"business_name": business_name}
+                    got_lock = (
+                        lock_resp.get("result")
+                        and lock_resp["result"][0].get("got_lock") in (1, "1", True)
                     )
-
-                if business_look_up_query and business_look_up_query["result"]:
-                    response["message"] = "BusinessInfo: Business already exists"
-                    response["code"] = 409
-                    return response, 409
-
-                business_stored_procedure_response = db.call(
-                    procedure="new_business_uid"
-                )
-                new_business_uid = business_stored_procedure_response["result"][0][
-                    "new_id"
-                ]
-
-                categories_uid_str = None
-                social_links_str = None
-                services_str = None
-                custom_tags = None
-
-                if "business_categories_uid" in payload:
-                    categories_uid_str = payload.pop("business_categories_uid")
-
-                if "social_links" in payload:
-                    social_links_str = payload.pop("social_links")
-
-                # Extract services data
-                if "business_services" in payload:
-                    services_str = payload.pop("business_services")
-
-                # Extract custom_tags if provided
-                if "custom_tags" in payload:
-                    try:
-                        custom_tags_str = payload.pop("custom_tags")
-                        # Try to parse as JSON if it's a string
-                        if isinstance(custom_tags_str, str):
-                            custom_tags = json.loads(custom_tags_str)
-                        elif isinstance(custom_tags_str, list):
-                            custom_tags = custom_tags_str
-                        else:
-                            print(
-                                f"Warning: custom_tags is not a valid format: {type(custom_tags_str)}"
-                            )
-                            custom_tags = None
-
-                        if custom_tags is not None and not isinstance(
-                            custom_tags, list
-                        ):
-                            print(
-                                f"Warning: custom_tags must be a list, got {type(custom_tags)}"
-                            )
-                            custom_tags = None
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing custom_tags JSON: {str(e)}")
-                        custom_tags = None
-                    except Exception as e:
-                        print(f"Error processing custom_tags: {str(e)}")
-                        custom_tags = None
-
-                # Extract business_user fields from payload
-                business_user_id = payload.pop(
-                    "business_user_id", user_uid
-                )  # Default to user_uid if not provided
-                business_role = payload.pop("business_role", None)
-                business_uid_param = payload.pop(
-                    "business_uid", None
-                )  # This should be None for POST, but handle if provided
-
-                payload["business_uid"] = new_business_uid
-                payload["business_joined_timestamp"] = datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-
-                if (
-                    "business_img_0" in request.files
-                    or "delete_business_images" in payload
-                ):
-                    key = {"business_personal_uid": new_business_uid}
-                    images = processImage(key, payload)
-                    payload["business_images_url"] = json.dumps(images)
-
-                # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
-                if (
-                    "business_profile_img" in request.files
-                    or "delete_business_profile_img" in payload
-                ):
-                    print(
-                        "[BUSINESS PROFILE IMAGE] POST - request.files keys=%s"
-                        % (list(request.files.keys()) if request.files else [])
-                    )
-                    print(
-                        "[BUSINESS PROFILE IMAGE] POST - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s"
-                        % (
-                            "business_profile_img" in (request.files or {}),
-                            "delete_business_profile_img" in payload,
+                    if not got_lock:
+                        response["message"] = (
+                            "BusinessInfo: Business create already in progress"
                         )
+                        response["code"] = 409
+                        return response, 409
+                    create_lock_held = True
+
+                    business_look_up_query = None
+                    if business_google_id:
+                        business_look_up_query = db.select(
+                            "every_circle.business",
+                            where={"business_google_id": business_google_id},
+                        )
+                    elif business_name:
+                        business_look_up_query = db.select(
+                            "every_circle.business",
+                            where={"business_name": business_name},
+                        )
+
+                    if business_look_up_query and business_look_up_query["result"]:
+                        existing_uid = business_look_up_query["result"][0].get(
+                            "business_uid"
+                        )
+                        response["message"] = "BusinessInfo: Business already exists"
+                        response["business_uid"] = existing_uid
+                        response["code"] = 409
+                        return response, 409
+
+                    business_stored_procedure_response = db.call(
+                        procedure="new_business_uid"
                     )
-                    if payload.get("delete_business_profile_img"):
+                    new_business_uid = business_stored_procedure_response["result"][0][
+                        "new_id"
+                    ]
+
+                    categories_uid_str = None
+                    social_links_str = None
+                    services_str = None
+                    custom_tags = None
+
+                    if "business_categories_uid" in payload:
+                        categories_uid_str = payload.pop("business_categories_uid")
+
+                    if "social_links" in payload:
+                        social_links_str = payload.pop("social_links")
+
+                    # Extract services data
+                    if "business_services" in payload:
+                        services_str = payload.pop("business_services")
+
+                    # Extract custom_tags if provided
+                    if "custom_tags" in payload:
+                        try:
+                            custom_tags_str = payload.pop("custom_tags")
+                            # Try to parse as JSON if it's a string
+                            if isinstance(custom_tags_str, str):
+                                custom_tags = json.loads(custom_tags_str)
+                            elif isinstance(custom_tags_str, list):
+                                custom_tags = custom_tags_str
+                            else:
+                                print(
+                                    f"Warning: custom_tags is not a valid format: {type(custom_tags_str)}"
+                                )
+                                custom_tags = None
+
+                            if custom_tags is not None and not isinstance(
+                                custom_tags, list
+                            ):
+                                print(
+                                    f"Warning: custom_tags must be a list, got {type(custom_tags)}"
+                                )
+                                custom_tags = None
+                        except json.JSONDecodeError as e:
+                            print(f"Error parsing custom_tags JSON: {str(e)}")
+                            custom_tags = None
+                        except Exception as e:
+                            print(f"Error processing custom_tags: {str(e)}")
+                            custom_tags = None
+
+                    # Extract business_user fields from payload
+                    business_user_id = payload.pop(
+                        "business_user_id", user_uid
+                    )  # Default to user_uid if not provided
+                    business_role = payload.pop("business_role", None)
+                    business_uid_param = payload.pop(
+                        "business_uid", None
+                    )  # This should be None for POST, but handle if provided
+
+                    payload["business_uid"] = new_business_uid
+                    payload["business_joined_timestamp"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                    if (
+                        "business_img_0" in request.files
+                        or "delete_business_images" in payload
+                    ):
+                        key = {"business_personal_uid": new_business_uid}
+                        images = processImage(key, payload)
+                        payload["business_images_url"] = json.dumps(images)
+
+                    # Business profile image: same flow as profile_personal_image (upload to S3, store URL)
+                    if (
+                        "business_profile_img" in request.files
+                        or "delete_business_profile_img" in payload
+                    ):
                         print(
-                            "[BUSINESS PROFILE IMAGE] POST - delete_business_profile_img value=%s"
+                            "[BUSINESS PROFILE IMAGE] POST - request.files keys=%s"
+                            % (list(request.files.keys()) if request.files else [])
+                        )
+                        print(
+                            "[BUSINESS PROFILE IMAGE] POST - business_profile_img in request.files=%s, delete_business_profile_img in payload=%s"
                             % (
-                                (payload["delete_business_profile_img"] or "")[:80]
-                                + (
-                                    "..."
-                                    if len(
-                                        payload.get("delete_business_profile_img") or ""
+                                "business_profile_img" in (request.files or {}),
+                                "delete_business_profile_img" in payload,
+                            )
+                        )
+                        if payload.get("delete_business_profile_img"):
+                            print(
+                                "[BUSINESS PROFILE IMAGE] POST - delete_business_profile_img value=%s"
+                                % (
+                                    (payload["delete_business_profile_img"] or "")[:80]
+                                    + (
+                                        "..."
+                                        if len(
+                                            payload.get("delete_business_profile_img") or ""
+                                        )
+                                        > 80
+                                        else ""
                                     )
-                                    > 80
-                                    else ""
                                 )
                             )
+                        payload.pop("business_profile_img", None)
+                        result = processSingleImageUpload(
+                            db,
+                            new_business_uid,
+                            "every_circle.business",
+                            "business_uid",
+                            "business_profile_img",
+                            "business_profile_img",
+                            "delete_business_profile_img",
+                            "business_profile",
+                            payload,
+                            is_create=True,
                         )
-                    payload.pop("business_profile_img", None)
-                    result = processSingleImageUpload(
-                        db,
-                        new_business_uid,
-                        "every_circle.business",
-                        "business_uid",
-                        "business_profile_img",
-                        "business_profile_img",
-                        "delete_business_profile_img",
-                        "business_profile",
-                        payload,
-                        is_create=True,
-                    )
-                    payload["business_profile_img"] = result
-                    print(
-                        "[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s"
-                        % (result)
-                    )
-
-                _apply_persisted_google_photos(payload, new_business_uid)
-
-                # Normalize business_category_id to a single text field (comma-separated if multiple)
-                if "business_category_id" in payload:
-                    print("In business_category_id", payload["business_category_id"])
-                    val = payload["business_category_id"]
-                    if isinstance(val, list):
-                        payload["business_category_id"] = ",".join(
-                            str(v).strip() for v in val
+                        payload["business_profile_img"] = result
+                        print(
+                            "[BUSINESS PROFILE IMAGE] POST - URL stored in DB (business_profile_img)=%s"
+                            % (result)
                         )
-                    elif val is not None and not isinstance(val, str):
-                        payload["business_category_id"] = str(val)
-                    elif isinstance(val, str):
-                        payload["business_category_id"] = val.strip()
 
-                # First service image (multipart): not columns on business table
-                print("Popping service_image_0_is_public - POST")
-                service_image_0_is_public = payload.pop(
-                    "bs_service_image_0_is_public", None
-                )
+                    _apply_persisted_google_photos(payload, new_business_uid)
 
-                if "business_cc_fee_payer" in payload:
-                    payload["business_cc_fee_payer"] = _normalize_business_cc_fee_payer(
-                        payload.get("business_cc_fee_payer")
+                    # Normalize business_category_id to a single text field (comma-separated if multiple)
+                    if "business_category_id" in payload:
+                        print("In business_category_id", payload["business_category_id"])
+                        val = payload["business_category_id"]
+                        if isinstance(val, list):
+                            payload["business_category_id"] = ",".join(
+                                str(v).strip() for v in val
+                            )
+                        elif val is not None and not isinstance(val, str):
+                            payload["business_category_id"] = str(val)
+                        elif isinstance(val, str):
+                            payload["business_category_id"] = val.strip()
+
+                    # First service image (multipart): not columns on business table
+                    print("Popping service_image_0_is_public - POST")
+                    service_image_0_is_public = payload.pop(
+                        "bs_service_image_0_is_public", None
                     )
-                else:
-                    payload["business_cc_fee_payer"] = "seller"
 
-                # print("Insert Payload: ", payload)
-                insert_response = db.insert("every_circle.business", payload)
-                # print("insert_response: ", insert_response)
-
-                # Insert into business_user table
-                # Always create a business_user record when creating a business
-                try:
-                    bu_uid_response = db.call(procedure="new_bu_uid")
-                    print(f"bu_uid_response: {bu_uid_response}")
-
-                    if "result" not in bu_uid_response or not bu_uid_response["result"]:
-                        error_msg = bu_uid_response.get(
-                            "message",
-                            "Stored procedure 'new_bu_uid' may not exist or failed",
+                    if "business_cc_fee_payer" in payload:
+                        payload["business_cc_fee_payer"] = _normalize_business_cc_fee_payer(
+                            payload.get("business_cc_fee_payer")
                         )
-                        print(f"Error: {error_msg}")
-                        print(f"Full response: {bu_uid_response}")
-                        response["message"] = f"Failed to generate bu_uid: {error_msg}"
-                        response["code"] = 500
-                        return response, 500
-                except Exception as e:
-                    print(f"Exception calling new_bu_uid: {str(e)}")
-                    traceback.print_exc()
-                    response["message"] = (
-                        f"Error calling new_bu_uid stored procedure: {str(e)}"
+                    else:
+                        payload["business_cc_fee_payer"] = "seller"
+
+                    # print("Insert Payload: ", payload)
+                    insert_response = db.insert("every_circle.business", payload)
+                    # print("insert_response: ", insert_response)
+
+                    # Insert into business_user table (skip if already linked)
+                    existing_bu = db.select(
+                        "every_circle.business_user",
+                        where={
+                            "bu_business_id": new_business_uid,
+                            "bu_user_id": business_user_id,
+                        },
                     )
-                    response["code"] = 500
-                    return response, 500
+                    if existing_bu.get("result"):
+                        print(
+                            f"business_user already exists for business {new_business_uid}, "
+                            f"user {business_user_id}; skipping insert"
+                        )
+                    else:
+                        try:
+                            bu_uid_response = db.call(procedure="new_bu_uid")
+                            print(f"bu_uid_response: {bu_uid_response}")
 
-                new_bu_uid = bu_uid_response["result"][0]["new_id"]
+                            if (
+                                "result" not in bu_uid_response
+                                or not bu_uid_response["result"]
+                            ):
+                                error_msg = bu_uid_response.get(
+                                    "message",
+                                    "Stored procedure 'new_bu_uid' may not exist or failed",
+                                )
+                                print(f"Error: {error_msg}")
+                                print(f"Full response: {bu_uid_response}")
+                                response["message"] = (
+                                    f"Failed to generate bu_uid: {error_msg}"
+                                )
+                                response["code"] = 500
+                                return response, 500
+                        except Exception as e:
+                            print(f"Exception calling new_bu_uid: {str(e)}")
+                            traceback.print_exc()
+                            response["message"] = (
+                                f"Error calling new_bu_uid stored procedure: {str(e)}"
+                            )
+                            response["code"] = 500
+                            return response, 500
 
-                business_user_payload = {
-                    "bu_uid": new_bu_uid,
-                    "bu_business_id": new_business_uid,
-                    "bu_user_id": business_user_id,
-                    "bu_role": business_role,
-                }
-                db.insert("every_circle.business_user", business_user_payload)
+                        new_bu_uid = bu_uid_response["result"][0]["new_id"]
 
-                if categories_uid_str:
-                    self._add_categories(db, categories_uid_str, new_business_uid)
+                        business_user_payload = {
+                            "bu_uid": new_bu_uid,
+                            "bu_business_id": new_business_uid,
+                            "bu_user_id": business_user_id,
+                            "bu_role": business_role,
+                        }
+                        db.insert("every_circle.business_user", business_user_payload)
 
-                if social_links_str:
-                    self._add_social_links(db, social_links_str, new_business_uid)
+                    if categories_uid_str:
+                        self._add_categories(db, categories_uid_str, new_business_uid)
 
-                # Add services if provided
-                if services_str:
-                    self._add_services(
-                        db,
-                        services_str,
-                        new_business_uid,
-                        business_user_id,
-                        request.files,
-                        service_image_0_is_public=service_image_0_is_public,
-                    )
+                    if social_links_str:
+                        self._add_social_links(db, social_links_str, new_business_uid)
 
-                # Process custom_tags if provided
-                if custom_tags:
-                    stored_tags = self._process_tags(db, new_business_uid, custom_tags)
-                    response["tags"] = stored_tags
-                    print(
-                        f"Processed {len(stored_tags)} tags for new business {new_business_uid}"
-                    )
+                    # Add services if provided
+                    if services_str:
+                        self._add_services(
+                            db,
+                            services_str,
+                            new_business_uid,
+                            business_user_id,
+                            request.files,
+                            service_image_0_is_public=service_image_0_is_public,
+                        )
 
-                # Handle additional business users if provided
-                additional_business_user = payload.pop("additional_business_user", None)
-                additional_business_role = payload.pop("additional_business_role", None)
-                if additional_business_user and additional_business_role:
-                    self._handle_additional_business_users(
-                        db,
-                        new_business_uid,
-                        additional_business_user,
-                        additional_business_role,
-                        exclude_user_id=business_user_id,
-                    )
+                    # Process custom_tags if provided
+                    if custom_tags:
+                        stored_tags = self._process_tags(db, new_business_uid, custom_tags)
+                        response["tags"] = stored_tags
+                        print(
+                            f"Processed {len(stored_tags)} tags for new business {new_business_uid}"
+                        )
 
-                # print(insert_response["code"])
-                if insert_response["code"] == 200:
-                    response = {
-                        "business_uid": new_business_uid,
-                        "message": "Business created successfully",
-                        "code": insert_response["code"],
-                    }
-                else:
-                    response = {
-                        "Error": f"{new_business_uid} - Not Created",
-                        "message": insert_response["message"],
-                        "code": insert_response["code"],
-                    }
+                    # Handle additional business users if provided
+                    additional_business_user = payload.pop("additional_business_user", None)
+                    additional_business_role = payload.pop("additional_business_role", None)
+                    if additional_business_user and additional_business_role:
+                        self._handle_additional_business_users(
+                            db,
+                            new_business_uid,
+                            additional_business_user,
+                            additional_business_role,
+                            exclude_user_id=business_user_id,
+                        )
 
-                return response, 200
+                    # print(insert_response["code"])
+                    if insert_response["code"] == 200:
+                        response = {
+                            "business_uid": new_business_uid,
+                            "message": "Business created successfully",
+                            "code": insert_response["code"],
+                        }
+                    else:
+                        response = {
+                            "Error": f"{new_business_uid} - Not Created",
+                            "message": insert_response["message"],
+                            "code": insert_response["code"],
+                        }
+
+                    return response, 200
+                finally:
+                    if create_lock_held:
+                        try:
+                            db.execute(
+                                "SELECT RELEASE_LOCK(%s) AS released",
+                                (lock_name,),
+                            )
+                        except Exception as release_err:
+                            print(
+                                f"Failed to release create lock {lock_name}: {release_err}"
+                            )
+
 
         except Exception as e:
             print(f"Error in BusinessInfo POST: {str(e)}")
