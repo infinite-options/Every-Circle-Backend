@@ -54,6 +54,7 @@ _VALID_REFUND_STATUSES = (
 
 _RETURN_REQUESTS_TABLE_READY = False
 _RETURN_ELIGIBILITY_COLUMNS_READY = False
+_TRANSACTION_SHIPPING_COLUMNS_READY = False
 
 RETURN_INELIGIBLE_NOT_RETURNABLE = "Not returnable"
 RETURN_INELIGIBLE_OUTSIDE_WINDOW = "Outside return window"
@@ -64,12 +65,113 @@ def _ensure_return_eligibility_columns(db):
     global _RETURN_ELIGIBILITY_COLUMNS_READY
     if _RETURN_ELIGIBILITY_COLUMNS_READY:
         return
-    db.execute(
-        "ALTER TABLE every_circle.transactions_items "
-        "ADD COLUMN ti_bs_is_returnable TINYINT(1) NULL DEFAULT 1",
-        cmd="post",
-    )
+    try:
+        db.execute(
+            "ALTER TABLE every_circle.transactions_items "
+            "ADD COLUMN ti_bs_is_returnable TINYINT(1) NULL DEFAULT 1",
+            cmd="post",
+        )
+    except Exception as e:
+        print(f"ti_bs_is_returnable column ensure (ok if exists): {e}")
     _RETURN_ELIGIBILITY_COLUMNS_READY = True
+
+
+def _ensure_transaction_shipping_columns(db):
+    """Add transaction / line shipping columns when missing (older installs)."""
+    global _TRANSACTION_SHIPPING_COLUMNS_READY
+    if _TRANSACTION_SHIPPING_COLUMNS_READY:
+        return
+    for ddl in (
+        "ALTER TABLE every_circle.transactions "
+        "ADD COLUMN transaction_shipping DECIMAL(10,2) NULL DEFAULT NULL",
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_shipping_amount DECIMAL(10,2) NULL DEFAULT NULL",
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_shipping_refundable TINYINT(1) NULL DEFAULT 0",
+    ):
+        try:
+            db.execute(ddl, cmd="post")
+        except Exception as e:
+            print(f"transaction shipping column ensure (ok if exists): {e}")
+    _TRANSACTION_SHIPPING_COLUMNS_READY = True
+
+
+def _parse_line_shipping_amount(value):
+    """Parse shipping dollar amount from checkout payload."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 2)
+    s = str(value).strip().replace("$", "").replace(",", "")
+    if not s or s.lower() in ("null", "none"):
+        return None
+    try:
+        return round(float(s), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_shipping_refundable(value, default=0):
+    """Snapshot ti_shipping_refundable as 0 or 1."""
+    if value is None or value == "":
+        return 1 if default else 0
+    return 1 if _as_returnable_flag(value, default=bool(default)) else 0
+
+
+def _shipping_amount_from_product(bs_data):
+    """Derive line shipping charge from business_services snapshot."""
+    if not bs_data:
+        return None
+    sh = bs_data.get("bs_shipping")
+    if sh is None or str(sh).strip() == "":
+        return None
+    low = str(sh).strip().lower()
+    if low == "free":
+        return 0.0
+    if low in ("buyer fixed", "buyer_fixed"):
+        amt = _parse_line_shipping_amount(bs_data.get("bs_shipping_amount"))
+        return 0.0 if amt is None else amt
+    return None
+
+
+def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
+    """
+    Set ti_shipping_amount / ti_shipping_refundable from checkout item payload,
+    falling back to business_services when omitted.
+    """
+    raw_amt = item.get("shipping_amount")
+    if raw_amt is None:
+        raw_amt = item.get("ti_shipping_amount")
+
+    raw_ref = item.get("shipping_refundable")
+    if raw_ref is None:
+        raw_ref = item.get("ti_shipping_refundable")
+
+    if raw_amt is not None and raw_amt != "":
+        tx_item["ti_shipping_amount"] = _parse_line_shipping_amount(raw_amt)
+    elif bs_data is not None:
+        amt = _shipping_amount_from_product(bs_data)
+        if amt is not None:
+            tx_item["ti_shipping_amount"] = amt
+
+    if raw_ref is not None and raw_ref != "":
+        tx_item["ti_shipping_refundable"] = _normalize_shipping_refundable(raw_ref)
+    elif bs_data is not None:
+        tx_item["ti_shipping_refundable"] = _normalize_shipping_refundable(
+            bs_data.get("bs_shipping_refundable"),
+            default=0,
+        )
+    else:
+        tx_item["ti_shipping_refundable"] = 0
+
+
+def _refund_shipping_for_line(ti_row, return_qty, original_qty):
+    """Refund shipping when the full line qty is returned and shipping is refundable."""
+    if int(return_qty) != int(original_qty):
+        return 0.0
+    if _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0) != 1:
+        return 0.0
+    return _to_float(ti_row.get("ti_shipping_amount"))
 
 
 def _as_returnable_flag(value, default=True):
@@ -841,6 +943,7 @@ def _validate_and_price_return_items(
     are not returnable or outside the snapshotted return window.
     """
     _ensure_return_eligibility_columns(db)
+    _ensure_transaction_shipping_columns(db)
 
     if not isinstance(items_payload, list) or len(items_payload) == 0:
         return False, {
@@ -864,6 +967,7 @@ def _validate_and_price_return_items(
 
     refund_subtotal = 0.0
     refund_tax = 0.0
+    refund_shipping = 0.0
     lines_processed = []
     seen_ti = set()
 
@@ -897,7 +1001,7 @@ def _validate_and_price_return_items(
                    ti_bs_cost_currency, ti_bs_sku, ti_bs_is_taxable, ti_bs_tax_rate,
                    ti_bs_refund_policy, ti_bs_return_window_days, ti_bs_is_returnable,
                    ti_received_at, ti_selected_options, ti_special_instructions,
-                   ti_choices_extra_cost
+                   ti_choices_extra_cost, ti_shipping_amount, ti_shipping_refundable
             FROM every_circle.transactions_items
             WHERE ti_uid = %s AND ti_transaction_id = %s
             """,
@@ -962,8 +1066,10 @@ def _validate_and_price_return_items(
             ti_row.get("ti_bs_is_taxable"),
             ti_row.get("ti_bs_tax_rate"),
         )
+        line_shipping = _refund_shipping_for_line(ti_row, rq, original_qty)
         refund_subtotal += line_subtotal
         refund_tax += line_tax
+        refund_shipping += line_shipping
 
         lines_processed.append(
             {
@@ -975,6 +1081,7 @@ def _validate_and_price_return_items(
                 "unit_cost": unit_cost,
                 "line_subtotal": line_subtotal,
                 "line_tax": line_tax,
+                "line_shipping": line_shipping,
                 "snapshot": ti_row,
             }
         )
@@ -983,6 +1090,7 @@ def _validate_and_price_return_items(
         "order_subtotal": order_subtotal,
         "refund_subtotal": refund_subtotal,
         "refund_tax": refund_tax,
+        "refund_shipping": refund_shipping,
         "lines_processed": lines_processed,
     }
 
@@ -991,18 +1099,23 @@ def _refund_breakdown_from_context(orig_tx, ctx):
     order_subtotal = ctx["order_subtotal"]
     refund_subtotal = ctx["refund_subtotal"]
     refund_tax = ctx["refund_tax"]
+    refund_shipping = _to_float(ctx.get("refund_shipping"))
     orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
     fee_ratio = refund_subtotal / order_subtotal if order_subtotal > 0 else 0.0
     refund_fees = round(orig_fees * fee_ratio, 4)
-    refund_grand = round(refund_subtotal + refund_tax + refund_fees, 4)
+    refund_grand = round(
+        refund_subtotal + refund_tax + refund_fees + refund_shipping, 4
+    )
     return {
         "subtotal": round(refund_subtotal, 4),
         "taxes": round(refund_tax, 4),
+        "shipping": round(refund_shipping, 4),
         "fees_allocated": round(refund_fees, 4),
         "total_customer_credit": round(refund_grand, 4),
         "fee_allocation_ratio": round(fee_ratio, 6),
         "original_order_subtotal": round(order_subtotal, 4),
         "refund_fees": refund_fees,
+        "refund_shipping": refund_shipping,
         "refund_grand": refund_grand,
         "fee_ratio": fee_ratio,
     }
@@ -1111,6 +1224,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
     refund_subtotal = refund_meta["subtotal"]
     refund_tax = refund_meta["taxes"]
     refund_fees = refund_meta["refund_fees"]
+    refund_shipping = refund_meta.get("refund_shipping", 0) or 0
     fee_ratio = refund_meta["fee_ratio"]
     order_subtotal = refund_meta["original_order_subtotal"]
 
@@ -1139,6 +1253,8 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
         "transaction_type": "return",
         "transaction_original_uid": original_tx_uid,
     }
+    if refund_shipping:
+        new_transaction["transaction_shipping"] = f"{-refund_shipping:.4f}"
 
     tx_insert = db.insert("every_circle.transactions", new_transaction)
     if tx_insert.get("code") != 200:
@@ -1194,6 +1310,10 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
             )
         if ti_row.get("ti_choices_extra_cost") is not None:
             tx_item["ti_choices_extra_cost"] = ti_row.get("ti_choices_extra_cost")
+        if ti_row.get("ti_shipping_amount") is not None:
+            tx_item["ti_shipping_amount"] = ti_row.get("ti_shipping_amount")
+        if ti_row.get("ti_shipping_refundable") is not None:
+            tx_item["ti_shipping_refundable"] = ti_row.get("ti_shipping_refundable")
 
         ti_insert = db.insert("every_circle.transactions_items", tx_item)
         if ti_insert.get("code") != 200:
@@ -1258,6 +1378,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
                 "return_quantity": rq,
                 "line_subtotal": line["line_subtotal"],
                 "line_tax": line["line_tax"],
+                "line_shipping": line.get("line_shipping", 0),
             }
         )
 
@@ -1268,6 +1389,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
         "refund_breakdown": {
             "subtotal": round(refund_subtotal, 4),
             "taxes": round(refund_tax, 4),
+            "shipping": round(refund_shipping, 4),
             "fees_allocated": round(refund_fees, 4),
             "total_customer_credit": round(refund_grand, 4),
             "fee_allocation_ratio": round(fee_ratio, 6),
@@ -1278,6 +1400,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
             "transaction_amount": new_transaction["transaction_amount"],
             "transaction_taxes": new_transaction["transaction_taxes"],
             "transaction_fees": new_transaction["transaction_fees"],
+            "transaction_shipping": new_transaction.get("transaction_shipping"),
         },
         "transaction_items_created": item_insert_count,
         "bounty_reversal_rows_created": bounty_insert_count,
@@ -1514,6 +1637,7 @@ def _line_estimated_total(orig_tx, ctx, line):
         "order_subtotal": ctx["order_subtotal"],
         "refund_subtotal": line["line_subtotal"],
         "refund_tax": line["line_tax"],
+        "refund_shipping": line.get("line_shipping", 0),
     }
     return _refund_breakdown_from_context(orig_tx, line_ctx)["total_customer_credit"]
 
@@ -2114,6 +2238,7 @@ class ReturnTransaction(Resource):
                 response["estimated_refund_breakdown"] = {
                     "subtotal": refund_meta["subtotal"],
                     "taxes": refund_meta["taxes"],
+                    "shipping": refund_meta["shipping"],
                     "fees_allocated": refund_meta["fees_allocated"],
                     "total_customer_credit": refund_meta["total_customer_credit"],
                     "fee_allocation_ratio": refund_meta["fee_allocation_ratio"],
@@ -2643,7 +2768,9 @@ class Transactions(Resource):
                 print("items: ", payload.get("items"))
                 items_count = 0
                 bounty_count = 0
+                order_shipping_total = 0.0
                 _ensure_return_eligibility_columns(db)
+                _ensure_transaction_shipping_columns(db)
 
                 for item in payload.get("items", []):
                     print(item)
@@ -2731,6 +2858,7 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("bs_is_returnable")
                         )
+                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("bs_bounty_type", "per_item") or "per_item"
                         )
@@ -2796,6 +2924,7 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("profile_expertise_is_returnable")
                         )
+                        _apply_line_shipping_snapshot(tx_item, item)
                         item_bounty_type = (
                             bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
                         )
@@ -2863,6 +2992,7 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("profile_wish_is_returnable")
                         )
+                        _apply_line_shipping_snapshot(tx_item, item)
                         item_bounty_type = (
                             bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
                         )
@@ -2877,7 +3007,9 @@ class Transactions(Resource):
                     if shipping_fields:
                         tx_item["ti_fulfillment_status"] = FULFILLMENT_STATUS_NOT_SHIPPED
 
-                    # # Get other item details from business services table using parameterized query
+                    order_shipping_total += _to_float(tx_item.get("ti_shipping_amount") or 0)
+
+                    # Insert transaction item
                     # bs_query = """
                     #     SELECT *
                     #     FROM every_circle.business_services
@@ -3231,6 +3363,19 @@ class Transactions(Resource):
                                     f"Error processing bounty for network participant {participant_id}: {str(e)}"
                                 )
                                 continue
+
+                if payload.get("total_shipping") is not None:
+                    parsed_total = _parse_line_shipping_amount(payload.get("total_shipping"))
+                    order_shipping = 0.0 if parsed_total is None else parsed_total
+                else:
+                    order_shipping = round(order_shipping_total, 2)
+
+                db.update(
+                    "every_circle.transactions",
+                    {"transaction_uid": new_transaction_uid},
+                    {"transaction_shipping": order_shipping},
+                )
+                response["transaction_shipping"] = order_shipping
 
                 response["transaction_items"] = items_count
                 response["transaction_bounty_count"] = bounty_count
@@ -3953,6 +4098,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
                 estimated_refund = {
                     "subtotal": refund_meta["subtotal"],
                     "taxes": refund_meta["taxes"],
+                    "shipping": refund_meta["shipping"],
                     "total_customer_credit": refund_meta["total_customer_credit"],
                 }
                 if refund_meta["fees_allocated"]:
@@ -3961,6 +4107,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
                 estimated_refund = {
                     "subtotal": refund_meta["subtotal"],
                     "taxes": refund_meta["taxes"],
+                    "shipping": refund_meta["shipping"],
                     "fees_allocated": refund_meta["fees_allocated"],
                     "total_customer_credit": refund_meta["total_customer_credit"],
                     "fee_allocation_ratio": refund_meta["fee_allocation_ratio"],

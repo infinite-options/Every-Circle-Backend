@@ -58,11 +58,16 @@ def _normalize_business_cc_fee_payer(value):
 # are dropped on PUT (they do not cause SQL errors).
 #
 # Frontend-only keys (never DB columns) are removed in _derive_business_service_fields:
-#   bs_qty_unlimited, bs_available_quantity, bs_free_shipping, bs_buyer_pays_shipping,
+#   bs_qty_unlimited, bs_available_quantity,
 #   bs_cc_fee_payer, bs_condition_type, bs_condition_detail,
 #   is_returnable, return_window_days (aliases → bs_*)
-# They are mapped into bs_quantity, bs_shipping, bs_condition, bs_is_returnable,
+# They are mapped into bs_quantity, bs_condition, bs_is_returnable,
 # bs_return_window_days when possible.
+#
+# Shipping (persisted as-is from FE):
+#   bs_shipping: NULL | 'Free' | 'Buyer Actual' | 'Buyer Fixed'
+#   bs_shipping_amount: DECIMAL required (incl. 0.00) when 'Buyer Fixed'; else NULL
+#   bs_shipping_refundable: 0 | 1
 #
 # If you add new API fields, either add a DB column and list it here, or strip/map
 # them in _derive_business_service_fields so they never reach _prepare.
@@ -95,11 +100,21 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
         "bs_updated_by",
         "bs_quantity",
         "bs_shipping",
+        "bs_shipping_amount",
+        "bs_shipping_refundable",
         "bs_condition",
     }
 )
 
 _BS_RETURNABLE_COLUMN_READY = False
+_BS_SHIPPING_AMOUNT_COLUMN_READY = False
+
+_BS_SHIPPING_FREE = "Free"
+_BS_SHIPPING_BUYER_ACTUAL = "Buyer Actual"
+_BS_SHIPPING_BUYER_FIXED = "Buyer Fixed"
+_BS_SHIPPING_ALLOWED = frozenset(
+    {_BS_SHIPPING_FREE, _BS_SHIPPING_BUYER_ACTUAL, _BS_SHIPPING_BUYER_FIXED}
+)
 
 
 def _ensure_business_service_returnable_column(db):
@@ -115,6 +130,25 @@ def _ensure_business_service_returnable_column(db):
     _BS_RETURNABLE_COLUMN_READY = True
 
 
+def _ensure_business_service_shipping_amount_column(db):
+    """Add shipping columns when missing (older installs)."""
+    global _BS_SHIPPING_AMOUNT_COLUMN_READY
+    if _BS_SHIPPING_AMOUNT_COLUMN_READY:
+        return
+    for ddl in (
+        "ALTER TABLE every_circle.business_services "
+        "ADD COLUMN bs_shipping_amount DECIMAL(10,2) NULL DEFAULT NULL",
+        "ALTER TABLE every_circle.business_services "
+        "ADD COLUMN bs_shipping_refundable TINYINT(1) NULL DEFAULT 0",
+    ):
+        try:
+            db.execute(ddl, cmd="post")
+        except Exception as e:
+            # Column may already exist
+            print(f"shipping column ensure (ok if exists): {e}")
+    _BS_SHIPPING_AMOUNT_COLUMN_READY = True
+
+
 def _truthy_flag(x):
     if x is None:
         return False
@@ -124,20 +158,89 @@ def _truthy_flag(x):
     return s in ("1", "true", "yes", "on")
 
 
+def _parse_shipping_amount(value):
+    """Parse number/string to float USD, or None when empty/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 2)
+    s = str(value).strip().replace("$", "").replace(",", "")
+    if not s or s.lower() in ("null", "none"):
+        return None
+    try:
+        return round(float(s), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_bs_shipping_value(value):
+    """Normalize to NULL | 'Free' | 'Buyer Actual' | 'Buyer Fixed'."""
+    if value is None or (isinstance(value, str) and not str(value).strip()):
+        return None
+    s = str(value).strip()
+    low = s.lower()
+    if low in ("null", "none"):
+        return None
+    if low == "free":
+        return _BS_SHIPPING_FREE
+    if low in ("buyer actual", "buyer_actual"):
+        return _BS_SHIPPING_BUYER_ACTUAL
+    if low in ("buyer fixed", "buyer_fixed"):
+        return _BS_SHIPPING_BUYER_FIXED
+    if s in _BS_SHIPPING_ALLOWED:
+        return s
+    return None
+
+
+def _derive_shipping_fields(service_data):
+    """
+    Persist bs_shipping + bs_shipping_amount from FE.
+
+    Buyer Fixed always stores a number (defaults to 0.00 if missing).
+    All other shipping states store amount as NULL.
+    If bs_shipping is omitted, leave both columns unchanged on update.
+    """
+    # Drop obsolete FE shipping keys if still present
+    for k in (
+        "bs_free_shipping",
+        "bs_buyer_pays_shipping",
+        "bs_shipping_cost_type",
+        "bs_fixed_shipping_amount",
+    ):
+        service_data.pop(k, None)
+
+    if "bs_shipping" not in service_data:
+        service_data.pop("bs_shipping_amount", None)
+        return
+
+    shipping = _normalize_bs_shipping_value(service_data.get("bs_shipping"))
+    amount = _parse_shipping_amount(service_data.get("bs_shipping_amount"))
+
+    if shipping == _BS_SHIPPING_BUYER_FIXED:
+        service_data["bs_shipping"] = _BS_SHIPPING_BUYER_FIXED
+        service_data["bs_shipping_amount"] = 0.0 if amount is None else amount
+    elif shipping in (_BS_SHIPPING_FREE, _BS_SHIPPING_BUYER_ACTUAL):
+        service_data["bs_shipping"] = shipping
+        service_data["bs_shipping_amount"] = None
+    else:
+        # null / unrecognized → N/A
+        service_data["bs_shipping"] = None
+        service_data["bs_shipping_amount"] = None
+
+
 def _derive_business_service_fields(service_data):
     """
-    Map frontend-only keys to bs_quantity, bs_shipping, bs_condition and remove
-    keys that are not database columns (so UPDATE/INSERT never sees them).
+    Map frontend-only keys to DB columns and remove keys that are not
+    database columns (so UPDATE/INSERT never sees them).
 
     bs_quantity: numeric string or 'unlimited'
-    bs_shipping: Free, Buyer, or NULL (None)
+    bs_shipping: Free | Buyer Actual | Buyer Fixed | NULL
+    bs_shipping_amount: required number when Buyer Fixed; else NULL
     bs_condition: NEW or seller text
     """
     legacy_keys = (
         "bs_qty_unlimited",
         "bs_available_quantity",
-        "bs_free_shipping",
-        "bs_buyer_pays_shipping",
         "bs_cc_fee_payer",
         "bs_condition_type",
         "bs_condition_detail",
@@ -180,28 +283,17 @@ def _derive_business_service_fields(service_data):
     else:
         service_data.pop("bs_quantity", None)
 
-    # --- bs_shipping ---
-    if "bs_shipping" in service_data:
-        sh = service_data["bs_shipping"]
-        if sh is None or (isinstance(sh, str) and not str(sh).strip()):
-            service_data["bs_shipping"] = None
-        else:
-            s = str(sh).strip()
-            low = s.lower()
-            if low in ("null", "none"):
-                service_data["bs_shipping"] = None
-            elif low == "free":
-                service_data["bs_shipping"] = "Free"
-            elif low == "buyer":
-                service_data["bs_shipping"] = "Buyer"
-            else:
-                service_data["bs_shipping"] = s
-    elif _truthy_flag(legacy.get("bs_free_shipping")):
-        service_data["bs_shipping"] = "Free"
-    elif _truthy_flag(legacy.get("bs_buyer_pays_shipping")):
-        service_data["bs_shipping"] = "Buyer"
+    # --- bs_shipping / bs_shipping_amount ---
+    _derive_shipping_fields(service_data)
+
+    if "bs_shipping_refundable" in service_data and service_data[
+        "bs_shipping_refundable"
+    ] not in (None, ""):
+        service_data["bs_shipping_refundable"] = (
+            1 if _truthy_flag(service_data["bs_shipping_refundable"]) else 0
+        )
     else:
-        service_data.pop("bs_shipping", None)
+        service_data.pop("bs_shipping_refundable", None)
 
     # --- bs_condition ---
     raw_c = service_data.get("bs_condition")
@@ -235,6 +327,7 @@ def _prepare_business_service_update_dict(service_data):
         "bs_shipping",
         "bs_condition",
         "bs_sku",
+        "bs_shipping_amount",
     }
     out = {}
     for k, v in service_data.items():
@@ -247,6 +340,12 @@ def _prepare_business_service_update_dict(service_data):
                 v = int(v)
             except (TypeError, ValueError):
                 v = None
+        if k == "bs_shipping_amount" and v is not None and v != "":
+            v = _parse_shipping_amount(v)
+        if k == "bs_shipping" and v is not None and v != "":
+            v = _normalize_bs_shipping_value(v)
+        if k == "bs_shipping_refundable" and v not in (None, ""):
+            v = 1 if _truthy_flag(v) else 0
         out[k] = v
     return out
 
@@ -387,6 +486,7 @@ class BusinessInfo(Resource):
                 links_response = db.execute(links_query)
 
                 # Added query for business services
+                _ensure_business_service_shipping_amount_column(db)
                 services_query = f"""
                     SELECT *
                     FROM every_circle.business_services
@@ -1037,6 +1137,7 @@ class BusinessInfo(Resource):
                             raise ValueError("business_services must be a JSON array")
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         _ensure_business_service_returnable_column(db)
+                        _ensure_business_service_shipping_amount_column(db)
 
                         # Process each service entry
                         for idx, service_data in enumerate(services_data):
@@ -1918,6 +2019,7 @@ class BusinessInfo(Resource):
             services = json.loads(services_str)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _ensure_business_service_returnable_column(db)
+            _ensure_business_service_shipping_amount_column(db)
 
             for idx, service in enumerate(services):
                 derived_input = dict(service)
@@ -2031,6 +2133,8 @@ class BusinessInfo(Resource):
                 for k in (
                     "bs_quantity",
                     "bs_shipping",
+                    "bs_shipping_amount",
+                    "bs_shipping_refundable",
                     "bs_condition",
                     "bs_is_returnable",
                     "bs_return_window_days",

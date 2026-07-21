@@ -22,6 +22,7 @@ from transactions import (
     _remaining_to_ship_qty,
     _is_cancel_unshipped_request,
     _ensure_return_eligibility_columns,
+    _ensure_transaction_shipping_columns,
     line_return_eligibility,
 )
 
@@ -126,6 +127,7 @@ def _load_sale_header(db, order_uid):
             transaction_amount,
             transaction_taxes,
             transaction_fees,
+            transaction_shipping,
             transaction_in_escrow,
             transaction_return_requested,
             transaction_return_note,
@@ -158,6 +160,7 @@ def _line_name_case_sql():
 
 def _load_sale_lines(db, order_uid):
     _ensure_return_eligibility_columns(db)
+    _ensure_transaction_shipping_columns(db)
     name_case = _line_name_case_sql()
     lines_q = db.execute(
         f"""
@@ -169,6 +172,8 @@ def _load_sale_lines(db, order_uid):
             ti.ti_received_at,
             ti.ti_bs_cost,
             ti.ti_choices_extra_cost,
+            ti.ti_shipping_amount,
+            ti.ti_shipping_refundable,
             ti.ti_special_instructions,
             ti.ti_selected_options,
             ti.ti_bs_is_returnable,
@@ -227,6 +232,8 @@ def _load_sale_lines(db, order_uid):
             "remaining_to_ship": remaining_to_ship,
             "ti_bs_cost": row.get("ti_bs_cost"),
             "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
+            "ti_shipping_amount": row.get("ti_shipping_amount"),
+            "ti_shipping_refundable": row.get("ti_shipping_refundable"),
             "ti_special_instructions": row.get("ti_special_instructions"),
             "item_name": row.get("item_name"),
             "selected_options": _parse_selected_options_field(
@@ -253,6 +260,7 @@ def _load_return_transactions(db, order_uid):
             transaction_amount,
             transaction_taxes,
             transaction_fees,
+            transaction_shipping,
             transaction_return_note
         FROM every_circle.transactions
         WHERE transaction_original_uid = %s
@@ -273,6 +281,8 @@ def _load_return_transactions(db, order_uid):
                 ti.ti_bs_qty,
                 ti.ti_bs_cost,
                 ti.ti_choices_extra_cost,
+                ti.ti_shipping_amount,
+                ti.ti_shipping_refundable,
                 ti.ti_special_instructions,
                 ti.ti_selected_options,
                 {name_case} AS item_name
@@ -297,6 +307,8 @@ def _load_return_transactions(db, order_uid):
                     "return_quantity": abs(qty),
                     "ti_bs_cost": row.get("ti_bs_cost"),
                     "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
+                    "ti_shipping_amount": row.get("ti_shipping_amount"),
+                    "ti_shipping_refundable": row.get("ti_shipping_refundable"),
                     "ti_special_instructions": row.get("ti_special_instructions"),
                     "item_name": row.get("item_name"),
                     "selected_options": _parse_selected_options_field(
