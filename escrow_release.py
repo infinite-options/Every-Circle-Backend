@@ -1,6 +1,9 @@
 """
 Auto-release escrow after a configurable number of days.
 
+Eligible orders must be fully shipped (or have no shippable lines). Unshipped
+physical orders stay in escrow until the seller ships or the buyer verifies.
+
 Used by EscrowReleaseCron_CLASS (Postman) and EscrowRelease_CRON (Zappa).
 Manual buyer confirmation can call release_escrow_for_transaction() separately.
 """
@@ -111,6 +114,7 @@ def format_escrow_release_email(response, run_dt=None):
             "SUMMARY",
             "-" * 72,
             f"  Escrow release window : {response.get('escrow_release_days', '?')} days",
+            "  Shipped-only filter   : yes (unshipped orders excluded)",
             f"  Eligible transactions : {response.get('eligible_count', 0)}",
             f"  Released              : {response.get('released_count', 0)}",
             f"  Failed                : {response.get('failed_count', 0)}",
@@ -192,14 +196,54 @@ def format_escrow_release_email(response, run_dt=None):
     return "\n".join(lines)
 
 
+def _unshipped_shippable_lines_sql(transaction_alias="t"):
+    """
+    True when the sale still has a shippable line that is not fully shipped.
+
+    Matches transaction_shipping.fulfillment_list_summary_sql unshipped_item_count.
+    """
+    return f"""
+        EXISTS (
+            SELECT 1
+            FROM every_circle.transactions_items ti
+            WHERE ti.ti_transaction_id = {transaction_alias}.transaction_uid
+              AND COALESCE(ti.ti_fulfillment_status, 'not_required')
+                  IN ('not_shipped', 'in_transit', 'delivered')
+              AND COALESCE(ti.ti_fulfillment_status, 'not_required') <> 'delivered'
+              AND COALESCE(ti.ti_shipped_qty, 0)
+                  < CAST(ti.ti_bs_qty AS UNSIGNED)
+        )
+    """
+
+
+def _order_is_shipped_for_auto_release(db, transaction_uid):
+    """False when any shippable line on the sale is still unshipped."""
+    q = db.execute(
+        f"""
+        SELECT CASE WHEN {_unshipped_shippable_lines_sql("t")} THEN 1 ELSE 0 END
+               AS has_unshipped
+        FROM every_circle.transactions t
+        WHERE t.transaction_uid = %s
+        """,
+        (transaction_uid,),
+    )
+    if q.get("code") != 200:
+        return False
+    rows = q.get("result") or []
+    if not rows:
+        return False
+    return int(rows[0].get("has_unshipped") or 0) == 0
+
+
 def _eligible_transactions_query(days):
-    return """
-        SELECT transaction_uid, transaction_datetime
-        FROM every_circle.transactions
-        WHERE transaction_in_escrow = 1
-          AND transaction_datetime < NOW() - INTERVAL %s DAY
-          AND COALESCE(transaction_return_requested, 0) = 0
-        ORDER BY transaction_datetime ASC
+    return f"""
+        SELECT t.transaction_uid, t.transaction_datetime
+        FROM every_circle.transactions t
+        WHERE t.transaction_in_escrow = 1
+          AND t.transaction_datetime < NOW() - INTERVAL %s DAY
+          AND COALESCE(t.transaction_return_requested, 0) = 0
+          AND NOT ({_unshipped_shippable_lines_sql("t")})
+        ORDER BY t.transaction_datetime ASC
     """
 
 
@@ -243,6 +287,17 @@ def release_escrow_for_transaction(db, transaction_uid, reason="auto_5_day"):
         return {
             "code": 409,
             "message": "Return in progress; escrow not released",
+            "transaction_uid": transaction_uid,
+            "reason": reason,
+            "skipped": True,
+        }
+
+    if reason == "auto_5_day" and not _order_is_shipped_for_auto_release(
+        db, transaction_uid
+    ):
+        return {
+            "code": 409,
+            "message": "Order not fully shipped; escrow not released",
             "transaction_uid": transaction_uid,
             "reason": reason,
             "skipped": True,
@@ -324,7 +379,10 @@ def _log_wallet_release(transaction_uid, wallet_updates):
 
 
 class EscrowReleaseJob:
-    """Core escrow auto-release batch job (Postman + Zappa call this)."""
+    """Core escrow auto-release batch job (Postman + Zappa call this).
+
+    Only releases orders that are fully shipped (or have no shippable lines).
+    """
 
     @classmethod
     def get(cls, days=None):
