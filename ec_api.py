@@ -23,7 +23,7 @@ exit_if_crypto_broken()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
-from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessClaim, ProfileConnectionDegrees
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessServiceRestock, BusinessClaim, ProfileConnectionDegrees
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -878,6 +878,7 @@ api.add_resource(AblyToken, '/api/v1/ably/token')
 api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")
+api.add_resource(BusinessServiceRestock, "/business/service/restock")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
 api.add_resource(ContentReports, "/api/v1/reports", "/api/v1/reports/<string:report_uid>")

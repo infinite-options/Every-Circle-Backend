@@ -853,6 +853,214 @@ class BusinessServicePurchase(Resource):
             return response, 500
 
 
+_RESTOCK_AUDIT_TABLE_READY = False
+
+
+def _ensure_restock_audit_table(db):
+    """Create restock audit table once per process if missing."""
+    global _RESTOCK_AUDIT_TABLE_READY
+    if _RESTOCK_AUDIT_TABLE_READY:
+        return
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS every_circle.business_service_restocks (
+            bsr_uid VARCHAR(64) NOT NULL,
+            bsr_bs_uid VARCHAR(64) NOT NULL,
+            bsr_quantity INT NOT NULL,
+            bsr_remaining INT NULL,
+            bsr_seller_id VARCHAR(64) NULL,
+            bsr_trr_uid VARCHAR(64) NULL,
+            bsr_order_uid VARCHAR(64) NULL,
+            bsr_created_at DATETIME NOT NULL,
+            PRIMARY KEY (bsr_uid),
+            UNIQUE KEY uq_bsr_trr_bs (bsr_trr_uid, bsr_bs_uid)
+        )
+        """,
+        cmd="post",
+    )
+    _RESTOCK_AUDIT_TABLE_READY = True
+
+
+def _new_bsr_uid(db):
+    """Allocate a restock audit uid."""
+    return f"bsr-{uuid.uuid4().hex[:12]}"
+
+
+def _load_restock_by_trr_uid(db, trr_uid, bs_uid):
+    if not trr_uid:
+        return None
+    result = db.execute(
+        """
+        SELECT bsr_quantity, bsr_remaining
+        FROM every_circle.business_service_restocks
+        WHERE bsr_trr_uid = %s AND bsr_bs_uid = %s
+        LIMIT 1
+        """,
+        (trr_uid, bs_uid),
+    )
+    rows = result.get("result") or []
+    return rows[0] if rows else None
+
+
+def _record_restock_audit(
+    db, bs_uid, quantity, remaining, seller_id=None, trr_uid=None, order_uid=None
+):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.insert(
+        "every_circle.business_service_restocks",
+        {
+            "bsr_uid": _new_bsr_uid(db),
+            "bsr_bs_uid": bs_uid,
+            "bsr_quantity": quantity,
+            "bsr_remaining": remaining,
+            "bsr_seller_id": seller_id,
+            "bsr_trr_uid": trr_uid,
+            "bsr_order_uid": order_uid,
+            "bsr_created_at": now,
+        },
+    )
+
+
+def _build_restock_response(bs_uid, quantity, remaining, message="OK"):
+    response = {
+        "message": message,
+        "code": 200,
+        "bs_uid": bs_uid,
+        "quantity": quantity,
+        "remaining": remaining,
+    }
+    if remaining is not None:
+        response["bs_available_quantity"] = remaining
+        response["available_quantity"] = remaining
+    return response
+
+
+class BusinessServiceRestock(Resource):
+    def post(self):
+        """Increment bs_quantity when inventory is restocked (e.g. after a return)."""
+        print("In BusinessServiceRestock POST")
+        response = {}
+
+        try:
+            payload = getattr(request, "_decrypted_json", None) or request.get_json(force=True) or {}
+            bs_uid = str(payload.get("bs_uid") or "").strip()
+            seller_id = str(payload.get("seller_id") or "").strip() or None
+            trr_uid = str(payload.get("trr_uid") or "").strip() or None
+            order_uid = str(payload.get("order_uid") or "").strip() or None
+            quantity = payload.get("quantity")
+
+            if not bs_uid:
+                response["message"] = "bs_uid is required"
+                response["code"] = 400
+                return response, 400
+
+            try:
+                quantity = int(quantity)
+                if quantity < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                response["message"] = "quantity must be a positive integer"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                _ensure_restock_audit_table(db)
+
+                if trr_uid:
+                    prior = _load_restock_by_trr_uid(db, trr_uid, bs_uid)
+                    if prior:
+                        response["message"] = "Restock already applied for this trr_uid"
+                        response["code"] = 409
+                        response["bs_uid"] = bs_uid
+                        response["quantity"] = int(prior.get("bsr_quantity") or quantity)
+                        remaining = prior.get("bsr_remaining")
+                        if remaining is not None:
+                            remaining = int(remaining)
+                        response["remaining"] = remaining
+                        return response, 409
+
+                svc_query = db.select(
+                    "every_circle.business_services", where={"bs_uid": bs_uid}
+                )
+                if not svc_query["result"]:
+                    response["message"] = "Service not found"
+                    response["code"] = 404
+                    return response, 404
+
+                row = svc_query["result"][0]
+                business_id = str(row.get("bs_business_id") or "").strip()
+
+                if seller_id and business_id and seller_id != business_id:
+                    response["message"] = "Seller does not own this product"
+                    response["code"] = 403
+                    return response, 403
+
+                current_qty = row.get("bs_quantity")
+                if current_qty is None or str(current_qty).strip().lower() == "unlimited":
+                    response = _build_restock_response(
+                        bs_uid,
+                        quantity,
+                        None,
+                        message="Unlimited stock — no increment needed",
+                    )
+                    _record_restock_audit(
+                        db,
+                        bs_uid,
+                        quantity,
+                        None,
+                        seller_id=seller_id,
+                        trr_uid=trr_uid,
+                        order_uid=order_uid,
+                    )
+                    return response, 200
+
+                current_qty_int = int(current_qty)
+                new_qty = current_qty_int + quantity
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                update_fields = {
+                    "bs_quantity": str(new_qty),
+                    "bs_updated_at": now,
+                }
+                if new_qty > 0 and str(row.get("bs_status") or "").strip() == "out_of_stock":
+                    update_fields["bs_is_visible"] = 1
+                    update_fields["bs_status"] = "active"
+
+                db.update(
+                    "every_circle.business_services",
+                    {"bs_uid": bs_uid},
+                    update_fields,
+                )
+
+                verify = db.select("every_circle.business_services", where={"bs_uid": bs_uid})
+                actual_qty = verify["result"][0].get("bs_quantity") if verify["result"] else None
+                remaining = int(actual_qty) if actual_qty is not None else new_qty
+
+                _record_restock_audit(
+                    db,
+                    bs_uid,
+                    quantity,
+                    remaining,
+                    seller_id=seller_id,
+                    trr_uid=trr_uid,
+                    order_uid=order_uid,
+                )
+
+                response = _build_restock_response(
+                    bs_uid,
+                    quantity,
+                    remaining,
+                    message="Restock recorded successfully",
+                )
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessServiceRestock POST: {str(e)}")
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+
 class BusinessClaim(Resource):
     def post(self):
         print("In BusinessClaim POST")
