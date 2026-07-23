@@ -14,6 +14,7 @@ from transaction_shipping import (
     shipping_payload_from_row,
     fulfillment_fields_from_row,
 )
+from transaction_shipping import apply_order_fulfillment_summary
 from transactions import (
     _load_return_request,
     _load_open_return_requests,
@@ -23,7 +24,13 @@ from transactions import (
     _is_cancel_unshipped_request,
     _ensure_return_eligibility_columns,
     _ensure_transaction_shipping_columns,
+    _batch_return_requests,
+    _omit_empty,
+    _is_return_list_row,
+    _resolve_parent_sale_uid,
     line_return_eligibility,
+    RETURN_STATUS_RETURNED,
+    REFUND_STATUS_REFUNDED,
 )
 
 
@@ -77,6 +84,7 @@ def resolve_order_uid(db, transaction_uid):
     row = rows[0]
     tx_type = row.get("transaction_type") or "sale"
     if tx_type == "return" and row.get("transaction_original_uid"):
+        print(f"In return block: {row['transaction_original_uid']}")
         return row["transaction_original_uid"], row.get("transaction_uid")
 
     return row.get("transaction_uid"), None
@@ -185,6 +193,8 @@ def _load_sale_lines(db, order_uid):
             ti.ti_tracking_number,
             ti.ti_fulfillment_note,
             {name_case} AS item_name,
+            bs.bs_service_name,
+            bs.bs_service_desc,
             COALESCE((
                 SELECT SUM(ABS(rti.ti_bs_qty))
                 FROM every_circle.transactions_items rti
@@ -236,6 +246,8 @@ def _load_sale_lines(db, order_uid):
             "ti_shipping_refundable": row.get("ti_shipping_refundable"),
             "ti_special_instructions": row.get("ti_special_instructions"),
             "item_name": row.get("item_name"),
+            "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
+            "bs_service_desc": row.get("bs_service_desc") or row.get("item_name"),
             "selected_options": _parse_selected_options_field(
                 row.get("ti_selected_options")
             ),
@@ -285,7 +297,9 @@ def _load_return_transactions(db, order_uid):
                 ti.ti_shipping_refundable,
                 ti.ti_special_instructions,
                 ti.ti_selected_options,
-                {name_case} AS item_name
+                {name_case} AS item_name,
+                bs.bs_service_name,
+                bs.bs_service_desc
             FROM every_circle.transactions_items ti
             LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
             LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
@@ -311,6 +325,8 @@ def _load_return_transactions(db, order_uid):
                     "ti_shipping_refundable": row.get("ti_shipping_refundable"),
                     "ti_special_instructions": row.get("ti_special_instructions"),
                     "item_name": row.get("item_name"),
+                    "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
+                    "bs_service_desc": row.get("bs_service_desc") or row.get("item_name"),
                     "selected_options": _parse_selected_options_field(
                         row.get("ti_selected_options")
                     ),
@@ -344,6 +360,199 @@ def _build_summary(sale, returns):
     }
 
 
+def _pending_payload_for_order(sale, req):
+    if not req:
+        return None
+    rs, fs = _pair_for_sale(sale, req)
+    cancel_flag = _is_cancel_unshipped_request(req)
+    return {
+        "trr_uid": req.get("trr_uid"),
+        "note": req.get("trr_note") or req.get("note"),
+        "seller_note": req.get("trr_seller_note") or req.get("seller_note"),
+        "estimated_total": req.get("trr_estimated_total"),
+        "transaction_item_uid": req.get("transaction_item_uid")
+        or req.get("trr_ti_uid"),
+        "return_quantity": req.get("return_quantity")
+        if req.get("return_quantity") is not None
+        else req.get("trr_return_quantity"),
+        "items": req.get("items") or [],
+        "return_transaction_uid": req.get("trr_return_transaction_uid"),
+        "stripe_refund_id": req.get("trr_stripe_refund_id"),
+        "created_at": req.get("trr_created_at"),
+        "updated_at": req.get("trr_updated_at"),
+        "cancel_unshipped": cancel_flag,
+        "pre_ship_cancel": cancel_flag,
+        "is_cancel_before_ship": cancel_flag,
+        **_status_payload(rs, fs),
+    }
+
+
+def _enrich_return_transactions_with_status(db, order_uid, sale, returns):
+    req_map = _batch_return_requests(db, [order_uid]).get(order_uid) or []
+    ledger_to_req = {}
+    for req in req_map:
+        ledger_uid = req.get("trr_return_transaction_uid")
+        if ledger_uid:
+            ledger_to_req.setdefault(ledger_uid, req)
+
+    enriched = []
+    for header in returns or []:
+        ret = dict(header)
+        linked = ledger_to_req.get(ret.get("transaction_uid"))
+        if linked:
+            rs, fs = _pair_for_sale(sale, linked)
+            ret.update(_status_payload(rs, fs))
+        elif not ret.get("return_status") and not ret.get("refund_status"):
+            ret.update(
+                _status_payload(RETURN_STATUS_RETURNED, REFUND_STATUS_REFUNDED)
+            )
+        enriched.append(ret)
+    return enriched
+
+
+def _apply_sale_fulfillment_rollup(sale_payload):
+    """Order-level shipping/received counts from sale lines (matches list rollups)."""
+    lines = sale_payload.get("lines") or []
+    shippable = shipped = unshipped = delivered = received = 0
+    has_in_transit = 0
+
+    for line in lines:
+        status = (
+            line.get("ti_fulfillment_status")
+            or line.get("fulfillment_status")
+            or "not_required"
+        )
+        order_qty = int(line.get("ti_bs_qty") or 0)
+        shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
+        received_qty = int(line.get("ti_received_qty") or 0)
+
+        if status in ("not_shipped", "in_transit", "delivered"):
+            shippable += 1
+            if status == "delivered" or shipped_qty >= order_qty:
+                shipped += 1
+            elif status != "delivered" and shipped_qty < order_qty:
+                unshipped += 1
+            if status == "delivered":
+                delivered += 1
+            if status == "in_transit":
+                has_in_transit = 1
+
+        if order_qty > 0 and received_qty >= order_qty:
+            received += 1
+
+    summary_row = {
+        "shippable_item_count": shippable,
+        "shipped_item_count": shipped,
+        "unshipped_item_count": unshipped,
+        "delivered_item_count": delivered,
+        "has_in_transit": has_in_transit,
+        "has_shippable_items": 1 if shippable > 0 else 0,
+    }
+    apply_order_fulfillment_summary([summary_row])
+
+    sale_payload["transaction_uid"] = sale_payload.get("transaction_uid")
+    sale_payload["shippable_item_count"] = summary_row["shippable_item_count"]
+    sale_payload["shipped_item_count"] = summary_row["shipped_item_count"]
+    sale_payload["unshipped_item_count"] = summary_row["unshipped_item_count"]
+    sale_payload["delivered_item_count"] = summary_row["delivered_item_count"]
+    sale_payload["received_item_count"] = received
+    sale_payload["all_items_shipped"] = summary_row["all_items_shipped"]
+    sale_payload["fulfillment_status"] = summary_row["fulfillment_status"]
+    sale_payload["shipping_status"] = summary_row["fulfillment_status"]
+
+    cancel_flag = bool(
+        sale_payload.get("cancel_unshipped")
+        or sale_payload.get("pre_ship_cancel")
+        or (
+            sale_payload.get("pending_return") or {}
+        ).get("cancel_unshipped")
+    )
+    if cancel_flag:
+        sale_payload["cancel_unshipped"] = 1
+        sale_payload["pre_ship_cancel"] = 1
+    return sale_payload
+
+
+def _stripe_refund_summary(status_fields, pending_returns, returns):
+    refund_status = (status_fields or {}).get("refund_status") or ""
+    if refund_status in ("stripe_fail", "stripe_failed"):
+        return {"ok": False}
+
+    refund_id = None
+    for req in pending_returns or []:
+        if req and req.get("stripe_refund_id"):
+            refund_id = req.get("stripe_refund_id")
+            break
+
+    if refund_status == REFUND_STATUS_REFUNDED or refund_id:
+        out = {"ok": True}
+        if refund_id:
+            out["refund_id"] = refund_id
+        return out
+    return None
+
+
+def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
+    """
+    Build the full order-detail payload for a sale uid.
+    Used by GET /orders/:uid and account-screen order_list_hydration.
+    """
+    sale = _load_sale_header(db, order_uid)
+    if not sale:
+        return None
+
+    sale_lines = _load_sale_lines(db, order_uid)
+    returns = _enrich_return_transactions_with_status(
+        db, order_uid, sale, _load_return_transactions(db, order_uid)
+    )
+    shipping = shipping_payload_from_row(load_shipping_for_transaction(db, order_uid))
+    open_returns = _load_open_return_requests(db, order_uid)
+    pending_return = (
+        open_returns[0] if open_returns else _load_return_request(db, order_uid)
+    )
+    return_status, refund_status = _pair_for_sale(sale, pending_return)
+    status_fields = _status_payload(return_status, refund_status)
+
+    pending_returns_payload = [
+        _pending_payload_for_order(sale, req) for req in open_returns
+    ]
+    pending_return_payload = (
+        pending_returns_payload[0] if pending_returns_payload else None
+    )
+
+    sale_payload = dict(sale)
+    sale_payload["lines"] = sale_lines
+    sale_payload["pending_return"] = pending_return_payload
+    sale_payload["pending_returns"] = pending_returns_payload
+    if pending_return_payload:
+        sale_payload["transaction_return_note"] = pending_return_payload.get("note")
+        sale_payload["transaction_return_seller_note"] = pending_return_payload.get(
+            "seller_note"
+        )
+    sale_payload.update(status_fields)
+    sale_payload.update(shipping)
+    _apply_sale_fulfillment_rollup(sale_payload)
+
+    stripe_refund = _stripe_refund_summary(
+        status_fields, pending_returns_payload, returns
+    )
+
+    payload = {
+        "order_uid": order_uid,
+        "requested_transaction_uid": requested_transaction_uid or order_uid,
+        "sale": sale_payload,
+        "returns": returns,
+        "pending_return": pending_return_payload,
+        "pending_returns": pending_returns_payload,
+        "summary": _build_summary(sale, returns),
+        **status_fields,
+        **shipping,
+    }
+    if stripe_refund is not None:
+        payload["stripe_refund"] = stripe_refund
+    return payload
+
+
 class OrderDetail(Resource):
     """
     GET /api/v1/orders/<transaction_uid>
@@ -354,6 +563,7 @@ class OrderDetail(Resource):
     """
 
     def get(self, transaction_uid):
+        print(f"OrderDetail GET: {transaction_uid}")
         response = {}
         try:
             profile_id = _viewer_profile_id()
@@ -386,79 +596,12 @@ class OrderDetail(Resource):
                     response["code"] = 403
                     return response, 403
 
-                sale_lines = _load_sale_lines(db, order_uid)
-                returns = _load_return_transactions(db, order_uid)
-                shipping = shipping_payload_from_row(
-                    load_shipping_for_transaction(db, order_uid)
+                payload = build_order_payload(
+                    db,
+                    order_uid,
+                    requested_transaction_uid=transaction_uid,
                 )
-                open_returns = _load_open_return_requests(db, order_uid)
-                pending_return = open_returns[0] if open_returns else _load_return_request(
-                    db, order_uid
-                )
-                return_status, refund_status = _pair_for_sale(sale, pending_return)
-                status_fields = _status_payload(return_status, refund_status)
-
-                def _pending_payload(req):
-                    if not req:
-                        return None
-                    rs, fs = _pair_for_sale(sale, req)
-                    cancel_flag = _is_cancel_unshipped_request(req)
-                    return {
-                        "trr_uid": req.get("trr_uid"),
-                        "note": req.get("trr_note") or req.get("note"),
-                        "seller_note": req.get("trr_seller_note")
-                        or req.get("seller_note"),
-                        "estimated_total": req.get("trr_estimated_total"),
-                        "transaction_item_uid": req.get("transaction_item_uid")
-                        or req.get("trr_ti_uid"),
-                        "return_quantity": req.get("return_quantity")
-                        if req.get("return_quantity") is not None
-                        else req.get("trr_return_quantity"),
-                        "items": req.get("items") or [],
-                        "return_transaction_uid": req.get("trr_return_transaction_uid"),
-                        "stripe_refund_id": req.get("trr_stripe_refund_id"),
-                        "created_at": req.get("trr_created_at"),
-                        "updated_at": req.get("trr_updated_at"),
-                        "cancel_unshipped": cancel_flag,
-                        "pre_ship_cancel": cancel_flag,
-                        "is_cancel_before_ship": cancel_flag,
-                        **_status_payload(rs, fs),
-                    }
-
-                pending_returns_payload = [
-                    _pending_payload(req) for req in open_returns
-                ]
-                pending_return_payload = (
-                    pending_returns_payload[0] if pending_returns_payload else None
-                )
-
-                sale_payload = dict(sale)
-                sale_payload["lines"] = sale_lines
-                sale_payload["pending_return"] = pending_return_payload
-                sale_payload["pending_returns"] = pending_returns_payload
-                # Prefer return-request fields over legacy sale columns.
-                if pending_return_payload:
-                    sale_payload["transaction_return_note"] = pending_return_payload.get(
-                        "note"
-                    )
-                    sale_payload["transaction_return_seller_note"] = (
-                        pending_return_payload.get("seller_note")
-                    )
-                sale_payload.update(status_fields)
-                sale_payload.update(shipping)
-
-                payload = {
-                    "order_uid": order_uid,
-                    "requested_transaction_uid": transaction_uid,
-                    "resolved_from_return_uid": resolved_from_return_uid,
-                    "sale": sale_payload,
-                    "returns": returns,
-                    "pending_return": pending_return_payload,
-                    "pending_returns": pending_returns_payload,
-                    "summary": _build_summary(sale, returns),
-                    **status_fields,
-                    **shipping,
-                }
+                payload["resolved_from_return_uid"] = resolved_from_return_uid
 
                 tz_name = _request_timezone()
                 payload = _enrich_order_datetimes(payload, tz_name)

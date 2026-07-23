@@ -11,10 +11,12 @@ Mutations (PUT transactions, decline returns) stay on existing endpoints.
 from flask_restful import Resource
 from flask import request
 
+from data_ec import connect
 from transactions import Transactions, SellerTransactions
 from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
+from order_list_hydration import attach_order_list_hydration
 
 
 def _request_timezone():
@@ -77,15 +79,16 @@ class AccountScreenPersonal(Resource):
         bounty_body = _enrich_section_datetimes(bounty_body)
         seller_body = _enrich_section_datetimes(seller_body)
 
-        return (
-            {
-                "code": 200,
-                "purchases": _merge_body_status(purchases_body, purchases_status),
-                "bounty_results": _merge_body_status(bounty_body, bounty_status),
-                "seller_transactions": _merge_body_status(seller_body, seller_status),
-            },
-            200,
-        )
+        response = {
+            "code": 200,
+            "purchases": _merge_body_status(purchases_body, purchases_status),
+            "bounty_results": _merge_body_status(bounty_body, bounty_status),
+            "seller_transactions": _merge_body_status(seller_body, seller_status),
+        }
+        with connect() as db:
+            attach_order_list_hydration(response, db, mode="personal")
+
+        return (response, 200)
 
 
 class AccountScreenBusiness(Resource):
@@ -109,14 +112,15 @@ class AccountScreenBusiness(Resource):
         seller_body = _enrich_section_datetimes(seller_body)
         bounty_body = _enrich_section_datetimes(bounty_body)
 
-        return (
-            {
-                "code": 200,
-                "seller_transactions": _merge_body_status(seller_body, seller_status),
-                "business_bounty_results": _merge_body_status(
-                    bounty_body, bounty_status
-                ),
-                "business_info": _merge_body_status(info_body, info_status),
-            },
-            200,
-        )
+        response = {
+            "code": 200,
+            "seller_transactions": _merge_body_status(seller_body, seller_status),
+            "business_bounty_results": _merge_body_status(
+                bounty_body, bounty_status
+            ),
+            "business_info": _merge_body_status(info_body, info_status),
+        }
+        with connect() as db:
+            attach_order_list_hydration(response, db, mode="business")
+
+        return (response, 200)
