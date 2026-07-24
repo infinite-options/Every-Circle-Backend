@@ -214,6 +214,81 @@ def release_bounty_to_useable(db, bounty_profile_id, amount):
     return _release_existing_wallet(db, wallet, bounty_profile_id, amount)
 
 
+def credit_seller_proceeds_to_wallet(db, profile_id, amount):
+    """
+    Credit seller sale proceeds to useable balance (not bounty escrow/pending).
+
+    Increases wallet_useable_balance, wallet_actual_balance, and
+    wallet_lifetime_earning. Does not touch wallet_pending.
+    """
+    amount = _round_money(amount)
+    if not profile_id or amount <= 0:
+        return {"code": 200, "skipped": True, "wallet_profile_id": profile_id}
+
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+
+    if wallet:
+        actual = _to_float(wallet.get("wallet_actual_balance"))
+        useable = _to_float(wallet.get("wallet_useable_balance"))
+        lifetime = _to_float(wallet.get("wallet_lifetime_earning"))
+
+        updates = {
+            "wallet_actual_balance": _round_money(actual + amount),
+            "wallet_useable_balance": _round_money(useable + amount),
+            "wallet_lifetime_earning": _round_money(lifetime + amount),
+        }
+        result = db.update(
+            "every_circle.wallet",
+            {"wallet_profile_id": wallet_id},
+            updates,
+        )
+        if result.get("code") != 200:
+            return {
+                "code": result.get("code", 500),
+                "message": result.get("message", "Failed to update wallet"),
+                "wallet_profile_id": profile_id,
+            }
+        return {
+            "code": 200,
+            "wallet_profile_id": profile_id,
+            "wallet_pk": wallet_id,
+            "credited": amount,
+            "wallet_created": False,
+        }
+
+    insert_result = db.insert(
+        "every_circle.wallet",
+        {
+            "wallet_profile_id": wallet_id,
+            "wallet_actual_balance": amount,
+            "wallet_pending": 0,
+            "wallet_useable_balance": amount,
+            "wallet_reserve": 0,
+            "wallet_lifetime_earning": amount,
+            "wallet_lifetime_spent": 0,
+        },
+    )
+    if insert_result.get("code") != 200:
+        insert_msg = insert_result.get("message", "")
+        if "duplicate entry" in insert_msg.lower():
+            wallet = get_wallet_row(db, profile_id)
+            if wallet:
+                return credit_seller_proceeds_to_wallet(db, profile_id, amount)
+        return {
+            "code": insert_result.get("code", 500),
+            "message": insert_result.get("message", "Failed to create wallet"),
+            "wallet_profile_id": profile_id,
+        }
+    return {
+        "code": 200,
+        "wallet_profile_id": profile_id,
+        "wallet_pk": wallet_id,
+        "credited": amount,
+        "wallet_created": True,
+    }
+
+
 def debit_bounty_from_wallet(db, bounty_profile_id, amount):
     """
     Remove bounty on return (negative transactions_bounty row).
@@ -266,9 +341,43 @@ def debit_bounty_from_wallet(db, bounty_profile_id, amount):
     }
 
 
+def _sum_posted_wallet_transactions(db, profile_id):
+    """
+    Sum posted wallet_transactions.wt_amount for a profile (seller proceeds, etc.).
+
+    Includes all wt_types so future clawbacks (negative amounts) net correctly.
+    """
+    if not profile_id:
+        return 0.0
+    # Lazy import: wallet_transactions_service imports wallet_service helpers.
+    from wallet_transactions_service import _ensure_wallet_transactions_table
+
+    _ensure_wallet_transactions_table(db)
+    # Match either the passed id or the resolved wallet PK (legacy platform ids).
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_amount), 0) AS seller_proceeds
+        FROM every_circle.wallet_transactions
+        WHERE wt_status = 'posted'
+          AND wt_profile_id IN (%s, %s)
+        """,
+        (profile_id, wallet_id),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return _round_money(rows[0].get("seller_proceeds"))
+
+
 def compute_wallet_from_bounty_ledger(db, profile_id):
     """
-    Recompute wallet balances from transactions_bounty + current transaction_in_escrow.
+    Recompute wallet balances from transactions_bounty + escrow, plus posted
+    seller proceeds in wallet_transactions so bounty reconcile does not wipe them.
+
+    useable = bounty_useable + SUM(posted wt_amount)
+    pending = bounty_pending only (seller proceeds never go to pending)
+    actual / lifetime = bounty_total + SUM(posted wt_amount)
     """
     ledger_q = db.execute(
         """
@@ -290,29 +399,33 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
         (profile_id,),
     )
     rows = ledger_q.get("result") or []
-    if not rows:
-        return {
-            "wallet_actual_balance": 0,
-            "wallet_pending": 0,
-            "wallet_useable_balance": 0,
-            "wallet_lifetime_earning": 0,
-        }
+    if rows:
+        row = rows[0]
+        bounty_total = _round_money(row.get("total_earned"))
+        pending = _round_money(row.get("pending_amount"))
+        bounty_useable = _round_money(row.get("useable_amount"))
+    else:
+        bounty_total = 0.0
+        pending = 0.0
+        bounty_useable = 0.0
 
-    row = rows[0]
-    total = _round_money(row.get("total_earned"))
-    pending = _round_money(row.get("pending_amount"))
-    useable = _round_money(row.get("useable_amount"))
+    seller_proceeds = _sum_posted_wallet_transactions(db, profile_id)
+    total = _round_money(bounty_total + seller_proceeds)
+    useable = _round_money(bounty_useable + seller_proceeds)
 
     return {
         "wallet_actual_balance": total,
         "wallet_pending": pending,
         "wallet_useable_balance": useable,
         "wallet_lifetime_earning": total,
+        "bounty_total": bounty_total,
+        "bounty_useable": bounty_useable,
+        "seller_proceeds": seller_proceeds,
     }
 
 
 def reconcile_profile_wallet(db, profile_id):
-    """Overwrite wallet row to match bounty ledger + escrow flags."""
+    """Overwrite wallet row to match bounty ledger + escrow + seller proceeds."""
     wallet_id = resolve_wallet_profile_id(profile_id)
     computed = compute_wallet_from_bounty_ledger(db, profile_id)
     wallet = get_wallet_row(db, profile_id)
@@ -355,17 +468,27 @@ def reconcile_profile_wallet(db, profile_id):
         "wallet_profile_id": wallet_id,
         "action": action,
         "wallet": fields,
+        "seller_proceeds": computed.get("seller_proceeds", 0),
     }
 
 
 def reconcile_all_profile_wallets(db):
-    """Reconcile every profile that appears in transactions_bounty."""
+    """Reconcile every profile in transactions_bounty or wallet_transactions."""
+    from wallet_transactions_service import _ensure_wallet_transactions_table
+
+    _ensure_wallet_transactions_table(db)
     profiles_q = db.execute(
         """
-        SELECT DISTINCT tb_profile_id AS profile_id
-        FROM every_circle.transactions_bounty
-        WHERE tb_profile_id IS NOT NULL AND tb_profile_id != ''
-        ORDER BY tb_profile_id
+        SELECT DISTINCT profile_id FROM (
+            SELECT tb_profile_id AS profile_id
+            FROM every_circle.transactions_bounty
+            WHERE tb_profile_id IS NOT NULL AND tb_profile_id != ''
+            UNION
+            SELECT wt_profile_id AS profile_id
+            FROM every_circle.wallet_transactions
+            WHERE wt_profile_id IS NOT NULL AND wt_profile_id != ''
+        ) AS profiles
+        ORDER BY profile_id
         """
     )
     profiles = profiles_q.get("result") or []

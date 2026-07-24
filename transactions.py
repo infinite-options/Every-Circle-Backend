@@ -15,6 +15,7 @@ from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
 from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
+from wallet_transactions_service import credit_partial_delivery
 from datetime_utils import utc_now_str, enrich_datetime_fields, parse_stored_datetime
 from transaction_shipping import (
     normalize_shipping_address,
@@ -4079,10 +4080,28 @@ class Transactions(Resource):
                         response["code"] = ti_update.get("code", 500)
                         return response, response["code"]
 
+                    credit_result = credit_partial_delivery(
+                        db,
+                        transaction_uid,
+                        ti_uid,
+                        received_qty,
+                        new_received,
+                    )
+                    if credit_result.get("code") != 200:
+                        response["message"] = credit_result.get(
+                            "message",
+                            "Failed to credit seller for partial delivery",
+                        )
+                        response["code"] = credit_result.get("code", 500)
+                        response["partial_delivery_credit"] = credit_result
+                        return response, response["code"]
+
                     line_out = {
                         "transaction_item_uid": ti_uid,
                         "ti_received_qty": new_received,
                         "ti_bs_qty": order_qty,
+                        "wt_uid": credit_result.get("wt_uid"),
+                        "wt_amount": credit_result.get("wt_amount"),
                     }
                     if set_delivered:
                         line_out["fulfillment_status"] = FULFILLMENT_STATUS_DELIVERED

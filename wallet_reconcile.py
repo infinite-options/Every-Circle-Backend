@@ -5,7 +5,10 @@ from wallet_service import reconcile_all_profile_wallets, reconcile_profile_wall
 
 
 class WalletReconcile(Resource):
-    """GET /api/v1/wallet_reconcile/<profile_id> — fix one profile's wallet from bounty ledger."""
+    """
+    GET /api/v1/wallet_reconcile/<profile_id>
+    Rebuild wallet from bounty ledger + escrow + posted wallet_transactions.
+    """
 
     def get(self, profile_id):
         if not profile_id:
@@ -21,7 +24,10 @@ class WalletReconcile(Resource):
 
 
 class WalletReconcileAll(Resource):
-    """GET /api/v1/wallet_reconcile — fix all profiles that appear in transactions_bounty."""
+    """
+    GET /api/v1/wallet_reconcile
+    Reconcile all profiles in transactions_bounty or wallet_transactions.
+    """
 
     def get(self):
         try:
