@@ -479,7 +479,9 @@ class BusinessInfo(Resource):
                 category_response = db.execute(category_query)
 
                 links_query = f"""
-                    SELECT bl_social_link_id as social_link_name, bl_url as business_link_url
+                    SELECT bl_social_link_id as social_link_name,
+                           bl_url as business_link_url,
+                           bl_short_name
                     FROM every_circle.business_link
                     WHERE bl_business_id = "{business_uid}"
                 """
@@ -709,6 +711,13 @@ class BusinessInfo(Resource):
                         "business_uid", None
                     )  # This should be None for POST, but handle if provided
 
+                    bl_short_name_provided = "bl_short_name" in payload
+                    bl_short_name = (
+                        payload.pop("bl_short_name", None)
+                        if bl_short_name_provided
+                        else None
+                    )
+
                     payload["business_uid"] = new_business_uid
                     payload["business_joined_timestamp"] = datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S"
@@ -803,6 +812,15 @@ class BusinessInfo(Resource):
                     # print("Insert Payload: ", payload)
                     insert_response = db.insert("every_circle.business", payload)
                     # print("insert_response: ", insert_response)
+
+                    if payload.get("business_website") or bl_short_name_provided:
+                        self._upsert_website_link(
+                            db,
+                            new_business_uid,
+                            website_url=payload.get("business_website"),
+                            short_name=bl_short_name,
+                            update_short_name=bl_short_name_provided,
+                        )
 
                     # Insert into business_user table (skip if already linked)
                     existing_bu = db.select(
@@ -948,6 +966,12 @@ class BusinessInfo(Resource):
             )
             delete_bs_service_image_0 = payload.pop(
                 "delete_bs_service_image_0", None
+            )
+            bl_short_name_provided = "bl_short_name" in payload
+            bl_short_name = (
+                payload.pop("bl_short_name", None)
+                if bl_short_name_provided
+                else None
             )
 
             key = {"business_uid": business_uid}
@@ -1603,6 +1627,17 @@ class BusinessInfo(Resource):
                         else "(none/empty)"
                     )
                 )
+                if "business_website" in payload or bl_short_name_provided:
+                    self._upsert_website_link(
+                        db,
+                        business_uid,
+                        website_url=payload.get("business_website")
+                        if "business_website" in payload
+                        else None,
+                        short_name=bl_short_name,
+                        update_short_name=bl_short_name_provided,
+                    )
+
                 if payload:
                     update_response = db.update("every_circle.business", key, payload)
                     print(update_response)
@@ -1682,6 +1717,59 @@ class BusinessInfo(Resource):
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
+
+    _WEBSITE_LINK_PLATFORM = "website"
+
+    def _upsert_website_link(
+        self,
+        db,
+        business_uid,
+        website_url=None,
+        short_name=None,
+        update_short_name=False,
+    ):
+        """Persist website URL and optional short title on business_link."""
+        update_fields = {}
+        if website_url is not None:
+            update_fields["bl_url"] = website_url
+        if update_short_name:
+            update_fields["bl_short_name"] = short_name
+
+        if not update_fields:
+            return
+
+        existing_response = db.execute(
+            f"""
+            SELECT bl_uid
+            FROM every_circle.business_link
+            WHERE bl_business_id = "{business_uid}"
+              AND bl_social_link_id = "{self._WEBSITE_LINK_PLATFORM}";
+            """
+        )
+
+        if existing_response.get("result"):
+            bl_uid = existing_response["result"][0]["bl_uid"]
+            db.update(
+                "every_circle.business_link",
+                {"bl_uid": bl_uid},
+                update_fields,
+            )
+            return
+
+        if not website_url and not (update_short_name and short_name):
+            return
+
+        bl_uid_response = db.call(procedure="new_bl_uid")
+        bl_uid = bl_uid_response["result"][0]["new_id"]
+        link_payload = {
+            "bl_uid": bl_uid,
+            "bl_business_id": business_uid,
+            "bl_social_link_id": self._WEBSITE_LINK_PLATFORM,
+            "bl_url": website_url or "",
+        }
+        if update_short_name:
+            link_payload["bl_short_name"] = short_name
+        db.insert("every_circle.business_link", link_payload)
 
     def _add_categories(self, db, categories_uid_str, business_uid):
         try:

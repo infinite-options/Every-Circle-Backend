@@ -4,6 +4,14 @@ from flask import request
 from flask_restful import Resource
 from datetime import datetime
 
+from business_info import (
+    _BS_SHIPPING_BUYER_ACTUAL,
+    _BS_SHIPPING_BUYER_FIXED,
+    _BS_SHIPPING_FREE,
+    _normalize_bs_shipping_value,
+    _parse_shipping_amount,
+    _truthy_flag,
+)
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from moderation import (
     MODERATED_ACKNOWLEDGED,
@@ -31,6 +39,17 @@ _EXPERIENCE_S3_PREFIX = "profile_experience"
 _EDUCATION_S3_PREFIX = "profile_education"
 
 _OFFERING_RETURNABLE_COLUMNS_READY = False
+_OFFERING_SHIPPING_COLUMNS_READY = False
+
+# UI-only offering keys (mirrors bs_free_shipping / bs_qty_unlimited on business_services).
+_EXPERTISE_NON_DB_KEYS = frozenset(
+    {
+        "profile_expertise_free_shipping",
+        "profile_expertise_buyer_pays_shipping",
+        "profile_expertise_shipping_cost_type",
+        "profile_expertise_qty_unlimited",
+    }
+)
 
 
 def _ensure_offering_returnable_columns(db):
@@ -49,6 +68,106 @@ def _ensure_offering_returnable_columns(db):
         cmd="post",
     )
     _OFFERING_RETURNABLE_COLUMNS_READY = True
+
+
+def _ensure_offering_shipping_columns(db):
+    """Add canonical shipping columns on profile_expertise when missing."""
+    global _OFFERING_SHIPPING_COLUMNS_READY
+    if _OFFERING_SHIPPING_COLUMNS_READY:
+        return
+    for ddl in (
+        "ALTER TABLE every_circle.profile_expertise "
+        "ADD COLUMN profile_expertise_shipping VARCHAR(32) NULL DEFAULT NULL",
+        "ALTER TABLE every_circle.profile_expertise "
+        "ADD COLUMN profile_expertise_shipping_amount DECIMAL(10,2) NULL DEFAULT NULL",
+        "ALTER TABLE every_circle.profile_expertise "
+        "ADD COLUMN profile_expertise_shipping_refundable TINYINT(1) NULL DEFAULT 0",
+    ):
+        try:
+            db.execute(ddl, cmd="post")
+        except Exception as e:
+            print(f"profile_expertise shipping column ensure (ok if exists): {e}")
+    _OFFERING_SHIPPING_COLUMNS_READY = True
+
+
+def _derive_expertise_shipping_fields(expertise_data):
+    """
+    Persist profile_expertise_shipping + profile_expertise_shipping_amount from FE.
+
+    Mirrors business_services bs_shipping handling. Legacy UI flags
+    (profile_expertise_free_shipping / profile_expertise_buyer_pays_shipping) are
+    accepted when profile_expertise_shipping is omitted, then stripped.
+    """
+    free_flag = expertise_data.pop("profile_expertise_free_shipping", None)
+    buyer_flag = expertise_data.pop("profile_expertise_buyer_pays_shipping", None)
+    cost_type = expertise_data.pop("profile_expertise_shipping_cost_type", None)
+
+    if (
+        "profile_expertise_shipping" not in expertise_data
+        or expertise_data.get("profile_expertise_shipping") in (None, "")
+    ):
+        if _truthy_flag(free_flag):
+            expertise_data["profile_expertise_shipping"] = _BS_SHIPPING_FREE
+        elif _truthy_flag(buyer_flag):
+            ct = str(cost_type or "").strip().lower()
+            if ct == "fixed":
+                expertise_data["profile_expertise_shipping"] = _BS_SHIPPING_BUYER_FIXED
+            else:
+                expertise_data["profile_expertise_shipping"] = _BS_SHIPPING_BUYER_ACTUAL
+        else:
+            expertise_data.pop("profile_expertise_shipping_amount", None)
+            return
+
+    shipping = _normalize_bs_shipping_value(expertise_data.get("profile_expertise_shipping"))
+    amount = _parse_shipping_amount(expertise_data.get("profile_expertise_shipping_amount"))
+
+    if shipping == _BS_SHIPPING_BUYER_FIXED:
+        expertise_data["profile_expertise_shipping"] = _BS_SHIPPING_BUYER_FIXED
+        expertise_data["profile_expertise_shipping_amount"] = (
+            0.0 if amount is None else amount
+        )
+    elif shipping in (_BS_SHIPPING_FREE, _BS_SHIPPING_BUYER_ACTUAL):
+        expertise_data["profile_expertise_shipping"] = shipping
+        expertise_data["profile_expertise_shipping_amount"] = None
+    else:
+        expertise_data["profile_expertise_shipping"] = None
+        expertise_data["profile_expertise_shipping_amount"] = None
+
+    if expertise_data.get("profile_expertise_shipping_refundable") not in (None, ""):
+        expertise_data["profile_expertise_shipping_refundable"] = (
+            1 if _truthy_flag(expertise_data["profile_expertise_shipping_refundable"]) else 0
+        )
+    else:
+        expertise_data.pop("profile_expertise_shipping_refundable", None)
+
+
+def _derive_expertise_quantity_fields(expertise_data):
+    """Map UI unlimited flag to profile_expertise_quantity (NULL = unlimited)."""
+    qty_unlimited = expertise_data.pop("profile_expertise_qty_unlimited", None)
+    raw_q = expertise_data.get("profile_expertise_quantity")
+    if raw_q is not None and str(raw_q).strip() != "":
+        q = str(raw_q).strip()
+        if q.lower() in ("unlimited", "null", "none"):
+            expertise_data["profile_expertise_quantity"] = None
+        else:
+            expertise_data["profile_expertise_quantity"] = q
+    elif _truthy_flag(qty_unlimited):
+        expertise_data["profile_expertise_quantity"] = None
+    else:
+        expertise_data.pop("profile_expertise_quantity", None)
+
+
+def _finalize_expertise_fields(expertise_data):
+    """Strip UI-only keys and normalize persisted offering columns."""
+    _derive_expertise_shipping_fields(expertise_data)
+    _derive_expertise_quantity_fields(expertise_data)
+    for key in _EXPERTISE_NON_DB_KEYS:
+        expertise_data.pop(key, None)
+
+
+def _ensure_offering_schema_columns(db):
+    _ensure_offering_returnable_columns(db)
+    _ensure_offering_shipping_columns(db)
 
 
 def _delete_expertise_s3_assets(expertise_uid):
@@ -128,8 +247,13 @@ def _expertise_dict_from_payload(exp_data):
             "profile_expertise_uid",
             "profile_expertise_profile_personal_id",
             "profile_expertise_moderated",
+            *_EXPERTISE_NON_DB_KEYS,
         ):
             m[k] = v
+    for key in _EXPERTISE_NON_DB_KEYS:
+        if key in exp_data:
+            m[key] = exp_data[key]
+    _finalize_expertise_fields(m)
     return m
 
 
@@ -1219,7 +1343,7 @@ class UserProfileInfo(Resource):
                         import json
                         expertises_data = json.loads(payload.pop('expertises'))
                         print("expertise data: ", expertises_data)
-                        _ensure_offering_returnable_columns(db)
+                        _ensure_offering_schema_columns(db)
                         
                         # Process each expertise entry (multipart: profile_expertise_image_0, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
@@ -1270,7 +1394,7 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         wishes_data = json.loads(payload.pop('wishes'))
-                        _ensure_offering_returnable_columns(db)
+                        _ensure_offering_schema_columns(db)
                         print("wishes data: ", wishes_data)
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
@@ -2063,7 +2187,7 @@ class UserProfileInfo(Resource):
                         expertises_data = json.loads(payload.pop('expertise_info'))
                         expertise_payload_refresh = True
                         expertise_uids = []
-                        _ensure_offering_returnable_columns(db)
+                        _ensure_offering_schema_columns(db)
                         
                         # Process each expertise entry (multipart files: profile_expertise_image_0, _1, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
@@ -2159,7 +2283,7 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_payload_refresh = True
                         wishes_uids = []
-                        _ensure_offering_returnable_columns(db)
+                        _ensure_offering_schema_columns(db)
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
                         for wish_idx, wish_data in enumerate(wishes_data):
