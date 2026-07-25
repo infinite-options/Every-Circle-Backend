@@ -97,6 +97,93 @@ def _ensure_transaction_shipping_columns(db):
     _TRANSACTION_SHIPPING_COLUMNS_READY = True
 
 
+def _parse_limited_quantity(raw_qty):
+    """Return int when stock is tracked; None means unlimited / not tracked."""
+    if raw_qty is None:
+        return None
+    s = str(raw_qty).strip().lower()
+    if s in ("", "unlimited", "null", "none"):
+        return None
+    try:
+        qty = int(float(s))
+        return qty if qty >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _purchase_qty(item):
+    try:
+        qty = int(item.get("quantity") or 1)
+        return qty if qty >= 1 else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _validate_purchase_quantity(available_qty, purchased_qty):
+    """Fast-fail when a listing has limited stock and the cart qty exceeds it."""
+    if available_qty is None:
+        return None
+    if available_qty < purchased_qty:
+        err = {
+            "message": "Insufficient stock",
+            "code": 409,
+            "remaining": available_qty,
+        }
+        return (err, 409)
+    return None
+
+
+def _rows_affected(db_result):
+    change = (db_result or {}).get("change") or ""
+    try:
+        return int(str(change).split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _decrement_tracked_quantity(db, table, uid_column, qty_column, uid, purchased_qty):
+    purchased_qty = int(purchased_qty or 1)
+    decrement_result = db.execute(
+        f"""
+        UPDATE every_circle.{table}
+        SET {qty_column} = {qty_column} - %s
+        WHERE {uid_column} = %s
+          AND {qty_column} IS NOT NULL
+          AND {qty_column} >= %s
+        """,
+        (purchased_qty, uid, purchased_qty),
+        cmd="post",
+    )
+    if decrement_result.get("code") != 200:
+        err = {"message": "Failed to update quantity", "code": 500}
+        return False, None, (err, 500)
+
+    if _rows_affected(decrement_result) > 0:
+        check = db.execute(
+            f"SELECT {qty_column} FROM every_circle.{table} WHERE {uid_column} = %s",
+            (uid,),
+        )
+        rows = (check or {}).get("result") or []
+        remaining = rows[0].get(qty_column) if rows else None
+        return True, remaining, None
+
+    check = db.execute(
+        f"SELECT {qty_column} FROM every_circle.{table} WHERE {uid_column} = %s",
+        (uid,),
+    )
+    rows = (check or {}).get("result") or []
+    available = _parse_limited_quantity(rows[0].get(qty_column) if rows else None)
+    if available is None:
+        return True, None, None
+
+    err = {
+        "message": "Insufficient stock",
+        "code": 409,
+        "remaining": available,
+    }
+    return False, available, (err, 409)
+
+
 def _parse_line_shipping_amount(value):
     """Parse shipping dollar amount from checkout payload."""
     if value is None or value == "":
@@ -119,20 +206,35 @@ def _normalize_shipping_refundable(value, default=0):
     return 1 if _as_returnable_flag(value, default=bool(default)) else 0
 
 
-def _shipping_amount_from_product(bs_data):
-    """Derive line shipping charge from business_services snapshot."""
-    if not bs_data:
+def _shipping_amount_from_product(product_data):
+    """Derive line shipping charge from business_services or profile_expertise snapshot."""
+    if not product_data:
         return None
-    sh = bs_data.get("bs_shipping")
+    sh = product_data.get("bs_shipping")
+    if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_expertise_shipping")
     if sh is None or str(sh).strip() == "":
         return None
     low = str(sh).strip().lower()
     if low == "free":
         return 0.0
     if low in ("buyer fixed", "buyer_fixed"):
-        amt = _parse_line_shipping_amount(bs_data.get("bs_shipping_amount"))
+        amt = _parse_line_shipping_amount(
+            product_data.get("bs_shipping_amount")
+            if product_data.get("bs_shipping_amount") is not None
+            else product_data.get("profile_expertise_shipping_amount")
+        )
         return 0.0 if amt is None else amt
     return None
+
+
+def _shipping_refundable_from_product(product_data, default=0):
+    if not product_data:
+        return default
+    raw = product_data.get("bs_shipping_refundable")
+    if raw is None or raw == "":
+        raw = product_data.get("profile_expertise_shipping_refundable")
+    return _normalize_shipping_refundable(raw, default=default)
 
 
 def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
@@ -160,8 +262,8 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
     if raw_ref is not None and raw_ref != "":
         tx_item["ti_shipping_refundable"] = _normalize_shipping_refundable(raw_ref)
     elif bs_data is not None:
-        tx_item["ti_shipping_refundable"] = _normalize_shipping_refundable(
-            bs_data.get("bs_shipping_refundable"),
+        tx_item["ti_shipping_refundable"] = _shipping_refundable_from_product(
+            bs_data,
             default=0,
         )
     else:
@@ -3015,6 +3117,7 @@ class Transactions(Resource):
                     # item_bounty_type = "per_item"
                     item_bounty_type = item.get("bounty_type", "per_item")
                     is_wish_item = False
+                    stock_decrement = None
 
                     if ti_bs_id and str(ti_bs_id).startswith("250"):
                         print("ti_bs_id is a business service")
@@ -3115,11 +3218,27 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("profile_expertise_is_returnable")
                         )
-                        _apply_line_shipping_snapshot(tx_item, item)
+                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
+
+                        purchased_qty = _purchase_qty(item)
+                        stock_err = _validate_purchase_quantity(
+                            _parse_limited_quantity(bs_data.get("profile_expertise_quantity")),
+                            purchased_qty,
+                        )
+                        if stock_err:
+                            response.update(stock_err[0])
+                            return response, stock_err[1]
+                        stock_decrement = {
+                            "table": "profile_expertise",
+                            "uid_column": "profile_expertise_uid",
+                            "qty_column": "profile_expertise_quantity",
+                            "uid": ti_bs_id,
+                            "purchased_qty": purchased_qty,
+                        }
 
                     elif ti_bs_id and str(ti_bs_id).startswith("165"):
                         print("ti_bs_id is a wish")
@@ -3189,6 +3308,22 @@ class Transactions(Resource):
                         )
                         print("tx_item: ", tx_item)
 
+                        purchased_qty = _purchase_qty(item)
+                        stock_err = _validate_purchase_quantity(
+                            _parse_limited_quantity(bs_data.get("profile_wish_quantity")),
+                            purchased_qty,
+                        )
+                        if stock_err:
+                            response.update(stock_err[0])
+                            return response, stock_err[1]
+                        stock_decrement = {
+                            "table": "profile_wish",
+                            "uid_column": "profile_wish_uid",
+                            "qty_column": "profile_wish_quantity",
+                            "uid": bs_data.get("profile_wish_uid"),
+                            "purchased_qty": purchased_qty,
+                        }
+
                     else:
                         print("ti_bs_id is not a valid ID")
                         continue
@@ -3242,21 +3377,25 @@ class Transactions(Resource):
                         )
                         continue
 
-                    # Decrement expertise quantity in DB when an offering with limited stock is sold
-                    if ti_bs_id and str(ti_bs_id).startswith("150"):
-                        purchased_qty = int(item.get("quantity") or 1)
-                        db.execute(
-                            """
-                            UPDATE every_circle.profile_expertise
-                            SET profile_expertise_quantity = GREATEST(0, profile_expertise_quantity - %s)
-                            WHERE profile_expertise_uid = %s
-                              AND profile_expertise_quantity IS NOT NULL
-                              AND profile_expertise_quantity > 0
-                            """,
-                            (purchased_qty, ti_bs_id),
-                            cmd="post",
+                    if stock_decrement:
+                        _, remaining, dec_err = _decrement_tracked_quantity(
+                            db,
+                            stock_decrement["table"],
+                            stock_decrement["uid_column"],
+                            stock_decrement["qty_column"],
+                            stock_decrement["uid"],
+                            stock_decrement["purchased_qty"],
                         )
-                        print(f"Decremented expertise quantity for {ti_bs_id} by {purchased_qty}")
+                        if dec_err:
+                            print(
+                                f"Warning: stock decrement failed after insert for "
+                                f"{stock_decrement['uid']}: {dec_err[0]}"
+                            )
+                        elif remaining is not None:
+                            print(
+                                f"Decremented {stock_decrement['table']} "
+                                f"{stock_decrement['uid']} to {remaining}"
+                            )
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
