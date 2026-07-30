@@ -1,15 +1,29 @@
 """
 Seller wallet_transactions ledger: table ensure, seller-eligible totals,
 and partial-delivery credit (idempotent insert + wallet credit).
+
+Statuses: posted (spendable) | held (return-window lock until wt_available_at).
+Types: partial_delivery_credit | return_clawback.
 """
 
 import re
+from datetime import datetime, timedelta, timezone
 
-from datetime_utils import utc_now_str
-from wallet_service import _round_money, _to_float, credit_seller_proceeds_to_wallet
+from datetime_utils import parse_stored_datetime, utc_now_str
+from wallet_service import (
+    _round_money,
+    _to_float,
+    credit_seller_proceeds_to_wallet,
+    debit_seller_proceeds_from_wallet,
+    release_seller_hold_to_useable,
+)
 
 WT_TYPE_PARTIAL_DELIVERY_CREDIT = "partial_delivery_credit"
+WT_TYPE_RETURN_CLAWBACK = "return_clawback"
 WT_STATUS_POSTED = "posted"
+WT_STATUS_HELD = "held"
+
+_DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 _WALLET_TRANSACTIONS_TABLE_READY = False
 
@@ -73,19 +87,23 @@ def _ensure_wallet_transactions_table(db):
             wt_currency VARCHAR(8) NOT NULL,
             wt_idempotency_key VARCHAR(128) NOT NULL,
             wt_note VARCHAR(512) NULL,
+            wt_available_at DATETIME NULL,
             wt_created_at DATETIME NOT NULL,
             wt_updated_at DATETIME NOT NULL,
             PRIMARY KEY (wt_uid),
             UNIQUE KEY uq_wt_idempotency (wt_idempotency_key),
             KEY idx_wt_transaction_id (wt_transaction_id),
             KEY idx_wt_ti_id (wt_ti_id),
-            KEY idx_wt_profile_id (wt_profile_id)
+            KEY idx_wt_profile_id (wt_profile_id),
+            KEY idx_wt_held_available (wt_status, wt_available_at)
         )
         """,
         cmd="post",
     )
-    # Older installs may lack the unique key or lookup indexes.
+    # Older installs may lack columns, unique key, or lookup indexes.
     for ddl in (
+        "ALTER TABLE every_circle.wallet_transactions "
+        "ADD COLUMN wt_available_at DATETIME NULL",
         "ALTER TABLE every_circle.wallet_transactions "
         "ADD UNIQUE KEY uq_wt_idempotency (wt_idempotency_key)",
         "ALTER TABLE every_circle.wallet_transactions "
@@ -94,6 +112,8 @@ def _ensure_wallet_transactions_table(db):
         "ADD KEY idx_wt_ti_id (wt_ti_id)",
         "ALTER TABLE every_circle.wallet_transactions "
         "ADD KEY idx_wt_profile_id (wt_profile_id)",
+        "ALTER TABLE every_circle.wallet_transactions "
+        "ADD KEY idx_wt_held_available (wt_status, wt_available_at)",
     ):
         db.execute(ddl, cmd="post")
     _WALLET_TRANSACTIONS_TABLE_READY = True
@@ -213,16 +233,85 @@ def resolve_seller_wallet_profile_id(db, transaction_business_id):
     return _business_owner_profile_uid(db, seller_id)
 
 
+def _as_returnable_flag(value, default=True):
+    """Interpret ti_bs_is_returnable (0/1, bool, or common string forms)."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return bool(default)
+
+
+def _parse_positive_window_days(value):
+    """Return a positive int return window, or None if null/empty/invalid."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        try:
+            days = int(float(s))
+        except (TypeError, ValueError):
+            return None
+    return days if days > 0 else None
+
+
+def _seller_proceeds_hold_decision(ti_row):
+    """
+    Hold returnable sale lines that have a positive return_window_days.
+
+    Returns (hold, wt_available_at, window_days).
+    Non-returnable or null/empty/invalid window → (False, None, None).
+    available_at = ti_received_at + window_days (UTC naive string).
+    """
+    if not _as_returnable_flag(ti_row.get("ti_bs_is_returnable"), default=True):
+        return False, None, None
+
+    window_days = _parse_positive_window_days(ti_row.get("ti_bs_return_window_days"))
+    if window_days is None:
+        return False, None, None
+
+    received_at = parse_stored_datetime(ti_row.get("ti_received_at"))
+    if received_at is None:
+        received_at = datetime.now(timezone.utc)
+
+    available_at = received_at + timedelta(days=window_days)
+    if available_at.tzinfo is not None:
+        available_at = available_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return True, available_at.strftime(_DATETIME_FMT), window_days
+
+
 def _posted_credits_total(db, transaction_uid):
+    """
+    Net held + posted seller proceeds for an order (cap basis).
+
+    partial_delivery_credit amounts minus return_clawback (negative) rows.
+    """
     q = db.execute(
         """
         SELECT COALESCE(SUM(wt_amount), 0) AS credited
         FROM every_circle.wallet_transactions
         WHERE wt_transaction_id = %s
-          AND wt_type = %s
-          AND wt_status = %s
+          AND wt_type IN (%s, %s)
+          AND wt_status IN (%s, %s)
         """,
-        (transaction_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, WT_STATUS_POSTED),
+        (
+            transaction_uid,
+            WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+            WT_TYPE_RETURN_CLAWBACK,
+            WT_STATUS_POSTED,
+            WT_STATUS_HELD,
+        ),
     )
     rows = q.get("result") or []
     if not rows:
@@ -261,7 +350,7 @@ def compute_partial_delivery_credit_amount(
 
     Normal: seller_eligible_total * (qty * unit_cost / transaction_amount)
     If transaction_amount is 0: equal split by qty / total_order_qty.
-    Capped so cumulative posted credits never exceed seller_eligible_total.
+    Capped so cumulative held+posted credits never exceed seller_eligible_total.
     """
     eligible = _round_money(seller_eligible_total)
     if eligible <= 0 or qty <= 0:
@@ -287,7 +376,8 @@ def _fetch_wt_by_idempotency_key(db, idempotency_key):
     q = db.execute(
         """
         SELECT wt_uid, wt_amount, wt_profile_id, wt_qty, wt_received_qty_after,
-               wt_transaction_id, wt_ti_id, wt_currency, wt_status, wt_type
+               wt_transaction_id, wt_ti_id, wt_currency, wt_status, wt_type,
+               wt_available_at
         FROM every_circle.wallet_transactions
         WHERE wt_idempotency_key = %s
         LIMIT 1
@@ -323,6 +413,10 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
 
     Idempotency key: ``{ti_uid}:{received_qty_after}``. Duplicate key is a
     success/no-op (existing row returned, wallet not re-credited).
+
+    Returnable lines with a positive ``ti_bs_return_window_days`` credit
+    ``wallet_pending`` with status ``held`` until ``wt_available_at``;
+    otherwise credit useable with status ``posted``.
     """
     _ensure_wallet_transactions_table(db)
 
@@ -364,7 +458,8 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
 
     ti_q = db.execute(
         """
-        SELECT ti_uid, ti_transaction_id, ti_bs_cost, ti_bs_cost_currency, ti_bs_qty
+        SELECT ti_uid, ti_transaction_id, ti_bs_cost, ti_bs_cost_currency, ti_bs_qty,
+               ti_bs_is_returnable, ti_bs_return_window_days, ti_received_at
         FROM every_circle.transactions_items
         WHERE ti_uid = %s AND ti_transaction_id = %s
         """,
@@ -377,6 +472,9 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
             "message": f"Transaction item not found on sale: {ti_uid}",
         }
     ti = ti_rows[0]
+
+    hold, available_at, _window_days = _seller_proceeds_hold_decision(ti)
+    wt_status = WT_STATUS_HELD if hold else WT_STATUS_POSTED
 
     seller_id = tx.get("transaction_business_id")
     seller_profile_id = resolve_seller_wallet_profile_id(db, seller_id)
@@ -421,6 +519,8 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
             {
                 "wt_unit_cost": _round_money(unit_cost),
                 "wt_amount": credit_amount,
+                "wt_status": wt_status,
+                "wt_available_at": available_at,
                 "wt_updated_at": now,
             },
         )
@@ -433,7 +533,7 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
                 "wt_uid": existing.get("wt_uid"),
             }
         wallet_result = credit_seller_proceeds_to_wallet(
-            db, seller_profile_id, credit_amount
+            db, seller_profile_id, credit_amount, hold=hold
         )
         if wallet_result.get("code") != 200:
             return {
@@ -449,6 +549,8 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         repaired["wt_unit_cost"] = _round_money(unit_cost)
         repaired["wt_amount"] = credit_amount
         repaired["wt_profile_id"] = seller_profile_id
+        repaired["wt_status"] = wt_status
+        repaired["wt_available_at"] = available_at
         return _wt_success_payload(
             repaired, idempotent_replay=False, wallet_result=wallet_result
         )
@@ -475,7 +577,7 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         "wt_transaction_id": transaction_uid,
         "wt_ti_id": ti_uid,
         "wt_type": WT_TYPE_PARTIAL_DELIVERY_CREDIT,
-        "wt_status": WT_STATUS_POSTED,
+        "wt_status": wt_status,
         "wt_qty": qty,
         "wt_received_qty_after": received_qty_after,
         "wt_unit_cost": _round_money(unit_cost),
@@ -483,6 +585,7 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         "wt_currency": currency[:8],
         "wt_idempotency_key": idempotency_key,
         "wt_note": None,
+        "wt_available_at": available_at,
         "wt_created_at": now,
         "wt_updated_at": now,
     }
@@ -506,7 +609,7 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
     wallet_result = None
     if credit_amount > 0:
         wallet_result = credit_seller_proceeds_to_wallet(
-            db, seller_profile_id, credit_amount
+            db, seller_profile_id, credit_amount, hold=hold
         )
         if wallet_result.get("code") != 200:
             return {
@@ -522,3 +625,559 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
     return _wt_success_payload(
         insert_row, idempotent_replay=False, wallet_result=wallet_result
     )
+
+
+def _line_seller_proceeds_net(db, ti_uid):
+    """
+    Net credited seller proceeds on a sale line (credits minus prior clawbacks).
+
+    Returns dict with net_amount, net_qty, held_amount, posted_amount, and
+    identity fields from the latest credit row (if any).
+    """
+    empty = {
+        "net_amount": 0.0,
+        "net_qty": 0,
+        "held_amount": 0.0,
+        "posted_amount": 0.0,
+        "wt_profile_id": None,
+        "wt_buyer_id": None,
+        "wt_seller_id": None,
+        "wt_transaction_id": None,
+        "wt_currency": "USD",
+        "wt_unit_cost": 0.0,
+    }
+    if not ti_uid:
+        return empty
+
+    q = db.execute(
+        """
+        SELECT
+            COALESCE(SUM(wt_amount), 0) AS net_amount,
+            COALESCE(SUM(
+                CASE
+                    WHEN wt_type = %s THEN wt_qty
+                    WHEN wt_type = %s THEN -ABS(wt_qty)
+                    ELSE 0
+                END
+            ), 0) AS net_qty,
+            COALESCE(SUM(
+                CASE WHEN wt_status = %s THEN wt_amount ELSE 0 END
+            ), 0) AS held_amount,
+            COALESCE(SUM(
+                CASE WHEN wt_status = %s THEN wt_amount ELSE 0 END
+            ), 0) AS posted_amount
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type IN (%s, %s)
+          AND wt_status IN (%s, %s)
+        """,
+        (
+            WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+            WT_TYPE_RETURN_CLAWBACK,
+            WT_STATUS_HELD,
+            WT_STATUS_POSTED,
+            ti_uid,
+            WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+            WT_TYPE_RETURN_CLAWBACK,
+            WT_STATUS_HELD,
+            WT_STATUS_POSTED,
+        ),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return empty
+
+    row = rows[0]
+    try:
+        net_qty = int(row.get("net_qty") or 0)
+    except (TypeError, ValueError):
+        net_qty = 0
+
+    meta_q = db.execute(
+        """
+        SELECT wt_profile_id, wt_buyer_id, wt_seller_id, wt_transaction_id,
+               wt_currency, wt_unit_cost
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type = %s
+        ORDER BY wt_created_at DESC, wt_uid DESC
+        LIMIT 1
+        """,
+        (ti_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT),
+    )
+    meta_rows = meta_q.get("result") or []
+    meta = meta_rows[0] if meta_rows else {}
+
+    return {
+        "net_amount": _round_money(row.get("net_amount")),
+        "net_qty": net_qty,
+        "held_amount": _round_money(row.get("held_amount")),
+        "posted_amount": _round_money(row.get("posted_amount")),
+        "wt_profile_id": meta.get("wt_profile_id"),
+        "wt_buyer_id": meta.get("wt_buyer_id"),
+        "wt_seller_id": meta.get("wt_seller_id"),
+        "wt_transaction_id": meta.get("wt_transaction_id"),
+        "wt_currency": (meta.get("wt_currency") or "USD"),
+        "wt_unit_cost": _round_money(meta.get("wt_unit_cost")),
+    }
+
+
+def compute_return_clawback_amount(net_amount, net_qty, return_qty):
+    """
+    Proportional clawback of net credited proceeds for a returned qty.
+
+    clawback = net_amount * (min(return_qty, net_qty) / net_qty)
+    """
+    net_amount = _round_money(net_amount)
+    try:
+        net_qty = int(net_qty or 0)
+        return_qty = int(return_qty or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if net_amount <= 0 or net_qty <= 0 or return_qty <= 0:
+        return 0.0
+    qty = min(return_qty, net_qty)
+    return _round_money(net_amount * (qty / float(net_qty)))
+
+
+def _insert_return_clawback_row(
+    db,
+    *,
+    idempotency_key,
+    profile_id,
+    buyer_id,
+    seller_id,
+    transaction_id,
+    ti_id,
+    qty,
+    unit_cost,
+    amount,
+    currency,
+    status,
+    note=None,
+):
+    """Insert one return_clawback ledger row. amount should be negative."""
+    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+    if existing:
+        return {
+            "code": 200,
+            "idempotent_replay": True,
+            "wt_uid": existing.get("wt_uid"),
+            "wt_amount": _round_money(existing.get("wt_amount")),
+            "wt_status": existing.get("wt_status"),
+            "row": existing,
+        }
+
+    wt_uid = _new_wallet_transaction_uid(db)
+    if not wt_uid:
+        return {
+            "code": 500,
+            "message": "Failed to generate wt_uid via new_wallet_transaction_uid",
+        }
+
+    now = utc_now_str()
+    insert_row = {
+        "wt_uid": wt_uid,
+        "wt_profile_id": profile_id,
+        "wt_buyer_id": buyer_id or "",
+        "wt_seller_id": seller_id or "",
+        "wt_transaction_id": transaction_id,
+        "wt_ti_id": ti_id,
+        "wt_type": WT_TYPE_RETURN_CLAWBACK,
+        "wt_status": status,
+        "wt_qty": int(qty or 0),
+        "wt_received_qty_after": 0,
+        "wt_unit_cost": _round_money(unit_cost),
+        "wt_amount": _round_money(amount),
+        "wt_currency": (currency or "USD")[:8],
+        "wt_idempotency_key": idempotency_key,
+        "wt_note": note,
+        "wt_available_at": None,
+        "wt_created_at": now,
+        "wt_updated_at": now,
+    }
+    insert_result = db.insert("every_circle.wallet_transactions", insert_row)
+    if insert_result.get("code") != 200:
+        insert_msg = (insert_result.get("message") or "").lower()
+        if "duplicate entry" in insert_msg:
+            existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+            if existing:
+                return {
+                    "code": 200,
+                    "idempotent_replay": True,
+                    "wt_uid": existing.get("wt_uid"),
+                    "wt_amount": _round_money(existing.get("wt_amount")),
+                    "wt_status": existing.get("wt_status"),
+                    "row": existing,
+                }
+        return {
+            "code": insert_result.get("code", 500),
+            "message": insert_result.get(
+                "message", "Failed to insert return_clawback row"
+            ),
+        }
+    return {
+        "code": 200,
+        "idempotent_replay": False,
+        "wt_uid": wt_uid,
+        "wt_amount": _round_money(amount),
+        "wt_status": status,
+        "row": insert_row,
+    }
+
+
+def clawback_seller_proceeds_on_return(
+    db,
+    *,
+    original_ti_uid,
+    return_ti_uid,
+    return_qty,
+    transaction_uid=None,
+):
+    """
+    Reverse seller proceeds for returned (previously credited) quantity.
+
+    Computes clawback proportional to return_qty vs net credited qty/amount on
+    the original sale line. Inserts negative ``return_clawback`` row(s) and
+    debits the seller wallet (pending first, then useable).
+
+    Idempotency key: ``clawback:{return_ti_uid}`` (and ``:held`` / ``:posted``
+    suffixes when the clawback splits across buckets).
+
+    Clawback ledger status mirrors the funds being reversed (held vs posted)
+    so wallet reconcile buckets stay consistent.
+    """
+    _ensure_wallet_transactions_table(db)
+
+    if not original_ti_uid or not return_ti_uid:
+        return {
+            "code": 400,
+            "message": "original_ti_uid and return_ti_uid are required",
+        }
+
+    try:
+        return_qty = int(return_qty or 0)
+    except (TypeError, ValueError):
+        return {"code": 400, "message": "return_qty must be an integer"}
+
+    if return_qty <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "No shipped return qty to claw back",
+            "clawed": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    # Full clawback already recorded for this return line.
+    primary_key = f"clawback:{return_ti_uid}"
+    existing_primary = _fetch_wt_by_idempotency_key(db, primary_key)
+    existing_held = _fetch_wt_by_idempotency_key(db, f"{primary_key}:held")
+    existing_posted = _fetch_wt_by_idempotency_key(db, f"{primary_key}:posted")
+    if existing_primary or existing_held or existing_posted:
+        replay_amount = _round_money(
+            abs(_to_float((existing_primary or {}).get("wt_amount")))
+            + abs(_to_float((existing_held or {}).get("wt_amount")))
+            + abs(_to_float((existing_posted or {}).get("wt_amount")))
+        )
+        return {
+            "code": 200,
+            "idempotent_replay": True,
+            "clawed": replay_amount,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+            "wt_uids": [
+                r.get("wt_uid")
+                for r in (existing_primary, existing_held, existing_posted)
+                if r
+            ],
+        }
+
+    line_net = _line_seller_proceeds_net(db, original_ti_uid)
+    clawback_amount = compute_return_clawback_amount(
+        line_net["net_amount"], line_net["net_qty"], return_qty
+    )
+    if clawback_amount <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "No net credited seller proceeds to claw back",
+            "clawed": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    profile_id = line_net.get("wt_profile_id")
+    transaction_id = transaction_uid or line_net.get("wt_transaction_id")
+    if not profile_id:
+        # Resolve seller from the sale if credit rows lack profile (edge case).
+        if transaction_id:
+            tx_q = db.execute(
+                """
+                SELECT transaction_business_id, transaction_profile_id
+                FROM every_circle.transactions
+                WHERE transaction_uid = %s
+                LIMIT 1
+                """,
+                (transaction_id,),
+            )
+            tx_rows = tx_q.get("result") or []
+            if tx_rows:
+                profile_id = resolve_seller_wallet_profile_id(
+                    db, tx_rows[0].get("transaction_business_id")
+                )
+                if not line_net.get("wt_buyer_id"):
+                    line_net["wt_buyer_id"] = tx_rows[0].get("transaction_profile_id")
+                if not line_net.get("wt_seller_id"):
+                    line_net["wt_seller_id"] = tx_rows[0].get(
+                        "transaction_business_id"
+                    )
+        if not profile_id:
+            return {
+                "code": 500,
+                "message": (
+                    "Unable to resolve seller wallet profile for clawback "
+                    f"on ti_uid={original_ti_uid!r}"
+                ),
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+            }
+
+    if not transaction_id:
+        return {
+            "code": 500,
+            "message": "Unable to resolve transaction_id for clawback",
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    held_net = max(_to_float(line_net.get("held_amount")), 0.0)
+    held_part = _round_money(min(clawback_amount, held_net))
+    posted_part = _round_money(clawback_amount - held_part)
+
+    claw_qty = min(return_qty, max(int(line_net.get("net_qty") or 0), 0))
+    if clawback_amount > 0 and held_part > 0 and posted_part > 0:
+        held_qty = int(round(claw_qty * (held_part / clawback_amount)))
+        held_qty = min(max(held_qty, 0), claw_qty)
+        posted_qty = claw_qty - held_qty
+    elif held_part > 0:
+        held_qty = claw_qty
+        posted_qty = 0
+    else:
+        held_qty = 0
+        posted_qty = claw_qty
+
+    note = f"return_clawback for {return_ti_uid}"
+    inserted = []
+    common = {
+        "profile_id": profile_id,
+        "buyer_id": line_net.get("wt_buyer_id"),
+        "seller_id": line_net.get("wt_seller_id"),
+        "transaction_id": transaction_id,
+        "ti_id": original_ti_uid,
+        "unit_cost": line_net.get("wt_unit_cost"),
+        "currency": line_net.get("wt_currency"),
+        "note": note,
+    }
+
+    if held_part > 0 and posted_part > 0:
+        held_ins = _insert_return_clawback_row(
+            db,
+            idempotency_key=f"{primary_key}:held",
+            qty=held_qty,
+            amount=-held_part,
+            status=WT_STATUS_HELD,
+            **common,
+        )
+        if held_ins.get("code") != 200:
+            return {
+                **held_ins,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+            }
+        inserted.append(held_ins)
+
+        posted_ins = _insert_return_clawback_row(
+            db,
+            idempotency_key=f"{primary_key}:posted",
+            qty=posted_qty,
+            amount=-posted_part,
+            status=WT_STATUS_POSTED,
+            **common,
+        )
+        if posted_ins.get("code") != 200:
+            return {
+                **posted_ins,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+            }
+        inserted.append(posted_ins)
+    else:
+        status = WT_STATUS_HELD if held_part > 0 else WT_STATUS_POSTED
+        part = held_part if held_part > 0 else posted_part
+        part_qty = held_qty if held_part > 0 else posted_qty
+        ins = _insert_return_clawback_row(
+            db,
+            idempotency_key=primary_key,
+            qty=part_qty,
+            amount=-part,
+            status=status,
+            **common,
+        )
+        if ins.get("code") != 200:
+            return {
+                **ins,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+            }
+        inserted.append(ins)
+
+    any_new = any(not r.get("idempotent_replay") for r in inserted)
+    wallet_result = None
+    if any_new and clawback_amount > 0:
+        wallet_result = debit_seller_proceeds_from_wallet(
+            db, profile_id, clawback_amount
+        )
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to debit seller proceeds on return"
+                ),
+                "clawed": clawback_amount,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+                "wt_uids": [r.get("wt_uid") for r in inserted],
+                "wallet": wallet_result,
+            }
+
+    return {
+        "code": 200,
+        "clawed": clawback_amount,
+        "held_part": held_part,
+        "posted_part": posted_part,
+        "original_ti_uid": original_ti_uid,
+        "return_ti_uid": return_ti_uid,
+        "wt_profile_id": profile_id,
+        "wt_uids": [r.get("wt_uid") for r in inserted],
+        "idempotent_replay": not any_new,
+        "wallet": wallet_result,
+    }
+
+
+def release_held_wallet_transaction(db, wt_row):
+    """
+    Move one held ledger credit from wallet_pending to useable and mark posted.
+
+    Idempotent: already-posted rows are skipped. Caller must ensure the hold
+    is eligible (``wt_available_at`` passed, no open return on the line).
+    """
+    if not wt_row:
+        return {"code": 400, "message": "wt_row is required"}
+
+    wt_uid = wt_row.get("wt_uid")
+    profile_id = wt_row.get("wt_profile_id")
+    amount = _round_money(wt_row.get("wt_amount"))
+    status = (wt_row.get("wt_status") or "").strip().lower()
+
+    if not wt_uid:
+        return {"code": 400, "message": "wt_uid is required"}
+
+    if status == WT_STATUS_POSTED:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "Already posted",
+            "wt_uid": wt_uid,
+            "wt_ti_id": wt_row.get("wt_ti_id"),
+            "wt_transaction_id": wt_row.get("wt_transaction_id"),
+            "moved_to_useable": 0,
+        }
+
+    if status != WT_STATUS_HELD:
+        return {
+            "code": 409,
+            "message": f"Unexpected wt_status={wt_row.get('wt_status')!r}",
+            "wt_uid": wt_uid,
+            "wt_ti_id": wt_row.get("wt_ti_id"),
+            "wt_transaction_id": wt_row.get("wt_transaction_id"),
+            "skipped": True,
+        }
+
+    wallet_result = None
+    if amount > 0:
+        if not profile_id:
+            return {
+                "code": 400,
+                "message": "wt_profile_id is required to release hold",
+                "wt_uid": wt_uid,
+            }
+        wallet_result = release_seller_hold_to_useable(db, profile_id, amount)
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to release seller hold to useable"
+                ),
+                "wt_uid": wt_uid,
+                "wt_ti_id": wt_row.get("wt_ti_id"),
+                "wt_transaction_id": wt_row.get("wt_transaction_id"),
+                "wallet": wallet_result,
+            }
+
+    now = utc_now_str()
+    upd = db.update(
+        "every_circle.wallet_transactions",
+        {"wt_uid": wt_uid},
+        {
+            "wt_status": WT_STATUS_POSTED,
+            "wt_updated_at": now,
+        },
+    )
+    if upd.get("code") != 200:
+        return {
+            "code": upd.get("code", 500),
+            "message": upd.get(
+                "message", "Failed to mark wallet_transactions row posted"
+            ),
+            "wt_uid": wt_uid,
+            "wt_ti_id": wt_row.get("wt_ti_id"),
+            "wt_transaction_id": wt_row.get("wt_transaction_id"),
+            "wallet": wallet_result,
+        }
+
+    # Held return_clawback rows on this line must flip with the credit so
+    # reconcile pending/useable buckets stay aligned after release.
+    ti_id = wt_row.get("wt_ti_id")
+    if ti_id:
+        db.execute(
+            """
+            UPDATE every_circle.wallet_transactions
+            SET wt_status = %s, wt_updated_at = %s
+            WHERE wt_ti_id = %s
+              AND wt_type = %s
+              AND wt_status = %s
+            """,
+            (
+                WT_STATUS_POSTED,
+                now,
+                ti_id,
+                WT_TYPE_RETURN_CLAWBACK,
+                WT_STATUS_HELD,
+            ),
+            cmd="post",
+        )
+
+    return {
+        "code": 200,
+        "message": "Seller hold released",
+        "wt_uid": wt_uid,
+        "wt_ti_id": wt_row.get("wt_ti_id"),
+        "wt_transaction_id": wt_row.get("wt_transaction_id"),
+        "wt_profile_id": profile_id,
+        "moved_to_useable": (
+            wallet_result.get("moved_to_useable", amount) if wallet_result else 0
+        ),
+        "wallet": wallet_result,
+    }

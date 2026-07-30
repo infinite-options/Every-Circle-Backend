@@ -136,6 +136,7 @@ def _load_sale_header(db, order_uid):
             transaction_taxes,
             transaction_fees,
             transaction_shipping,
+            COALESCE(transaction_wallet_amount, 0) AS transaction_wallet_amount,
             transaction_in_escrow,
             transaction_return_requested,
             transaction_return_note,

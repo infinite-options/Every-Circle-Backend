@@ -14,8 +14,19 @@ from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interacti
 from user_path_connection import ConnectionsPath
 from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
-from wallet_service import credit_bounty_to_wallet, debit_bounty_from_wallet
-from wallet_transactions_service import credit_partial_delivery
+from wallet_service import (
+    credit_bounty_to_wallet,
+    credit_useable_from_refund,
+    debit_bounty_from_wallet,
+    debit_useable_for_purchase,
+    transfer_wallet_refund_to_buyer,
+)
+from wallet_transactions_service import (
+    clawback_seller_proceeds_on_return,
+    credit_partial_delivery,
+    resolve_seller_wallet_profile_id,
+    _parse_unit_cost,
+)
 from datetime_utils import utc_now_str, enrich_datetime_fields, parse_stored_datetime
 from transaction_shipping import (
     normalize_shipping_address,
@@ -75,6 +86,16 @@ def _ensure_return_eligibility_columns(db):
     except Exception as e:
         print(f"ti_bs_is_returnable column ensure (ok if exists): {e}")
     _RETURN_ELIGIBILITY_COLUMNS_READY = True
+
+
+def _parse_wallet_amount(raw):
+    """Parse optional wallet_amount from checkout payload; default 0."""
+    if raw is None or raw == "":
+        return 0.0
+    amount = round(_to_float(raw), 4)
+    if amount < 0:
+        return None
+    return amount
 
 
 def _ensure_transaction_shipping_columns(db):
@@ -1118,6 +1139,7 @@ def _load_sale_for_return(db, transaction_uid):
         SELECT transaction_uid, transaction_profile_id, transaction_business_id,
                transaction_stripe_pi, transaction_total, transaction_amount,
                transaction_taxes, transaction_fees,
+               COALESCE(transaction_wallet_amount, 0) AS transaction_wallet_amount,
                transaction_return_requested, transaction_return_note,
                COALESCE(transaction_type, 'sale') AS transaction_type
         FROM every_circle.transactions
@@ -1188,7 +1210,8 @@ def _validate_and_price_return_items(
                    ti_bs_refund_policy, ti_bs_return_window_days, ti_bs_is_returnable,
                    ti_received_at, ti_selected_options, ti_special_instructions,
                    ti_choices_extra_cost, ti_shipping_amount, ti_shipping_refundable,
-                   COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty
+                   COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
+                   COALESCE(ti_received_qty, 0) AS ti_received_qty
             FROM every_circle.transactions_items
             WHERE ti_uid = %s AND ti_transaction_id = %s
             """,
@@ -1291,7 +1314,7 @@ def _validate_and_price_return_items(
                 "code": 400,
             }, None
 
-        unit_cost = _to_float(ti_row.get("ti_bs_cost"))
+        unit_cost = _parse_unit_cost(ti_row.get("ti_bs_cost"))
         scale = _bounty_scale_for_line(rq, original_qty)
         if scale is None:
             return False, {
@@ -1354,6 +1377,24 @@ def _refund_breakdown_from_context(orig_tx, ctx):
     refund_grand = round(
         refund_subtotal + refund_tax + refund_shipping - refund_fees, 4
     )
+
+    orig_total = abs(_to_float(orig_tx.get("transaction_total")))
+    wallet_paid = abs(_to_float(orig_tx.get("transaction_wallet_amount")))
+    has_card = bool(
+        _normalize_stripe_payment_intent_id(orig_tx.get("transaction_stripe_pi"))
+    )
+    # Full wallet checkout with missing/zero column: no card PI means all wallet.
+    if wallet_paid <= 0 and not has_card and orig_total > 0:
+        wallet_paid = orig_total
+    if orig_total > 0 and wallet_paid > 0:
+        wallet_paid = min(wallet_paid, orig_total)
+        wallet_ratio = wallet_paid / orig_total
+        wallet_refund = round(refund_grand * wallet_ratio, 4)
+        stripe_refund = round(refund_grand - wallet_refund, 4)
+    else:
+        wallet_refund = 0.0
+        stripe_refund = refund_grand
+
     return {
         "subtotal": round(refund_subtotal, 4),
         "taxes": round(refund_tax, 4),
@@ -1366,6 +1407,9 @@ def _refund_breakdown_from_context(orig_tx, ctx):
         "refund_shipping": refund_shipping,
         "refund_grand": refund_grand,
         "fee_ratio": fee_ratio,
+        "wallet_paid": round(wallet_paid, 4),
+        "wallet_refund": wallet_refund,
+        "stripe_refund": stripe_refund,
     }
 
 
@@ -1375,9 +1419,21 @@ def _estimated_refund_api_payload(refund_meta, *, compact=False):
 
     Uses ``total`` (not total_customer_credit). ``estimated_total`` at the
     response root should match ``estimated_refund.total``.
+
+    Includes wallet vs card split so FE createRefund only hits Stripe for the
+    card portion (wallet-paid amounts restore to useable balance).
     """
     fees = round(_to_float(refund_meta.get("fees_allocated")), 4)
     total = round(_to_float(refund_meta.get("total_customer_credit")), 4)
+    wallet_refund = round(_to_float(refund_meta.get("wallet_refund")), 4)
+    stripe_refund = round(
+        _to_float(
+            refund_meta.get("stripe_refund")
+            if refund_meta.get("stripe_refund") is not None
+            else total
+        ),
+        4,
+    )
     payload = {
         "subtotal": round(_to_float(refund_meta.get("subtotal")), 4),
         "taxes": round(_to_float(refund_meta.get("taxes")), 4),
@@ -1386,6 +1442,8 @@ def _estimated_refund_api_payload(refund_meta, *, compact=False):
             4,
         ),
         "total": total,
+        "wallet_refund": wallet_refund,
+        "stripe_refund": stripe_refund,
     }
     if not compact or fees:
         payload["fees_allocated"] = fees
@@ -1505,6 +1563,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
     refund_shipping = refund_meta.get("refund_shipping", 0) or 0
     fee_ratio = refund_meta["fee_ratio"]
     order_subtotal = refund_meta["original_order_subtotal"]
+    wallet_refund = round(_to_float(refund_meta.get("wallet_refund")), 4)
 
     new_uid_resp = db.call(procedure="new_transaction_uid")
     if not new_uid_resp.get("result") or len(new_uid_resp["result"]) == 0:
@@ -1526,6 +1585,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
         "transaction_amount": f"{-refund_subtotal:.4f}",
         "transaction_taxes": f"{-refund_tax:.4f}",
         "transaction_fees": f"{-refund_fees:.4f}",
+        "transaction_wallet_amount": f"{-wallet_refund:.4f}",
         "transaction_in_escrow": 0,
         "transaction_return_note": return_note,
         "transaction_type": "return",
@@ -1544,6 +1604,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
     bounty_insert_count = 0
     item_insert_count = 0
     response_lines = []
+    total_seller_clawed = 0.0
 
     for line in lines_processed:
         ti_row = line["snapshot"]
@@ -1649,6 +1710,38 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
                             f"{br.get('tb_profile_id')}: {wallet_result}"
                         )
 
+        # Claw back seller proceeds for returned qty that was delivery-credited.
+        # Prefer explicit return_shipped_qty; if a "cancel unshipped" still has
+        # received/credited units (shipped_qty not bumped on verify), claw those too.
+        return_shipped_qty = int(line.get("return_shipped_qty") or 0)
+        cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
+        claw_qty = return_shipped_qty
+        if claw_qty <= 0 and cancel_unshipped_qty > 0:
+            snap = line.get("snapshot") or {}
+            received_qty = int(snap.get("ti_received_qty") or 0)
+            if received_qty > 0 or snap.get("ti_received_at"):
+                claw_qty = min(int(rq), received_qty if received_qty > 0 else int(rq))
+        clawback_result = None
+        if claw_qty > 0:
+            clawback_result = clawback_seller_proceeds_on_return(
+                db,
+                original_ti_uid=line["original_ti_uid"],
+                return_ti_uid=new_ti_uid,
+                return_qty=claw_qty,
+                transaction_uid=original_tx_uid,
+            )
+            if clawback_result.get("code") != 200:
+                print(
+                    "Warning: Failed to claw back seller proceeds on return for "
+                    f"{line['original_ti_uid']}: {clawback_result}"
+                )
+            else:
+                total_seller_clawed = round(
+                    total_seller_clawed
+                    + _to_float(clawback_result.get("clawed")),
+                    4,
+                )
+
         response_lines.append(
             {
                 "original_transaction_item_uid": line["original_ti_uid"],
@@ -1659,8 +1752,45 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
                 "line_subtotal": line["line_subtotal"],
                 "line_tax": line["line_tax"],
                 "line_shipping": line.get("line_shipping", 0),
+                "seller_proceeds_clawback": (
+                    clawback_result.get("clawed", 0) if clawback_result else 0
+                ),
             }
         )
+
+    # Move wallet-paid tender back to the buyer. When seller proceeds were
+    # clawed above, that debit funds this credit (seller → buyer). Otherwise
+    # (pre-ship cancel) the platform restores the buyer's useable balance.
+    wallet_credit_result = None
+    if wallet_refund > 0:
+        seller_profile_id = resolve_seller_wallet_profile_id(
+            db, orig_tx.get("transaction_business_id")
+        )
+        wallet_credit_result = transfer_wallet_refund_to_buyer(
+            db,
+            buyer_profile_id=orig_tx.get("transaction_profile_id"),
+            seller_profile_id=seller_profile_id,
+            amount=wallet_refund,
+            seller_clawed_amount=total_seller_clawed,
+        )
+        print(
+            "wallet refund transfer on return: ",
+            {
+                "wallet_refund": wallet_refund,
+                "seller_clawed": total_seller_clawed,
+                "seller_profile_id": seller_profile_id,
+                "result": wallet_credit_result,
+            },
+        )
+        if wallet_credit_result.get("code") != 200:
+            return False, {
+                "message": wallet_credit_result.get(
+                    "message",
+                    "Failed to transfer wallet refund to buyer",
+                ),
+                "code": wallet_credit_result.get("code", 500),
+                "wallet_transfer": wallet_credit_result,
+            }, None
 
     return True, None, {
         "return_transaction_uid": new_transaction_uid,
@@ -1668,12 +1798,16 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
         "trr_transaction_uid": original_tx_uid,
         "estimated_refund": _estimated_refund_api_payload(refund_meta),
         "estimated_total": round(refund_grand, 4),
+        "wallet_refund": wallet_refund,
+        "wallet_credit": wallet_credit_result,
+        "seller_proceeds_clawed": total_seller_clawed,
         "ledger_amounts_negative": {
             "transaction_total": new_transaction["transaction_total"],
             "transaction_amount": new_transaction["transaction_amount"],
             "transaction_taxes": new_transaction["transaction_taxes"],
             "transaction_fees": new_transaction["transaction_fees"],
             "transaction_shipping": new_transaction.get("transaction_shipping"),
+            "transaction_wallet_amount": new_transaction.get("transaction_wallet_amount"),
         },
         "transaction_items_created": item_insert_count,
         "bounty_reversal_rows_created": bounty_insert_count,
@@ -2298,12 +2432,30 @@ def _finalize_pending_return(
     if not ledger_ok:
         return ledger_err, ledger_err.get("code", 500)
 
-    if isinstance(stripe_refund_from_client, dict) and (
+    stripe_refund_amount = round(
+        _to_float(refund_meta.get("stripe_refund", refund_meta["refund_grand"])),
+        4,
+    )
+    wallet_refund_amount = round(_to_float(refund_meta.get("wallet_refund")), 4)
+
+    # Wallet-only (or wallet covers this return): never refund to the card.
+    if stripe_refund_amount < 0.01:
+        stripe_result = {
+            "ok": True,
+            "skipped": True,
+            "refund_id": None,
+            "message": "No card portion to refund (wallet covered refund)",
+        }
+    elif isinstance(stripe_refund_from_client, dict) and (
         "ok" in stripe_refund_from_client
         or stripe_refund_from_client.get("refund_id")
+        or stripe_refund_from_client.get("skipped")
     ):
         stripe_result = {
-            "ok": bool(stripe_refund_from_client.get("ok")),
+            "ok": bool(
+                stripe_refund_from_client.get("ok")
+                or stripe_refund_from_client.get("skipped")
+            ),
             "skipped": bool(stripe_refund_from_client.get("skipped")),
             "refund_id": stripe_refund_from_client.get("refund_id"),
             "message": stripe_refund_from_client.get("message"),
@@ -2320,12 +2472,22 @@ def _finalize_pending_return(
             stripe_meta["cancel_unshipped"] = "1"
         stripe_result = _issue_stripe_refund(
             orig_tx.get("transaction_stripe_pi"),
-            refund_meta["refund_grand"],
+            stripe_refund_amount,
             metadata=stripe_meta,
         )
 
+    if wallet_refund_amount >= 0.01:
+        wallet_refund_ok = (
+            isinstance(ledger_result.get("wallet_credit"), dict)
+            and ledger_result["wallet_credit"].get("code") == 200
+            and _to_float(ledger_result["wallet_credit"].get("credited")) >= 0.01
+        )
+    else:
+        wallet_refund_ok = True
+
+    refund_money_ok = bool(stripe_result.get("ok")) and wallet_refund_ok
     final_refund_status = (
-        REFUND_STATUS_REFUNDED if stripe_result.get("ok") else REFUND_STATUS_REJECTED
+        REFUND_STATUS_REFUNDED if refund_money_ok else REFUND_STATUS_REJECTED
     )
     _update_return_statuses(
         db,
@@ -2348,7 +2510,7 @@ def _finalize_pending_return(
         fail_msg = "Item received; refund not completed (Rejected)"
 
     response = {
-        "message": ok_msg if stripe_result.get("ok") else fail_msg,
+        "message": ok_msg if refund_money_ok else fail_msg,
         "code": 200,
         "trr_uid": primary_trr,
         "trr_uids": batch_uids,
@@ -2361,6 +2523,11 @@ def _finalize_pending_return(
             "skipped": bool(stripe_result.get("skipped")),
             "refund_id": stripe_result.get("refund_id"),
             "message": stripe_result.get("message"),
+            "amount": stripe_refund_amount,
+        },
+        "wallet_refund": {
+            "ok": wallet_refund_ok,
+            "amount": wallet_refund_amount,
         },
         "seller_note": seller_note,
         "refund_business_code_hint": _refund_business_code_from_note(seller_note),
@@ -2964,13 +3131,13 @@ class Transactions(Resource):
             # Validate required fields
             required_fields = [
                 "profile_id",
-                "stripe_payment_intent",
                 "total_amount_paid",
                 "total_costs",
                 "items",
             ]
             missing_fields = [
                 field for field in required_fields if not payload.get(field)
+                and payload.get(field) != 0
             ]
 
             if missing_fields:
@@ -2980,6 +3147,40 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
             print("No Missing Fields")
+
+            wallet_amount = _parse_wallet_amount(
+                payload.get("wallet_amount")
+                if payload.get("wallet_amount") is not None
+                else payload.get("wallet_amount_applied")
+            )
+            if wallet_amount is None:
+                response["message"] = "wallet_amount must be a non-negative number"
+                response["code"] = 400
+                return response, 400
+
+            total_amount_paid = round(_to_float(payload.get("total_amount_paid")), 4)
+            if total_amount_paid < 0:
+                response["message"] = "total_amount_paid must be non-negative"
+                response["code"] = 400
+                return response, 400
+
+            if wallet_amount - total_amount_paid > 1e-9:
+                response["message"] = (
+                    "wallet_amount cannot exceed total_amount_paid"
+                )
+                response["code"] = 400
+                return response, 400
+
+            card_amount = round(total_amount_paid - wallet_amount, 4)
+            stripe_pi = _normalize_stripe_payment_intent_id(
+                payload.get("stripe_payment_intent")
+            )
+            if card_amount >= 0.01 and not stripe_pi:
+                response["message"] = (
+                    "stripe_payment_intent is required when card charge is greater than zero"
+                )
+                response["code"] = 400
+                return response, 400
 
             shipping_fields, shipping_error = normalize_shipping_address(
                 payload.get("shipping_address")
@@ -2994,13 +3195,12 @@ class Transactions(Resource):
                 "transaction_profile_id": payload.get("profile_id"),
                 "transaction_business_id": payload.get("business_id"),
                 # Always store pi_… (never a client secret) so refunds can use this field
-                "transaction_stripe_pi": _normalize_stripe_payment_intent_id(
-                    payload.get("stripe_payment_intent")
-                ),
+                "transaction_stripe_pi": stripe_pi,
                 "transaction_total": payload.get("total_amount_paid"),
                 "transaction_amount": payload.get("total_costs"),
                 "transaction_taxes": payload.get("total_taxes"),
                 "transaction_fees": payload.get("total_fees"),
+                "transaction_wallet_amount": wallet_amount,
                 "transaction_in_escrow": (
                     1 if payload.get("transaction_in_escrow") else 0
                 ),
@@ -3008,6 +3208,43 @@ class Transactions(Resource):
             }
 
             with connect() as db:
+                wallet_debited = 0.0
+                if wallet_amount >= 0.01:
+                    wallet_debit = debit_useable_for_purchase(
+                        db,
+                        payload.get("profile_id"),
+                        wallet_amount,
+                    )
+                    if wallet_debit.get("code") != 200:
+                        response["message"] = wallet_debit.get(
+                            "message", "Failed to apply wallet balance"
+                        )
+                        response["code"] = wallet_debit.get("code", 400)
+                        response["wallet"] = wallet_debit
+                        return response, response["code"]
+                    wallet_debited = _to_float(wallet_debit.get("debited"))
+                    response["wallet_applied"] = wallet_debit
+                else:
+                    response["wallet_applied"] = {
+                        "code": 200,
+                        "skipped": True,
+                        "debited": 0.0,
+                    }
+                response["card_amount"] = card_amount
+                response["wallet_amount"] = wallet_amount
+
+                def _rollback_wallet_debit():
+                    if wallet_debited < 0.01:
+                        return
+                    restore = credit_useable_from_refund(
+                        db, payload.get("profile_id"), wallet_debited
+                    )
+                    if restore.get("code") != 200:
+                        print(
+                            "Warning: Failed to restore wallet after checkout failure: "
+                            f"{restore}"
+                        )
+
                 # Generate new transaction UID
                 transaction_stored_procedure_response = db.call(
                     procedure="new_transaction_uid"
@@ -3016,6 +3253,7 @@ class Transactions(Resource):
                     not transaction_stored_procedure_response.get("result")
                     or len(transaction_stored_procedure_response["result"]) == 0
                 ):
+                    _rollback_wallet_debit()
                     response["message"] = "Failed to generate transaction UID"
                     response["code"] = 500
                     return response, 500
@@ -3032,6 +3270,7 @@ class Transactions(Resource):
                 print("transaction post response: ", transaction_response)
 
                 if transaction_response.get("code") != 200:
+                    _rollback_wallet_debit()
                     response["message"] = transaction_response.get(
                         "message", "Failed to insert transaction"
                     )

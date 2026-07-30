@@ -54,6 +54,10 @@ from transaction_receipt import TransactionReceipt
 from order_detail import OrderDetail
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from escrow_release import EscrowReleaseJob, format_escrow_release_email
+from seller_hold_release import (
+    SellerHoldReleaseJob,
+    format_seller_hold_release_email,
+)
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
@@ -818,6 +822,84 @@ def EscrowRelease_CRON(Resource):
     return _escrow_release_cron_wrapper()
 
 
+def _seller_hold_release_cron_wrapper():
+    print("\nIn Seller Hold Release CRON\n\n\n")
+    response = {}
+    dt = datetime.today()
+    recipients = [
+        "pmarathay@gmail.com",
+        "pmarathay@infiniteoptions.com",
+    ]
+    try:
+        response = SellerHoldReleaseJob.get()
+
+        if "cron fail" in response.keys():
+            raise Exception("Error in cronjob")
+
+        try:
+            subject = f"Every-Circle Seller Hold Release CRON — SUCCESS ({dt})"
+            body = format_seller_hold_release_email(response, run_dt=dt)
+
+            for recipient in recipients:
+                sendEmail(recipient, subject, body)
+
+            response["email"] = {
+                "message": (
+                    f"Every-Circle Seller Hold Release CRON Job Email for {dt} sent!"
+                ),
+                "code": 200,
+            }
+
+        except Exception:
+            response["email fail"] = {
+                "message": (
+                    f"Every-Circle Seller Hold Release CRON Job Email for {dt} "
+                    "could not be sent"
+                ),
+                "code": 500,
+            }
+
+    except Exception:
+        try:
+            failed_count = response.get("failed_count", 0)
+            subject = (
+                f"Every-Circle Seller Hold Release CRON — FAILED "
+                f"({failed_count} errors, {dt})"
+            )
+            body = format_seller_hold_release_email(response, run_dt=dt)
+
+            for recipient in recipients:
+                sendEmail(recipient, subject, body)
+
+            response["email"] = {
+                "message": (
+                    f"Every-Circle Seller Hold Release CRON Job Fail Email "
+                    f"for {dt} sent!"
+                ),
+                "code": 201,
+            }
+
+        except Exception:
+            response["email fail"] = {
+                "message": (
+                    f"Every-Circle Seller Hold Release CRON Job Fail Email for {dt} "
+                    "could not be sent"
+                ),
+                "code": 500,
+            }
+
+    return response
+
+
+class SellerHoldReleaseCron_CLASS(Resource):
+    def get(self):
+        return _seller_hold_release_cron_wrapper()
+
+
+def SellerHoldRelease_CRON(Resource):
+    return _seller_hold_release_cron_wrapper()
+
+
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
@@ -913,6 +995,9 @@ api.add_resource(
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
 api.add_resource(EscrowReleaseCron_CLASS, "/api/v1/escrow_release_cron")
+api.add_resource(
+    SellerHoldReleaseCron_CLASS, "/api/v1/seller_hold_release_cron"
+)
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 
