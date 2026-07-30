@@ -1,4 +1,5 @@
 import os
+import uuid
 
 from flask import request
 from flask_restful import Resource
@@ -13,6 +14,7 @@ from business_info import (
     _truthy_flag,
 )
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
+from transactions import _parse_limited_quantity
 from moderation import (
     MODERATED_ACKNOWLEDGED,
     MODERATED_PENDING_REVIEW,
@@ -38,9 +40,6 @@ _WISH_S3_PREFIX = "profile_wish"
 _EXPERIENCE_S3_PREFIX = "profile_experience"
 _EDUCATION_S3_PREFIX = "profile_education"
 
-_OFFERING_RETURNABLE_COLUMNS_READY = False
-_OFFERING_SHIPPING_COLUMNS_READY = False
-
 # UI-only offering keys (mirrors bs_free_shipping / bs_qty_unlimited on business_services).
 _EXPERTISE_NON_DB_KEYS = frozenset(
     {
@@ -50,44 +49,6 @@ _EXPERTISE_NON_DB_KEYS = frozenset(
         "profile_expertise_qty_unlimited",
     }
 )
-
-
-def _ensure_offering_returnable_columns(db):
-    """Add is_returnable on expertise/wish offerings when missing."""
-    global _OFFERING_RETURNABLE_COLUMNS_READY
-    if _OFFERING_RETURNABLE_COLUMNS_READY:
-        return
-    db.execute(
-        "ALTER TABLE every_circle.profile_expertise "
-        "ADD COLUMN profile_expertise_is_returnable TINYINT(1) NULL DEFAULT 1",
-        cmd="post",
-    )
-    db.execute(
-        "ALTER TABLE every_circle.profile_wish "
-        "ADD COLUMN profile_wish_is_returnable TINYINT(1) NULL DEFAULT 1",
-        cmd="post",
-    )
-    _OFFERING_RETURNABLE_COLUMNS_READY = True
-
-
-def _ensure_offering_shipping_columns(db):
-    """Add canonical shipping columns on profile_expertise when missing."""
-    global _OFFERING_SHIPPING_COLUMNS_READY
-    if _OFFERING_SHIPPING_COLUMNS_READY:
-        return
-    for ddl in (
-        "ALTER TABLE every_circle.profile_expertise "
-        "ADD COLUMN profile_expertise_shipping VARCHAR(32) NULL DEFAULT NULL",
-        "ALTER TABLE every_circle.profile_expertise "
-        "ADD COLUMN profile_expertise_shipping_amount DECIMAL(10,2) NULL DEFAULT NULL",
-        "ALTER TABLE every_circle.profile_expertise "
-        "ADD COLUMN profile_expertise_shipping_refundable TINYINT(1) NULL DEFAULT 0",
-    ):
-        try:
-            db.execute(ddl, cmd="post")
-        except Exception as e:
-            print(f"profile_expertise shipping column ensure (ok if exists): {e}")
-    _OFFERING_SHIPPING_COLUMNS_READY = True
 
 
 def _derive_expertise_shipping_fields(expertise_data):
@@ -163,11 +124,6 @@ def _finalize_expertise_fields(expertise_data):
     _derive_expertise_quantity_fields(expertise_data)
     for key in _EXPERTISE_NON_DB_KEYS:
         expertise_data.pop(key, None)
-
-
-def _ensure_offering_schema_columns(db):
-    _ensure_offering_returnable_columns(db)
-    _ensure_offering_shipping_columns(db)
 
 
 def _delete_expertise_s3_assets(expertise_uid):
@@ -819,6 +775,225 @@ def _apply_profile_education_multipart_image(
         )
 
 
+def _new_per_uid():
+    return f"per-{uuid.uuid4().hex[:12]}"
+
+
+def _load_expertise_restock_by_trr_uid(db, trr_uid, profile_expertise_uid):
+    if not trr_uid:
+        return None
+    result = db.execute(
+        """
+        SELECT per_quantity, per_remaining
+        FROM every_circle.profile_expertise_restocks
+        WHERE per_trr_uid = %s AND per_profile_expertise_uid = %s
+        LIMIT 1
+        """,
+        (trr_uid, profile_expertise_uid),
+    )
+    rows = result.get("result") or []
+    return rows[0] if rows else None
+
+
+def _record_expertise_restock_audit(
+    db,
+    profile_expertise_uid,
+    quantity,
+    remaining,
+    seller_id=None,
+    trr_uid=None,
+    order_uid=None,
+):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.insert(
+        "every_circle.profile_expertise_restocks",
+        {
+            "per_uid": _new_per_uid(),
+            "per_profile_expertise_uid": profile_expertise_uid,
+            "per_quantity": quantity,
+            "per_remaining": remaining,
+            "per_seller_id": seller_id,
+            "per_trr_uid": trr_uid,
+            "per_order_uid": order_uid,
+            "per_created_at": now,
+        },
+    )
+
+
+def _build_expertise_restock_response(
+    profile_expertise_uid, quantity, remaining, message="OK"
+):
+    response = {
+        "message": message,
+        "code": 200,
+        "profile_expertise_uid": profile_expertise_uid,
+        "quantity": quantity,
+        "remaining": remaining,
+    }
+    if remaining is not None:
+        response["available_quantity"] = remaining
+    return response
+
+
+def _seller_owns_offering(db, seller_id, owner_profile_uid):
+    """True when seller_id is the offering owner's profile or user uid."""
+    if not seller_id or not owner_profile_uid:
+        return True
+    if str(seller_id) == str(owner_profile_uid):
+        return True
+    by_user = db.execute(
+        """
+        SELECT profile_personal_uid
+        FROM every_circle.profile_personal
+        WHERE profile_personal_user_id = %s
+        LIMIT 1
+        """,
+        (seller_id,),
+    )
+    rows = by_user.get("result") or []
+    return bool(rows) and str(rows[0].get("profile_personal_uid")) == str(
+        owner_profile_uid
+    )
+
+
+class ProfileExpertiseRestock(Resource):
+    def post(self):
+        """Increment profile_expertise_quantity when inventory is restocked (e.g. after a return)."""
+        print("In ProfileExpertiseRestock POST")
+        response = {}
+
+        try:
+            payload = getattr(request, "_decrypted_json", None) or request.get_json(force=True) or {}
+            profile_expertise_uid = str(
+                payload.get("profile_expertise_uid") or ""
+            ).strip()
+            seller_id = (
+                str(payload.get("seller_id") or payload.get("profile_id") or "").strip()
+                or None
+            )
+            trr_uid = str(payload.get("trr_uid") or "").strip() or None
+            order_uid = str(payload.get("order_uid") or "").strip() or None
+            quantity = payload.get("quantity")
+
+            if not profile_expertise_uid:
+                response["message"] = "profile_expertise_uid is required"
+                response["code"] = 400
+                return response, 400
+
+            try:
+                quantity = int(quantity)
+                if quantity < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                response["message"] = "quantity must be a positive integer"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                if trr_uid:
+                    prior = _load_expertise_restock_by_trr_uid(
+                        db, trr_uid, profile_expertise_uid
+                    )
+                    if prior:
+                        response["message"] = "Restock already applied for this trr_uid"
+                        response["code"] = 409
+                        response["profile_expertise_uid"] = profile_expertise_uid
+                        response["quantity"] = int(
+                            prior.get("per_quantity") or quantity
+                        )
+                        remaining = prior.get("per_remaining")
+                        if remaining is not None:
+                            remaining = int(remaining)
+                        response["remaining"] = remaining
+                        return response, 409
+
+                offering_q = db.select(
+                    "every_circle.profile_expertise",
+                    where={"profile_expertise_uid": profile_expertise_uid},
+                )
+                if not offering_q["result"]:
+                    response["message"] = "Offering not found"
+                    response["code"] = 404
+                    return response, 404
+
+                row = offering_q["result"][0]
+                owner_uid = str(
+                    row.get("profile_expertise_profile_personal_id") or ""
+                ).strip()
+
+                if seller_id and owner_uid and not _seller_owns_offering(
+                    db, seller_id, owner_uid
+                ):
+                    response["message"] = "Seller does not own this offering"
+                    response["code"] = 403
+                    return response, 403
+
+                current_qty = _parse_limited_quantity(
+                    row.get("profile_expertise_quantity")
+                )
+                if current_qty is None:
+                    response = _build_expertise_restock_response(
+                        profile_expertise_uid,
+                        quantity,
+                        None,
+                        message="Unlimited stock — no increment needed",
+                    )
+                    _record_expertise_restock_audit(
+                        db,
+                        profile_expertise_uid,
+                        quantity,
+                        None,
+                        seller_id=seller_id,
+                        trr_uid=trr_uid,
+                        order_uid=order_uid,
+                    )
+                    return response, 200
+
+                new_qty = current_qty + quantity
+                db.update(
+                    "every_circle.profile_expertise",
+                    {"profile_expertise_uid": profile_expertise_uid},
+                    {"profile_expertise_quantity": new_qty},
+                )
+
+                verify = db.select(
+                    "every_circle.profile_expertise",
+                    where={"profile_expertise_uid": profile_expertise_uid},
+                )
+                actual_qty = (
+                    verify["result"][0].get("profile_expertise_quantity")
+                    if verify["result"]
+                    else None
+                )
+                remaining = _parse_limited_quantity(actual_qty)
+                if remaining is None:
+                    remaining = new_qty
+
+                _record_expertise_restock_audit(
+                    db,
+                    profile_expertise_uid,
+                    quantity,
+                    remaining,
+                    seller_id=seller_id,
+                    trr_uid=trr_uid,
+                    order_uid=order_uid,
+                )
+
+                response = _build_expertise_restock_response(
+                    profile_expertise_uid,
+                    quantity,
+                    remaining,
+                    message="Restock recorded successfully",
+                )
+                return response, 200
+
+        except Exception as e:
+            print(f"Error in ProfileExpertiseRestock POST: {str(e)}")
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500
+
+
 class UserProfileInfo(Resource):
     def get(self, uid):
         print("In UserProfileInfo GET", uid, type(uid))
@@ -990,15 +1165,24 @@ class UserProfileInfo(Resource):
                     if not is_owner_view and not viewer_is_admin:
                         moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
                     expertise_query = f"""
-                        SELECT profile_expertise.*, COUNT(er_profile_expertise_id) AS expertise_responses, COUNT(ti_bs_qty) AS expertise_sales
+                        SELECT profile_expertise.*,
+                            (
+                                SELECT COUNT(*)
+                                FROM every_circle.expertise_response er
+                                WHERE er.er_profile_expertise_id = profile_expertise.profile_expertise_uid
+                            ) AS expertise_responses,
+                            (
+                                SELECT COALESCE(SUM(ti.ti_bs_qty), 0)
+                                FROM every_circle.transactions_items ti
+                                INNER JOIN every_circle.transactions t
+                                    ON t.transaction_uid = ti.ti_transaction_id
+                                WHERE ti.ti_bs_id = profile_expertise.profile_expertise_uid
+                                  AND COALESCE(t.transaction_type, 'sale') IN ('sale', 'return')
+                            ) AS expertise_sales
                         FROM every_circle.profile_expertise
-                        LEFT JOIN every_circle.expertise_response ON er_profile_expertise_id = profile_expertise_uid
-                        LEFT JOIN every_circle.transactions_items ON ti_bs_id = profile_expertise_uid
-                        -- WHERE profile_expertise_profile_personal_id ='110-000015'
                         WHERE profile_expertise_profile_personal_id = %s
                           AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
                           {moderated_filter}
-                        GROUP BY profile_expertise_uid
                     """
                     expertise_info = db.execute(expertise_query, (profile_id,))
                     expertise_rows = (
@@ -1343,8 +1527,6 @@ class UserProfileInfo(Resource):
                         import json
                         expertises_data = json.loads(payload.pop('expertises'))
                         print("expertise data: ", expertises_data)
-                        _ensure_offering_schema_columns(db)
-                        
                         # Process each expertise entry (multipart: profile_expertise_image_0, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
                             expertise_info = {}
@@ -1394,7 +1576,6 @@ class UserProfileInfo(Resource):
                     try:
                         import json
                         wishes_data = json.loads(payload.pop('wishes'))
-                        _ensure_offering_schema_columns(db)
                         print("wishes data: ", wishes_data)
                         
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
@@ -2187,8 +2368,6 @@ class UserProfileInfo(Resource):
                         expertises_data = json.loads(payload.pop('expertise_info'))
                         expertise_payload_refresh = True
                         expertise_uids = []
-                        _ensure_offering_schema_columns(db)
-                        
                         # Process each expertise entry (multipart files: profile_expertise_image_0, _1, ...)
                         for expertise_idx, exp_data in enumerate(expertises_data):
                             print("exp_data", exp_data)
@@ -2283,8 +2462,6 @@ class UserProfileInfo(Resource):
                         wishes_data = json.loads(payload.pop('wishes_info'))
                         wishes_payload_refresh = True
                         wishes_uids = []
-                        _ensure_offering_schema_columns(db)
-                        
                         # Process each wish entry (multipart: profile_wish_image_0, ...)
                         for wish_idx, wish_data in enumerate(wishes_data):
                             print("wish_data", wish_data)

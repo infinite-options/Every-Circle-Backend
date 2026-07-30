@@ -11,8 +11,6 @@ from wallet_service import _round_money, _to_float, credit_seller_proceeds_to_wa
 WT_TYPE_PARTIAL_DELIVERY_CREDIT = "partial_delivery_credit"
 WT_STATUS_POSTED = "posted"
 
-_WALLET_TRANSACTIONS_TABLE_READY = False
-
 # First numeric token from display costs stored on transaction items.
 # Real values in DB include: "89.99", "100/each", "1000/hr", "200 total", "$1,000.50".
 _UNIT_COST_RE = re.compile(r"[+-]?\d+(?:,\d{3})*(?:\.\d+)?")
@@ -48,55 +46,6 @@ def _parse_unit_cost(value):
         return float(match.group(0).replace(",", ""))
     except (TypeError, ValueError):
         return 0.0
-
-
-def _ensure_wallet_transactions_table(db):
-    """Create wallet_transactions once per process if missing."""
-    global _WALLET_TRANSACTIONS_TABLE_READY
-    if _WALLET_TRANSACTIONS_TABLE_READY:
-        return
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS every_circle.wallet_transactions (
-            wt_uid VARCHAR(64) NOT NULL,
-            wt_profile_id VARCHAR(64) NOT NULL,
-            wt_buyer_id VARCHAR(64) NOT NULL,
-            wt_seller_id VARCHAR(64) NOT NULL,
-            wt_transaction_id VARCHAR(64) NOT NULL,
-            wt_ti_id VARCHAR(64) NOT NULL,
-            wt_type VARCHAR(32) NOT NULL,
-            wt_status VARCHAR(32) NOT NULL DEFAULT 'posted',
-            wt_qty INT NOT NULL,
-            wt_received_qty_after INT NOT NULL,
-            wt_unit_cost DECIMAL(18,4) NOT NULL,
-            wt_amount DECIMAL(18,4) NOT NULL,
-            wt_currency VARCHAR(8) NOT NULL,
-            wt_idempotency_key VARCHAR(128) NOT NULL,
-            wt_note VARCHAR(512) NULL,
-            wt_created_at DATETIME NOT NULL,
-            wt_updated_at DATETIME NOT NULL,
-            PRIMARY KEY (wt_uid),
-            UNIQUE KEY uq_wt_idempotency (wt_idempotency_key),
-            KEY idx_wt_transaction_id (wt_transaction_id),
-            KEY idx_wt_ti_id (wt_ti_id),
-            KEY idx_wt_profile_id (wt_profile_id)
-        )
-        """,
-        cmd="post",
-    )
-    # Older installs may lack the unique key or lookup indexes.
-    for ddl in (
-        "ALTER TABLE every_circle.wallet_transactions "
-        "ADD UNIQUE KEY uq_wt_idempotency (wt_idempotency_key)",
-        "ALTER TABLE every_circle.wallet_transactions "
-        "ADD KEY idx_wt_transaction_id (wt_transaction_id)",
-        "ALTER TABLE every_circle.wallet_transactions "
-        "ADD KEY idx_wt_ti_id (wt_ti_id)",
-        "ALTER TABLE every_circle.wallet_transactions "
-        "ADD KEY idx_wt_profile_id (wt_profile_id)",
-    ):
-        db.execute(ddl, cmd="post")
-    _WALLET_TRANSACTIONS_TABLE_READY = True
 
 
 def _new_wallet_transaction_uid(db):
@@ -324,8 +273,6 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
     Idempotency key: ``{ti_uid}:{received_qty_after}``. Duplicate key is a
     success/no-op (existing row returned, wallet not re-credited).
     """
-    _ensure_wallet_transactions_table(db)
-
     try:
         qty = int(qty)
         received_qty_after = int(received_qty_after)

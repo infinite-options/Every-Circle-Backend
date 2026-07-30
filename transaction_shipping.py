@@ -282,7 +282,15 @@ def fulfillment_fields_from_row(row):
     shipped_qty = int(row.get("ti_shipped_qty") or 0)
     carrier = row.get("ti_tracking_carrier")
     tracking = row.get("ti_tracking_number")
-    return {
+    method = row.get("ti_fulfillment_method") or row.get("fulfillment_method")
+    shipping_not_required = row.get("ti_shipping_not_required")
+    if shipping_not_required is None:
+        shipping_not_required = 1 if status == FULFILLMENT_STATUS_NOT_REQUIRED else 0
+    line_shipping = row.get("ti_line_shipping_amount")
+    if line_shipping is None and row.get("ti_shipping_amount") is not None:
+        qty = int(row.get("ti_bs_qty") or 1)
+        line_shipping = round(float(row.get("ti_shipping_amount") or 0) * qty, 2)
+    out = {
         "fulfillment_status": status,
         "ti_fulfillment_status": status,
         "shipped_quantity": shipped_qty,
@@ -294,7 +302,18 @@ def fulfillment_fields_from_row(row):
         "ti_tracking_carrier": carrier,
         "ti_tracking_number": tracking,
         "fulfillment_note": row.get("ti_fulfillment_note"),
+        "shipping_not_required": int(shipping_not_required or 0),
+        "ti_shipping_not_required": int(shipping_not_required or 0),
     }
+    if line_shipping is not None:
+        out["ti_line_shipping_amount"] = round(float(line_shipping), 2)
+    if method:
+        out["fulfillment_method"] = method
+        out["ti_fulfillment_method"] = method
+    listing_shipping = row.get("ti_listing_shipping")
+    if listing_shipping:
+        out["ti_listing_shipping"] = listing_shipping
+    return out
 
 
 def fulfillment_select_sql(alias="ti"):
@@ -305,7 +324,11 @@ def fulfillment_select_sql(alias="ti"):
         {alias}.ti_shipped_at,
         {alias}.ti_tracking_carrier,
         {alias}.ti_tracking_number,
-        {alias}.ti_fulfillment_note
+        {alias}.ti_fulfillment_note,
+        {alias}.ti_fulfillment_method,
+        {alias}.ti_shipping_not_required,
+        {alias}.ti_line_shipping_amount,
+        {alias}.ti_listing_shipping
     """
 
 

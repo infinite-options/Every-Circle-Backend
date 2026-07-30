@@ -349,10 +349,6 @@ def _sum_posted_wallet_transactions(db, profile_id):
     """
     if not profile_id:
         return 0.0
-    # Lazy import: wallet_transactions_service imports wallet_service helpers.
-    from wallet_transactions_service import _ensure_wallet_transactions_table
-
-    _ensure_wallet_transactions_table(db)
     # Match either the passed id or the resolved wallet PK (legacy platform ids).
     wallet_id = resolve_wallet_profile_id(profile_id)
     q = db.execute(
@@ -474,9 +470,6 @@ def reconcile_profile_wallet(db, profile_id):
 
 def reconcile_all_profile_wallets(db):
     """Reconcile every profile in transactions_bounty or wallet_transactions."""
-    from wallet_transactions_service import _ensure_wallet_transactions_table
-
-    _ensure_wallet_transactions_table(db)
     profiles_q = db.execute(
         """
         SELECT DISTINCT profile_id FROM (

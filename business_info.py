@@ -106,47 +106,12 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
     }
 )
 
-_BS_RETURNABLE_COLUMN_READY = False
-_BS_SHIPPING_AMOUNT_COLUMN_READY = False
-
 _BS_SHIPPING_FREE = "Free"
 _BS_SHIPPING_BUYER_ACTUAL = "Buyer Actual"
 _BS_SHIPPING_BUYER_FIXED = "Buyer Fixed"
 _BS_SHIPPING_ALLOWED = frozenset(
     {_BS_SHIPPING_FREE, _BS_SHIPPING_BUYER_ACTUAL, _BS_SHIPPING_BUYER_FIXED}
 )
-
-
-def _ensure_business_service_returnable_column(db):
-    """Add bs_is_returnable when missing (older installs)."""
-    global _BS_RETURNABLE_COLUMN_READY
-    if _BS_RETURNABLE_COLUMN_READY:
-        return
-    db.execute(
-        "ALTER TABLE every_circle.business_services "
-        "ADD COLUMN bs_is_returnable TINYINT(1) NULL DEFAULT 1",
-        cmd="post",
-    )
-    _BS_RETURNABLE_COLUMN_READY = True
-
-
-def _ensure_business_service_shipping_amount_column(db):
-    """Add shipping columns when missing (older installs)."""
-    global _BS_SHIPPING_AMOUNT_COLUMN_READY
-    if _BS_SHIPPING_AMOUNT_COLUMN_READY:
-        return
-    for ddl in (
-        "ALTER TABLE every_circle.business_services "
-        "ADD COLUMN bs_shipping_amount DECIMAL(10,2) NULL DEFAULT NULL",
-        "ALTER TABLE every_circle.business_services "
-        "ADD COLUMN bs_shipping_refundable TINYINT(1) NULL DEFAULT 0",
-    ):
-        try:
-            db.execute(ddl, cmd="post")
-        except Exception as e:
-            # Column may already exist
-            print(f"shipping column ensure (ok if exists): {e}")
-    _BS_SHIPPING_AMOUNT_COLUMN_READY = True
 
 
 def _truthy_flag(x):
@@ -488,7 +453,6 @@ class BusinessInfo(Resource):
                 links_response = db.execute(links_query)
 
                 # Added query for business services
-                _ensure_business_service_shipping_amount_column(db)
                 services_query = f"""
                     SELECT *
                     FROM every_circle.business_services
@@ -1216,9 +1180,6 @@ class BusinessInfo(Resource):
                         if not isinstance(services_data, list):
                             raise ValueError("business_services must be a JSON array")
                         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        _ensure_business_service_returnable_column(db)
-                        _ensure_business_service_shipping_amount_column(db)
-
                         # Process each service entry
                         for idx, service_data in enumerate(services_data):
                             if not isinstance(service_data, dict):
@@ -2162,9 +2123,6 @@ class BusinessInfo(Resource):
             # import json
             services = json.loads(services_str)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _ensure_business_service_returnable_column(db)
-            _ensure_business_service_shipping_amount_column(db)
-
             for idx, service in enumerate(services):
                 derived_input = dict(service)
 

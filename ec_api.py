@@ -33,7 +33,7 @@ from business_revenue import BusinessRevenue
 from category_list import CategoryList
 from chatbot import ChatbotAPI
 from tag_generator_api import TagGeneratorAPI
-from user_profile_info import UserProfileInfo
+from user_profile_info import UserProfileInfo, ProfileExpertiseRestock
 from business_info import BusinessInfo
 from business_map import BusinessMap
 from business_services_options import BusinessServiceOptions
@@ -879,6 +879,7 @@ api.add_resource(DeclinedReturns, '/api/v1/transactions/returns/declined')
 api.add_resource(ProfileViews, '/api/v1/profile_views', '/api/v1/profile_views/<string:profile_uid>')
 api.add_resource(BusinessServicePurchase, "/business/service/purchase")
 api.add_resource(BusinessServiceRestock, "/business/service/restock")
+api.add_resource(ProfileExpertiseRestock, "/api/v1/profile-expertise/restock")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
 api.add_resource(ContentReports, "/api/v1/reports", "/api/v1/reports/<string:report_uid>")

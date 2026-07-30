@@ -22,8 +22,6 @@ from transactions import (
     _status_payload,
     _remaining_to_ship_qty,
     _is_cancel_unshipped_request,
-    _ensure_return_eligibility_columns,
-    _ensure_transaction_shipping_columns,
     _batch_return_requests,
     _omit_empty,
     _is_return_list_row,
@@ -167,8 +165,6 @@ def _line_name_case_sql():
 
 
 def _load_sale_lines(db, order_uid):
-    _ensure_return_eligibility_columns(db)
-    _ensure_transaction_shipping_columns(db)
     name_case = _line_name_case_sql()
     lines_q = db.execute(
         f"""
@@ -192,6 +188,10 @@ def _load_sale_lines(db, order_uid):
             ti.ti_tracking_carrier,
             ti.ti_tracking_number,
             ti.ti_fulfillment_note,
+            ti.ti_fulfillment_method,
+            ti.ti_shipping_not_required,
+            ti.ti_line_shipping_amount,
+            ti.ti_listing_shipping,
             {name_case} AS item_name,
             bs.bs_service_name,
             bs.bs_service_desc,

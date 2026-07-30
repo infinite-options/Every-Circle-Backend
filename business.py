@@ -853,34 +853,6 @@ class BusinessServicePurchase(Resource):
             return response, 500
 
 
-_RESTOCK_AUDIT_TABLE_READY = False
-
-
-def _ensure_restock_audit_table(db):
-    """Create restock audit table once per process if missing."""
-    global _RESTOCK_AUDIT_TABLE_READY
-    if _RESTOCK_AUDIT_TABLE_READY:
-        return
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS every_circle.business_service_restocks (
-            bsr_uid VARCHAR(64) NOT NULL,
-            bsr_bs_uid VARCHAR(64) NOT NULL,
-            bsr_quantity INT NOT NULL,
-            bsr_remaining INT NULL,
-            bsr_seller_id VARCHAR(64) NULL,
-            bsr_trr_uid VARCHAR(64) NULL,
-            bsr_order_uid VARCHAR(64) NULL,
-            bsr_created_at DATETIME NOT NULL,
-            PRIMARY KEY (bsr_uid),
-            UNIQUE KEY uq_bsr_trr_bs (bsr_trr_uid, bsr_bs_uid)
-        )
-        """,
-        cmd="post",
-    )
-    _RESTOCK_AUDIT_TABLE_READY = True
-
-
 def _new_bsr_uid(db):
     """Allocate a restock audit uid."""
     return f"bsr-{uuid.uuid4().hex[:12]}"
@@ -964,8 +936,6 @@ class BusinessServiceRestock(Resource):
                 return response, 400
 
             with connect() as db:
-                _ensure_restock_audit_table(db)
-
                 if trr_uid:
                     prior = _load_restock_by_trr_uid(db, trr_uid, bs_uid)
                     if prior:
