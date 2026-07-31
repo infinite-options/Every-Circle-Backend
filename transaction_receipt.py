@@ -59,6 +59,10 @@ class TransactionReceipt(Resource):
                         ti.ti_tracking_carrier,
                         ti.ti_tracking_number,
                         ti.ti_fulfillment_note,
+                        ti.ti_fulfillment_method,
+                        ti.ti_shipping_not_required,
+                        ti.ti_line_shipping_amount,
+                        ti.ti_listing_shipping,
                         CASE
                             WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title

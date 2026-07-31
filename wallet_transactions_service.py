@@ -418,8 +418,6 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
     ``wallet_pending`` with status ``held`` until ``wt_available_at``;
     otherwise credit useable with status ``posted``.
     """
-    _ensure_wallet_transactions_table(db)
-
     try:
         qty = int(qty)
         received_qty_after = int(received_qty_after)
