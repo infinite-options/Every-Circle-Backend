@@ -47,6 +47,7 @@ from transactions import (
 from user_path_connection import ConnectionsPath
 from network_connection import NetworkPath
 from profile_details import ProfileDetails
+from profile_avatar import ProfileAvatar, ProfileAvatars
 from profile_wish import ProfileWishInfo, ProfileWishResponse
 from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertiseResponsesForOffering
 from bounty_results import BountyResults, BusinessBountyResults
@@ -927,6 +928,8 @@ api.add_resource(Transactions, '/api/v1/transactions', '/api/v1/transactions/<st
 api.add_resource(SellerTransactions,'/api/v1/transactions/seller/<string:profile_id>')
 
 api.add_resource(ConnectionsPath, '/api/connections_path/<string:first_uid>/<string:second_uid>')
+api.add_resource(ProfileAvatar, '/api/v1/profile_avatar/<string:profile_uid>')
+api.add_resource(ProfileAvatars, '/api/v1/profile_avatars')
 api.add_resource(NetworkPath, "/api/network/<string:target_uid>/<int:degree>")
 api.add_resource(ProfileDetails, "/api/profiledetails/<string:query>")
 api.add_resource(ProfileWishInfo,  "/api/profilewishinfo", "/api/profilewishinfo/<string:profile_wish_id>")
