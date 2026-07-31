@@ -196,6 +196,10 @@ def _expertise_dict_from_payload(exp_data):
         m["profile_expertise_city"] = exp_data["city"]
     if "state" in exp_data:
         m["profile_expertise_state"] = exp_data["state"]
+    if "zip" in exp_data:
+        m["profile_expertise_zip"] = exp_data["zip"]
+    elif "zipCode" in exp_data:
+        m["profile_expertise_zip"] = exp_data["zipCode"]
     if "mode" in exp_data:
         m["profile_expertise_mode"] = exp_data["mode"]
     for k, v in exp_data.items():
@@ -258,6 +262,14 @@ def _wish_dict_from_payload(wish_data):
         m["profile_wish_city"] = wish_data["profile_wish_city"]
     if "profile_wish_state" in wish_data:
         m["profile_wish_state"] = wish_data["profile_wish_state"]
+    if "city" in wish_data:
+        m["profile_wish_city"] = wish_data["city"]
+    if "state" in wish_data:
+        m["profile_wish_state"] = wish_data["state"]
+    if "zip" in wish_data:
+        m["profile_wish_zip"] = wish_data["zip"]
+    elif "zipCode" in wish_data:
+        m["profile_wish_zip"] = wish_data["zipCode"]
     if "mode" in wish_data:
         m["profile_wish_mode"] = wish_data["mode"]
     for k, v in wish_data.items():

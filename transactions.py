@@ -235,17 +235,36 @@ def _money_close(a, b, tol=0.02):
     return abs(round(_to_float(a), 2) - round(_to_float(b), 2)) <= tol
 
 
+VALID_FULFILLMENT_METHODS = ("ship", "pickup", "virtual")
+
+
+def _is_no_shipping_fulfillment(method):
+    """Pickup and virtual lines skip shipping address, charges, and ship workflow."""
+    return method in ("pickup", "virtual")
+
+
 def _normalize_listing_mode(raw):
-    """Map profile_expertise_mode to virtual | in_person | both."""
+    """
+    Map profile_expertise_mode / profile_wish_mode to virtual | ship | pickup | both.
+
+    New modes: virtual, ship, pickup. Legacy strings (in-person, virtual or in-person)
+    are still accepted.
+    """
     if raw is None or str(raw).strip() == "":
         return "virtual"
-    s = str(raw).strip().lower()
+    s = str(raw).strip().lower().replace("_", " ")
     if "virtual or in-person" in s or "virtual or in person" in s:
         return "both"
-    if "in-person" in s or "in person" in s:
-        return "in_person"
+    if s in ("ship", "shipping"):
+        return "ship"
+    if s in ("pickup", "in person", "in-person"):
+        return "pickup"
+    if "pickup" in s or "in-person" in s or "in person" in s:
+        return "pickup"
     if "virtual" in s:
         return "virtual"
+    if "ship" in s:
+        return "ship"
     return "virtual"
 
 
@@ -265,33 +284,48 @@ def _has_shipping_config(product_data):
 
 
 def _listing_supports_ship(listing_mode, product_data):
-    if listing_mode in ("virtual", "both"):
+    if listing_mode is None:
+        return _has_shipping_config(product_data)
+    if listing_mode in ("ship", "both"):
         return True
-    return _has_shipping_config(product_data)
+    return False
 
 
 def _listing_supports_pickup(listing_mode):
-    return listing_mode in ("in_person", "both")
+    if listing_mode is None:
+        return False
+    return listing_mode in ("pickup", "both")
+
+
+def _listing_supports_virtual(listing_mode):
+    if listing_mode is None:
+        return False
+    return listing_mode in ("virtual", "both")
 
 
 def _resolve_fulfillment_method(item, listing_mode, product_data):
     """
-    Resolve ship vs pickup with backward-compatible defaults.
+    Resolve ship / pickup / virtual with backward-compatible defaults.
     Returns (method, error_message_or_None).
     """
     raw = item.get("fulfillment_method")
     if raw is not None and str(raw).strip():
         method = str(raw).strip().lower()
-        if method not in ("ship", "pickup"):
-            return None, "Invalid fulfillment_method; must be 'ship' or 'pickup'"
+        if method not in VALID_FULFILLMENT_METHODS:
+            return (
+                None,
+                "Invalid fulfillment_method; must be 'ship', 'pickup', or 'virtual'",
+            )
         return method, None
 
     if listing_mode == "both":
         return None, "fulfillment_method is required for dual-mode listings"
-    if listing_mode == "in_person":
+    if listing_mode == "pickup":
         return "pickup", None
-    if listing_mode == "virtual":
+    if listing_mode == "ship":
         return "ship", None
+    if listing_mode == "virtual":
+        return "virtual", None
     if _has_shipping_config(product_data):
         return "ship", None
     return "pickup", None
@@ -305,8 +339,8 @@ def _is_buyer_actual_shipping(product_data):
 
 
 def _compute_expected_line_shipping(fulfillment_method, product_data, qty):
-    """Total shipping charge for a checkout line (0 for pickup / free / buyer actual)."""
-    if fulfillment_method == "pickup":
+    """Total shipping charge for a checkout line (0 for pickup / virtual / free / buyer actual)."""
+    if _is_no_shipping_fulfillment(fulfillment_method):
         return 0.0
     sh = _listing_shipping_type(product_data)
     if not sh:
@@ -335,7 +369,7 @@ def _snapshot_listing_shipping_on_line(tx_item, product_data):
 
 
 def _apply_checkout_fulfillment(tx_item, plan, product_data):
-    """Apply ship/pickup choice to a transaction line."""
+    """Apply ship / pickup / virtual choice to a transaction line."""
     method = plan["fulfillment_method"]
     qty = int(plan.get("qty") or tx_item.get("ti_bs_qty") or 1)
     line_shipping = round(_to_float(plan.get("line_shipping_amount")), 2)
@@ -343,7 +377,7 @@ def _apply_checkout_fulfillment(tx_item, plan, product_data):
     tx_item["ti_fulfillment_method"] = method
     _snapshot_listing_shipping_on_line(tx_item, product_data)
 
-    if method == "pickup":
+    if _is_no_shipping_fulfillment(method):
         tx_item["ti_fulfillment_status"] = FULFILLMENT_STATUS_NOT_REQUIRED
         tx_item["ti_shipping_not_required"] = 1
         tx_item["ti_line_shipping_amount"] = 0.0
@@ -430,7 +464,7 @@ def _fetch_listing_for_checkout_item(db, item):
                 "code": 404,
             }
         bs_data = bs_response["result"][0]
-        listing_mode = None
+        listing_mode = _normalize_listing_mode(bs_data.get("profile_wish_mode"))
     else:
         return None, ti_bs_id, None, False, {
             "message": f"Invalid item id: {ti_bs_id}",
@@ -484,6 +518,11 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "message": f"Pickup fulfillment is not allowed for item {ti_bs_id}",
                 "code": 400,
             }, None
+        if method == "virtual" and not _listing_supports_virtual(listing_mode):
+            return False, {
+                "message": f"Virtual fulfillment is not allowed for item {ti_bs_id}",
+                "code": 400,
+            }, None
 
         expected_line_ship = _compute_expected_line_shipping(method, bs_data, qty)
         declared_raw = item.get("line_shipping_amount")
@@ -522,17 +561,21 @@ def _plan_checkout(db, items, payload, shipping_fields):
             else:
                 declared_line_ship = expected_line_ship
 
-        if method == "pickup" and declared_line_ship != 0:
+        if _is_no_shipping_fulfillment(method) and declared_line_ship != 0:
             return False, {
-                "message": f"Pickup lines must have line_shipping_amount 0 ({ti_bs_id})",
+                "message": (
+                    f"{method.title()} lines must have line_shipping_amount 0 ({ti_bs_id})"
+                ),
                 "code": 400,
             }, None
 
         snr = item.get("shipping_not_required")
-        if snr is not None and method == "pickup":
+        if snr is not None and _is_no_shipping_fulfillment(method):
             if int(snr) != 1:
                 return False, {
-                    "message": f"shipping_not_required must be 1 for pickup lines ({ti_bs_id})",
+                    "message": (
+                        f"shipping_not_required must be 1 for {method} lines ({ti_bs_id})"
+                    ),
                     "code": 400,
                 }, None
 
