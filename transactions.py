@@ -5,6 +5,7 @@ import os
 import traceback
 from flask import request, jsonify
 import json
+import re
 import requests as http_requests
 
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
@@ -264,29 +265,74 @@ def _is_no_shipping_fulfillment(method):
     return method in ("pickup", "virtual")
 
 
-def _normalize_listing_mode(raw):
+def _parse_listing_mode_flags(raw):
     """
-    Map profile_expertise_mode / profile_wish_mode to virtual | ship | pickup | both.
-
-    New modes: virtual, ship, pickup. Legacy strings (in-person, virtual or in-person)
-    are still accepted.
+    Parse profile_expertise_mode / profile_wish_mode like the FE:
+    optional Virtual, Delivered, and/or In-Person (comma-separated).
     """
     if raw is None or str(raw).strip() == "":
-        return "virtual"
-    s = str(raw).strip().lower().replace("_", " ")
+        return {"virtual": False, "delivered": False, "inPerson": False}
+    s = str(raw).strip().lower()
     if "virtual or in-person" in s or "virtual or in person" in s:
-        return "both"
-    if s in ("ship", "shipping"):
-        return "ship"
-    if s in ("pickup", "in person", "in-person"):
-        return "pickup"
-    if "pickup" in s or "in-person" in s or "in person" in s:
-        return "pickup"
-    if "virtual" in s:
+        return {"virtual": True, "delivered": False, "inPerson": True}
+    if s == "virtual":
+        return {"virtual": True, "delivered": False, "inPerson": False}
+    if s in ("in-person", "in person"):
+        return {"virtual": False, "delivered": False, "inPerson": True}
+    if s in ("delivered", "delivery"):
+        return {"virtual": False, "delivered": True, "inPerson": False}
+    has_virtual = bool(re.search(r"\bvirtual\b", s))
+    has_delivered = bool(re.search(r"\bdeliver(ed|y)\b", s))
+    has_in_person = bool(re.search(r"in-?\s*person", s))
+    return {"virtual": has_virtual, "delivered": has_delivered, "inPerson": has_in_person}
+
+
+def _mode_flags_from_product(product_data):
+    if not product_data:
+        return _parse_listing_mode_flags(None)
+    raw = (
+        product_data.get("bs_mode")
+        or product_data.get("profile_expertise_mode")
+        or product_data.get("profile_wish_mode")
+    )
+    return _parse_listing_mode_flags(raw)
+
+
+def _business_listing_mode(product_data):
+    """Business services (250-*): require valid bs_mode (no shipping inference fallback)."""
+    if not product_data:
+        return None
+    raw = product_data.get("bs_mode")
+    if raw is None or not str(raw).strip():
+        return None
+    mode_str = str(raw).strip()
+    flags = _parse_listing_mode_flags(mode_str)
+    if not any(flags.values()):
+        return None
+    return _normalize_listing_mode(mode_str)
+
+
+def _normalize_listing_mode(raw):
+    """
+    Map profile_expertise_mode / profile_wish_mode / bs_mode to virtual | ship | pickup | both.
+
+    New modes: Virtual, Delivered, In-Person (any combination). Legacy strings
+    (in-person, virtual or in-person) are still accepted.
+    """
+    flags = _parse_listing_mode_flags(raw)
+    virtual = flags["virtual"]
+    delivered = flags["delivered"]
+    in_person = flags["inPerson"]
+    active = int(virtual) + int(delivered) + int(in_person)
+    if active == 0:
         return "virtual"
-    if "ship" in s:
-        return "ship"
-    return "virtual"
+    if active == 1:
+        if delivered:
+            return "ship"
+        if in_person:
+            return "pickup"
+        return "virtual"
+    return "both"
 
 
 def _listing_shipping_type(product_data):
@@ -305,20 +351,31 @@ def _has_shipping_config(product_data):
 
 
 def _listing_supports_ship(listing_mode, product_data):
-    if listing_mode is None:
-        return _has_shipping_config(product_data)
+    flags = _mode_flags_from_product(product_data)
+    if flags["delivered"] or flags["virtual"]:
+        return True
     if listing_mode in ("ship", "both"):
         return True
+    if listing_mode is None:
+        return _has_shipping_config(product_data)
     return False
 
 
-def _listing_supports_pickup(listing_mode):
+def _listing_supports_pickup(listing_mode, product_data=None):
+    flags = _mode_flags_from_product(product_data)
+    if flags["inPerson"]:
+        return True
+    if listing_mode in ("pickup", "both"):
+        return True
     if listing_mode is None:
-        return False
-    return listing_mode in ("pickup", "both")
+        return not _has_shipping_config(product_data)
+    return False
 
 
-def _listing_supports_virtual(listing_mode):
+def _listing_supports_virtual(listing_mode, product_data=None):
+    flags = _mode_flags_from_product(product_data)
+    if flags["virtual"]:
+        return True
     if listing_mode is None:
         return False
     return listing_mode in ("virtual", "both")
@@ -444,7 +501,15 @@ def _fetch_listing_for_checkout_item(db, item):
                 "code": 404,
             }
         bs_data = bs_response["result"][0]
-        listing_mode = None
+        listing_mode = _business_listing_mode(bs_data)
+        if listing_mode is None:
+            return None, ti_bs_id, None, False, {
+                "message": (
+                    f"Business service {ti_bs_id} has missing or invalid bs_mode "
+                    "(requires Virtual, Delivered, and/or In-Person)"
+                ),
+                "code": 400,
+            }
     elif str(ti_bs_id).startswith("150"):
         bs_response = db.execute(
             "SELECT * FROM every_circle.profile_expertise WHERE profile_expertise_uid = %s",
@@ -534,12 +599,12 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "message": f"Ship fulfillment is not allowed for item {ti_bs_id}",
                 "code": 400,
             }, None
-        if method == "pickup" and not _listing_supports_pickup(listing_mode):
+        if method == "pickup" and not _listing_supports_pickup(listing_mode, bs_data):
             return False, {
                 "message": f"Pickup fulfillment is not allowed for item {ti_bs_id}",
                 "code": 400,
             }, None
-        if method == "virtual" and not _listing_supports_virtual(listing_mode):
+        if method == "virtual" and not _listing_supports_virtual(listing_mode, bs_data):
             return False, {
                 "message": f"Virtual fulfillment is not allowed for item {ti_bs_id}",
                 "code": 400,
@@ -1740,10 +1805,10 @@ def _refund_breakdown_from_context(orig_tx, ctx):
     refund_shipping = _to_float(ctx.get("refund_shipping"))
     orig_fees = abs(_to_float(orig_tx.get("transaction_fees")))
     fee_ratio = refund_subtotal / order_subtotal if order_subtotal > 0 else 0.0
-    refund_fees = round(orig_fees * fee_ratio, 4)
-    refund_grand = round(
-        refund_subtotal + refund_tax + refund_shipping - refund_fees, 4
-    )
+    # Card processing fees are non-refundable but are NOT part of merchandise/tax/shipping.
+    # Refund = subtotal + tax + shipping only — do not subtract fees again (that double-counts).
+    refund_fees = 0.0
+    refund_grand = round(refund_subtotal + refund_tax + refund_shipping, 4)
 
     orig_total = abs(_to_float(orig_tx.get("transaction_total")))
     wallet_paid = abs(_to_float(orig_tx.get("transaction_wallet_amount")))
@@ -1766,7 +1831,8 @@ def _refund_breakdown_from_context(orig_tx, ctx):
         "subtotal": round(refund_subtotal, 4),
         "taxes": round(refund_tax, 4),
         "shipping": round(refund_shipping, 4),
-        "fees_allocated": round(refund_fees, 4),
+        "fees_allocated": 0.0,
+        "fees_not_refunded": round(orig_fees * fee_ratio, 4),
         "total_customer_credit": round(refund_grand, 4),
         "fee_allocation_ratio": round(fee_ratio, 6),
         "original_order_subtotal": round(order_subtotal, 4),
@@ -1951,7 +2017,7 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
         "transaction_total": f"{-refund_grand:.4f}",
         "transaction_amount": f"{-refund_subtotal:.4f}",
         "transaction_taxes": f"{-refund_tax:.4f}",
-        "transaction_fees": f"{-refund_fees:.4f}",
+        "transaction_fees": "0.0000",
         "transaction_wallet_amount": f"{-wallet_refund:.4f}",
         "transaction_in_escrow": 0,
         "transaction_return_note": return_note,
@@ -2404,7 +2470,7 @@ def _pair_for_sale(orig_tx, pending=None):
 
 
 def _line_estimated_total(orig_tx, ctx, line):
-    """Estimated customer credit for a single return line (incl. fee share)."""
+    """Estimated customer credit for a single return line (merchandise + tax + shipping)."""
     line_ctx = {
         "order_subtotal": ctx["order_subtotal"],
         "refund_subtotal": line["line_subtotal"],
@@ -3381,6 +3447,7 @@ class Transactions(Resource):
                     t.transaction_amount,
                     t.transaction_taxes,
                     t.transaction_fees,
+                    t.transaction_shipping,
                     t.transaction_profile_id,
                     t.transaction_in_escrow,
                     t.transaction_return_requested,
@@ -5625,6 +5692,7 @@ class SellerTransactions(Resource):
                         t.transaction_amount,
                         t.transaction_taxes,
                         t.transaction_fees,
+                        t.transaction_shipping,
                         t.transaction_business_id AS seller_id,
                         t.transaction_profile_id,
                         t.transaction_in_escrow,

@@ -2,6 +2,7 @@ from flask_restful import Resource
 from flask import request
 from datetime import datetime
 import ast
+import re
 import traceback
 import json
 import googlemaps
@@ -69,6 +70,10 @@ def _normalize_business_cc_fee_payer(value):
 #   bs_shipping_amount: DECIMAL required (incl. 0.00) when 'Buyer Fixed'; else NULL
 #   bs_shipping_refundable: 0 | 1
 #
+# Fulfillment modes (same labels as offerings):
+#   bs_mode: NULL | 'Virtual' | 'Delivered' | 'In-Person' | comma-separated combo
+#   Delivered requires bs_shipping configured; Buyer Fixed requires bs_shipping_amount.
+#
 # If you add new API fields, either add a DB column and list it here, or strip/map
 # them in _derive_business_service_fields so they never reach _prepare.
 _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
@@ -102,6 +107,7 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
         "bs_shipping",
         "bs_shipping_amount",
         "bs_shipping_refundable",
+        "bs_mode",
         "bs_condition",
     }
 )
@@ -155,6 +161,97 @@ def _normalize_bs_shipping_value(value):
     if s in _BS_SHIPPING_ALLOWED:
         return s
     return None
+
+
+def _parse_bs_mode_flags(raw):
+    """Parse bs_mode like profile_expertise_mode: Virtual, Delivered, In-Person (any combo)."""
+    if raw is None or str(raw).strip() == "":
+        return {"virtual": False, "delivered": False, "inPerson": False}
+    s = str(raw).strip().lower()
+    if "virtual or in-person" in s or "virtual or in person" in s:
+        return {"virtual": True, "delivered": False, "inPerson": True}
+    if s == "virtual":
+        return {"virtual": True, "delivered": False, "inPerson": False}
+    if s in ("in-person", "in person"):
+        return {"virtual": False, "delivered": False, "inPerson": True}
+    if s in ("delivered", "delivery"):
+        return {"virtual": False, "delivered": True, "inPerson": False}
+    return {
+        "virtual": bool(re.search(r"\bvirtual\b", s)),
+        "delivered": bool(re.search(r"\bdeliver(ed|y)\b", s)),
+        "inPerson": bool(re.search(r"in-?\s*person", s)),
+    }
+
+
+def _serialize_bs_mode_flags(flags):
+    parts = []
+    if flags.get("virtual"):
+        parts.append("Virtual")
+    if flags.get("delivered"):
+        parts.append("Delivered")
+    if flags.get("inPerson"):
+        parts.append("In-Person")
+    return ", ".join(parts)
+
+
+def _normalize_bs_mode_value(raw):
+    """Canonical bs_mode string or None when empty/invalid."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    flags = _parse_bs_mode_flags(raw)
+    if not any(flags.values()):
+        return None
+    return _serialize_bs_mode_flags(flags)[:45]
+
+
+def _business_service_has_delivery_charge(service_data):
+    shipping = _normalize_bs_shipping_value(service_data.get("bs_shipping"))
+    return shipping in _BS_SHIPPING_ALLOWED
+
+
+def _validate_business_service_fulfillment(service_data):
+    """
+    Validate bs_mode + delivery charge rules.
+    Returns error message string or None when valid.
+    """
+    if not service_data or not isinstance(service_data, dict):
+        return None
+
+    raw_mode = service_data.get("bs_mode")
+    if raw_mode is None or not str(raw_mode).strip():
+        return "bs_mode is required (Virtual, Delivered, and/or In-Person)"
+    flags = _parse_bs_mode_flags(raw_mode)
+
+    if not any(flags.values()):
+        return "At least one fulfillment mode is required (Virtual, Delivered, and/or In-Person)"
+
+    if flags["delivered"]:
+        if not _business_service_has_delivery_charge(service_data):
+            return (
+                "Delivered mode requires delivery charge (bs_shipping: Free, "
+                "Buyer Actual, or Buyer Fixed)"
+            )
+        shipping = _normalize_bs_shipping_value(service_data.get("bs_shipping"))
+        if shipping == _BS_SHIPPING_BUYER_FIXED:
+            amount = _parse_shipping_amount(service_data.get("bs_shipping_amount"))
+            zero_ok = service_data.get("bs_shipping_amount") in (0, "0", "0.00")
+            if amount is None and not zero_ok:
+                return "Buyer Fixed delivery charge requires bs_shipping_amount"
+
+    return None
+
+
+def _derive_bs_mode_fields(service_data):
+    """Normalize bs_mode when present in the payload; omit key to leave DB unchanged on update."""
+    if "bs_mode" not in service_data:
+        service_data.pop("bs_mode", None)
+        return
+
+    normalized = _normalize_bs_mode_value(service_data.get("bs_mode"))
+    if normalized:
+        service_data["bs_mode"] = normalized
+    else:
+        service_data["bs_mode"] = ""
 
 
 def _derive_shipping_fields(service_data):
@@ -251,6 +348,9 @@ def _derive_business_service_fields(service_data):
     # --- bs_shipping / bs_shipping_amount ---
     _derive_shipping_fields(service_data)
 
+    # --- bs_mode (after shipping — legacy default uses bs_shipping) ---
+    _derive_bs_mode_fields(service_data)
+
     if "bs_shipping_refundable" in service_data and service_data[
         "bs_shipping_refundable"
     ] not in (None, ""):
@@ -290,6 +390,7 @@ def _prepare_business_service_update_dict(service_data):
         "bs_bounty_limit",
         "bs_quantity",
         "bs_shipping",
+        "bs_mode",
         "bs_condition",
         "bs_sku",
         "bs_shipping_amount",
@@ -1383,6 +1484,21 @@ class BusinessInfo(Resource):
                                         service_data["bs_cost"]
                                     )
                                 _derive_business_service_fields(service_data)
+                                merged_for_validation = {
+                                    **service_exists_query["result"][0],
+                                    **service_data,
+                                }
+                                fulfillment_err = _validate_business_service_fulfillment(
+                                    merged_for_validation
+                                )
+                                if fulfillment_err:
+                                    service_update_errors.append(
+                                        {
+                                            "bs_uid": service_uid,
+                                            "error": fulfillment_err,
+                                        }
+                                    )
+                                    continue
                                 service_data = _prepare_business_service_update_dict(
                                     service_data
                                 )
@@ -2232,11 +2348,16 @@ class BusinessInfo(Resource):
                     )
 
                 _derive_business_service_fields(derived_input)
+                fulfillment_err = _validate_business_service_fulfillment(derived_input)
+                if fulfillment_err:
+                    raise ValueError(fulfillment_err)
+
                 for k in (
                     "bs_quantity",
                     "bs_shipping",
                     "bs_shipping_amount",
                     "bs_shipping_refundable",
+                    "bs_mode",
                     "bs_condition",
                     "bs_is_returnable",
                     "bs_return_window_days",
