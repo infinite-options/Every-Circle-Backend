@@ -5068,8 +5068,53 @@ def _line_bounty_totals(db, ti_uids):
     }
 
 
+def _seller_bounty_pool_for_line_row(ti_row):
+    """
+    Seller bounty pool for one sale line (matches bounty_results.bounty_paid).
+    per_item: unit bounty × purchased qty; total: flat line bounty.
+    """
+    if not ti_row:
+        return 0.0
+    bounty_type = str(
+        ti_row.get("bs_bounty_type") or ti_row.get("ti_bs_bounty_type") or "per_item"
+    ).strip().lower()
+    unit = _to_float(ti_row.get("bs_bounty") or ti_row.get("ti_bs_bounty"))
+    if unit <= 0:
+        return 0.0
+    original_qty = max(1, int(ti_row.get("ti_bs_qty") or 0))
+    if bounty_type == "total":
+        return unit
+    return unit * original_qty
+
+
+def _seller_bounty_to_reclaim_for_line(ti_row, return_qty):
+    """Seller bounty reversed for a partial/full line return."""
+    if not ti_row:
+        return 0.0
+    try:
+        rq = int(return_qty)
+    except (TypeError, ValueError):
+        return 0.0
+    if rq < 1:
+        return 0.0
+    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+    scale = _bounty_scale_for_line(rq, original_qty)
+    if scale is None:
+        return 0.0
+    line_pool = _seller_bounty_pool_for_line_row(ti_row)
+    if line_pool > 0:
+        bounty_type = str(
+            ti_row.get("bs_bounty_type") or ti_row.get("ti_bs_bounty_type") or "per_item"
+        ).strip().lower()
+        if bounty_type == "total":
+            return round(line_pool * scale, 4)
+        unit = _to_float(ti_row.get("bs_bounty") or ti_row.get("ti_bs_bounty"))
+        return round(unit * rq, 4)
+    return 0.0
+
+
 def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
-    """Scale original line bounty by return_quantity / original qty."""
+    """Seller bounty to reclaim — scaled by return qty (never full order unless full return)."""
     if not items_payload:
         return 0.0
     ti_uids = [e.get("transaction_item_uid") for e in items_payload if e.get("transaction_item_uid")]
@@ -5087,16 +5132,22 @@ def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
             continue
         ti_q = db.execute(
             """
-            SELECT ti_bs_qty
-            FROM every_circle.transactions_items
-            WHERE ti_uid = %s AND ti_transaction_id = %s
+            SELECT ti.ti_bs_qty, ti.ti_bs_bounty, bs.bs_bounty, bs.bs_bounty_type
+            FROM every_circle.transactions_items ti
+            LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
+            WHERE ti.ti_uid = %s AND ti.ti_transaction_id = %s
             """,
             (ti_uid, order_uid),
         )
         ti_rows = ti_q.get("result") or []
         if not ti_rows:
             continue
-        original_qty = int(ti_rows[0].get("ti_bs_qty") or 0)
+        ti_row = ti_rows[0]
+        seller_reclaim = _seller_bounty_to_reclaim_for_line(ti_row, rq)
+        if seller_reclaim > 0:
+            total += seller_reclaim
+            continue
+        original_qty = int(ti_row.get("ti_bs_qty") or 0)
         scale = _bounty_scale_for_line(rq, original_qty)
         if scale is None:
             continue
