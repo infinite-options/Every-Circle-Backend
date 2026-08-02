@@ -13,7 +13,6 @@ from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 from data_ec import connect, processImage
 from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interaction
 from user_path_connection import ConnectionsPath
-from escrow_release import release_escrow_for_transaction, summarize_escrow_result
 from wallet_ids import EC_WALLET_ID
 from wallet_service import (
     credit_bounty_to_wallet,
@@ -4295,8 +4294,6 @@ class Transactions(Resource):
                             )
                         print("network_participants: ", network_participants)
 
-                        in_escrow = bool(transaction.get("transaction_in_escrow"))
-
                         # Process known participants (buyer, recommender, ec-wallet)
                         for participant in known_participants:
                             participant_id = participant.get("tb_profile_id")
@@ -4364,7 +4361,7 @@ class Transactions(Resource):
                                         db,
                                         participant_id,
                                         bounty_amount,
-                                        in_escrow=in_escrow,
+                                        in_escrow=True,
                                     )
                                     print("wallet_result: ", wallet_result)
                                     if wallet_result.get("code") != 200:
@@ -4449,7 +4446,7 @@ class Transactions(Resource):
                                         db,
                                         participant_id,
                                         bounty_amount,
-                                        in_escrow=in_escrow,
+                                        in_escrow=True,
                                     )
                                     print("wallet_result: ", wallet_result)
                                     if wallet_result.get("code") != 200:
@@ -5026,22 +5023,12 @@ class Transactions(Resource):
                     updated_lines.append(line_out)
 
                 all_received = _all_lines_fully_received(db, transaction_uid)
-                escrow_release_result = None
                 update_fields = {}
 
-                if all_received and int(tx_row.get("transaction_in_escrow") or 0) == 1:
-                    escrow_release_result = release_escrow_for_transaction(
-                        db, transaction_uid, reason="buyer_confirmed"
-                    )
-                    if escrow_release_result.get("code") != 200:
-                        response["message"] = escrow_release_result.get(
-                            "message", "Failed to release escrow"
-                        )
-                        response["code"] = escrow_release_result.get("code", 500)
-                        return response, response["code"]
+                if all_received:
                     update_fields["transaction_in_escrow"] = 0
-                else:
-                    update_fields["transaction_in_escrow"] = 0 if all_received else 1
+                elif int(tx_row.get("transaction_in_escrow") or 0) == 1:
+                    update_fields["transaction_in_escrow"] = 1
 
                 if "transaction_return_requested" in payload:
                     update_fields["transaction_return_requested"] = (
@@ -5066,10 +5053,6 @@ class Transactions(Resource):
                 response["code"] = 200
                 response["transaction_uid"] = transaction_uid
                 response.update(update_fields)
-                if escrow_release_result:
-                    response["escrow_release"] = summarize_escrow_result(
-                        escrow_release_result
-                    )
                 response["delivery_verification_items"] = updated_lines
                 response["all_items_received"] = all_received
                 return response, 200

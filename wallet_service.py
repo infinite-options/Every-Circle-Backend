@@ -1,8 +1,16 @@
 """
-Wallet balance updates kept in sync with transactions_bounty + escrow state.
+Wallet balance updates kept in sync with transactions_bounty + seller proceeds.
+
+Bounty is always credited to wallet_pending at purchase. It moves to useable when
+the sale line is fully verified and either (a) there is no return-window hold, or
+(b) the seller hold cron releases the line after wt_available_at.
 """
 
+from datetime_utils import utc_now_str
 from wallet_ids import resolve_wallet_profile_id
+
+_BOUNTY_RELEASE_COLUMN_READY = False
+_BOUNTY_RELEASE_BACKFILL_DONE = False
 
 
 def _to_float(value):
@@ -41,11 +49,219 @@ def get_wallet_row(db, bounty_profile_id):
     return wallets[0] if wallets else None
 
 
+def ensure_bounty_release_column(db):
+    """Add ti_bounty_released_at once per process (tracks pending → useable release)."""
+    global _BOUNTY_RELEASE_COLUMN_READY, _BOUNTY_RELEASE_BACKFILL_DONE
+    if _BOUNTY_RELEASE_COLUMN_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_bounty_released_at DATETIME NULL",
+        cmd="post",
+    )
+    _BOUNTY_RELEASE_COLUMN_READY = True
+
+    if _BOUNTY_RELEASE_BACKFILL_DONE:
+        return
+    # Legacy rows: bounty was useable immediately when checkout had escrow off.
+    db.execute(
+        """
+        UPDATE every_circle.transactions_items ti
+        INNER JOIN every_circle.transactions t
+            ON ti.ti_transaction_id = t.transaction_uid
+        SET ti.ti_bounty_released_at = t.transaction_datetime
+        WHERE ti.ti_bounty_released_at IS NULL
+          AND COALESCE(t.transaction_in_escrow, 0) = 0
+          AND (t.transaction_type IS NULL OR t.transaction_type = 'sale')
+          AND EXISTS (
+            SELECT 1 FROM every_circle.transactions_bounty tb
+            WHERE tb.tb_ti_id = ti.ti_uid AND tb.tb_amount > 0.0001
+          )
+        """,
+        cmd="post",
+    )
+    # Legacy rows: escrow cleared and line fully verified, no active seller hold.
+    db.execute(
+        """
+        UPDATE every_circle.transactions_items ti
+        INNER JOIN every_circle.transactions t
+            ON ti.ti_transaction_id = t.transaction_uid
+        SET ti.ti_bounty_released_at = COALESCE(ti.ti_received_at, t.transaction_datetime)
+        WHERE ti.ti_bounty_released_at IS NULL
+          AND COALESCE(t.transaction_in_escrow, 0) = 0
+          AND COALESCE(ti.ti_received_qty, 0) >= CAST(ti.ti_bs_qty AS SIGNED)
+          AND CAST(ti.ti_bs_qty AS UNSIGNED) > 0
+          AND EXISTS (
+            SELECT 1 FROM every_circle.transactions_bounty tb
+            WHERE tb.tb_ti_id = ti.ti_uid AND tb.tb_amount > 0.0001
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM every_circle.wallet_transactions wt
+            WHERE wt.wt_ti_id = ti.ti_uid
+              AND wt.wt_type = 'partial_delivery_credit'
+              AND wt.wt_status = 'held'
+          )
+        """,
+        cmd="post",
+    )
+    _BOUNTY_RELEASE_BACKFILL_DONE = True
+
+
+def line_is_fully_verified(received_qty, order_qty):
+    order_qty = int(order_qty or 0)
+    if order_qty <= 0:
+        return False
+    return int(received_qty or 0) >= order_qty
+
+
+def release_bounty_for_line(db, ti_uid):
+    """
+    Move all bounty for a sale line from pending to useable for every recipient.
+
+    Idempotent: no-op when ti_bounty_released_at is already set.
+    """
+    ensure_bounty_release_column(db)
+    ti_uid = str(ti_uid or "").strip()
+    if not ti_uid:
+        return {"code": 400, "message": "ti_uid is required", "ti_uid": ti_uid}
+
+    ti_q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty,
+               ti_bounty_released_at
+        FROM every_circle.transactions_items
+        WHERE ti_uid = %s
+        """,
+        (ti_uid,),
+    )
+    ti_rows = ti_q.get("result") or []
+    if not ti_rows:
+        return {"code": 404, "message": f"Transaction item not found: {ti_uid}", "ti_uid": ti_uid}
+
+    ti = ti_rows[0]
+    if ti.get("ti_bounty_released_at"):
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "already_released",
+            "ti_uid": ti_uid,
+        }
+
+    order_qty = int(ti.get("ti_bs_qty") or 0)
+    received_qty = int(ti.get("ti_received_qty") or 0)
+    if not line_is_fully_verified(received_qty, order_qty):
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "line_not_fully_verified",
+            "ti_uid": ti_uid,
+        }
+
+    bounty_q = db.execute(
+        """
+        SELECT tb_profile_id, COALESCE(SUM(tb_amount), 0) AS bounty_total
+        FROM every_circle.transactions_bounty
+        WHERE tb_ti_id = %s
+        GROUP BY tb_profile_id
+        HAVING bounty_total > 0.0001
+        """,
+        (ti_uid,),
+    )
+    recipients = bounty_q.get("result") or []
+    if not recipients:
+        now = utc_now_str()
+        db.update(
+            "every_circle.transactions_items",
+            {"ti_uid": ti_uid},
+            {"ti_bounty_released_at": now},
+        )
+        return {
+            "code": 200,
+            "ti_uid": ti_uid,
+            "released": True,
+            "wallet_updates": [],
+            "total_moved": 0.0,
+        }
+
+    wallet_updates = []
+    for row in recipients:
+        profile_id = row.get("tb_profile_id")
+        amount = _round_money(row.get("bounty_total"))
+        if not profile_id or amount <= 0:
+            continue
+        outcome = release_bounty_to_useable(db, profile_id, amount)
+        if outcome.get("code") != 200:
+            return {
+                "code": outcome.get("code", 500),
+                "message": outcome.get(
+                    "message", f"Failed to release bounty for {profile_id}"
+                ),
+                "ti_uid": ti_uid,
+                "wallet_updates": wallet_updates,
+            }
+        wallet_updates.append(outcome)
+
+    now = utc_now_str()
+    mark = db.update(
+        "every_circle.transactions_items",
+        {"ti_uid": ti_uid},
+        {"ti_bounty_released_at": now},
+    )
+    if mark.get("code") != 200:
+        return {
+            "code": mark.get("code", 500),
+            "message": mark.get("message", "Failed to mark bounty released"),
+            "ti_uid": ti_uid,
+            "wallet_updates": wallet_updates,
+        }
+
+    total_moved = _round_money(
+        sum(_to_float(w.get("moved_to_useable")) for w in wallet_updates)
+    )
+    return {
+        "code": 200,
+        "ti_uid": ti_uid,
+        "released": True,
+        "wallet_updates": wallet_updates,
+        "total_moved": total_moved,
+    }
+
+
+def sync_bounty_release_after_line_credit(
+    db, ti_uid, *, received_qty_after, order_qty, hold
+):
+    """
+    Release bounty when a line is fully verified and seller proceeds are not held.
+
+    When hold=True (return window), bounty stays pending until seller hold cron
+    calls release_bounty_for_line after wt_available_at.
+    """
+    if hold:
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "return_window_hold",
+            "ti_uid": ti_uid,
+        }
+    if not line_is_fully_verified(received_qty_after, order_qty):
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "line_not_fully_verified",
+            "ti_uid": ti_uid,
+        }
+    return release_bounty_for_line(db, ti_uid)
+
+
 def credit_bounty_to_wallet(db, bounty_profile_id, amount, in_escrow=False):
     """
     Add bounty at purchase time.
-    Always increases actual + lifetime; splits pending vs useable by escrow flag.
+
+    Always credits wallet_pending (and actual + lifetime). The in_escrow argument
+    is kept for call-site compatibility; new purchases always hold bounty pending
+    until line verification (+ return window when applicable).
     """
+    in_escrow = True
     amount = _round_money(amount)
     if not bounty_profile_id or amount <= 0:
         return {"code": 200, "skipped": True, "wallet_profile_id": bounty_profile_id}
@@ -748,26 +964,35 @@ def _sum_buyer_wallet_purchase_spent(db, profile_id):
 
 def compute_wallet_from_bounty_ledger(db, profile_id):
     """
-    Recompute wallet balances from transactions_bounty + escrow, plus
+    Recompute wallet balances from transactions_bounty + line release state, plus
     wallet_transactions seller proceeds (posted + held), minus buyer
     wallet purchase spends (transaction_wallet_amount).
+
+    Bounty useable/pending follows ti_bounty_released_at (not transaction_in_escrow).
 
     useable = bounty_useable + SUM(posted wt_amount) - net_purchase_spent
     pending = bounty_pending + SUM(held wt_amount)
     lifetime_earning = bounty_total + SUM(held + posted wt_amount)
     actual = lifetime_earning - net_purchase_spent
     """
+    ensure_bounty_release_column(db)
     ledger_q = db.execute(
         """
         SELECT
             COALESCE(SUM(tb.tb_amount), 0) AS total_earned,
             COALESCE(SUM(
-                CASE WHEN COALESCE(t.transaction_in_escrow, 0) = 1
-                THEN tb.tb_amount ELSE 0 END
+                CASE
+                    WHEN tb.tb_amount > 0
+                     AND ti.ti_bounty_released_at IS NULL
+                    THEN tb.tb_amount ELSE 0
+                END
             ), 0) AS pending_amount,
             COALESCE(SUM(
-                CASE WHEN COALESCE(t.transaction_in_escrow, 0) = 0
-                THEN tb.tb_amount ELSE 0 END
+                CASE
+                    WHEN tb.tb_amount > 0
+                     AND ti.ti_bounty_released_at IS NOT NULL
+                    THEN tb.tb_amount ELSE 0
+                END
             ), 0) AS useable_amount
         FROM every_circle.transactions_bounty tb
         INNER JOIN every_circle.transactions_items ti ON tb.tb_ti_id = ti.ti_uid
@@ -813,7 +1038,7 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
 
 
 def reconcile_profile_wallet(db, profile_id):
-    """Overwrite wallet row to match bounty ledger + escrow + seller proceeds."""
+    """Overwrite wallet row to match bounty ledger + line release + seller proceeds."""
     wallet_id = resolve_wallet_profile_id(profile_id)
     computed = compute_wallet_from_bounty_ledger(db, profile_id)
     wallet = get_wallet_row(db, profile_id)

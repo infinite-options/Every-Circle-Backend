@@ -1,11 +1,16 @@
 """
 Auto-release escrow after a configurable number of days.
 
+NOTE: Scheduled cron invocation is currently disabled in deployment settings.
+This module is retained for a future auto-verify rewrite. It must not release
+bounty to useable while the verify + return-window table rules are in effect.
+
 Eligible orders must be fully shipped (or have no shippable lines). Unshipped
 physical orders stay in escrow until the seller ships or the buyer verifies.
 
 Used by EscrowReleaseCron_CLASS (Postman) and EscrowRelease_CRON (Zappa).
-Manual buyer confirmation can call release_escrow_for_transaction() separately.
+Manual buyer confirmation previously called release_escrow_for_transaction();
+delivery verification now releases bounty per line via wallet_service instead.
 """
 
 import traceback

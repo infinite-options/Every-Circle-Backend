@@ -60,6 +60,7 @@ from seller_hold_release import (
     format_seller_hold_release_email,
 )
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
+from wallet_ledger import WalletLedger
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -1004,6 +1005,7 @@ api.add_resource(
 )
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
+api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
 
 
 class GooglePlacesInfo(Resource):

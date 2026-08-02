@@ -7,7 +7,7 @@ from wallet_service import reconcile_all_profile_wallets, reconcile_profile_wall
 class WalletReconcile(Resource):
     """
     GET /api/v1/wallet_reconcile/<profile_id>
-    Rebuild wallet from bounty ledger + escrow + posted wallet_transactions.
+    Rebuild wallet from bounty ledger (ti_bounty_released_at) + seller proceeds.
     """
 
     def get(self, profile_id):

@@ -15,7 +15,9 @@ from wallet_service import (
     _to_float,
     credit_seller_proceeds_to_wallet,
     debit_seller_proceeds_from_wallet,
+    release_bounty_for_line,
     release_seller_hold_to_useable,
+    sync_bounty_release_after_line_credit,
 )
 
 WT_TYPE_PARTIAL_DELIVERY_CREDIT = "partial_delivery_credit"
@@ -407,6 +409,29 @@ def _wt_success_payload(row, *, idempotent_replay=False, wallet_result=None):
     return payload
 
 
+def _attach_bounty_release_to_credit_result(
+    db, result, *, ti_uid, ti, received_qty_after, hold
+):
+    """Augment a credit_partial_delivery payload with coupled bounty release."""
+    if not isinstance(result, dict) or result.get("code") != 200:
+        return result
+    order_qty = int(ti.get("ti_bs_qty") or 0)
+    bounty_release = sync_bounty_release_after_line_credit(
+        db,
+        ti_uid,
+        received_qty_after=received_qty_after,
+        order_qty=order_qty,
+        hold=hold,
+    )
+    result["bounty_release"] = bounty_release
+    if bounty_release.get("code") != 200:
+        result["code"] = bounty_release.get("code", 500)
+        result["message"] = bounty_release.get(
+            "message", "Failed to release bounty for line"
+        )
+    return result
+
+
 def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after):
     """
     Insert a partial_delivery_credit ledger row and credit the seller wallet.
@@ -506,7 +531,14 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         existing
         and _to_float(existing.get("wt_amount")) > 0
     ):
-        return _wt_success_payload(existing, idempotent_replay=True)
+        return _attach_bounty_release_to_credit_result(
+            db,
+            _wt_success_payload(existing, idempotent_replay=True),
+            ti_uid=ti_uid,
+            ti=ti,
+            received_qty_after=received_qty_after,
+            hold=hold,
+        )
 
     # Repair prior zero-amount ledger rows (e.g. unparseable "100/each" unit cost).
     if existing and _to_float(existing.get("wt_amount")) == 0 and credit_amount > 0:
@@ -549,12 +581,26 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         repaired["wt_profile_id"] = seller_profile_id
         repaired["wt_status"] = wt_status
         repaired["wt_available_at"] = available_at
-        return _wt_success_payload(
-            repaired, idempotent_replay=False, wallet_result=wallet_result
+        return _attach_bounty_release_to_credit_result(
+            db,
+            _wt_success_payload(
+                repaired, idempotent_replay=False, wallet_result=wallet_result
+            ),
+            ti_uid=ti_uid,
+            ti=ti,
+            received_qty_after=received_qty_after,
+            hold=hold,
         )
 
     if existing:
-        return _wt_success_payload(existing, idempotent_replay=True)
+        return _attach_bounty_release_to_credit_result(
+            db,
+            _wt_success_payload(existing, idempotent_replay=True),
+            ti_uid=ti_uid,
+            ti=ti,
+            received_qty_after=received_qty_after,
+            hold=hold,
+        )
 
     currency = (ti.get("ti_bs_cost_currency") or "USD").strip() or "USD"
     now = utc_now_str()
@@ -594,7 +640,14 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         if "duplicate entry" in insert_msg:
             existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
             if existing:
-                return _wt_success_payload(existing, idempotent_replay=True)
+                return _attach_bounty_release_to_credit_result(
+                    db,
+                    _wt_success_payload(existing, idempotent_replay=True),
+                    ti_uid=ti_uid,
+                    ti=ti,
+                    received_qty_after=received_qty_after,
+                    hold=hold,
+                )
         return {
             "code": insert_result.get("code", 500),
             "message": insert_result.get(
@@ -620,8 +673,15 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
                 "wallet": wallet_result,
             }
 
-    return _wt_success_payload(
-        insert_row, idempotent_replay=False, wallet_result=wallet_result
+    return _attach_bounty_release_to_credit_result(
+        db,
+        _wt_success_payload(
+            insert_row, idempotent_replay=False, wallet_result=wallet_result
+        ),
+        ti_uid=ti_uid,
+        ti=ti,
+        received_qty_after=received_qty_after,
+        hold=hold,
     )
 
 
@@ -1167,6 +1227,8 @@ def release_held_wallet_transaction(db, wt_row):
             cmd="post",
         )
 
+    bounty_release = release_bounty_for_line(db, ti_id) if ti_id else None
+
     return {
         "code": 200,
         "message": "Seller hold released",
@@ -1178,4 +1240,5 @@ def release_held_wallet_transaction(db, wt_row):
             wallet_result.get("moved_to_useable", amount) if wallet_result else 0
         ),
         "wallet": wallet_result,
+        "bounty_release": bounty_release,
     }
