@@ -13,8 +13,9 @@ from transaction_shipping import (
     load_shipping_for_transaction,
     shipping_payload_from_row,
     fulfillment_fields_from_row,
+    apply_order_fulfillment_summary,
+    line_is_shippable_row,
 )
-from transaction_shipping import apply_order_fulfillment_summary
 from transactions import (
     _load_return_request,
     _load_open_return_requests,
@@ -414,40 +415,47 @@ def _enrich_return_transactions_with_status(db, order_uid, sale, returns):
 def _apply_sale_fulfillment_rollup(sale_payload):
     """Order-level shipping/received counts from sale lines (matches list rollups)."""
     lines = sale_payload.get("lines") or []
-    shippable = shipped = unshipped = delivered = received = 0
+    shippable = unshipped = delivered = received = order_qty_total = 0
+    shippable_units = shipped_units = 0
     has_in_transit = 0
 
     for line in lines:
+        order_qty = int(line.get("ti_bs_qty") or 0)
+        shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
+        received_qty = int(line.get("ti_received_qty") or 0)
+        order_qty_total += order_qty
+        received += received_qty
+
+        if not line_is_shippable_row(line):
+            continue
+
         status = (
             line.get("ti_fulfillment_status")
             or line.get("fulfillment_status")
             or "not_required"
         )
-        order_qty = int(line.get("ti_bs_qty") or 0)
-        shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
-        received_qty = int(line.get("ti_received_qty") or 0)
 
-        if status in ("not_shipped", "in_transit", "delivered"):
-            shippable += 1
-            if status == "delivered" or shipped_qty >= order_qty:
-                shipped += 1
-            elif status != "delivered" and shipped_qty < order_qty:
-                unshipped += 1
-            if status == "delivered":
-                delivered += 1
-            if status == "in_transit":
-                has_in_transit = 1
-
-        if order_qty > 0 and received_qty >= order_qty:
-            received += 1
+        shippable += 1
+        shippable_units += order_qty
+        shipped_units += shipped_qty
+        unshipped += max(order_qty - shipped_qty, 0)
+        if status == "delivered" and shipped_qty >= order_qty:
+            delivered += 1
+        if status == "in_transit":
+            has_in_transit = 1
 
     summary_row = {
         "shippable_item_count": shippable,
-        "shipped_item_count": shipped,
+        "shipped_item_count": shipped_units,
         "unshipped_item_count": unshipped,
         "delivered_item_count": delivered,
         "has_in_transit": has_in_transit,
         "has_shippable_items": 1 if shippable > 0 else 0,
+        "ti_shipped_qty": shipped_units,
+        "shippable_unit_count": shippable_units,
+        "ti_received_qty": received,
+        "ti_bs_qty": order_qty_total,
+        "received_item_count": received,
     }
     apply_order_fulfillment_summary([summary_row])
 
@@ -456,8 +464,12 @@ def _apply_sale_fulfillment_rollup(sale_payload):
     sale_payload["shipped_item_count"] = summary_row["shipped_item_count"]
     sale_payload["unshipped_item_count"] = summary_row["unshipped_item_count"]
     sale_payload["delivered_item_count"] = summary_row["delivered_item_count"]
+    sale_payload["ti_shipped_qty"] = summary_row.get("ti_shipped_qty", 0)
+    sale_payload["ti_received_qty"] = received
     sale_payload["received_item_count"] = received
+    sale_payload["all_items_received"] = summary_row["all_items_received"]
     sale_payload["all_items_shipped"] = summary_row["all_items_shipped"]
+    sale_payload["has_shippable_items"] = summary_row["has_shippable_items"]
     sale_payload["fulfillment_status"] = summary_row["fulfillment_status"]
     sale_payload["shipping_status"] = summary_row["fulfillment_status"]
 

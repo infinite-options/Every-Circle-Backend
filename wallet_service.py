@@ -52,59 +52,56 @@ def get_wallet_row(db, bounty_profile_id):
 def ensure_bounty_release_column(db):
     """Add ti_bounty_released_at once per process (tracks pending → useable release)."""
     global _BOUNTY_RELEASE_COLUMN_READY, _BOUNTY_RELEASE_BACKFILL_DONE
-    if _BOUNTY_RELEASE_COLUMN_READY:
-        return
-    db.execute(
-        "ALTER TABLE every_circle.transactions_items "
-        "ADD COLUMN ti_bounty_released_at DATETIME NULL",
-        cmd="post",
-    )
-    _BOUNTY_RELEASE_COLUMN_READY = True
+    if not _BOUNTY_RELEASE_COLUMN_READY:
+        db.execute(
+            "ALTER TABLE every_circle.transactions_items "
+            "ADD COLUMN ti_bounty_released_at DATETIME NULL",
+            cmd="post",
+        )
+        _BOUNTY_RELEASE_COLUMN_READY = True
 
-    if _BOUNTY_RELEASE_BACKFILL_DONE:
-        return
-    # Legacy rows: bounty was useable immediately when checkout had escrow off.
+        if not _BOUNTY_RELEASE_BACKFILL_DONE:
+            # Legacy rows: escrow cleared, line fully verified, no active seller hold.
+            db.execute(
+                """
+                UPDATE every_circle.transactions_items ti
+                INNER JOIN every_circle.transactions t
+                    ON ti.ti_transaction_id = t.transaction_uid
+                SET ti.ti_bounty_released_at = COALESCE(ti.ti_received_at, t.transaction_datetime)
+                WHERE ti.ti_bounty_released_at IS NULL
+                  AND COALESCE(t.transaction_in_escrow, 0) = 0
+                  AND COALESCE(ti.ti_received_qty, 0) >= CAST(ti.ti_bs_qty AS SIGNED)
+                  AND CAST(ti.ti_bs_qty AS UNSIGNED) > 0
+                  AND EXISTS (
+                    SELECT 1 FROM every_circle.transactions_bounty tb
+                    WHERE tb.tb_ti_id = ti.ti_uid AND tb.tb_amount > 0.0001
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM every_circle.wallet_transactions wt
+                    WHERE wt.wt_ti_id = ti.ti_uid
+                      AND wt.wt_type = 'partial_delivery_credit'
+                      AND wt.wt_status = 'held'
+                  )
+                """,
+                cmd="post",
+            )
+            _BOUNTY_RELEASE_BACKFILL_DONE = True
+
+    _repair_partial_bounty_release_flags(db)
+
+
+def _repair_partial_bounty_release_flags(db):
+    """Clear bounty-released markers on lines that are not fully verified."""
     db.execute(
         """
-        UPDATE every_circle.transactions_items ti
-        INNER JOIN every_circle.transactions t
-            ON ti.ti_transaction_id = t.transaction_uid
-        SET ti.ti_bounty_released_at = t.transaction_datetime
-        WHERE ti.ti_bounty_released_at IS NULL
-          AND COALESCE(t.transaction_in_escrow, 0) = 0
-          AND (t.transaction_type IS NULL OR t.transaction_type = 'sale')
-          AND EXISTS (
-            SELECT 1 FROM every_circle.transactions_bounty tb
-            WHERE tb.tb_ti_id = ti.ti_uid AND tb.tb_amount > 0.0001
-          )
+        UPDATE every_circle.transactions_items
+        SET ti_bounty_released_at = NULL
+        WHERE ti_bounty_released_at IS NOT NULL
+          AND CAST(ti_bs_qty AS UNSIGNED) > 0
+          AND COALESCE(ti_received_qty, 0) < CAST(ti_bs_qty AS SIGNED)
         """,
         cmd="post",
     )
-    # Legacy rows: escrow cleared and line fully verified, no active seller hold.
-    db.execute(
-        """
-        UPDATE every_circle.transactions_items ti
-        INNER JOIN every_circle.transactions t
-            ON ti.ti_transaction_id = t.transaction_uid
-        SET ti.ti_bounty_released_at = COALESCE(ti.ti_received_at, t.transaction_datetime)
-        WHERE ti.ti_bounty_released_at IS NULL
-          AND COALESCE(t.transaction_in_escrow, 0) = 0
-          AND COALESCE(ti.ti_received_qty, 0) >= CAST(ti.ti_bs_qty AS SIGNED)
-          AND CAST(ti.ti_bs_qty AS UNSIGNED) > 0
-          AND EXISTS (
-            SELECT 1 FROM every_circle.transactions_bounty tb
-            WHERE tb.tb_ti_id = ti.ti_uid AND tb.tb_amount > 0.0001
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM every_circle.wallet_transactions wt
-            WHERE wt.wt_ti_id = ti.ti_uid
-              AND wt.wt_type = 'partial_delivery_credit'
-              AND wt.wt_status = 'held'
-          )
-        """,
-        cmd="post",
-    )
-    _BOUNTY_RELEASE_BACKFILL_DONE = True
 
 
 def line_is_fully_verified(received_qty, order_qty):
@@ -139,16 +136,23 @@ def release_bounty_for_line(db, ti_uid):
         return {"code": 404, "message": f"Transaction item not found: {ti_uid}", "ti_uid": ti_uid}
 
     ti = ti_rows[0]
-    if ti.get("ti_bounty_released_at"):
-        return {
-            "code": 200,
-            "skipped": True,
-            "reason": "already_released",
-            "ti_uid": ti_uid,
-        }
-
     order_qty = int(ti.get("ti_bs_qty") or 0)
     received_qty = int(ti.get("ti_received_qty") or 0)
+
+    if ti.get("ti_bounty_released_at"):
+        if line_is_fully_verified(received_qty, order_qty):
+            return {
+                "code": 200,
+                "skipped": True,
+                "reason": "already_released",
+                "ti_uid": ti_uid,
+            }
+        db.update(
+            "every_circle.transactions_items",
+            {"ti_uid": ti_uid},
+            {"ti_bounty_released_at": None},
+        )
+
     if not line_is_fully_verified(received_qty, order_qty):
         return {
             "code": 200,

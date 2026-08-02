@@ -34,6 +34,7 @@ from transaction_shipping import (
     attach_shipping_to_transaction_rows,
     apply_order_fulfillment_summary,
     fulfillment_list_summary_sql,
+    ensure_fulfillment_list_rollups,
     append_fulfillment_field,
     FULFILLMENT_STATUS_NOT_REQUIRED,
     FULFILLMENT_STATUS_NOT_SHIPPED,
@@ -3515,6 +3516,7 @@ class Transactions(Resource):
                 return response, 400
 
             with connect() as db:
+                ensure_fulfillment_list_rollups(db)
                 fulfillment_summary = fulfillment_list_summary_sql("ti")
                 # Execute query with parameterized profile_id for security
                 query = (
@@ -3562,6 +3564,7 @@ class Transactions(Resource):
                     ) AS purchased_item,
                     SUM(ti.ti_bs_qty) AS ti_bs_qty,
                     MIN(ti.ti_uid) AS ti_uid,
+                    MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
                     __FULFILLMENT_SUMMARY__
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
@@ -4951,43 +4954,17 @@ class Transactions(Resource):
                         return response, 400
 
                     new_received = current_received + received_qty
-                    current_status = (
-                        ti_row.get("ti_fulfillment_status") or "not_required"
-                    )
-                    set_delivered = new_received >= order_qty and current_status in (
-                        FULFILLMENT_STATUS_NOT_SHIPPED,
-                        FULFILLMENT_STATUS_IN_TRANSIT,
-                    )
 
-                    if set_delivered:
-                        ti_update = db.execute(
-                            """
-                            UPDATE every_circle.transactions_items
-                            SET ti_received_qty = %s,
-                                ti_received_at = %s,
-                                ti_fulfillment_status = %s
-                            WHERE ti_uid = %s AND ti_transaction_id = %s
-                            """,
-                            (
-                                new_received,
-                                received_at,
-                                FULFILLMENT_STATUS_DELIVERED,
-                                ti_uid,
-                                transaction_uid,
-                            ),
-                            "post",
-                        )
-                    else:
-                        ti_update = db.execute(
-                            """
-                            UPDATE every_circle.transactions_items
-                            SET ti_received_qty = %s,
-                                ti_received_at = %s
-                            WHERE ti_uid = %s AND ti_transaction_id = %s
-                            """,
-                            (new_received, received_at, ti_uid, transaction_uid),
-                            "post",
-                        )
+                    ti_update = db.execute(
+                        """
+                        UPDATE every_circle.transactions_items
+                        SET ti_received_qty = %s,
+                            ti_received_at = %s
+                        WHERE ti_uid = %s AND ti_transaction_id = %s
+                        """,
+                        (new_received, received_at, ti_uid, transaction_uid),
+                        "post",
+                    )
                     if ti_update.get("code") != 200:
                         response["message"] = ti_update.get(
                             "message", "Failed to update transaction item"
@@ -5018,8 +4995,6 @@ class Transactions(Resource):
                         "wt_uid": credit_result.get("wt_uid"),
                         "wt_amount": credit_result.get("wt_amount"),
                     }
-                    if set_delivered:
-                        line_out["fulfillment_status"] = FULFILLMENT_STATUS_DELIVERED
                     updated_lines.append(line_out)
 
                 all_received = _all_lines_fully_received(db, transaction_uid)
@@ -5795,6 +5770,7 @@ class SellerTransactions(Resource):
                 return response, 400
 
             with connect() as db:
+                ensure_fulfillment_list_rollups(db)
                 fulfillment_summary = fulfillment_list_summary_sql("ti")
                 # Execute query to get transactions
                 query = (
@@ -5844,6 +5820,7 @@ class SellerTransactions(Resource):
                         MIN(ti.ti_bs_id) AS ti_bs_id,
                         SUM(ti.ti_bs_qty) AS ti_bs_qty,
                         MIN(ti.ti_uid) AS ti_uid,
+                        MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
                         MIN(ti.ti_bs_cost) AS unit_price,
                         __FULFILLMENT_SUMMARY__,
                         MIN(buyer_pp.profile_personal_first_name) AS buyer_first_name,

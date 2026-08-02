@@ -12,6 +12,11 @@ _SALE_HEADER_KEYS = frozenset(
         "shipped_item_count",
         "shippable_item_count",
         "all_items_shipped",
+        "all_items_received",
+        "ti_shipped_qty",
+        "ti_received_qty",
+        "received_item_count",
+        "delivered_item_count",
         "return_status",
         "refund_status",
         "transaction_return_status",
@@ -19,8 +24,6 @@ _SALE_HEADER_KEYS = frozenset(
         "display_status",
         "cancel_unshipped",
         "pre_ship_cancel",
-        "received_item_count",
-        "delivered_item_count",
     }
 )
 
@@ -245,7 +248,8 @@ def _row_needs_received_hydration(row):
         return False
     if int(row.get("transaction_in_escrow") or 0) != 1:
         return False
-    if row.get("received_item_count") is not None:
+    # Row-level ti_received_qty is always on list payloads; hydration adds per-line detail.
+    if row.get("received_item_count") is not None and row.get("ti_received_qty") is not None:
         return False
     return True
 

@@ -12,7 +12,7 @@ from flask_restful import Resource
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
-from wallet_service import _round_money, _to_float, get_wallet_row
+from wallet_service import _round_money, _to_float, get_wallet_row, line_is_fully_verified
 
 
 def _request_timezone():
@@ -46,36 +46,47 @@ def _entry_type_label(entry_type):
     return labels.get(entry_type, entry_type.replace("_", " ").title())
 
 
+def _bounty_line_fully_verified(row):
+    order_qty = int(row.get("ti_bs_qty") or 0)
+    received_qty = int(row.get("ti_received_qty") or 0)
+    return line_is_fully_verified(received_qty, order_qty)
+
+
 def _normalize_bounty_entry(row):
     amount = _round_money(row.get("amount"))
     tx_type = (row.get("transaction_type") or "sale").lower()
+    fully_verified = _bounty_line_fully_verified(row)
     if amount < 0 or tx_type == "return":
         entry_type = "bounty_reversal"
         availability = "useable"
         useable_delta = amount
     else:
         entry_type = "bounty_earned"
-        if row.get("ti_bounty_released_at"):
+        if row.get("ti_bounty_released_at") and fully_verified:
             availability = "useable"
             useable_delta = amount
+        elif fully_verified:
+            # Verified but return-window hold not yet released
+            availability = "pending"
+            useable_delta = 0.0
         else:
-            order_qty = int(row.get("ti_bs_qty") or 0)
-            received_qty = int(row.get("ti_received_qty") or 0)
-            if order_qty > 0 and received_qty >= order_qty:
-                # Verified but return-window hold not yet released
-                availability = "pending"
-                useable_delta = 0.0
-            else:
-                availability = "pending"
-                useable_delta = 0.0
+            availability = "pending"
+            useable_delta = 0.0
 
     counterparty = row.get("counterparty_name") or "Unknown"
     if entry_type == "bounty_reversal":
         description = f"Bounty reversed on return — {counterparty}"
-    elif availability == "pending" and int(row.get("ti_received_qty") or 0) >= int(
-        row.get("ti_bs_qty") or 0
-    ) and int(row.get("ti_bs_qty") or 0) > 0:
+    elif (
+        availability == "pending"
+        and fully_verified
+        and int(row.get("ti_bs_qty") or 0) > 0
+    ):
         description = f"Bounty earned (pending return window) — {counterparty}"
+    elif not fully_verified and int(row.get("ti_received_qty") or 0) > 0:
+        description = (
+            f"Bounty earned (partially verified "
+            f"{row.get('ti_received_qty')}/{row.get('ti_bs_qty')}) — {counterparty}"
+        )
     else:
         description = f"Bounty earned — {counterparty}"
 

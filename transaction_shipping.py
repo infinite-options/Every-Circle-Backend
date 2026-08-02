@@ -210,6 +210,7 @@ FULFILLMENT_STATUS_NOT_REQUIRED = "not_required"
 FULFILLMENT_STATUS_NOT_SHIPPED = "not_shipped"
 FULFILLMENT_STATUS_IN_TRANSIT = "in_transit"
 FULFILLMENT_STATUS_DELIVERED = "delivered"
+FULFILLMENT_STATUS_PARTIAL = "partial"
 
 FULFILLMENT_STATUSES = frozenset(
     {
@@ -217,8 +218,62 @@ FULFILLMENT_STATUSES = frozenset(
         FULFILLMENT_STATUS_NOT_SHIPPED,
         FULFILLMENT_STATUS_IN_TRANSIT,
         FULFILLMENT_STATUS_DELIVERED,
+        FULFILLMENT_STATUS_PARTIAL,
     }
 )
+
+_VERIFY_ONLY_DELIVERED_REPAIR_DONE = False
+
+
+def line_is_shippable_sql(alias="ti"):
+    """SQL predicate: line requires seller shipping (not pickup/virtual)."""
+    return f"""(
+        COALESCE({alias}.ti_fulfillment_method, '') NOT IN ('pickup', 'virtual')
+        AND COALESCE({alias}.ti_shipping_not_required, 0) = 0
+        AND COALESCE({alias}.ti_fulfillment_status, 'not_required') <> 'not_required'
+    )"""
+
+
+def line_is_shippable_row(row):
+    """True when a sale line requires seller shipping (matches list rollup SQL)."""
+    if not row:
+        return False
+    method = str(row.get("ti_fulfillment_method") or row.get("fulfillment_method") or "").strip().lower()
+    if method in ("pickup", "virtual"):
+        return False
+    if int(row.get("ti_shipping_not_required") or 0) == 1:
+        return False
+    status = str(
+        row.get("ti_fulfillment_status") or row.get("fulfillment_status") or FULFILLMENT_STATUS_NOT_REQUIRED
+    ).strip().lower()
+    return status != FULFILLMENT_STATUS_NOT_REQUIRED
+
+
+def repair_verify_only_delivered_fulfillment_status(db):
+    """
+    One-time idempotent repair: reset lines marked delivered by buyer verify
+    (never seller-shipped) back to not_shipped.
+    """
+    global _VERIFY_ONLY_DELIVERED_REPAIR_DONE
+    if _VERIFY_ONLY_DELIVERED_REPAIR_DONE:
+        return
+    db.execute(
+        """
+        UPDATE every_circle.transactions_items
+        SET ti_fulfillment_status = 'not_shipped'
+        WHERE COALESCE(ti_fulfillment_method, 'ship') NOT IN ('pickup', 'virtual')
+          AND COALESCE(ti_shipping_not_required, 0) = 0
+          AND COALESCE(ti_fulfillment_status, '') = 'delivered'
+          AND COALESCE(ti_shipped_qty, 0) < CAST(ti_bs_qty AS UNSIGNED)
+        """,
+        cmd="post",
+    )
+    _VERIFY_ONLY_DELIVERED_REPAIR_DONE = True
+
+
+def ensure_fulfillment_list_rollups(db):
+    """Run idempotent fulfillment data repairs before list rollups."""
+    repair_verify_only_delivered_fulfillment_status(db)
 
 # Seller may set these via PUT fulfillment_updates
 SELLER_FULFILLMENT_STATUSES = frozenset(
@@ -334,55 +389,58 @@ def fulfillment_select_sql(alias="ti"):
 
 def fulfillment_list_summary_sql(alias="ti"):
     """Aggregates for buyer/seller transaction list rows (GROUP BY transaction)."""
+    shippable = line_is_shippable_sql(alias)
     return f"""
+        SUM(CASE WHEN {shippable} THEN 1 ELSE 0 END) AS shippable_item_count,
         SUM(
             CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required')
-                     IN ('not_shipped', 'in_transit', 'delivered')
-                THEN 1 ELSE 0
+                WHEN {shippable}
+                THEN CAST({alias}.ti_bs_qty AS UNSIGNED) ELSE 0
             END
-        ) AS shippable_item_count,
+        ) AS shippable_unit_count,
         SUM(
             CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required')
-                     IN ('not_shipped', 'in_transit', 'delivered')
-                     AND (
-                         COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'delivered'
-                         OR COALESCE({alias}.ti_shipped_qty, 0)
-                            >= CAST({alias}.ti_bs_qty AS UNSIGNED)
-                     )
-                THEN 1 ELSE 0
+                WHEN {shippable}
+                THEN COALESCE({alias}.ti_shipped_qty, 0) ELSE 0
+            END
+        ) AS ti_shipped_qty,
+        SUM(
+            CASE
+                WHEN {shippable}
+                THEN COALESCE({alias}.ti_shipped_qty, 0) ELSE 0
             END
         ) AS shipped_item_count,
         SUM(
             CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required')
-                     IN ('not_shipped', 'in_transit', 'delivered')
-                     AND COALESCE({alias}.ti_fulfillment_status, 'not_required') <> 'delivered'
-                     AND COALESCE({alias}.ti_shipped_qty, 0)
-                         < CAST({alias}.ti_bs_qty AS UNSIGNED)
-                THEN 1 ELSE 0
+                WHEN {shippable}
+                THEN GREATEST(
+                    CAST({alias}.ti_bs_qty AS UNSIGNED)
+                        - COALESCE({alias}.ti_shipped_qty, 0),
+                    0
+                )
+                ELSE 0
             END
         ) AS unshipped_item_count,
         SUM(
             CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'delivered'
+                WHEN {shippable}
+                     AND COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'delivered'
+                     AND COALESCE({alias}.ti_shipped_qty, 0)
+                         >= CAST({alias}.ti_bs_qty AS UNSIGNED)
                 THEN 1 ELSE 0
             END
         ) AS delivered_item_count,
         MAX(
             CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'in_transit'
+                WHEN {shippable}
+                     AND COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'in_transit'
                 THEN 1 ELSE 0
             END
         ) AS has_in_transit,
-        MAX(
-            CASE
-                WHEN COALESCE({alias}.ti_fulfillment_status, 'not_required')
-                     IN ('not_shipped', 'in_transit', 'delivered')
-                THEN 1 ELSE 0
-            END
-        ) AS has_shippable_items
+        MAX(CASE WHEN {shippable} THEN 1 ELSE 0 END) AS has_shippable_items,
+        SUM(COALESCE({alias}.ti_received_qty, 0)) AS ti_received_qty,
+        SUM(COALESCE({alias}.ti_bs_qty, 0)) AS ti_bs_qty_for_received,
+        SUM(COALESCE({alias}.ti_received_qty, 0)) AS received_item_count
     """
 
 
@@ -401,9 +459,19 @@ def apply_order_fulfillment_summary(rows):
             continue
 
         shippable = int(row.get("shippable_item_count") or 0)
-        shipped = int(row.get("shipped_item_count") or 0)
+        shippable_units = int(
+            row.get("shippable_unit_count") or row.get("ti_bs_qty") or 0
+        )
+        shipped = int(row.get("shipped_item_count") or row.get("ti_shipped_qty") or 0)
         unshipped = int(row.get("unshipped_item_count") or 0)
+        shipped_units = int(row.get("ti_shipped_qty") or shipped)
         delivered = int(row.get("delivered_item_count") or 0)
+        received_qty = int(row.get("ti_received_qty") or 0)
+        order_qty = int(
+            row.get("ti_bs_qty_for_received") or row.get("ti_bs_qty") or 0
+        )
+        received_units = int(row.get("received_item_count") or received_qty)
+        has_in_transit = int(row.get("has_in_transit") or 0)
 
         # Return rows inherit sale shipping address via order_uid, but fulfillment
         # counts come from the return's own lines (usually not_required).
@@ -411,9 +479,21 @@ def apply_order_fulfillment_summary(rows):
         row["shipped_item_count"] = shipped
         row["unshipped_item_count"] = unshipped
         row["delivered_item_count"] = delivered
+        row["ti_shipped_qty"] = shipped_units
+        row["ti_received_qty"] = received_qty
+        row["received_item_count"] = received_units
+        row.pop("ti_bs_qty_for_received", None)
+        row.pop("shippable_unit_count", None)
+        if order_qty > 0:
+            row["all_items_received"] = 1 if received_qty >= order_qty else 0
+        else:
+            row["all_items_received"] = 0
         row["needs_shipping"] = 1 if unshipped > 0 else 0
         row["needs_shipment"] = row["needs_shipping"]
-        row["all_items_shipped"] = 1 if shippable > 0 and unshipped == 0 else 0
+        if shippable_units > 0:
+            row["all_items_shipped"] = 1 if shipped_units >= shippable_units else 0
+        else:
+            row["all_items_shipped"] = 0
         row["has_shippable_items"] = 1 if shippable > 0 else int(
             row.get("has_shippable_items") or 0
         )
@@ -422,8 +502,12 @@ def apply_order_fulfillment_summary(rows):
             row["fulfillment_status"] = FULFILLMENT_STATUS_NOT_REQUIRED
         elif unshipped <= 0 and delivered >= shippable:
             row["fulfillment_status"] = FULFILLMENT_STATUS_DELIVERED
-        elif unshipped <= 0:
+        elif unshipped <= 0 and has_in_transit:
             row["fulfillment_status"] = FULFILLMENT_STATUS_IN_TRANSIT
+        elif unshipped <= 0 and shipped >= shippable:
+            row["fulfillment_status"] = FULFILLMENT_STATUS_IN_TRANSIT
+        elif shipped > 0 and unshipped > 0:
+            row["fulfillment_status"] = FULFILLMENT_STATUS_PARTIAL
         elif shipped <= 0:
             row["fulfillment_status"] = FULFILLMENT_STATUS_NOT_SHIPPED
         else:
