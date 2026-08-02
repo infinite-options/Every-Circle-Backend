@@ -590,10 +590,10 @@ class BusinessInfo(Resource):
                     WHERE bt.bt_business_id = "{business_uid}"
                     ORDER BY t.tag_name
                 """
-                print(f"Executing tags query for business_uid: {business_uid}")
-                print(f"Tags query: {tags_query}")
+                # print(f"Executing tags query for business_uid: {business_uid}")
+                # print(f"Tags query: {tags_query}")
                 tags_response = db.execute(tags_query)
-                print(f"Tags response: {tags_response}")
+                # print(f"Tags response: {tags_response}")
 
                 # Format tags as a simple list of tag names
                 tags = []

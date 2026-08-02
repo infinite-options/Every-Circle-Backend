@@ -265,6 +265,45 @@ def _is_no_shipping_fulfillment(method):
     return method in ("pickup", "virtual")
 
 
+def _line_uses_ship_fulfillment(ti_row):
+    """
+    True when return split uses shipped vs unshipped caps.
+    Pickup / virtual / not_required use received vs unreceived instead.
+    """
+    if not ti_row:
+        return False
+    method = str(ti_row.get("ti_fulfillment_method") or "").strip().lower()
+    if method in ("pickup", "virtual"):
+        return False
+    if method == "ship":
+        return True
+    if int(ti_row.get("ti_shipping_not_required") or 0) == 1:
+        return False
+    status = str(
+        ti_row.get("ti_fulfillment_status") or FULFILLMENT_STATUS_NOT_REQUIRED
+    ).strip().lower()
+    if status == FULFILLMENT_STATUS_NOT_REQUIRED:
+        return False
+    return status in (
+        "not_shipped",
+        "in_transit",
+        "delivered",
+        "partial",
+        "partially_shipped",
+    )
+
+
+def _returnable_qty_remaining(
+    db, order_uid, ti_uid, order_qty, exclude_trr_uid=None
+):
+    """Units still returnable on a line after ledger returns and open reservations."""
+    returned = _already_returned_qty(db, order_uid, ti_uid)
+    reserved = _reserved_return_qty(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    return max(int(order_qty or 0) - returned - reserved, 0)
+
+
 def _parse_listing_mode_flags(raw):
     """
     Parse profile_expertise_mode / profile_wish_mode like the FE:
@@ -1643,7 +1682,10 @@ def _validate_and_price_return_items(
                    ti_received_at, ti_selected_options, ti_special_instructions,
                    ti_choices_extra_cost, ti_shipping_amount, ti_shipping_refundable,
                    COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
-                   COALESCE(ti_received_qty, 0) AS ti_received_qty
+                   COALESCE(ti_received_qty, 0) AS ti_received_qty,
+                   COALESCE(ti_fulfillment_method, '') AS ti_fulfillment_method,
+                   COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+                   COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required
             FROM every_circle.transactions_items
             WHERE ti_uid = %s AND ti_transaction_id = %s
             """,
@@ -1657,10 +1699,14 @@ def _validate_and_price_return_items(
             }, None
 
         ti_row = ti_rows[0]
-        shipped_on_line = int(ti_row.get("ti_shipped_qty") or 0) == 0
+        uses_ship = _line_uses_ship_fulfillment(ti_row)
+        if uses_ship:
+            line_unshipped = int(ti_row.get("ti_shipped_qty") or 0) == 0
+        else:
+            line_unshipped = int(ti_row.get("ti_received_qty") or 0) == 0
         parsed = _parse_return_item_quantities(
             entry,
-            line_unshipped=shipped_on_line,
+            line_unshipped=line_unshipped,
             order_cancel=bool(entry.get("_order_cancel")),
         )
         if not parsed:
@@ -1703,28 +1749,50 @@ def _validate_and_price_return_items(
                 }, None
 
         original_qty = int(ti_row.get("ti_bs_qty") or 0)
+        received_qty = int(ti_row.get("ti_received_qty") or 0)
         shipped_qty = int(ti_row.get("ti_shipped_qty") or 0)
-        if return_shipped_qty > shipped_qty:
+        returnable_remaining = _returnable_qty_remaining(
+            db, original_tx_uid, ti_uid, original_qty, exclude_trr_uid=exclude_trr_uid
+        )
+
+        if uses_ship:
+            left_seller_qty = shipped_qty
+            remaining_not_left = _remaining_to_ship_qty(
+                db,
+                original_tx_uid,
+                ti_uid,
+                original_qty,
+                shipped_qty,
+                exclude_trr_uid=exclude_trr_uid,
+            )
+            left_label = "shipped"
+            not_left_label = "unshipped"
+        else:
+            left_seller_qty = min(received_qty, returnable_remaining)
+            remaining_not_left = _remaining_unreceived_qty(
+                db,
+                original_tx_uid,
+                ti_uid,
+                original_qty,
+                received_qty,
+                exclude_trr_uid=exclude_trr_uid,
+            )
+            left_label = "received"
+            not_left_label = "unreceived"
+
+        if return_shipped_qty > left_seller_qty:
             return False, {
                 "message": (
-                    f"return_shipped_qty exceeds shipped qty for {ti_uid} "
-                    f"(requested {return_shipped_qty}, shipped {shipped_qty})"
+                    f"return_shipped_qty exceeds {left_label} qty for {ti_uid} "
+                    f"(requested {return_shipped_qty}, {left_label} {left_seller_qty})"
                 ),
                 "code": 400,
             }, None
-        remaining_unshipped = _remaining_to_ship_qty(
-            db,
-            original_tx_uid,
-            ti_uid,
-            original_qty,
-            shipped_qty,
-            exclude_trr_uid=exclude_trr_uid,
-        )
-        if cancel_unshipped_qty > remaining_unshipped:
+        if cancel_unshipped_qty > remaining_not_left:
             return False, {
                 "message": (
-                    f"cancel_unshipped_qty exceeds remaining unshipped qty for {ti_uid} "
-                    f"(requested {cancel_unshipped_qty}, remaining {remaining_unshipped})"
+                    f"cancel_unshipped_qty exceeds remaining {not_left_label} qty for {ti_uid} "
+                    f"(requested {cancel_unshipped_qty}, remaining {remaining_not_left})"
                 ),
                 "code": 400,
             }, None
@@ -2321,6 +2389,21 @@ def _remaining_to_ship_qty(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
     return max(int(order_qty or 0) - int(shipped_qty or 0) - returned - reserved, 0)
+
+
+def _remaining_unreceived_qty(
+    db, order_uid, ti_uid, order_qty, received_qty, exclude_trr_uid=None
+):
+    """
+    Pickup / virtual: units not yet buyer-confirmed received, minus returns/reservations.
+    """
+    order_qty = int(order_qty or 0)
+    received_qty = int(received_qty or 0)
+    unreceived_pool = max(order_qty - received_qty, 0)
+    total_remaining = _returnable_qty_remaining(
+        db, order_uid, ti_uid, order_qty, exclude_trr_uid=exclude_trr_uid
+    )
+    return min(unreceived_pool, total_remaining)
 
 
 def _load_open_return_requests(db, transaction_uid):
