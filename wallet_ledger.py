@@ -12,7 +12,7 @@ from flask_restful import Resource
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
-from wallet_service import _round_money, _to_float, get_wallet_row, line_is_fully_verified
+from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified
 
 
 def _request_timezone():
@@ -40,6 +40,8 @@ def _entry_type_label(entry_type):
         "sale_proceeds": "Sale proceeds",
         "sale_proceeds_held": "Sale proceeds (pending)",
         "sale_proceeds_clawback": "Sale proceeds clawback",
+        "sale_proceeds_hold": "Sale proceeds reserved (return)",
+        "bounty_reclaim_reserved": "Bounty reserved (return)",
         "wallet_payment": "Wallet payment",
         "wallet_refund": "Wallet refund",
     }
@@ -129,17 +131,35 @@ def _normalize_wallet_transaction_entry(row):
     useable_delta = amount if availability == "useable" else 0.0
 
     buyer = row.get("buyer_name") or row.get("wt_buyer_id") or "buyer"
+    received_qty = int(row.get("wt_received_qty_after") or row.get("ti_received_qty") or 0)
+    order_qty = int(row.get("ti_bs_qty") or 0)
     if entry_type == "sale_proceeds_clawback":
         description = f"Sale proceeds clawback — order from {buyer}"
     elif entry_type == "sale_proceeds_held":
-        description = f"Sale proceeds (pending return window) — {buyer}"
+        if order_qty > 0 and received_qty < order_qty:
+            description = (
+                f"Sale proceeds (pending return window, "
+                f"{received_qty}/{order_qty} verified) — {buyer}"
+            )
+        else:
+            description = f"Sale proceeds (pending return window) — {buyer}"
+    elif order_qty > 0 and received_qty < order_qty:
+        description = (
+            f"Sale proceeds ({received_qty}/{order_qty} verified) — {buyer}"
+        )
     else:
         description = f"Sale proceeds — {buyer}"
 
     entry_dt = row.get("wt_created_at") or row.get("transaction_datetime")
+    tx_uid = row.get("wt_transaction_id")
+    entry_id = (
+        f"wt:sale:{tx_uid}:{wt_status}"
+        if wt_type == "partial_delivery_credit"
+        else f"wt:{row.get('wt_uid')}"
+    )
 
     return {
-        "entry_id": f"wt:{row.get('wt_uid')}",
+        "entry_id": entry_id,
         "entry_source": "wallet_transactions",
         "entry_type": entry_type,
         "entry_type_label": _entry_type_label(entry_type),
@@ -147,7 +167,7 @@ def _normalize_wallet_transaction_entry(row):
         "useable_delta": useable_delta,
         "availability": availability,
         "currency": row.get("wt_currency") or "USD",
-        "transaction_uid": row.get("wt_transaction_id"),
+        "transaction_uid": tx_uid,
         "transaction_original_uid": None,
         "transaction_type": "sale",
         "entry_datetime": entry_dt,
@@ -159,6 +179,106 @@ def _normalize_wallet_transaction_entry(row):
         "wt_status": wt_status,
         "wt_note": row.get("wt_note"),
         "wt_available_at": row.get("wt_available_at"),
+        "ti_received_qty": received_qty or None,
+        "ti_bs_qty": order_qty or None,
+    }
+
+
+def _aggregate_sale_proceeds_rows(rows):
+    """
+    Collapse incremental partial_delivery_credit rows (one per verify) into a
+    single ledger line per sale + status. Underlying wallet_transactions rows
+    remain for audit; unit progress lives on transactions_items.
+    """
+    credits_by_key = {}
+    other_rows = []
+
+    for row in rows:
+        if (row.get("wt_type") or "") != "partial_delivery_credit":
+            other_rows.append(row)
+            continue
+        tx_uid = row.get("wt_transaction_id")
+        status = row.get("wt_status") or "posted"
+        key = (tx_uid, status)
+        credits_by_key.setdefault(key, []).append(row)
+
+    aggregated = []
+    for (_tx_uid, _status), group in credits_by_key.items():
+        group.sort(
+            key=lambda r: (
+                str(r.get("wt_created_at") or ""),
+                str(r.get("wt_uid") or ""),
+            )
+        )
+        latest = dict(group[-1])
+        latest["wt_amount"] = _round_money(
+            sum(_to_float(r.get("wt_amount")) for r in group)
+        )
+        ti_totals = {}
+        for row in group:
+            ti_id = row.get("wt_ti_id")
+            if not ti_id:
+                continue
+            ti_totals[ti_id] = {
+                "bs": int(row.get("ti_bs_qty") or 0),
+                "received": max(
+                    int(row.get("ti_received_qty") or 0),
+                    int(row.get("wt_received_qty_after") or 0),
+                    ti_totals.get(ti_id, {}).get("received", 0),
+                ),
+            }
+        order_qty = sum(item["bs"] for item in ti_totals.values())
+        received_qty = sum(item["received"] for item in ti_totals.values())
+        if order_qty > 0:
+            latest["ti_bs_qty"] = order_qty
+            latest["ti_received_qty"] = received_qty
+            latest["wt_received_qty_after"] = received_qty
+        else:
+            latest["wt_received_qty_after"] = max(
+                int(r.get("wt_received_qty_after") or 0) for r in group
+            )
+        aggregated.append(latest)
+
+    return other_rows + aggregated
+
+
+def _normalize_reservation_entry(row):
+    wt_type = row.get("wt_type") or ""
+    amount_raw = _round_money(row.get("wt_amount"))
+    buyer = row.get("buyer_name") or row.get("wt_buyer_id") or "buyer"
+    trr_uid = row.get("wt_note")
+
+    if wt_type == "bounty_reclaim_reservation":
+        entry_type = "bounty_reclaim_reserved"
+        description = f"Bounty reserved for pending return — {buyer}"
+    else:
+        entry_type = "sale_proceeds_clawback"
+        description = f"Sale proceeds clawback (pending return) — {buyer}"
+
+    signed_amount = _round_money(-amount_raw)
+    tx_uid = row.get("wt_transaction_id")
+
+    return {
+        "entry_id": f"reservation:{row.get('wt_uid')}",
+        "entry_source": "wallet_transactions",
+        "entry_type": entry_type,
+        "entry_type_label": _entry_type_label(entry_type),
+        "amount": signed_amount,
+        "useable_delta": 0.0,
+        "availability": "pending",
+        "currency": row.get("wt_currency") or "USD",
+        "transaction_uid": tx_uid,
+        "transaction_original_uid": None,
+        "transaction_type": "sale",
+        "entry_datetime": row.get("wt_created_at") or row.get("transaction_datetime"),
+        "description": description,
+        "counterparty_name": buyer,
+        "purchaser_name": buyer,
+        "wt_uid": row.get("wt_uid"),
+        "wt_type": "return_clawback" if entry_type == "sale_proceeds_clawback" else wt_type,
+        "wt_status": "held" if entry_type == "sale_proceeds_clawback" else row.get("wt_status"),
+        "trr_uid": trr_uid,
+        "ti_uid": row.get("wt_ti_id"),
     }
 
 
@@ -267,19 +387,27 @@ def _fetch_wallet_transaction_ledger_rows(db, profile_id):
             wt.wt_note,
             wt.wt_available_at,
             wt.wt_created_at,
+            wt.wt_received_qty_after,
             t.transaction_datetime,
+            ti.ti_bs_qty,
+            COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
             CONCAT(bp.profile_personal_first_name, ' ', bp.profile_personal_last_name)
                 AS buyer_name
         FROM every_circle.wallet_transactions wt
         LEFT JOIN every_circle.transactions t
             ON wt.wt_transaction_id = t.transaction_uid
+        LEFT JOIN every_circle.transactions_items ti
+            ON wt.wt_ti_id = ti.ti_uid
         LEFT JOIN every_circle.profile_personal bp
             ON wt.wt_buyer_id = bp.profile_personal_uid
         WHERE wt.wt_profile_id IN (%s, %s)
+          AND wt.wt_type NOT IN ('return_refund_reservation', 'bounty_reclaim_reservation')
+          AND wt.wt_status NOT IN ('reserved', 'cleared')
         """,
         (profile_id, wallet_id),
     )
-    return q.get("result") or []
+    rows = q.get("result") or []
+    return _aggregate_sale_proceeds_rows(rows)
 
 
 def _fetch_wallet_spend_ledger_rows(db, profile_id):
@@ -331,13 +459,17 @@ def _attach_running_balances(entries):
 
 
 def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
+    from wallet_return_reservations import fetch_reservation_ledger_rows
+
     bounty_rows = _fetch_bounty_ledger_rows(db, profile_id)
     wt_rows = _fetch_wallet_transaction_ledger_rows(db, profile_id)
     spend_rows = _fetch_wallet_spend_ledger_rows(db, profile_id)
+    reservation_rows = fetch_reservation_ledger_rows(db, profile_id)
 
     entries = []
     entries.extend(_normalize_bounty_entry(r) for r in bounty_rows)
     entries.extend(_normalize_wallet_transaction_entry(r) for r in wt_rows)
+    entries.extend(_normalize_reservation_entry(r) for r in reservation_rows)
     entries.extend(_normalize_wallet_spend_entry(r) for r in spend_rows)
 
     entries = [e for e in entries if abs(_to_float(e.get("amount"))) > 0.0001]
@@ -348,23 +480,7 @@ def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
 
     page = entries[offset : offset + limit]
 
-    wallet = get_wallet_row(db, profile_id)
-    wallet_summary = None
-    if wallet:
-        wallet_summary = {
-            "wallet_profile_id": wallet.get("wallet_profile_id"),
-            "wallet_useable_balance": _round_money(
-                wallet.get("wallet_useable_balance")
-            ),
-            "wallet_pending": _round_money(wallet.get("wallet_pending")),
-            "wallet_actual_balance": _round_money(
-                wallet.get("wallet_actual_balance")
-            ),
-            "wallet_lifetime_earning": _round_money(
-                wallet.get("wallet_lifetime_earning")
-            ),
-            "wallet_lifetime_spent": _round_money(wallet.get("wallet_lifetime_spent")),
-        }
+    wallet_summary = build_wallet_summary(db, profile_id)
 
     return {
         "code": 200,

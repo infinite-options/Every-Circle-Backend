@@ -17,6 +17,8 @@ from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
 from order_list_hydration import attach_order_list_hydration
+from wallet_service import build_wallet_summary
+from wallet_transactions_service import resolve_seller_wallet_profile_id
 
 
 def _request_timezone():
@@ -87,6 +89,7 @@ class AccountScreenPersonal(Resource):
         }
         with connect() as db:
             attach_order_list_hydration(response, db, mode="personal")
+            response["wallet"] = build_wallet_summary(db, profile_id)
 
         return (response, 200)
 
@@ -122,5 +125,8 @@ class AccountScreenBusiness(Resource):
         }
         with connect() as db:
             attach_order_list_hydration(response, db, mode="business")
+            wallet_profile_id = resolve_seller_wallet_profile_id(db, business_uid)
+            if wallet_profile_id:
+                response["wallet"] = build_wallet_summary(db, wallet_profile_id)
 
         return (response, 200)

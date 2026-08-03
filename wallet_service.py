@@ -49,6 +49,159 @@ def get_wallet_row(db, bounty_profile_id):
     return wallets[0] if wallets else None
 
 
+def adjust_wallet_reserve(db, profile_id, delta):
+    """Increment/decrement wallet_reserve (blocks spendable balance)."""
+    delta = _round_money(delta)
+    if not profile_id or delta == 0:
+        return {"code": 200, "skipped": True, "delta": 0}
+
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        if delta < 0:
+            return {"code": 200, "skipped": True, "delta": 0}
+        insert_result = db.insert(
+            "every_circle.wallet",
+            {
+                "wallet_profile_id": wallet_id,
+                "wallet_actual_balance": 0,
+                "wallet_pending": 0,
+                "wallet_useable_balance": 0,
+                "wallet_reserve": _round_money(delta),
+                "wallet_lifetime_earning": 0,
+                "wallet_lifetime_spent": 0,
+            },
+        )
+        if insert_result.get("code") != 200:
+            return {
+                "code": insert_result.get("code", 500),
+                "message": insert_result.get("message", "Failed to create wallet"),
+            }
+        return {
+            "code": 200,
+            "wallet_profile_id": profile_id,
+            "wallet_reserve": _round_money(delta),
+            "delta": delta,
+        }
+
+    current = _to_float(wallet.get("wallet_reserve"))
+    useable = _to_float(wallet.get("wallet_useable_balance"))
+    new_reserve = _round_money(max(0.0, current + delta))
+    new_useable = _round_money(max(0.0, useable - delta))
+    result = db.update(
+        "every_circle.wallet",
+        {"wallet_profile_id": wallet_id},
+        {
+            "wallet_reserve": new_reserve,
+            "wallet_useable_balance": new_useable,
+        },
+    )
+    if result.get("code") != 200:
+        return {
+            "code": result.get("code", 500),
+            "message": result.get("message", "Failed to update wallet_reserve"),
+        }
+    return {
+        "code": 200,
+        "wallet_profile_id": profile_id,
+        "wallet_reserve": new_reserve,
+        "wallet_useable_balance": new_useable,
+        "delta": delta,
+    }
+
+
+def apply_pending_clawback_hold(db, profile_id, amount):
+    """
+    Reserve pending seller proceeds when a return is opened (before confirm).
+
+    Reduces wallet_pending only; actual/lifetime are debited on confirm.
+    """
+    amount = _round_money(abs(amount))
+    if not profile_id or amount <= 0:
+        return {"code": 200, "skipped": True, "wallet_profile_id": profile_id}
+
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return {
+            "code": 404,
+            "message": f"Wallet not found for {profile_id}",
+            "wallet_profile_id": profile_id,
+        }
+
+    pending = _to_float(wallet.get("wallet_pending"))
+    from_pending = min(amount, pending)
+    result = db.update(
+        "every_circle.wallet",
+        {"wallet_profile_id": wallet_id},
+        {"wallet_pending": _round_money(pending - from_pending)},
+    )
+    if result.get("code") != 200:
+        return {
+            "code": result.get("code", 500),
+            "message": result.get("message", "Failed to apply pending clawback hold"),
+            "wallet_profile_id": profile_id,
+        }
+    return {
+        "code": 200,
+        "wallet_profile_id": profile_id,
+        "held_from_pending": from_pending,
+    }
+
+
+def release_pending_clawback_hold(db, profile_id, amount):
+    """Reverse apply_pending_clawback_hold when a return request is declined."""
+    amount = _round_money(abs(amount))
+    if not profile_id or amount <= 0:
+        return {"code": 200, "skipped": True, "wallet_profile_id": profile_id}
+
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return {
+            "code": 404,
+            "message": f"Wallet not found for {profile_id}",
+            "wallet_profile_id": profile_id,
+        }
+
+    pending = _to_float(wallet.get("wallet_pending"))
+    result = db.update(
+        "every_circle.wallet",
+        {"wallet_profile_id": wallet_id},
+        {"wallet_pending": _round_money(pending + amount)},
+    )
+    if result.get("code") != 200:
+        return {
+            "code": result.get("code", 500),
+            "message": result.get("message", "Failed to release pending clawback hold"),
+            "wallet_profile_id": profile_id,
+        }
+    return {
+        "code": 200,
+        "wallet_profile_id": profile_id,
+        "released_to_pending": amount,
+    }
+
+
+def build_wallet_summary(db, profile_id):
+    """Authoritative wallet block for wallet_ledger and account-screen APIs."""
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return None
+    reserve = _round_money(wallet.get("wallet_reserve"))
+    useable = _round_money(wallet.get("wallet_useable_balance"))
+    return {
+        "wallet_profile_id": wallet.get("wallet_profile_id"),
+        "wallet_useable_balance": useable,
+        "wallet_pending": _round_money(wallet.get("wallet_pending")),
+        "wallet_reserve": reserve,
+        "wallet_useable_after_reserve": _round_money(max(0.0, useable)),
+        "wallet_actual_balance": _round_money(wallet.get("wallet_actual_balance")),
+        "wallet_lifetime_earning": _round_money(wallet.get("wallet_lifetime_earning")),
+        "wallet_lifetime_spent": _round_money(wallet.get("wallet_lifetime_spent")),
+    }
+
+
 def ensure_bounty_release_column(db):
     """Add ti_bounty_released_at once per process (tracks pending → useable release)."""
     global _BOUNTY_RELEASE_COLUMN_READY, _BOUNTY_RELEASE_BACKFILL_DONE
@@ -228,6 +381,133 @@ def release_bounty_for_line(db, ti_uid):
         "released": True,
         "wallet_updates": wallet_updates,
         "total_moved": total_moved,
+    }
+
+
+def release_bounty_for_line_net(db, ti_uid):
+    """
+    Release bounty for a line minus active bounty reclaim reservations.
+
+    Full release when no reservations; partial per-recipient release when
+    reservations cover part of pending bounty.
+    """
+    ensure_bounty_release_column(db)
+    ti_uid = str(ti_uid or "").strip()
+    if not ti_uid:
+        return {"code": 400, "message": "ti_uid is required", "ti_uid": ti_uid}
+
+    from wallet_return_reservations import sum_active_bounty_reservation
+
+    ti_q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty,
+               ti_bounty_released_at
+        FROM every_circle.transactions_items
+        WHERE ti_uid = %s
+        """,
+        (ti_uid,),
+    )
+    ti_rows = ti_q.get("result") or []
+    if not ti_rows:
+        return {"code": 404, "message": f"Transaction item not found: {ti_uid}", "ti_uid": ti_uid}
+
+    ti = ti_rows[0]
+    order_qty = int(ti.get("ti_bs_qty") or 0)
+    received_qty = int(ti.get("ti_received_qty") or 0)
+
+    if ti.get("ti_bounty_released_at") and line_is_fully_verified(received_qty, order_qty):
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "already_released",
+            "ti_uid": ti_uid,
+        }
+
+    if not line_is_fully_verified(received_qty, order_qty):
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "line_not_fully_verified",
+            "ti_uid": ti_uid,
+        }
+
+    reserved_total = sum_active_bounty_reservation(db, ti_uid=ti_uid)
+    if reserved_total <= 0:
+        return release_bounty_for_line(db, ti_uid)
+
+    bounty_q = db.execute(
+        """
+        SELECT tb_profile_id, COALESCE(SUM(tb_amount), 0) AS bounty_total
+        FROM every_circle.transactions_bounty
+        WHERE tb_ti_id = %s
+        GROUP BY tb_profile_id
+        HAVING bounty_total > 0.0001
+        """,
+        (ti_uid,),
+    )
+    recipients = bounty_q.get("result") or []
+    if not recipients:
+        now = utc_now_str()
+        db.update(
+            "every_circle.transactions_items",
+            {"ti_uid": ti_uid},
+            {"ti_bounty_released_at": now},
+        )
+        return {
+            "code": 200,
+            "ti_uid": ti_uid,
+            "released": True,
+            "wallet_updates": [],
+            "total_moved": 0.0,
+        }
+
+    pending_total = _round_money(
+        sum(_to_float(r.get("bounty_total")) for r in recipients)
+    )
+    releasable_total = _round_money(max(0.0, pending_total - reserved_total))
+    if releasable_total <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "reason": "fully_reserved",
+            "ti_uid": ti_uid,
+            "reserved_total": reserved_total,
+        }
+
+    wallet_updates = []
+    for row in recipients:
+        profile_id = row.get("tb_profile_id")
+        pending_amt = _round_money(row.get("bounty_total"))
+        reserved_amt = sum_active_bounty_reservation(
+            db, ti_uid=ti_uid, profile_id=profile_id
+        )
+        release_amt = _round_money(max(0.0, pending_amt - reserved_amt))
+        if not profile_id or release_amt <= 0:
+            continue
+        outcome = release_bounty_to_useable(db, profile_id, release_amt)
+        if outcome.get("code") != 200:
+            return {
+                "code": outcome.get("code", 500),
+                "message": outcome.get(
+                    "message", f"Failed partial bounty release for {profile_id}"
+                ),
+                "ti_uid": ti_uid,
+                "wallet_updates": wallet_updates,
+            }
+        wallet_updates.append(outcome)
+
+    total_moved = _round_money(
+        sum(_to_float(w.get("moved_to_useable")) for w in wallet_updates)
+    )
+
+    return {
+        "code": 200,
+        "ti_uid": ti_uid,
+        "released": True,
+        "partial": True,
+        "wallet_updates": wallet_updates,
+        "total_moved": total_moved,
+        "reserved_total": reserved_total,
     }
 
 

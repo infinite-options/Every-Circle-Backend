@@ -362,31 +362,13 @@ def _build_summary(sale, returns):
     }
 
 
-def _pending_payload_for_order(sale, req):
+def _pending_payload_for_order(db, sale, req, *, compact=False):
+    """Full pending_return payload aligned with seller_transactions list rows."""
     if not req:
         return None
-    rs, fs = _pair_for_sale(sale, req)
-    cancel_flag = _is_cancel_unshipped_request(req)
-    return {
-        "trr_uid": req.get("trr_uid"),
-        "note": req.get("trr_note") or req.get("note"),
-        "seller_note": req.get("trr_seller_note") or req.get("seller_note"),
-        "estimated_total": req.get("trr_estimated_total"),
-        "transaction_item_uid": req.get("transaction_item_uid")
-        or req.get("trr_ti_uid"),
-        "return_quantity": req.get("return_quantity")
-        if req.get("return_quantity") is not None
-        else req.get("trr_return_quantity"),
-        "items": req.get("items") or [],
-        "return_transaction_uid": req.get("trr_return_transaction_uid"),
-        "stripe_refund_id": req.get("trr_stripe_refund_id"),
-        "created_at": req.get("trr_created_at"),
-        "updated_at": req.get("trr_updated_at"),
-        "cancel_unshipped": cancel_flag,
-        "pre_ship_cancel": cancel_flag,
-        "is_cancel_before_ship": cancel_flag,
-        **_status_payload(rs, fs),
-    }
+    from transactions import _pending_return_payload_for_sale
+
+    return _pending_return_payload_for_sale(db, sale, req, compact=compact)
 
 
 def _enrich_return_transactions_with_status(db, order_uid, sale, returns):
@@ -527,7 +509,8 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     status_fields = _status_payload(return_status, refund_status)
 
     pending_returns_payload = [
-        _pending_payload_for_order(sale, req) for req in open_returns
+        _pending_payload_for_order(db, sale, req, compact=True)
+        for req in open_returns
     ]
     pending_return_payload = (
         pending_returns_payload[0] if pending_returns_payload else None

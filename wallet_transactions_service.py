@@ -16,14 +16,19 @@ from wallet_service import (
     credit_seller_proceeds_to_wallet,
     debit_seller_proceeds_from_wallet,
     release_bounty_for_line,
+    release_bounty_for_line_net,
     release_seller_hold_to_useable,
     sync_bounty_release_after_line_credit,
 )
 
 WT_TYPE_PARTIAL_DELIVERY_CREDIT = "partial_delivery_credit"
 WT_TYPE_RETURN_CLAWBACK = "return_clawback"
+WT_TYPE_RETURN_REFUND_RESERVATION = "return_refund_reservation"
+WT_TYPE_BOUNTY_RECLAIM_RESERVATION = "bounty_reclaim_reservation"
 WT_STATUS_POSTED = "posted"
 WT_STATUS_HELD = "held"
+WT_STATUS_RESERVED = "reserved"
+WT_STATUS_CLEARED = "cleared"
 
 _DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -884,6 +889,113 @@ def _insert_return_clawback_row(
     }
 
 
+def _find_pending_clawback_holds(db, original_ti_uid):
+    """Held return_clawback rows created when buyer opened the return request."""
+    if not original_ti_uid:
+        return []
+    q = db.execute(
+        """
+        SELECT wt_uid, wt_profile_id, wt_amount, wt_status, wt_idempotency_key,
+               wt_buyer_id, wt_seller_id, wt_transaction_id, wt_ti_id, wt_currency,
+               wt_unit_cost, wt_qty, wt_note
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type = %s
+          AND wt_status = %s
+          AND wt_idempotency_key LIKE 'return_clawback_hold:%%'
+        ORDER BY wt_created_at ASC, wt_uid ASC
+        """,
+        (original_ti_uid, WT_TYPE_RETURN_CLAWBACK, WT_STATUS_HELD),
+    )
+    return q.get("result") or []
+
+
+def _finalize_pending_clawback_holds(
+    db,
+    *,
+    original_ti_uid,
+    return_ti_uid=None,
+    trr_uid=None,
+):
+    """
+    Post held return_clawback rows from return request and debit actual/lifetime.
+
+    Called on return confirm when clawback holds were created at request time.
+    """
+    holds = _find_pending_clawback_holds(db, original_ti_uid)
+    if trr_uid:
+        holds = [h for h in holds if (h.get("wt_note") or "") == trr_uid]
+    if not holds:
+        return None
+
+    total = _round_money(sum(abs(_to_float(h.get("wt_amount"))) for h in holds))
+    if total <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "clawed": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    profile_id = holds[0].get("wt_profile_id")
+    now = utc_now_str()
+    wt_uids = []
+    for row in holds:
+        wt_uid = row.get("wt_uid")
+        status = row.get("wt_status")
+        if status == WT_STATUS_POSTED:
+            wt_uids.append(wt_uid)
+            continue
+        note = row.get("wt_note") or ""
+        if return_ti_uid and note and not note.startswith("return_clawback for"):
+            note = f"return_clawback for {return_ti_uid}"
+        upd = db.update(
+            "every_circle.wallet_transactions",
+            {"wt_uid": wt_uid},
+            {
+                "wt_status": WT_STATUS_POSTED,
+                "wt_note": note or row.get("wt_note"),
+                "wt_updated_at": now,
+            },
+        )
+        if upd.get("code") != 200:
+            return {
+                "code": upd.get("code", 500),
+                "message": upd.get("message", "Failed to finalize clawback hold"),
+                "wt_uid": wt_uid,
+            }
+        wt_uids.append(wt_uid)
+
+    wallet_result = debit_seller_proceeds_from_wallet(db, profile_id, total)
+    if wallet_result.get("code") != 200:
+        return {
+            "code": wallet_result.get("code", 500),
+            "message": wallet_result.get(
+                "message", "Failed to debit seller proceeds on return finalize"
+            ),
+            "clawed": total,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+            "wt_uids": wt_uids,
+            "wallet": wallet_result,
+        }
+
+    return {
+        "code": 200,
+        "clawed": total,
+        "held_part": total,
+        "posted_part": 0.0,
+        "original_ti_uid": original_ti_uid,
+        "return_ti_uid": return_ti_uid,
+        "wt_profile_id": profile_id,
+        "wt_uids": wt_uids,
+        "idempotent_replay": False,
+        "finalized_request_hold": True,
+        "wallet": wallet_result,
+    }
+
+
 def clawback_seller_proceeds_on_return(
     db,
     *,
@@ -891,6 +1003,7 @@ def clawback_seller_proceeds_on_return(
     return_ti_uid,
     return_qty,
     transaction_uid=None,
+    trr_uid=None,
 ):
     """
     Reverse seller proceeds for returned (previously credited) quantity.
@@ -927,6 +1040,15 @@ def clawback_seller_proceeds_on_return(
             "original_ti_uid": original_ti_uid,
             "return_ti_uid": return_ti_uid,
         }
+
+    finalized = _finalize_pending_clawback_holds(
+        db,
+        original_ti_uid=original_ti_uid,
+        return_ti_uid=return_ti_uid,
+        trr_uid=trr_uid,
+    )
+    if finalized is not None:
+        return finalized
 
     # Full clawback already recorded for this return line.
     primary_key = f"clawback:{return_ti_uid}"
@@ -1227,7 +1349,7 @@ def release_held_wallet_transaction(db, wt_row):
             cmd="post",
         )
 
-    bounty_release = release_bounty_for_line(db, ti_id) if ti_id else None
+    bounty_release = release_bounty_for_line_net(db, ti_id) if ti_id else None
 
     return {
         "code": 200,
@@ -1239,6 +1361,132 @@ def release_held_wallet_transaction(db, wt_row):
         "moved_to_useable": (
             wallet_result.get("moved_to_useable", amount) if wallet_result else 0
         ),
+        "wallet": wallet_result,
+        "bounty_release": bounty_release,
+    }
+
+
+def _line_held_proceeds_total(db, ti_uid):
+    """Sum held partial_delivery_credit amounts for a sale line."""
+    if not ti_uid:
+        return 0.0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_amount), 0) AS held_total
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type = %s
+          AND wt_status = %s
+        """,
+        (ti_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, WT_STATUS_HELD),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return _round_money(rows[0].get("held_total"))
+
+
+def release_partial_held_wallet_transaction(db, wt_row, release_amount):
+    """
+    Release part of a held partial_delivery_credit row to useable.
+
+    Splits the row when release_amount < wt_amount: the released portion is
+    marked posted; the remainder stays held with a new wt_uid.
+    """
+    if not wt_row:
+        return {"code": 400, "message": "wt_row is required"}
+
+    wt_uid = wt_row.get("wt_uid")
+    profile_id = wt_row.get("wt_profile_id")
+    full_amount = _round_money(wt_row.get("wt_amount"))
+    release_amount = _round_money(release_amount)
+
+    if release_amount <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "Nothing to release",
+            "wt_uid": wt_uid,
+            "moved_to_useable": 0,
+        }
+
+    if release_amount >= full_amount:
+        return release_held_wallet_transaction(db, wt_row)
+
+    wallet_result = release_seller_hold_to_useable(db, profile_id, release_amount)
+    if wallet_result.get("code") != 200:
+        return {
+            "code": wallet_result.get("code", 500),
+            "message": wallet_result.get(
+                "message", "Failed partial release to useable"
+            ),
+            "wt_uid": wt_uid,
+            "wallet": wallet_result,
+        }
+
+    remainder = _round_money(full_amount - release_amount)
+    now = utc_now_str()
+    new_uid = _new_wallet_transaction_uid(db)
+    if not new_uid:
+        return {"code": 500, "message": "Failed to generate wt_uid for split hold"}
+
+    released_row = dict(wt_row)
+    released_row.update(
+        {
+            "wt_uid": wt_uid,
+            "wt_amount": release_amount,
+            "wt_status": WT_STATUS_POSTED,
+            "wt_updated_at": now,
+        }
+    )
+    upd = db.update(
+        "every_circle.wallet_transactions",
+        {"wt_uid": wt_uid},
+        {
+            "wt_amount": release_amount,
+            "wt_status": WT_STATUS_POSTED,
+            "wt_updated_at": now,
+        },
+    )
+    if upd.get("code") != 200:
+        return {
+            "code": upd.get("code", 500),
+            "message": upd.get("message", "Failed to update released portion"),
+            "wt_uid": wt_uid,
+        }
+
+    held_row = dict(wt_row)
+    held_row.update(
+        {
+            "wt_uid": new_uid,
+            "wt_amount": remainder,
+            "wt_status": WT_STATUS_HELD,
+            "wt_idempotency_key": f"{wt_row.get('wt_idempotency_key')}:held_remainder",
+            "wt_created_at": now,
+            "wt_updated_at": now,
+        }
+    )
+    ins = db.insert("every_circle.wallet_transactions", held_row)
+    if ins.get("code") != 200:
+        return {
+            "code": ins.get("code", 500),
+            "message": ins.get("message", "Failed to insert held remainder row"),
+            "wt_uid": wt_uid,
+        }
+
+    ti_id = wt_row.get("wt_ti_id")
+    bounty_release = release_bounty_for_line_net(db, ti_id) if ti_id else None
+
+    return {
+        "code": 200,
+        "message": "Partial seller hold released",
+        "wt_uid": wt_uid,
+        "wt_ti_id": ti_id,
+        "wt_transaction_id": wt_row.get("wt_transaction_id"),
+        "wt_profile_id": profile_id,
+        "moved_to_useable": release_amount,
+        "partial": True,
+        "held_remainder_wt_uid": new_uid,
         "wallet": wallet_result,
         "bounty_release": bounty_release,
     }

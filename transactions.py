@@ -1550,7 +1550,8 @@ _TRR_SELECT_COLS = """
     trr_ti_uid, trr_return_quantity, trr_items_json, trr_note, trr_seller_note,
     trr_status, trr_return_status, trr_refund_status, trr_cancel_unshipped,
     trr_estimated_total, trr_return_transaction_uid,
-    trr_stripe_refund_id, trr_created_at, trr_updated_at
+    trr_stripe_refund_id, trr_created_at, trr_updated_at,
+    trr_bounty_to_reclaim, trr_estimated_refund_json
 """
 
 
@@ -1943,6 +1944,7 @@ def _estimated_refund_api_payload(refund_meta, *, compact=False):
             4,
         ),
         "total": total,
+        "total_customer_credit": total,
         "wallet_refund": wallet_refund,
         "stripe_refund": stripe_refund,
     }
@@ -2053,7 +2055,7 @@ def _issue_stripe_refund(payment_intent_id, amount_dollars, metadata=None):
     }
 
 
-def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
+def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=None):
     """Insert negative sale + reverse bounties. Returns (ok, error_or_None, result_dict)."""
     original_tx_uid = orig_tx.get("transaction_uid")
     lines_processed = ctx["lines_processed"]
@@ -2224,12 +2226,14 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note):
                 claw_qty = min(int(rq), received_qty if received_qty > 0 else int(rq))
         clawback_result = None
         if claw_qty > 0:
+            line_trr_uid = (trr_by_ti or {}).get(line["original_ti_uid"])
             clawback_result = clawback_seller_proceeds_on_return(
                 db,
                 original_ti_uid=line["original_ti_uid"],
                 return_ti_uid=new_ti_uid,
                 return_qty=claw_qty,
                 transaction_uid=original_tx_uid,
+                trr_uid=line_trr_uid,
             )
             if clawback_result.get("code") != 200:
                 print(
@@ -2938,8 +2942,19 @@ def _finalize_pending_return(
         return err, err.get("code", 400)
 
     refund_meta = _refund_breakdown_from_context(orig_tx, ctx)
+    trr_by_ti = {}
+    for req in requests:
+        ti_uid = req.get("trr_ti_uid")
+        if not ti_uid:
+            for entry in req.get("items") or []:
+                ti_uid = entry.get("transaction_item_uid")
+                if ti_uid:
+                    break
+        if ti_uid and req.get("trr_uid"):
+            trr_by_ti[ti_uid] = req.get("trr_uid")
+
     ledger_ok, ledger_err, ledger_result = _create_return_ledger(
-        db, orig_tx, ctx, refund_meta, return_note
+        db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=trr_by_ti
     )
     if not ledger_ok:
         return ledger_err, ledger_err.get("code", 500)
@@ -3001,6 +3016,18 @@ def _finalize_pending_return(
     final_refund_status = (
         REFUND_STATUS_REFUNDED if refund_money_ok else REFUND_STATUS_REJECTED
     )
+
+    from wallet_return_reservations import clear_return_reservations
+
+    clear_result = clear_return_reservations(
+        db, batch_uids, finalize=refund_money_ok
+    )
+    if clear_result.get("code") != 200:
+        print(
+            f"Warning: failed to clear return reservations for {batch_uids}: "
+            f"{clear_result}"
+        )
+
     _update_return_statuses(
         db,
         original_tx_uid,
@@ -3185,6 +3212,25 @@ class ReturnTransaction(Resource):
                     return_note=return_note,
                 )
 
+                reservation_result = None
+                from wallet_return_reservations import (
+                    create_reservations_for_return_batch,
+                )
+
+                reservation_result = create_reservations_for_return_batch(
+                    db,
+                    orig_tx=orig_tx,
+                    trr_uids=trr_uids,
+                    ctx=ctx,
+                    refund_meta=refund_meta,
+                )
+                if reservation_result.get("code") != 200:
+                    response["message"] = reservation_result.get(
+                        "message", "Failed to create wallet reservations"
+                    )
+                    response["code"] = reservation_result.get("code", 500)
+                    return response, response["code"]
+
                 if is_cancel:
                     response["message"] = (
                         "Unshipped items cancelled successfully (Cancelled - Pending)"
@@ -3216,6 +3262,10 @@ class ReturnTransaction(Resource):
                 estimated_refund = _estimated_refund_api_payload(refund_meta)
                 response["estimated_refund"] = estimated_refund
                 response["estimated_total"] = estimated_refund["total"]
+                if reservation_result:
+                    response["wallet_reservations"] = reservation_result.get(
+                        "reservations"
+                    )
                 response["transaction_return_items"] = items_payload
                 return response, 200
 
@@ -3350,6 +3400,35 @@ class ConfirmReturnTransaction(Resource):
                         return_requested=1,
                         seller_note=seller_note,
                     )
+
+                    from wallet_return_reservations import (
+                        clear_return_reservations,
+                        release_pending_after_reservation_clear,
+                    )
+
+                    clear_result = clear_return_reservations(db, batch_uids)
+                    if clear_result.get("code") != 200:
+                        response["message"] = clear_result.get(
+                            "message", "Failed to clear wallet reservations"
+                        )
+                        response["code"] = clear_result.get("code", 500)
+                        return response, response["code"]
+
+                    if not _sale_has_other_open_returns(
+                        db, transaction_uid, exclude_trr_uid=batch_uids
+                    ):
+                        ti_uids = set()
+                        for req in requests:
+                            if req.get("trr_ti_uid"):
+                                ti_uids.add(req.get("trr_ti_uid"))
+                            for entry in req.get("items") or []:
+                                if entry.get("transaction_item_uid"):
+                                    ti_uids.add(entry.get("transaction_item_uid"))
+                        for ti_uid in ti_uids:
+                            release_pending_after_reservation_clear(
+                                db, transaction_uid, ti_uid
+                            )
+
                     response["message"] = (
                         "Cancel rejected (Cancelled - Rejected)"
                         if is_cancel
@@ -5109,17 +5188,90 @@ def _line_bounty_totals(db, ti_uids):
     }
 
 
+def _order_bounty_paid(db, order_uid):
+    """Total bounty paid on a sale (sum of transactions_bounty on all lines)."""
+    if not order_uid:
+        return 0.0
+    return _batch_order_bounty_paid(db, [order_uid]).get(order_uid, 0.0)
+
+
+def _sale_line_count(db, order_uid):
+    if not order_uid:
+        return 0
+    q = db.execute(
+        """
+        SELECT COUNT(*) AS line_count
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0
+    try:
+        return int(rows[0].get("line_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_ti_row_for_bounty(db, ti_uid, order_uid):
+    """Load sale line with catalog bounty from business_services or profile_expertise."""
+    if not ti_uid:
+        return None
+    params = [ti_uid]
+    order_clause = ""
+    if order_uid:
+        order_clause = " AND ti.ti_transaction_id = %s"
+        params.append(order_uid)
+    q = db.execute(
+        f"""
+        SELECT
+            ti.*,
+            bs.bs_bounty,
+            bs.bs_bounty_type,
+            pe.profile_expertise_bounty,
+            pe.profile_expertise_bounty_type
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.business_services bs
+            ON ti.ti_bs_id = bs.bs_uid
+        LEFT JOIN every_circle.profile_expertise pe
+            ON ti.ti_bs_id = pe.profile_expertise_uid
+        WHERE ti.ti_uid = %s{order_clause}
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+    rows = q.get("result") or []
+    return rows[0] if rows else None
+
+
+def _catalog_bounty_unit_and_type(ti_row):
+    if not ti_row:
+        return 0.0, "per_item"
+    unit = _to_float(
+        ti_row.get("bs_bounty")
+        or ti_row.get("ti_bs_bounty")
+        or ti_row.get("profile_expertise_bounty")
+    )
+    bounty_type = str(
+        ti_row.get("bs_bounty_type")
+        or ti_row.get("ti_bs_bounty_type")
+        or ti_row.get("profile_expertise_bounty_type")
+        or "per_item"
+    ).strip().lower()
+    return unit, bounty_type
+
+
 def _seller_bounty_pool_for_line_row(ti_row):
     """
     Seller bounty pool for one sale line (matches bounty_results.bounty_paid).
     per_item: unit bounty × purchased qty; total: flat line bounty.
+    Supports business_services (250-*) and profile_expertise (150-*).
     """
     if not ti_row:
         return 0.0
-    bounty_type = str(
-        ti_row.get("bs_bounty_type") or ti_row.get("ti_bs_bounty_type") or "per_item"
-    ).strip().lower()
-    unit = _to_float(ti_row.get("bs_bounty") or ti_row.get("ti_bs_bounty"))
+    unit, bounty_type = _catalog_bounty_unit_and_type(ti_row)
     if unit <= 0:
         return 0.0
     original_qty = max(1, int(ti_row.get("ti_bs_qty") or 0))
@@ -5128,7 +5280,7 @@ def _seller_bounty_pool_for_line_row(ti_row):
     return unit * original_qty
 
 
-def _seller_bounty_to_reclaim_for_line(ti_row, return_qty):
+def _seller_bounty_to_reclaim_for_line(ti_row, return_qty, *, line_bounty_ledger=None):
     """Seller bounty reversed for a partial/full line return."""
     if not ti_row:
         return 0.0
@@ -5142,23 +5294,81 @@ def _seller_bounty_to_reclaim_for_line(ti_row, return_qty):
     scale = _bounty_scale_for_line(rq, original_qty)
     if scale is None:
         return 0.0
+
+    ledger_pool = round(_to_float(line_bounty_ledger), 4)
+    if ledger_pool > 0:
+        return round(ledger_pool * scale, 4)
+
     line_pool = _seller_bounty_pool_for_line_row(ti_row)
     if line_pool > 0:
-        bounty_type = str(
-            ti_row.get("bs_bounty_type") or ti_row.get("ti_bs_bounty_type") or "per_item"
-        ).strip().lower()
+        _unit, bounty_type = _catalog_bounty_unit_and_type(ti_row)
         if bounty_type == "total":
             return round(line_pool * scale, 4)
-        unit = _to_float(ti_row.get("bs_bounty") or ti_row.get("ti_bs_bounty"))
+        unit, _ = _catalog_bounty_unit_and_type(ti_row)
         return round(unit * rq, 4)
     return 0.0
 
 
+def _bounty_to_reclaim_for_line(
+    db,
+    order_uid,
+    ti_uid,
+    return_qty,
+    *,
+    ti_row=None,
+    line_bounty_ledger=None,
+):
+    """
+    Seller bounty to reclaim for one returned sale line.
+
+    Priority:
+      1. transactions_bounty ledger on the line × return ratio
+      2. Catalog bounty (250-* services or 150-* expertise) × return qty/ratio
+      3. Single-line order fallback: order_bounty_paid × return ratio
+    """
+    try:
+        rq = int(return_qty or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if rq < 1 or not ti_uid:
+        return 0.0
+
+    if ti_row is None:
+        ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid)
+    if not ti_row:
+        return 0.0
+
+    if line_bounty_ledger is None:
+        line_bounty_ledger = _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0)
+
+    reclaim = _seller_bounty_to_reclaim_for_line(
+        ti_row, rq, line_bounty_ledger=line_bounty_ledger
+    )
+    if reclaim > 0:
+        return round(reclaim, 4)
+
+    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+    scale = _bounty_scale_for_line(rq, original_qty)
+    if scale is None:
+        return 0.0
+
+    if _sale_line_count(db, order_uid) == 1:
+        order_bounty = _order_bounty_paid(db, order_uid)
+        if order_bounty > 0:
+            return round(order_bounty * scale, 4)
+
+    return 0.0
+
+
 def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
-    """Seller bounty to reclaim — scaled by return qty (never full order unless full return)."""
+    """Seller bounty to reclaim — scaled by return qty per line."""
     if not items_payload:
         return 0.0
-    ti_uids = [e.get("transaction_item_uid") for e in items_payload if e.get("transaction_item_uid")]
+    ti_uids = [
+        e.get("transaction_item_uid")
+        for e in items_payload
+        if e.get("transaction_item_uid")
+    ]
     line_bounties = _line_bounty_totals(db, ti_uids)
     total = 0.0
     for entry in items_payload:
@@ -5171,29 +5381,30 @@ def _bounty_to_reclaim_for_items(db, order_uid, items_payload):
             continue
         if rq < 1:
             continue
-        ti_q = db.execute(
-            """
-            SELECT ti.ti_bs_qty, ti.ti_bs_bounty, bs.bs_bounty, bs.bs_bounty_type
-            FROM every_circle.transactions_items ti
-            LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
-            WHERE ti.ti_uid = %s AND ti.ti_transaction_id = %s
-            """,
-            (ti_uid, order_uid),
+        total += _bounty_to_reclaim_for_line(
+            db,
+            order_uid,
+            ti_uid,
+            rq,
+            line_bounty_ledger=line_bounties.get(ti_uid, 0.0),
         )
-        ti_rows = ti_q.get("result") or []
-        if not ti_rows:
-            continue
-        ti_row = ti_rows[0]
-        seller_reclaim = _seller_bounty_to_reclaim_for_line(ti_row, rq)
-        if seller_reclaim > 0:
-            total += seller_reclaim
-            continue
-        original_qty = int(ti_row.get("ti_bs_qty") or 0)
-        scale = _bounty_scale_for_line(rq, original_qty)
-        if scale is None:
-            continue
-        total += line_bounties.get(ti_uid, 0.0) * scale
     return round(total, 4)
+
+
+def _stored_bounty_to_reclaim_usable(stored_value):
+    """Stored TRR bounty is authoritative only when positive."""
+    if stored_value is None:
+        return None
+    amount = round(_to_float(stored_value), 4)
+    return amount if amount > 0 else None
+
+
+def _resolve_bounty_to_reclaim(db, order_uid, pending, items):
+    """Compute bounty_to_reclaim for pending_return payloads."""
+    stored = _stored_bounty_to_reclaim_usable(pending.get("trr_bounty_to_reclaim"))
+    if stored is not None:
+        return stored
+    return _bounty_to_reclaim_for_items(db, order_uid, items)
 
 
 def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
@@ -5222,7 +5433,14 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
     items = pending.get("items") or []
 
     estimated_refund = None
-    if items:
+    stored_json = pending.get("trr_estimated_refund_json")
+    if stored_json:
+        try:
+            estimated_refund = json.loads(stored_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            estimated_refund = None
+
+    if estimated_refund is None and items:
         ok, _err, ctx = _validate_and_price_return_items(
             db,
             order_uid,
@@ -5249,7 +5467,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             if stored:
                 estimated_refund = {"total": round(stored, 4)}
 
-    bounty_to_reclaim = _bounty_to_reclaim_for_items(db, order_uid, items)
+    bounty_to_reclaim = _resolve_bounty_to_reclaim(db, order_uid, pending, items)
 
     payload = {
         "trr_uid": pending.get("trr_uid"),
@@ -5301,6 +5519,8 @@ def _sale_item_names_by_ti(db, order_uid, ti_uids):
         SELECT
             ti.ti_uid,
             ti.ti_bs_id,
+            ti.ti_bs_cost,
+            ti.ti_bs_cost_currency,
             CASE
                 WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
                 WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
@@ -5326,6 +5546,8 @@ def _sale_item_names_by_ti(db, order_uid, ti_uids):
         out[row.get("ti_uid")] = {
             "item_name": row.get("item_name"),
             "ti_bs_id": row.get("ti_bs_id"),
+            "ti_bs_cost": row.get("ti_bs_cost"),
+            "ti_bs_cost_currency": row.get("ti_bs_cost_currency"),
         }
     return out
 
@@ -5399,8 +5621,12 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         return_lines.append(
             {
                 "ti_uid": ti_uid,
+                "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
                 "item_name": name,
                 "return_quantity": abs(rq),
+                "ti_bs_cost": looked_up.get("ti_bs_cost") or entry.get("ti_bs_cost"),
+                "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
+                or entry.get("ti_bs_cost_currency"),
             }
         )
 
@@ -5443,15 +5669,23 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         "shipping_refund": shipping_refund,
         "fees_allocated": fees_allocated,
         "total": credit,
+        "total_customer_credit": credit,
     }
 
     # Pending returns are not transactions yet — identity is trr_uid(s),
-    # parent sale is trr_transaction_uid only (no transaction_uid / transaction_original_uid aliases).
+    # parent sale is trr_transaction_uid / order_uid / original_transaction_uid.
+    primary_ti_bs_id = None
+    if return_lines:
+        primary_ti_bs_id = return_lines[0].get("ti_bs_id")
+
     row = {
         "trr_uids": trr_uids,
         "trr_transaction_uid": order_uid,
+        "transaction_uid": trr_uids[0] if len(trr_uids) == 1 else None,
+        "order_uid": order_uid,
+        "original_transaction_uid": order_uid,
         "transaction_type": "return",
-        "is_return": True,
+        "is_return": 1,
         "is_pending_return": True,
         "transaction_datetime": primary.get("trr_created_at")
         or sale_row.get("transaction_datetime"),
@@ -5461,6 +5695,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         "transaction_profile_id": sale_row.get("transaction_profile_id"),
         "transaction_return_note": primary.get("trr_note"),
         "purchased_item": ", ".join(item_names) if item_names else None,
+        "ti_bs_id": primary_ti_bs_id,
         "ti_bs_qty": qty_total,
         "return_lines": return_lines,
         "return_quantity_total": qty_total,
@@ -5474,6 +5709,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         # Keep a slim pending_return for FE helpers that still read pending_return.*.
         "pending_return": _omit_empty(
             {
+                "trr_uid": trr_uids[0] if len(trr_uids) == 1 else None,
                 "trr_uids": trr_uids,
                 "trr_transaction_uid": order_uid,
                 "note": primary.get("trr_note"),
@@ -5492,6 +5728,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
     }
     if len(trr_uids) == 1:
         row["trr_uid"] = trr_uids[0]
+        row["transaction_uid"] = trr_uids[0]
     return _omit_empty(row)
 
 
@@ -6033,6 +6270,23 @@ class DeclinedReturns(Resource):
                         return_requested=0,
                         seller_note=seller_note or None,
                     )
+                    from wallet_return_reservations import (
+                        clear_return_reservations,
+                        release_pending_after_reservation_clear,
+                    )
+
+                    clear_return_reservations(db, batch_uids)
+                    if not _sale_has_other_open_returns(
+                        db, transaction_uid, exclude_trr_uid=batch_uids
+                    ):
+                        ti_uids = set()
+                        for req in requests:
+                            if req.get("trr_ti_uid"):
+                                ti_uids.add(req.get("trr_ti_uid"))
+                        for ti_uid in ti_uids:
+                            release_pending_after_reservation_clear(
+                                db, transaction_uid, ti_uid
+                            )
                     response["message"] = (
                         f"Return resolved in seller's favor "
                         f"({_display_return_status(final_return, REFUND_STATUS_REJECTED)})"
@@ -6070,6 +6324,23 @@ class DeclinedReturns(Resource):
                     return_requested=1,
                     seller_note=seller_note or None,
                 )
+                from wallet_return_reservations import (
+                    clear_return_reservations,
+                    release_pending_after_reservation_clear,
+                )
+
+                clear_return_reservations(db, batch_uids)
+                if not _sale_has_other_open_returns(
+                    db, transaction_uid, exclude_trr_uid=batch_uids
+                ):
+                    ti_uids = set()
+                    for req in requests:
+                        if req.get("trr_ti_uid"):
+                            ti_uids.add(req.get("trr_ti_uid"))
+                    for ti_uid in ti_uids:
+                        release_pending_after_reservation_clear(
+                            db, transaction_uid, ti_uid
+                        )
                 response["message"] = "Return rejected (Returning - Rejected)"
                 response["code"] = 200
                 response["trr_uid"] = trr_uid

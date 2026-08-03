@@ -2,7 +2,9 @@
 Auto-release seller return-window holds after wt_available_at.
 
 Held partial_delivery_credit rows move from wallet_pending to useable and
-flip to status posted. Lines with an open return request are skipped.
+flip to status posted. When an open return has active wallet reservations,
+only the net amount (held − reserved refund) is released; bounty release
+uses the same net logic (pending − reserved reclaim).
 
 Used by SellerHoldReleaseCron_CLASS (Postman) and SellerHoldRelease_CRON (Zappa).
 """
@@ -12,11 +14,14 @@ from datetime import datetime
 
 from data_ec import connect
 from datetime_utils import utc_now_str
+from wallet_return_reservations import sum_active_proceeds_reservation
 from wallet_transactions_service import (
     WT_STATUS_HELD,
     WT_TYPE_PARTIAL_DELIVERY_CREDIT,
     _ensure_wallet_transactions_table,
+    _line_held_proceeds_total,
     release_held_wallet_transaction,
+    release_partial_held_wallet_transaction,
 )
 
 
@@ -54,6 +59,7 @@ def summarize_hold_release_result(result):
             "wt_ti_id": result.get("wt_ti_id"),
             "message": "hold released",
             "moved_to_useable": result.get("moved_to_useable"),
+            "partial": result.get("partial"),
         }
     return {
         "wt_uid": wt_uid,
@@ -148,40 +154,145 @@ def format_seller_hold_release_email(response, run_dt=None):
     return "\n".join(lines)
 
 
-def _open_return_covers_line(req, ti_uid):
-    """True when an open TRR includes this sale line."""
-    if not ti_uid or not req:
-        return False
-    if req.get("trr_ti_uid"):
-        return req.get("trr_ti_uid") == ti_uid
-    for entry in req.get("items") or []:
-        if entry.get("transaction_item_uid") == ti_uid:
-            return True
-    return False
+def _line_net_releasable_proceeds(db, transaction_uid, ti_uid):
+    """Held sale proceeds minus active return refund reservations on the line."""
+    held = _line_held_proceeds_total(db, ti_uid)
+    reserved = sum_active_proceeds_reservation(
+        db, transaction_uid=transaction_uid, ti_uid=ti_uid
+    )
+    return max(0.0, held - reserved), held, reserved
 
 
-def _has_open_return_for_line(db, transaction_uid, ti_uid):
+def release_seller_hold_for_row(db, wt_row, *, release_budget=None):
     """
-    Skip release while any open return request covers this line.
+    Release one held row if eligible.
 
-    Uses the same open-status concept as returns (lazy import to avoid
-    pulling transactions at module import time).
+    When open return reservations exist on the line, releases only the net
+    amount (held − reserved refund). Never releases amounts covered by active
+    reservations.
+
+    release_budget: optional dict keyed by (transaction_uid, ti_uid) tracking
+    how much net releasable has already been moved this cron run.
     """
+    wt_uid = wt_row.get("wt_uid") if wt_row else None
+    ti_uid = wt_row.get("wt_ti_id") if wt_row else None
+    transaction_uid = wt_row.get("wt_transaction_id") if wt_row else None
+
+    net_releasable, held_total, reserved = _line_net_releasable_proceeds(
+        db, transaction_uid, ti_uid
+    )
+
+    budget_key = (transaction_uid, ti_uid)
+    already_released = 0.0
+    if release_budget is not None:
+        already_released = float(release_budget.get(budget_key) or 0)
+    remaining_budget = max(0.0, net_releasable - already_released)
+
+    if remaining_budget <= 0 and reserved > 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "Proceeds fully reserved for open return",
+            "wt_uid": wt_uid,
+            "wt_ti_id": ti_uid,
+            "wt_transaction_id": transaction_uid,
+            "held_total": held_total,
+            "reserved_refund": reserved,
+        }
+
+    row_amount = float(wt_row.get("wt_amount") or 0)
+    release_amount = min(row_amount, remaining_budget) if reserved > 0 else row_amount
+
+    if release_amount <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "No net proceeds to release",
+            "wt_uid": wt_uid,
+            "wt_ti_id": ti_uid,
+            "wt_transaction_id": transaction_uid,
+        }
+
+    if release_amount < row_amount:
+        result = release_partial_held_wallet_transaction(db, wt_row, release_amount)
+    else:
+        result = release_held_wallet_transaction(db, wt_row)
+
+    if (
+        release_budget is not None
+        and result.get("code") == 200
+        and not result.get("skipped")
+    ):
+        moved = float(result.get("moved_to_useable") or release_amount)
+        release_budget[budget_key] = already_released + moved
+
+    return result
+
+
+def release_seller_holds_for_line(db, transaction_uid, ti_uid):
+    """
+    Release all eligible held rows for a sale line (e.g. after reservation clear).
+
+    Respects active reservations and wt_available_at eligibility.
+    """
+    _ensure_wallet_transactions_table(db)
     if not transaction_uid or not ti_uid:
-        return False
-    from transactions import _load_open_return_requests
+        return {"code": 400, "message": "transaction_uid and ti_uid are required"}
 
-    for req in _load_open_return_requests(db, transaction_uid):
-        if _open_return_covers_line(req, ti_uid):
-            return True
-    return False
+    now = utc_now_str()
+    q = db.execute(
+        """
+        SELECT wt_uid, wt_profile_id, wt_buyer_id, wt_seller_id,
+               wt_transaction_id, wt_ti_id, wt_type, wt_status,
+               wt_qty, wt_amount, wt_available_at, wt_created_at,
+               wt_idempotency_key, wt_received_qty_after, wt_unit_cost,
+               wt_currency
+        FROM every_circle.wallet_transactions
+        WHERE wt_status = %s
+          AND wt_type = %s
+          AND wt_ti_id = %s
+          AND wt_transaction_id = %s
+          AND wt_available_at IS NOT NULL
+          AND wt_available_at <= %s
+        ORDER BY wt_available_at ASC, wt_created_at ASC
+        """,
+        (
+            WT_STATUS_HELD,
+            WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+            ti_uid,
+            transaction_uid,
+            now,
+        ),
+    )
+    rows = q.get("result") or []
+    released = []
+    skipped = []
+    release_budget = {}
+    for row in rows:
+        result = release_seller_hold_for_row(db, row, release_budget=release_budget)
+        if result.get("skipped"):
+            skipped.append(summarize_hold_release_result(result))
+        elif result.get("code") == 200:
+            released.append(summarize_hold_release_result(result))
+        else:
+            skipped.append(summarize_hold_release_result(result))
+
+    return {
+        "code": 200,
+        "transaction_uid": transaction_uid,
+        "ti_uid": ti_uid,
+        "released_holds": released,
+        "skipped_holds": skipped,
+    }
 
 
 def _eligible_held_query():
     return """
         SELECT wt_uid, wt_profile_id, wt_buyer_id, wt_seller_id,
                wt_transaction_id, wt_ti_id, wt_type, wt_status,
-               wt_qty, wt_amount, wt_available_at, wt_created_at
+               wt_qty, wt_amount, wt_available_at, wt_created_at,
+               wt_idempotency_key, wt_received_qty_after, wt_unit_cost,
+               wt_currency
         FROM every_circle.wallet_transactions
         WHERE wt_status = %s
           AND wt_type = %s
@@ -189,27 +300,6 @@ def _eligible_held_query():
           AND wt_available_at <= %s
         ORDER BY wt_available_at ASC, wt_created_at ASC
     """
-
-
-def release_seller_hold_for_row(db, wt_row):
-    """
-    Release one held row if eligible. Skips when an open return covers the line.
-    """
-    wt_uid = wt_row.get("wt_uid") if wt_row else None
-    ti_uid = wt_row.get("wt_ti_id") if wt_row else None
-    transaction_uid = wt_row.get("wt_transaction_id") if wt_row else None
-
-    if _has_open_return_for_line(db, transaction_uid, ti_uid):
-        return {
-            "code": 200,
-            "skipped": True,
-            "message": "Open return on line; hold not released",
-            "wt_uid": wt_uid,
-            "wt_ti_id": ti_uid,
-            "wt_transaction_id": transaction_uid,
-        }
-
-    return release_held_wallet_transaction(db, wt_row)
 
 
 def _log_hold_release(result):
@@ -253,9 +343,12 @@ class SellerHoldReleaseJob:
 
                 eligible = eligible_q.get("result") or []
                 response["eligible_count"] = len(eligible)
+                release_budget = {}
 
                 for row in eligible:
-                    result = release_seller_hold_for_row(db, row)
+                    result = release_seller_hold_for_row(
+                        db, row, release_budget=release_budget
+                    )
                     if result.get("skipped"):
                         response["skipped_holds"].append(
                             summarize_hold_release_result(result)

@@ -67,7 +67,19 @@ _RETURN_LINE_KEYS = frozenset(
     }
 )
 
-_PENDING_RETURN_KEYS = frozenset({"trr_uid", "items"})
+_PENDING_RETURN_KEYS = frozenset(
+    {
+        "trr_uid",
+        "trr_uids",
+        "return_status",
+        "refund_status",
+        "display_status",
+        "bounty_to_reclaim",
+        "estimated_refund",
+        "estimated_total",
+        "items",
+    }
+)
 
 _PENDING_ITEM_KEYS = frozenset(
     {
@@ -75,6 +87,7 @@ _PENDING_ITEM_KEYS = frozenset(
         "transaction_item_uid",
         "return_quantity",
         "item_name",
+        "ti_bs_id",
     }
 )
 
@@ -276,6 +289,8 @@ def personal_row_needs_hydration(row):
 def business_row_needs_hydration(row):
     if not isinstance(row, dict):
         return False
+    if _row_has_return_signals(row):
+        return True
     if _row_needs_shipping_hydration(row):
         return True
     if _row_needs_received_hydration(row):
