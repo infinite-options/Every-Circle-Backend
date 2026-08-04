@@ -2115,7 +2115,7 @@ class UserProfileInfo(Resource):
                             if not platform_lower:
                                 continue
                             url = (url or '').strip()
-                            is_public = 1 if social_media_public.get(platform_lower, True) else 0
+                            is_public = 1 if social_media_public.get(platform_lower, False) else 0
 
                             if platform_lower in existing_map:
                                 link_uid = existing_map[platform_lower]
