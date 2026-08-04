@@ -21,6 +21,25 @@ from wallet_service import build_wallet_summary
 from wallet_transactions_service import resolve_seller_wallet_profile_id
 
 
+def _load_seller_offerings(db, business_uid):
+    """Personal offerings (150-*) for the seller profile tied to this business account."""
+    profile_id = resolve_seller_wallet_profile_id(db, business_uid)
+    if not profile_id:
+        return []
+    rows = db.execute(
+        """
+        SELECT profile_expertise_uid, profile_expertise_title,
+               profile_expertise_quantity, profile_expertise_cost,
+               profile_expertise_bounty, profile_expertise_sku
+        FROM every_circle.profile_expertise
+        WHERE profile_expertise_profile_personal_id = %s
+        ORDER BY profile_expertise_title
+        """,
+        (profile_id,),
+    )
+    return (rows or {}).get("result") or []
+
+
 def _request_timezone():
     return request.args.get("timezone") or request.args.get("tz")
 
@@ -128,5 +147,11 @@ class AccountScreenBusiness(Resource):
             wallet_profile_id = resolve_seller_wallet_profile_id(db, business_uid)
             if wallet_profile_id:
                 response["wallet"] = build_wallet_summary(db, wallet_profile_id)
+            offerings = _load_seller_offerings(db, business_uid)
+            if offerings:
+                response["offerings"] = offerings
+                if isinstance(response.get("business_info"), dict):
+                    response["business_info"] = dict(response["business_info"])
+                    response["business_info"]["offerings"] = offerings
 
         return (response, 200)

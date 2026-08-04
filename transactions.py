@@ -129,10 +129,12 @@ def _decrement_tracked_quantity(db, table, uid_column, qty_column, uid, purchase
     decrement_result = db.execute(
         f"""
         UPDATE every_circle.{table}
-        SET {qty_column} = {qty_column} - %s
+        SET {qty_column} = CAST(CAST({qty_column} AS SIGNED) - %s AS CHAR)
         WHERE {uid_column} = %s
           AND {qty_column} IS NOT NULL
-          AND {qty_column} >= %s
+          AND TRIM(CAST({qty_column} AS CHAR)) <> ''
+          AND LOWER(TRIM(CAST({qty_column} AS CHAR))) NOT IN ('unlimited', 'null', 'none')
+          AND CAST({qty_column} AS SIGNED) >= %s
         """,
         (purchased_qty, uid, purchased_qty),
         cmd="post",
@@ -165,6 +167,63 @@ def _decrement_tracked_quantity(db, table, uid_column, qty_column, uid, purchase
         "remaining": available,
     }
     return False, available, (err, 409)
+
+
+def _increment_tracked_quantity(db, table, uid_column, qty_column, uid, qty):
+    """Restore limited stock after a failed checkout line insert."""
+    qty = int(qty or 0)
+    if qty <= 0:
+        return
+    db.execute(
+        f"""
+        UPDATE every_circle.{table}
+        SET {qty_column} = CAST(CAST({qty_column} AS SIGNED) + %s AS CHAR)
+        WHERE {uid_column} = %s
+          AND {qty_column} IS NOT NULL
+          AND TRIM(CAST({qty_column} AS CHAR)) <> ''
+          AND LOWER(TRIM(CAST({qty_column} AS CHAR))) NOT IN ('unlimited', 'null', 'none')
+        """,
+        (qty, uid),
+        cmd="post",
+    )
+
+
+def _inventory_update_payload(stock_decrement, remaining):
+    if not stock_decrement:
+        return None
+    uid = stock_decrement.get("uid")
+    if not uid:
+        return None
+    entry = {
+        "product_uid": uid,
+        "remaining": remaining,
+        "quantity": stock_decrement.get("purchased_qty"),
+    }
+    if stock_decrement.get("table") == "profile_expertise":
+        entry["profile_expertise_uid"] = uid
+    elif stock_decrement.get("table") == "business_services":
+        entry["bs_uid"] = uid
+    elif stock_decrement.get("table") == "profile_wish":
+        entry["profile_wish_uid"] = uid
+    return entry
+
+
+def _find_existing_sale_by_stripe_pi(db, stripe_pi):
+    """Return an existing sale row for this PaymentIntent (checkout idempotency)."""
+    if not stripe_pi:
+        return None
+    rows = db.execute(
+        """
+        SELECT transaction_uid, transaction_profile_id, transaction_business_id
+        FROM every_circle.transactions
+        WHERE transaction_stripe_pi = %s
+          AND COALESCE(transaction_type, 'sale') = 'sale'
+        LIMIT 1
+        """,
+        (stripe_pi,),
+    )
+    result = (rows or {}).get("result") or []
+    return result[0] if result else None
 
 
 def _parse_line_shipping_amount(value):
@@ -3994,6 +4053,17 @@ class Transactions(Resource):
             }
 
             with connect() as db:
+                if stripe_pi:
+                    existing_sale = _find_existing_sale_by_stripe_pi(db, stripe_pi)
+                    if existing_sale:
+                        response["message"] = "Transaction already recorded"
+                        response["code"] = 200
+                        response["transaction_uid"] = existing_sale.get(
+                            "transaction_uid"
+                        )
+                        response["idempotent"] = True
+                        return response, 200
+
                 plan_ok, plan_err, checkout_plan = _plan_checkout(
                     db,
                     payload.get("items", []),
@@ -4103,6 +4173,7 @@ class Transactions(Resource):
                 items_count = 0
                 bounty_count = 0
                 order_shipping_total = 0.0
+                inventory_updates = []
                 for item_idx, item in enumerate(payload.get("items", [])):
                     print(item)
                     # {'bs_uid': '250-000021', 'quantity': 9, 'recommender_profile_id': '110-000231'}
@@ -4263,11 +4334,14 @@ class Transactions(Resource):
                         print("tx_item: ", tx_item)
 
                         purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(
+                            bs_data.get("profile_expertise_quantity")
+                        )
                         stock_err = _validate_purchase_quantity(
-                            _parse_limited_quantity(bs_data.get("profile_expertise_quantity")),
-                            purchased_qty,
+                            available_qty, purchased_qty
                         )
                         if stock_err:
+                            _rollback_wallet_debit()
                             response.update(stock_err[0])
                             return response, stock_err[1]
                         stock_decrement = {
@@ -4276,6 +4350,7 @@ class Transactions(Resource):
                             "qty_column": "profile_expertise_quantity",
                             "uid": ti_bs_id,
                             "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
                         }
 
                     elif ti_bs_id and str(ti_bs_id).startswith("165"):
@@ -4347,11 +4422,14 @@ class Transactions(Resource):
                         print("tx_item: ", tx_item)
 
                         purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(
+                            bs_data.get("profile_wish_quantity")
+                        )
                         stock_err = _validate_purchase_quantity(
-                            _parse_limited_quantity(bs_data.get("profile_wish_quantity")),
-                            purchased_qty,
+                            available_qty, purchased_qty
                         )
                         if stock_err:
+                            _rollback_wallet_debit()
                             response.update(stock_err[0])
                             return response, stock_err[1]
                         stock_decrement = {
@@ -4360,6 +4438,7 @@ class Transactions(Resource):
                             "qty_column": "profile_wish_quantity",
                             "uid": bs_data.get("profile_wish_uid"),
                             "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
                         }
 
                     else:
@@ -4407,6 +4486,46 @@ class Transactions(Resource):
                     # tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
                     # print("tx_item: ", tx_item)
 
+                    remaining_after = None
+                    if stock_decrement:
+                        _, remaining_after, dec_err = _decrement_tracked_quantity(
+                            db,
+                            stock_decrement["table"],
+                            stock_decrement["uid_column"],
+                            stock_decrement["qty_column"],
+                            stock_decrement["uid"],
+                            stock_decrement["purchased_qty"],
+                        )
+                        if dec_err:
+                            _rollback_wallet_debit()
+                            for prior in inventory_updates:
+                                if not prior.get("limited"):
+                                    continue
+                                _increment_tracked_quantity(
+                                    db,
+                                    prior["table"],
+                                    prior["uid_column"],
+                                    prior["qty_column"],
+                                    prior["uid"],
+                                    prior["purchased_qty"],
+                                )
+                            response.update(dec_err[0])
+                            return response, dec_err[1]
+                        inv_entry = _inventory_update_payload(
+                            stock_decrement, remaining_after
+                        )
+                        if inv_entry:
+                            inventory_updates.append(
+                                {
+                                    **stock_decrement,
+                                    **inv_entry,
+                                }
+                            )
+                            print(
+                                f"Decremented {stock_decrement['table']} "
+                                f"{stock_decrement['uid']} to {remaining_after}"
+                            )
+
                     # Insert transaction item
                     transaction_item_response = db.insert(
                         "every_circle.transactions_items", tx_item
@@ -4416,30 +4535,20 @@ class Transactions(Resource):
                     if transaction_item_response.get("code") == 200:
                         items_count += 1
                     else:
+                        if stock_decrement and stock_decrement.get("limited"):
+                            _increment_tracked_quantity(
+                                db,
+                                stock_decrement["table"],
+                                stock_decrement["uid_column"],
+                                stock_decrement["qty_column"],
+                                stock_decrement["uid"],
+                                stock_decrement["purchased_qty"],
+                            )
+                            inventory_updates.pop()
                         print(
                             f"Warning: Failed to insert transaction item: {transaction_item_response}"
                         )
                         continue
-
-                    if stock_decrement:
-                        _, remaining, dec_err = _decrement_tracked_quantity(
-                            db,
-                            stock_decrement["table"],
-                            stock_decrement["uid_column"],
-                            stock_decrement["qty_column"],
-                            stock_decrement["uid"],
-                            stock_decrement["purchased_qty"],
-                        )
-                        if dec_err:
-                            print(
-                                f"Warning: stock decrement failed after insert for "
-                                f"{stock_decrement['uid']}: {dec_err[0]}"
-                            )
-                        elif remaining is not None:
-                            print(
-                                f"Decremented {stock_decrement['table']} "
-                                f"{stock_decrement['uid']} to {remaining}"
-                            )
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
@@ -4759,6 +4868,22 @@ class Transactions(Resource):
 
                 response["transaction_items"] = items_count
                 response["transaction_bounty_count"] = bounty_count
+                if inventory_updates:
+                    response["inventory_updates"] = [
+                        {
+                            k: v
+                            for k, v in entry.items()
+                            if k
+                            not in (
+                                "table",
+                                "uid_column",
+                                "qty_column",
+                                "limited",
+                                "purchased_qty",
+                            )
+                        }
+                        for entry in inventory_updates
+                    ]
                 response["message"] = "Transaction completed successfully"
                 response["code"] = 200
                 return response, 200
