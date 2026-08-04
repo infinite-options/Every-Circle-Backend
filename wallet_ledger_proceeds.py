@@ -32,12 +32,25 @@ def _entry_type_label(entry_type):
     return labels.get(entry_type, entry_type.replace("_", " ").title())
 
 
+def _format_proceeds_bucket_summary(buckets):
+    """Parenthetical bucket counts for sale-proceeds descriptions; omit zeros."""
+    parts = []
+    for key, label in (
+        ("pending_shipment", "pending shipment"),
+        ("pending_verification", "pending verification"),
+        ("pending_return_window", "pending return window"),
+    ):
+        count = int(buckets.get(key) or 0)
+        if count > 0:
+            parts.append(f"{count} {label}")
+    return ", ".join(parts)
+
+
 def _original_description(buyer, buckets):
-    return (
-        f"Sale proceeds ({buckets['pending_shipment']} pending shipment, "
-        f"{buckets['pending_verification']} pending verification, "
-        f"{buckets['pending_return_window']} pending return window) — {buyer}"
-    )
+    summary = _format_proceeds_bucket_summary(buckets)
+    if summary:
+        return f"Sale proceeds ({summary}) — {buyer}"
+    return f"Sale proceeds — {buyer}"
 
 
 def _bucket_snapshot_from_totals(
