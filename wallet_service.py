@@ -11,6 +11,7 @@ from wallet_ids import resolve_wallet_profile_id
 
 _BOUNTY_RELEASE_COLUMN_READY = False
 _BOUNTY_RELEASE_BACKFILL_DONE = False
+_BOUNTY_RELEASE_REPAIR_DONE = False
 
 
 def _to_float(value):
@@ -240,7 +241,10 @@ def ensure_bounty_release_column(db):
             )
             _BOUNTY_RELEASE_BACKFILL_DONE = True
 
-    _repair_partial_bounty_release_flags(db)
+    global _BOUNTY_RELEASE_REPAIR_DONE
+    if not _BOUNTY_RELEASE_REPAIR_DONE:
+        _repair_partial_bounty_release_flags(db)
+        _BOUNTY_RELEASE_REPAIR_DONE = True
 
 
 def _repair_partial_bounty_release_flags(db):
@@ -1124,6 +1128,57 @@ def transfer_wallet_refund_to_buyer(
         "funded_by": funded_by,
         "buyer_credit": buyer_credit,
         "seller_debit": seller_debit_result,
+    }
+
+
+def debit_seller_proceeds_pending_only(db, profile_id, amount):
+    """
+    Reverse seller proceeds from the pending bucket only (return-window holds).
+
+    Use when clawing back units whose proceeds were never posted to useable.
+    """
+    amount = _round_money(abs(amount))
+    if not profile_id or amount <= 0:
+        return {"code": 200, "skipped": True, "wallet_profile_id": profile_id}
+
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return {
+            "code": 404,
+            "message": f"Wallet not found for {profile_id}",
+            "wallet_profile_id": profile_id,
+        }
+
+    pending = _to_float(wallet.get("wallet_pending"))
+    actual = _to_float(wallet.get("wallet_actual_balance"))
+    lifetime = _to_float(wallet.get("wallet_lifetime_earning"))
+    from_pending = min(amount, pending)
+
+    updates = {
+        "wallet_pending": _round_money(pending - from_pending),
+        "wallet_actual_balance": _round_money(actual - from_pending),
+        "wallet_lifetime_earning": _round_money(lifetime - from_pending),
+    }
+
+    result = db.update(
+        "every_circle.wallet",
+        {"wallet_profile_id": wallet_id},
+        updates,
+    )
+    if result.get("code") != 200:
+        return {
+            "code": result.get("code", 500),
+            "message": result.get("message", "Failed to debit seller pending proceeds"),
+            "wallet_profile_id": profile_id,
+        }
+    return {
+        "code": 200,
+        "wallet_profile_id": profile_id,
+        "wallet_pk": wallet_id,
+        "debited": from_pending,
+        "from_pending": from_pending,
+        "from_useable": 0.0,
     }
 
 

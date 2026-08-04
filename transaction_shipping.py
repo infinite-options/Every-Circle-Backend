@@ -387,9 +387,36 @@ def fulfillment_select_sql(alias="ti"):
     """
 
 
-def fulfillment_list_summary_sql(alias="ti"):
+def line_cancelled_qty_sql(ti_alias, order_uid_sql):
+    """
+    SQL subquery: confirmed pre-ship cancel qty for a sale line.
+    Used in list rollups so unshipped_item_count subtracts cancels.
+    """
+    return f"""COALESCE((
+        SELECT SUM(
+            CASE
+                WHEN rti.ti_cancel_unshipped_qty IS NOT NULL
+                THEN rti.ti_cancel_unshipped_qty
+                WHEN COALESCE(trr.trr_cancel_unshipped, 0) = 1
+                THEN ABS(rti.ti_bs_qty)
+                ELSE 0
+            END
+        )
+        FROM every_circle.transactions_items rti
+        INNER JOIN every_circle.transactions rt
+            ON rti.ti_transaction_id = rt.transaction_uid
+        LEFT JOIN every_circle.transaction_return_requests trr
+            ON trr.trr_return_transaction_uid = rt.transaction_uid
+        WHERE rt.transaction_original_uid = {order_uid_sql}
+          AND COALESCE(rt.transaction_type, 'return') = 'return'
+          AND rti.ti_original_ti_uid = {ti_alias}.ti_uid
+    ), 0)"""
+
+
+def fulfillment_list_summary_sql(alias="ti", *, order_uid_sql="t.transaction_uid"):
     """Aggregates for buyer/seller transaction list rows (GROUP BY transaction)."""
     shippable = line_is_shippable_sql(alias)
+    cancelled = line_cancelled_qty_sql(alias, order_uid_sql)
     return f"""
         SUM(CASE WHEN {shippable} THEN 1 ELSE 0 END) AS shippable_item_count,
         SUM(
@@ -415,7 +442,8 @@ def fulfillment_list_summary_sql(alias="ti"):
                 WHEN {shippable}
                 THEN GREATEST(
                     CAST({alias}.ti_bs_qty AS UNSIGNED)
-                        - COALESCE({alias}.ti_shipped_qty, 0),
+                        - COALESCE({alias}.ti_shipped_qty, 0)
+                        - ({cancelled}),
                     0
                 )
                 ELSE 0
@@ -490,8 +518,10 @@ def apply_order_fulfillment_summary(rows):
             row["all_items_received"] = 0
         row["needs_shipping"] = 1 if unshipped > 0 else 0
         row["needs_shipment"] = row["needs_shipping"]
-        if shippable_units > 0:
-            row["all_items_shipped"] = 1 if shipped_units >= shippable_units else 0
+        if shippable > 0:
+            row["all_items_shipped"] = 1 if unshipped <= 0 else 0
+        elif shippable_units > 0:
+            row["all_items_shipped"] = 1 if unshipped <= 0 else 0
         else:
             row["all_items_shipped"] = 0
         row["has_shippable_items"] = 1 if shippable > 0 else int(

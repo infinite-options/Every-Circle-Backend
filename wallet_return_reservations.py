@@ -30,10 +30,11 @@ from wallet_transactions_service import (
     WT_TYPE_RETURN_REFUND_RESERVATION,
     _ensure_wallet_transactions_table,
     _insert_return_clawback_row,
-    _line_seller_proceeds_net,
     _new_wallet_transaction_uid,
-    compute_return_clawback_amount,
+    _sale_line_reversal_context,
+    compute_seller_proceeds_reversal_for_line,
     resolve_seller_wallet_profile_id,
+    seller_proceeds_reversal_description,
 )
 
 _TTR_RESERVATION_COLUMNS_READY = False
@@ -79,6 +80,8 @@ def _insert_proceeds_clawback_hold(
     transaction_id,
     ti_id,
     return_qty,
+    return_shipped_qty=0,
+    cancel_unshipped_qty=0,
     currency="USD",
 ):
     """
@@ -86,13 +89,33 @@ def _insert_proceeds_clawback_hold(
 
     Idempotent per trr_uid. Reduces wallet_pending via apply_pending_clawback_hold.
     """
-    line_net = _line_seller_proceeds_net(db, ti_id)
-    clawback_amount = compute_return_clawback_amount(
-        line_net["net_amount"], line_net["net_qty"], return_qty
+    try:
+        return_shipped_qty = int(return_shipped_qty or 0)
+        cancel_unshipped_qty = int(cancel_unshipped_qty or 0)
+    except (TypeError, ValueError):
+        return_shipped_qty = 0
+        cancel_unshipped_qty = 0
+
+    if return_shipped_qty <= 0 and cancel_unshipped_qty <= 0:
+        try:
+            total_qty = int(return_qty or 0)
+        except (TypeError, ValueError):
+            total_qty = 0
+        if total_qty > 0:
+            return_shipped_qty = total_qty
+
+    ti_row, line_bounty = _sale_line_reversal_context(db, ti_id, transaction_id)
+    clawback_amount = compute_seller_proceeds_reversal_for_line(
+        ti_row,
+        return_shipped_qty=return_shipped_qty,
+        cancel_unshipped_qty=cancel_unshipped_qty,
+        line_bounty_ledger=line_bounty,
     )
     if clawback_amount <= 0:
         return {"code": 200, "skipped": True, "amount": 0, "trr_uid": trr_uid}
 
+    hold_qty = return_shipped_qty + cancel_unshipped_qty
+    unit_cost = _round_money(clawback_amount / hold_qty) if hold_qty > 0 else 0.0
     idempotency_key = f"return_clawback_hold:{trr_uid}"
     ins = _insert_return_clawback_row(
         db,
@@ -102,8 +125,8 @@ def _insert_proceeds_clawback_hold(
         seller_id=seller_id,
         transaction_id=transaction_id,
         ti_id=ti_id,
-        qty=return_qty,
-        unit_cost=line_net.get("wt_unit_cost"),
+        qty=hold_qty,
+        unit_cost=unit_cost,
         amount=-clawback_amount,
         currency=currency,
         status=WT_STATUS_HELD,
@@ -127,6 +150,13 @@ def _insert_proceeds_clawback_hold(
         "wt_status": WT_STATUS_HELD,
         "wallet": wallet_result,
         "trr_uid": trr_uid,
+        "return_shipped_qty": return_shipped_qty,
+        "cancel_unshipped_qty": cancel_unshipped_qty,
+        "description": seller_proceeds_reversal_description(
+            return_shipped_qty,
+            cancel_unshipped_qty,
+            amount=clawback_amount,
+        ),
     }
 
 
@@ -264,6 +294,8 @@ def create_reservations_for_return_request(
     buyer_id,
     seller_id,
     return_qty=0,
+    return_shipped_qty=None,
+    cancel_unshipped_qty=None,
     currency="USD",
 ):
     """
@@ -288,6 +320,39 @@ def create_reservations_for_return_request(
         return_qty = 0
 
     if return_qty > 0 and ti_uid:
+        if return_shipped_qty is None or cancel_unshipped_qty is None:
+            trr_q = db.execute(
+                """
+                SELECT trr_items_json, trr_ti_uid, trr_return_quantity,
+                       trr_cancel_unshipped
+                FROM every_circle.transaction_return_requests
+                WHERE trr_uid = %s
+                LIMIT 1
+                """,
+                (trr_uid,),
+            )
+            trr_rows = trr_q.get("result") or []
+            if trr_rows:
+                from transactions import _items_from_return_request_row
+
+                items = _items_from_return_request_row(trr_rows[0])
+                for entry in items:
+                    if entry.get("transaction_item_uid") != ti_uid:
+                        continue
+                    if return_shipped_qty is None:
+                        return_shipped_qty = entry.get("return_shipped_qty")
+                    if cancel_unshipped_qty is None:
+                        cancel_unshipped_qty = entry.get("cancel_unshipped_qty")
+                    break
+        try:
+            return_shipped_qty = int(return_shipped_qty or 0)
+        except (TypeError, ValueError):
+            return_shipped_qty = 0
+        try:
+            cancel_unshipped_qty = int(cancel_unshipped_qty or 0)
+        except (TypeError, ValueError):
+            cancel_unshipped_qty = 0
+
         proceeds = _insert_proceeds_clawback_hold(
             db,
             trr_uid=trr_uid,
@@ -297,6 +362,8 @@ def create_reservations_for_return_request(
             transaction_id=transaction_uid,
             ti_id=ti_uid,
             return_qty=return_qty,
+            return_shipped_qty=return_shipped_qty,
+            cancel_unshipped_qty=cancel_unshipped_qty,
             currency=currency,
         )
         if proceeds.get("code") != 200:
@@ -587,6 +654,8 @@ def create_reservations_for_return_batch(
         )
 
         currency = (ti_row.get("ti_bs_cost_currency") or "USD") if ti_row else "USD"
+        return_shipped_qty = int(line.get("return_shipped_qty") or 0)
+        cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
         result = create_reservations_for_return_request(
             db,
             trr_uid=trr_uid,
@@ -597,6 +666,8 @@ def create_reservations_for_return_batch(
             buyer_id=buyer_id,
             seller_id=seller_id,
             return_qty=return_qty,
+            return_shipped_qty=return_shipped_qty,
+            cancel_unshipped_qty=cancel_unshipped_qty,
             currency=currency,
         )
         if result.get("code") != 200:

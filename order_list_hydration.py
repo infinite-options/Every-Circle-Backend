@@ -41,7 +41,10 @@ _SALE_LINE_KEYS = frozenset(
         "shipped_qty",
         "ti_shipped_qty",
         "remaining_to_ship",
+        "cancelled_qty",
         "returned_qty",
+        "remaining_qty",
+        "returned_qty_total",
         "ti_received_qty",
     }
 )
@@ -61,6 +64,8 @@ _RETURN_LINE_KEYS = frozenset(
     {
         "ti_uid",
         "return_quantity",
+        "return_shipped_qty",
+        "cancel_unshipped_qty",
         "ti_bs_qty",
         "item_name",
         "bs_service_name",
@@ -86,6 +91,8 @@ _PENDING_ITEM_KEYS = frozenset(
         "ti_uid",
         "transaction_item_uid",
         "return_quantity",
+        "return_shipped_qty",
+        "cancel_unshipped_qty",
         "item_name",
         "ti_bs_id",
     }

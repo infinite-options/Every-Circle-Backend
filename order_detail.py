@@ -22,6 +22,8 @@ from transactions import (
     _pair_for_sale,
     _status_payload,
     _remaining_to_ship_qty,
+    _confirmed_return_split,
+    _return_ledger_line_split,
     _is_cancel_unshipped_request,
     _batch_return_requests,
     _omit_empty,
@@ -114,9 +116,11 @@ def _can_view_order(sale_row, profile_id, business_uid):
         return False
     if profile_id and str(sale_row.get("transaction_profile_id")) == str(profile_id):
         return True
-    if business_uid and str(sale_row.get("transaction_business_id")) == str(
-        business_uid
-    ):
+    seller_business_id = str(sale_row.get("transaction_business_id") or "")
+    if business_uid and seller_business_id == str(business_uid):
+        return True
+    # Personal sellers often use profile_personal_uid as transaction_business_id.
+    if profile_id and seller_business_id == str(profile_id):
         return True
     return False
 
@@ -196,22 +200,7 @@ def _load_sale_lines(db, order_uid):
             ti.ti_listing_shipping,
             {name_case} AS item_name,
             bs.bs_service_name,
-            bs.bs_service_desc,
-            COALESCE((
-                SELECT SUM(ABS(rti.ti_bs_qty))
-                FROM every_circle.transactions_items rti
-                INNER JOIN every_circle.transactions rt
-                    ON rti.ti_transaction_id = rt.transaction_uid
-                WHERE rt.transaction_original_uid = %s
-                  AND COALESCE(rt.transaction_type, 'return') = 'return'
-                  AND (
-                      rti.ti_original_ti_uid = ti.ti_uid
-                      OR (
-                          rti.ti_original_ti_uid IS NULL
-                          AND rti.ti_bs_id = ti.ti_bs_id
-                      )
-                  )
-            ), 0) AS returned_qty
+            bs.bs_service_desc
         FROM every_circle.transactions_items ti
         LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
         LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
@@ -219,12 +208,14 @@ def _load_sale_lines(db, order_uid):
         WHERE ti.ti_transaction_id = %s
         ORDER BY ti.ti_uid ASC
         """,
-        (order_uid, order_uid),
+        (order_uid,),
     )
     lines = []
     for row in lines_q.get("result") or []:
         order_qty = int(row.get("ti_bs_qty") or 0)
-        returned_qty = int(row.get("returned_qty") or 0)
+        returned_qty, cancelled_qty = _confirmed_return_split(
+            db, order_uid, row.get("ti_uid")
+        )
         shipped_qty = int(row.get("ti_shipped_qty") or 0)
         remaining_to_ship = _remaining_to_ship_qty(
             db,
@@ -233,15 +224,23 @@ def _load_sale_lines(db, order_uid):
             order_qty,
             shipped_qty,
         )
+        active_units = max(order_qty - cancelled_qty - returned_qty, 0)
+        from order_quantity_context import line_quantity_context as _line_qty_ctx
+
+        qty_ctx = _line_qty_ctx(db, order_uid, row.get("ti_uid"), row=row)
         eligibility = line_return_eligibility(row)
         line = {
             "ti_uid": row.get("ti_uid"),
             "ti_bs_id": row.get("ti_bs_id"),
             "ti_bs_qty": order_qty,
             "ti_received_qty": int(row.get("ti_received_qty") or 0),
+            "cancelled_qty": cancelled_qty,
             "returned_qty": returned_qty,
-            "remaining_qty": max(order_qty - returned_qty, 0),
+            "returned_qty_total": cancelled_qty + returned_qty,
+            "remaining_qty": active_units,
             "remaining_to_ship": remaining_to_ship,
+            "unverified_shipped_qty": qty_ctx.get("unverified_shipped_qty", 0),
+            "verified_returnable_qty": qty_ctx.get("verified_returnable_qty", 0),
             "ti_bs_cost": row.get("ti_bs_cost"),
             "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
             "ti_shipping_amount": row.get("ti_shipping_amount"),
@@ -293,6 +292,8 @@ def _load_return_transactions(db, order_uid):
                 ti.ti_original_ti_uid,
                 ti.ti_bs_id,
                 ti.ti_bs_qty,
+                ti.ti_return_shipped_qty,
+                ti.ti_cancel_unshipped_qty,
                 ti.ti_bs_cost,
                 ti.ti_choices_extra_cost,
                 ti.ti_shipping_amount,
@@ -314,6 +315,9 @@ def _load_return_transactions(db, order_uid):
         return_lines = []
         for row in lines_q.get("result") or []:
             qty = int(row.get("ti_bs_qty") or 0)
+            return_shipped_qty, cancel_unshipped_qty = _return_ledger_line_split(
+                db, return_uid, row
+            )
             return_lines.append(
                 {
                     "ti_uid": row.get("ti_uid"),
@@ -321,6 +325,8 @@ def _load_return_transactions(db, order_uid):
                     "ti_bs_id": row.get("ti_bs_id"),
                     "ti_bs_qty": qty,
                     "return_quantity": abs(qty),
+                    "return_shipped_qty": return_shipped_qty,
+                    "cancel_unshipped_qty": cancel_unshipped_qty,
                     "ti_bs_cost": row.get("ti_bs_cost"),
                     "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
                     "ti_shipping_amount": row.get("ti_shipping_amount"),
@@ -420,8 +426,9 @@ def _apply_sale_fulfillment_rollup(sale_payload):
         shippable += 1
         shippable_units += order_qty
         shipped_units += shipped_qty
-        unshipped += max(order_qty - shipped_qty, 0)
-        if status == "delivered" and shipped_qty >= order_qty:
+        line_unshipped = int(line.get("remaining_to_ship") or 0)
+        unshipped += line_unshipped
+        if status == "delivered" and line_unshipped <= 0:
             delivered += 1
         if status == "in_transit":
             has_in_transit = 1

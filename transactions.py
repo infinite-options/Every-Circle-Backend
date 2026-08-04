@@ -293,15 +293,106 @@ def _line_uses_ship_fulfillment(ti_row):
     )
 
 
+_RETURN_SPLIT_COLUMNS_READY = False
+
+
+def ensure_return_split_columns(db):
+    """Add split return qty columns on return ledger lines (idempotent)."""
+    global _RETURN_SPLIT_COLUMNS_READY
+    if _RETURN_SPLIT_COLUMNS_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_return_shipped_qty INT NULL",
+        cmd="post",
+    )
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_cancel_unshipped_qty INT NULL",
+        cmd="post",
+    )
+    _RETURN_SPLIT_COLUMNS_READY = True
+
+
+def _confirmed_return_split(db, order_uid, ti_uid):
+    """
+    Confirmed return ledger split for a sale line.
+    Returns (return_shipped_qty, cancel_unshipped_qty).
+    """
+    ensure_return_split_columns(db)
+    q = db.execute(
+        """
+        SELECT
+            rti.ti_bs_qty,
+            rti.ti_return_shipped_qty,
+            rti.ti_cancel_unshipped_qty,
+            rti.ti_original_ti_uid,
+            rt.transaction_uid AS return_tx_uid
+        FROM every_circle.transactions_items rti
+        INNER JOIN every_circle.transactions rt
+            ON rti.ti_transaction_id = rt.transaction_uid
+        WHERE rt.transaction_original_uid = %s
+          AND COALESCE(rt.transaction_type, 'return') = 'return'
+          AND rti.ti_original_ti_uid = %s
+        """,
+        (order_uid, ti_uid),
+    )
+    return_shipped = 0
+    cancel_unshipped = 0
+    for row in q.get("result") or []:
+        shipped, cancel = _return_ledger_line_split(db, row.get("return_tx_uid"), row)
+        return_shipped += shipped
+        cancel_unshipped += cancel
+    return return_shipped, cancel_unshipped
+
+
+def _returnable_verified_qty(
+    db, order_uid, ti_uid, verified_qty, exclude_trr_uid=None
+):
+    """
+    Verified units still eligible for post-ship physical return.
+    Physical returns may only come from the verified pool.
+    """
+    returned = _already_returned_qty(db, order_uid, ti_uid)
+    reserved_return, _cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    return max(int(verified_qty or 0) - returned - reserved_return, 0)
+
+
+def _max_return_shipped_qty(
+    db, order_uid, ti_uid, shipped_qty, verified_qty, exclude_trr_uid=None
+):
+    """Physical returns: min(shipped, verified) minus ledger returns and open reservations."""
+    returned = _already_returned_qty(db, order_uid, ti_uid)
+    reserved_return, _cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    cap = min(int(shipped_qty or 0), int(verified_qty or 0))
+    return max(cap - returned - reserved_return, 0)
+
+
+def _max_cancel_unshipped_qty(
+    db, order_uid, ti_uid, purchased_qty, shipped_qty, exclude_trr_uid=None
+):
+    """Pre-ship cancel: unshipped pool minus confirmed cancels and open reservations."""
+    cancelled = _cancelled_qty(db, order_uid, ti_uid)
+    _reserved_return, reserved_cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    pool = max(int(purchased_qty or 0) - int(shipped_qty or 0) - cancelled, 0)
+    return max(pool - reserved_cancel, 0)
+
+
 def _returnable_qty_remaining(
     db, order_uid, ti_uid, order_qty, exclude_trr_uid=None
 ):
-    """Units still returnable on a line after ledger returns and open reservations."""
-    returned = _already_returned_qty(db, order_uid, ti_uid)
+    """Units still returnable on a line after ledger returns/cancels and open reservations."""
+    returned, cancelled = _confirmed_return_split(db, order_uid, ti_uid)
     reserved = _reserved_return_qty(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
-    return max(int(order_qty or 0) - returned - reserved, 0)
+    return max(int(order_qty or 0) - returned - cancelled - reserved, 0)
 
 
 def _parse_listing_mode_flags(raw):
@@ -1556,20 +1647,64 @@ _TRR_SELECT_COLS = """
 
 
 def _already_returned_qty(db, order_uid, ti_uid):
-    q = db.execute(
+    """Post-ship physical returns only (excludes pre-ship cancels)."""
+    returned, _cancelled = _confirmed_return_split(db, order_uid, ti_uid)
+    return returned
+
+
+def _cancelled_qty(db, order_uid, ti_uid):
+    """Pre-ship cancels only (excludes post-ship physical returns)."""
+    _returned, cancelled = _confirmed_return_split(db, order_uid, ti_uid)
+    return cancelled
+
+
+def _return_ledger_line_split(db, return_tx_uid, row):
+    """Split qty for a confirmed return ledger line."""
+    return_shipped = row.get("ti_return_shipped_qty")
+    cancel_unshipped = row.get("ti_cancel_unshipped_qty")
+    if return_shipped is not None or cancel_unshipped is not None:
+        return int(return_shipped or 0), int(cancel_unshipped or 0)
+
+    qty = abs(int(row.get("ti_bs_qty") or 0))
+    ti_uid = row.get("ti_original_ti_uid")
+    trr_q = db.execute(
         """
-        SELECT COALESCE(SUM(ABS(rti.ti_bs_qty)), 0) AS returned_qty
-        FROM every_circle.transactions_items rti
-        INNER JOIN every_circle.transactions rt
-            ON rti.ti_transaction_id = rt.transaction_uid
-        WHERE rt.transaction_original_uid = %s
-          AND COALESCE(rt.transaction_type, 'return') = 'return'
-          AND rti.ti_original_ti_uid = %s
+        SELECT trr_cancel_unshipped, trr_items_json, trr_ti_uid
+        FROM every_circle.transaction_return_requests
+        WHERE trr_return_transaction_uid = %s
+        LIMIT 1
         """,
-        (order_uid, ti_uid),
+        (return_tx_uid,),
     )
-    rows = q.get("result") or []
-    return int(_to_float(rows[0].get("returned_qty"))) if rows else 0
+    trr_rows = trr_q.get("result") or []
+    if trr_rows:
+        trr = trr_rows[0]
+        try:
+            items = json.loads(trr.get("trr_items_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        for entry in items if isinstance(items, list) else []:
+            if ti_uid and entry.get("transaction_item_uid") != ti_uid:
+                continue
+            if entry.get("return_shipped_qty") is not None:
+                try:
+                    shipped = int(entry.get("return_shipped_qty") or 0)
+                except (TypeError, ValueError):
+                    shipped = 0
+            else:
+                shipped = 0
+            if entry.get("cancel_unshipped_qty") is not None:
+                try:
+                    cancel = int(entry.get("cancel_unshipped_qty") or 0)
+                except (TypeError, ValueError):
+                    cancel = 0
+            else:
+                cancel = 0
+            if shipped or cancel:
+                return shipped, cancel
+        if int(trr.get("trr_cancel_unshipped") or 0) == 1:
+            return 0, qty
+    return qty, 0
 
 
 def _as_trr_uid_set(exclude_trr_uid=None):
@@ -1581,31 +1716,54 @@ def _as_trr_uid_set(exclude_trr_uid=None):
     return {exclude_trr_uid}
 
 
-def _reserved_return_qty(db, order_uid, ti_uid, exclude_trr_uid=None):
-    """Qty already claimed by other open return requests on this sale."""
+def _reserved_return_split(db, order_uid, ti_uid, exclude_trr_uid=None):
+    """
+    Qty reserved by open return requests, split by post-ship return vs pre-ship cancel.
+    Returns (return_shipped_qty, cancel_unshipped_qty).
+    """
     exclude = _as_trr_uid_set(exclude_trr_uid)
     open_reqs = _load_open_return_requests(db, order_uid)
-    reserved = 0
+    return_shipped = 0
+    cancel_unshipped = 0
     for req in open_reqs:
         if req.get("trr_uid") in exclude:
             continue
-        # One row == one item (new); legacy rows may still list multiple in items.
-        if req.get("trr_ti_uid"):
-            if req.get("trr_ti_uid") != ti_uid:
-                continue
-            try:
-                reserved += int(req.get("trr_return_quantity") or 0)
-            except (TypeError, ValueError):
-                continue
-            continue
-        for entry in req.get("items") or []:
+        items = req.get("items") or _items_from_return_request_row(req)
+        cancel_only = bool(
+            req.get("trr_cancel_unshipped")
+            or req.get("cancel_unshipped")
+            or req.get("pre_ship_cancel")
+        )
+        for entry in items:
             if entry.get("transaction_item_uid") != ti_uid:
                 continue
             try:
-                reserved += int(entry.get("return_quantity") or 0)
+                total = int(entry.get("return_quantity") or 0)
             except (TypeError, ValueError):
                 continue
-    return reserved
+            if entry.get("return_shipped_qty") is not None:
+                try:
+                    return_shipped += int(entry.get("return_shipped_qty") or 0)
+                except (TypeError, ValueError):
+                    pass
+            elif not cancel_only:
+                return_shipped += total
+            if entry.get("cancel_unshipped_qty") is not None:
+                try:
+                    cancel_unshipped += int(entry.get("cancel_unshipped_qty") or 0)
+                except (TypeError, ValueError):
+                    pass
+            elif cancel_only:
+                cancel_unshipped += total
+    return return_shipped, cancel_unshipped
+
+
+def _reserved_return_qty(db, order_uid, ti_uid, exclude_trr_uid=None):
+    """Total qty already claimed by other open return requests on this sale."""
+    return_shipped, cancel_unshipped = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    return return_shipped + cancel_unshipped
 
 
 def _load_sale_for_return(db, transaction_uid):
@@ -1757,8 +1915,15 @@ def _validate_and_price_return_items(
         )
 
         if uses_ship:
-            left_seller_qty = shipped_qty
-            remaining_not_left = _remaining_to_ship_qty(
+            max_return_shipped = _max_return_shipped_qty(
+                db,
+                original_tx_uid,
+                ti_uid,
+                shipped_qty,
+                received_qty,
+                exclude_trr_uid=exclude_trr_uid,
+            )
+            max_cancel = _max_cancel_unshipped_qty(
                 db,
                 original_tx_uid,
                 ti_uid,
@@ -1766,7 +1931,9 @@ def _validate_and_price_return_items(
                 shipped_qty,
                 exclude_trr_uid=exclude_trr_uid,
             )
-            left_label = "shipped"
+            left_seller_qty = max_return_shipped
+            remaining_not_left = max_cancel
+            left_label = "verified returnable"
             not_left_label = "unshipped"
         else:
             left_seller_qty = min(received_qty, returnable_remaining)
@@ -1784,28 +1951,30 @@ def _validate_and_price_return_items(
         if return_shipped_qty > left_seller_qty:
             return False, {
                 "message": (
-                    f"return_shipped_qty exceeds {left_label} qty for {ti_uid} "
-                    f"(requested {return_shipped_qty}, {left_label} {left_seller_qty})"
+                    f"return_shipped_qty exceeds max returnable verified qty for {ti_uid} "
+                    f"(requested {return_shipped_qty}, max {left_seller_qty}; "
+                    f"min(shipped, verified)=({shipped_qty}, {received_qty}))"
                 ),
                 "code": 400,
             }, None
         if cancel_unshipped_qty > remaining_not_left:
             return False, {
                 "message": (
-                    f"cancel_unshipped_qty exceeds remaining {not_left_label} qty for {ti_uid} "
-                    f"(requested {cancel_unshipped_qty}, remaining {remaining_not_left})"
+                    f"cancel_unshipped_qty exceeds max cancel-unshipped qty for {ti_uid} "
+                    f"(requested {cancel_unshipped_qty}, max {remaining_not_left})"
                 ),
                 "code": 400,
             }, None
 
         already_returned = _already_returned_qty(db, original_tx_uid, ti_uid)
+        already_cancelled = _cancelled_qty(db, original_tx_uid, ti_uid)
         reserved = _reserved_return_qty(
             db,
             original_tx_uid,
             ti_uid,
             exclude_trr_uid=exclude_trr_uid,
         )
-        remaining = original_qty - already_returned - reserved
+        remaining = original_qty - already_returned - already_cancelled - reserved
         if rq > remaining:
             return False, {
                 "message": (
@@ -2057,6 +2226,7 @@ def _issue_stripe_refund(payment_intent_id, amount_dollars, metadata=None):
 
 def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=None):
     """Insert negative sale + reverse bounties. Returns (ok, error_or_None, result_dict)."""
+    ensure_return_split_columns(db)
     original_tx_uid = orig_tx.get("transaction_uid")
     lines_processed = ctx["lines_processed"]
     refund_grand = refund_meta["refund_grand"]
@@ -2157,6 +2327,11 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
         if ti_row.get("ti_shipping_refundable") is not None:
             tx_item["ti_shipping_refundable"] = ti_row.get("ti_shipping_refundable")
 
+        return_shipped_qty = int(line.get("return_shipped_qty") or 0)
+        cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
+        tx_item["ti_return_shipped_qty"] = return_shipped_qty
+        tx_item["ti_cancel_unshipped_qty"] = cancel_unshipped_qty
+
         ti_insert = db.insert("every_circle.transactions_items", tx_item)
         if ti_insert.get("code") != 200:
             return False, {
@@ -2219,11 +2394,6 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
         return_shipped_qty = int(line.get("return_shipped_qty") or 0)
         cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
         claw_qty = return_shipped_qty
-        if claw_qty <= 0 and cancel_unshipped_qty > 0:
-            snap = line.get("snapshot") or {}
-            received_qty = int(snap.get("ti_received_qty") or 0)
-            if received_qty > 0 or snap.get("ti_received_at"):
-                claw_qty = min(int(rq), received_qty if received_qty > 0 else int(rq))
         clawback_result = None
         if claw_qty > 0:
             line_trr_uid = (trr_by_ti or {}).get(line["original_ti_uid"])
@@ -2245,6 +2415,25 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
                     total_seller_clawed
                     + _to_float(clawback_result.get("clawed")),
                     4,
+                )
+
+        cancel_adjust_result = None
+        if cancel_unshipped_qty > 0 and not (
+            clawback_result and clawback_result.get("finalized_request_hold")
+        ):
+            from wallet_transactions_service import adjust_seller_proceeds_on_cancel_unshipped
+
+            cancel_adjust_result = adjust_seller_proceeds_on_cancel_unshipped(
+                db,
+                original_ti_uid=line["original_ti_uid"],
+                return_ti_uid=new_ti_uid,
+                cancel_qty=cancel_unshipped_qty,
+                transaction_uid=original_tx_uid,
+            )
+            if cancel_adjust_result.get("code") != 200:
+                print(
+                    "Warning: Failed to adjust seller proceeds for cancel on "
+                    f"{line['original_ti_uid']}: {cancel_adjust_result}"
                 )
 
         response_lines.append(
@@ -2384,15 +2573,18 @@ def _remaining_to_ship_qty(
     db, order_uid, ti_uid, order_qty, shipped_qty, exclude_trr_uid=None
 ):
     """
-    Units still shippable after accounting for already-shipped, ledger-returned,
-    and open return/cancel reservations.
-    remaining_to_ship = max(purchased - shipped - returned - reserved, 0)
+    Units still shippable after shipped qty and pre-ship cancels/reservations.
+    Post-ship physical returns do not reduce remaining_to_ship.
+    remaining_to_ship = max(purchased - shipped - cancelled - reserved_cancel, 0)
     """
-    returned = _already_returned_qty(db, order_uid, ti_uid)
-    reserved = _reserved_return_qty(
+    cancelled = _cancelled_qty(db, order_uid, ti_uid)
+    _reserved_return, reserved_cancel = _reserved_return_split(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
-    return max(int(order_qty or 0) - int(shipped_qty or 0) - returned - reserved, 0)
+    return max(
+        int(order_qty or 0) - int(shipped_qty or 0) - cancelled - reserved_cancel,
+        0,
+    )
 
 
 def _remaining_unreceived_qty(

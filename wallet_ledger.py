@@ -13,6 +13,12 @@ from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
 from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified
+from order_quantity_context import (
+    line_quantity_context,
+    order_quantity_context,
+    compute_seller_proceeds_ledger_amounts,
+    quantity_context_fields,
+)
 
 
 def _request_timezone():
@@ -38,7 +44,14 @@ def _entry_type_label(entry_type):
         "bounty_earned": "Bounty earned",
         "bounty_reversal": "Bounty reversed",
         "sale_proceeds": "Sale proceeds",
-        "sale_proceeds_held": "Sale proceeds (pending)",
+        "sale_proceeds_original": "Sale proceeds",
+        "sale_proceeds_cancel": "Sale proceeds",
+        "sale_proceeds_return_clawback": "Sale proceeds",
+        "sale_proceeds_verify_transfer": "Sale proceeds",
+        "sale_proceeds_return_window_release": "Sale proceeds",
+        "sale_proceeds_held": "Sale proceeds",
+        "sale_proceeds_transfer": "Sale proceeds transfer",
+        "sale_proceeds_adjustment": "Sale proceeds adjustment",
         "sale_proceeds_clawback": "Sale proceeds clawback",
         "sale_proceeds_hold": "Sale proceeds reserved (return)",
         "bounty_reclaim_reserved": "Bounty reserved (return)",
@@ -48,18 +61,56 @@ def _entry_type_label(entry_type):
     return labels.get(entry_type, entry_type.replace("_", " ").title())
 
 
-def _bounty_line_fully_verified(row):
-    order_qty = int(row.get("ti_bs_qty") or 0)
+def _bounty_line_fully_verified(row, *, denom=None):
+    order_qty = int(denom if denom is not None else row.get("ti_bs_qty") or 0)
     received_qty = int(row.get("ti_received_qty") or 0)
     return line_is_fully_verified(received_qty, order_qty)
 
 
-def _normalize_bounty_entry(row):
+def _pending_return_window_description(buyer, net_verified_held):
+    held = int(net_verified_held or 0)
+    if held > 0:
+        return (
+            f"Sale proceeds (pending return window, {held} verified units) — {buyer}"
+        )
+    return f"Sale proceeds (pending return window) — {buyer}"
+
+
+def _clawback_description(buyer, *, returned_qty=0):
+    if int(returned_qty or 0) > 0:
+        return (
+            f"Sale proceeds clawback ({int(returned_qty)} returned) — "
+            f"order from {buyer}"
+        )
+    return f"Sale proceeds clawback — order from {buyer}"
+
+
+def _quantity_context_for_entry(db, row):
+    tx_uid = row.get("wt_transaction_id") or row.get("transaction_uid")
+    ti_uid = row.get("wt_ti_id") or row.get("ti_uid")
+    if not tx_uid or not ti_uid:
+        if tx_uid:
+            return order_quantity_context(db, tx_uid)
+        return None
+    return line_quantity_context(db, tx_uid, ti_uid)
+
+
+def _normalize_bounty_entry(db, row):
     amount = _round_money(row.get("amount"))
     tx_type = (row.get("transaction_type") or "sale").lower()
-    fully_verified = _bounty_line_fully_verified(row)
+    order_uid = row.get("transaction_original_uid") or row.get("transaction_uid")
+    ti_uid = row.get("ti_uid")
+    qty_ctx = None
+    if order_uid and ti_uid:
+        qty_ctx = line_quantity_context(db, order_uid, ti_uid, row=row)
+
     received_qty = int(row.get("ti_received_qty") or 0)
-    order_qty = int(row.get("ti_bs_qty") or 0)
+    denom_qty = int(row.get("ti_bs_qty") or 0)
+    if qty_ctx:
+        received_qty = int(qty_ctx.get("verified_qty") or received_qty)
+        denom_qty = int(qty_ctx.get("active_units") or qty_ctx.get("purchased_qty") or denom_qty)
+
+    fully_verified = _bounty_line_fully_verified(row, denom=denom_qty)
     if amount < 0 or tx_type == "return":
         entry_type = "bounty_reversal"
         availability = "useable"
@@ -78,17 +129,24 @@ def _normalize_bounty_entry(row):
         description = f"Bounty reversed on return — {counterparty}"
     elif availability == "useable":
         description = f"Bounty earned — {counterparty}"
-    elif fully_verified and order_qty > 0:
+    elif fully_verified and denom_qty > 0:
         description = f"Bounty earned (pending return window) — {counterparty}"
-    elif received_qty > 0 and order_qty > 0:
-        description = (
-            f"Bounty earned (pending verification, "
-            f"{received_qty}/{order_qty}) — {counterparty}"
-        )
+    elif received_qty > 0 and denom_qty > 0:
+        pending_units = int((qty_ctx or {}).get("pending_verification_units") or 0)
+        if pending_units > 0:
+            description = (
+                f"Bounty earned (pending verification, {pending_units} units) — "
+                f"{counterparty}"
+            )
+        else:
+            description = (
+                f"Bounty earned (pending verification, "
+                f"{received_qty}/{denom_qty}) — {counterparty}"
+            )
     else:
         description = f"Bounty earned (pending verification) — {counterparty}"
 
-    return {
+    entry = {
         "entry_id": f"bounty:{row.get('ti_uid')}:{row.get('transaction_uid')}",
         "entry_source": "transactions_bounty",
         "entry_type": entry_type,
@@ -105,56 +163,94 @@ def _normalize_bounty_entry(row):
         "counterparty_name": counterparty,
         "purchaser_name": row.get("purchaser_name"),
         "ti_uid": row.get("ti_uid"),
-        "ti_received_qty": row.get("ti_received_qty"),
-        "ti_bs_qty": row.get("ti_bs_qty"),
+        "ti_received_qty": received_qty or None,
+        "ti_bs_qty": denom_qty or None,
         "bounty_released_at": row.get("ti_bounty_released_at"),
     }
+    if qty_ctx:
+        entry.update(quantity_context_fields(qty_ctx))
+    return entry
 
 
-def _normalize_wallet_transaction_entry(row):
+def _normalize_wallet_transaction_entry(db, row):
     amount = _round_money(row.get("wt_amount"))
     wt_type = row.get("wt_type") or ""
     wt_status = row.get("wt_status") or "posted"
 
     if wt_type == "return_clawback":
         entry_type = "sale_proceeds_clawback"
+    elif wt_type == "cancel_unshipped_adjustment":
+        entry_type = "sale_proceeds_adjustment"
+    elif wt_status == "held" and wt_type == "partial_delivery_credit":
+        entry_type = "sale_proceeds_held"
     elif wt_status == "held":
         entry_type = "sale_proceeds_held"
     else:
         entry_type = "sale_proceeds"
 
-    availability = "pending" if wt_status == "held" else "useable"
-    useable_delta = amount if availability == "useable" else 0.0
-
     buyer = row.get("buyer_name") or row.get("wt_buyer_id") or "buyer"
-    received_qty = int(row.get("wt_received_qty_after") or row.get("ti_received_qty") or 0)
-    order_qty = int(row.get("ti_bs_qty") or 0)
+    qty_ctx = row.get("_qty_ctx") or row.get("_proceeds_ctx")
+    if qty_ctx is None:
+        qty_ctx = _quantity_context_for_entry(db, row)
+    if qty_ctx and not row.get("_proceeds_ctx"):
+        tx_uid = row.get("wt_transaction_id")
+        if tx_uid:
+            try:
+                qty_ctx = {**qty_ctx, **compute_seller_proceeds_ledger_amounts(db, tx_uid)}
+            except Exception:
+                pass
+
+    cancelled_qty = int((qty_ctx or {}).get("cancelled_qty") or 0)
+    returned_qty = int((qty_ctx or {}).get("returned_qty") or 0)
+    net_verified_held = int((qty_ctx or {}).get("net_verified_held") or 0)
+    verified_qty = int((qty_ctx or {}).get("verified_qty") or 0)
+    active_units = int((qty_ctx or {}).get("active_units") or 0)
+    per_unit = _to_float((qty_ctx or {}).get("seller_proceeds_per_unit") or 0)
+    tx_uid = row.get("wt_transaction_id")
+
     if entry_type == "sale_proceeds_clawback":
-        description = f"Sale proceeds clawback — order from {buyer}"
-    elif entry_type == "sale_proceeds_held":
-        if order_qty > 0 and received_qty < order_qty:
-            description = (
-                f"Sale proceeds (pending return window, "
-                f"{received_qty}/{order_qty} verified) — {buyer}"
-            )
+        description = _clawback_description(buyer, returned_qty=returned_qty)
+        from wallet_transactions_service import order_has_posted_useable_proceeds
+
+        if wt_status == "posted" and tx_uid and order_has_posted_useable_proceeds(
+            db, tx_uid
+        ):
+            availability = "useable"
+            useable_delta = amount
         else:
-            description = f"Sale proceeds (pending return window) — {buyer}"
-    elif order_qty > 0 and received_qty < order_qty:
+            availability = "pending"
+            useable_delta = 0.0
+    elif entry_type == "sale_proceeds_held":
+        if wt_type == "partial_delivery_credit" and per_unit > 0 and net_verified_held > 0:
+            amount = _round_money(per_unit * net_verified_held)
+        description = _pending_return_window_description(buyer, net_verified_held)
+        availability = "pending"
+        useable_delta = 0.0
+    elif wt_type == "cancel_unshipped_adjustment":
+        entry_type = "sale_proceeds_adjustment"
         description = (
-            f"Sale proceeds ({received_qty}/{order_qty} verified) — {buyer}"
+            f"Sale proceeds reduced — {cancelled_qty} units cancelled before shipment"
+            if cancelled_qty > 0
+            else f"Sale proceeds reduced — units cancelled before shipment"
         )
+        availability = "pending"
+        useable_delta = 0.0
     else:
         description = f"Sale proceeds — {buyer}"
+        availability = "useable"
+        useable_delta = amount
 
     entry_dt = row.get("wt_created_at") or row.get("transaction_datetime")
-    tx_uid = row.get("wt_transaction_id")
-    entry_id = (
-        f"wt:sale:{tx_uid}:{wt_status}"
-        if wt_type == "partial_delivery_credit"
-        else f"wt:{row.get('wt_uid')}"
-    )
+    if entry_type == "sale_proceeds_adjustment":
+        entry_id = f"wt:{row.get('wt_uid')}"
+    elif (
+        wt_type == "partial_delivery_credit"
+    ):
+        entry_id = f"wt:sale:{tx_uid}:{wt_status}"
+    else:
+        entry_id = f"wt:{row.get('wt_uid')}"
 
-    return {
+    entry = {
         "entry_id": entry_id,
         "entry_source": "wallet_transactions",
         "entry_type": entry_type,
@@ -175,12 +271,15 @@ def _normalize_wallet_transaction_entry(row):
         "wt_status": wt_status,
         "wt_note": row.get("wt_note"),
         "wt_available_at": row.get("wt_available_at"),
-        "ti_received_qty": received_qty or None,
-        "ti_bs_qty": order_qty or None,
+        "ti_received_qty": verified_qty or None,
+        "ti_bs_qty": active_units or None,
     }
+    if qty_ctx:
+        entry.update(quantity_context_fields(qty_ctx))
+    return entry
 
 
-def _aggregate_sale_proceeds_rows(rows):
+def _aggregate_sale_proceeds_rows(db, rows):
     """
     Collapse incremental partial_delivery_credit rows (one per verify) into a
     single ledger line per sale + status. Underlying wallet_transactions rows
@@ -225,7 +324,14 @@ def _aggregate_sale_proceeds_rows(rows):
             }
         order_qty = sum(item["bs"] for item in ti_totals.values())
         received_qty = sum(item["received"] for item in ti_totals.values())
-        if order_qty > 0:
+        qty_ctx = order_quantity_context(db, _tx_uid) if _tx_uid else None
+        if qty_ctx and _tx_uid:
+            proceeds_ctx = compute_seller_proceeds_ledger_amounts(db, _tx_uid)
+            latest["_qty_ctx"] = qty_ctx
+            latest["_proceeds_ctx"] = proceeds_ctx
+            latest["ti_received_qty"] = int(qty_ctx.get("verified_qty") or received_qty)
+            latest["wt_received_qty_after"] = latest["ti_received_qty"]
+        elif order_qty > 0:
             latest["ti_bs_qty"] = order_qty
             latest["ti_received_qty"] = received_qty
             latest["wt_received_qty_after"] = received_qty
@@ -387,107 +493,25 @@ def _seller_business_ids(db, profile_id):
     return list(ids)
 
 
-def _fetch_uncredited_seller_proceeds_rows(db, profile_id):
-    """
-    Sales where seller-eligible proceeds are not yet fully reflected in
-    wallet_transactions (pre-verification or partially credited).
-    """
-    from wallet_transactions_service import (
-        _posted_credits_total,
-        compute_seller_eligible_total,
-    )
-
+def _fetch_seller_sale_uids(db, profile_id):
     seller_ids = _seller_business_ids(db, profile_id)
     if not seller_ids:
         return []
-
     placeholders = ", ".join(["%s"] * len(seller_ids))
     q = db.execute(
         f"""
-        SELECT
-            t.transaction_uid,
-            t.transaction_datetime,
-            t.transaction_in_escrow,
-            SUM(COALESCE(ti.ti_bs_qty, 0)) AS order_qty,
-            SUM(COALESCE(ti.ti_received_qty, 0)) AS received_qty,
-            CONCAT(bp.profile_personal_first_name, ' ', bp.profile_personal_last_name)
-                AS buyer_name
+        SELECT DISTINCT t.transaction_uid
         FROM every_circle.transactions t
-        INNER JOIN every_circle.transactions_items ti
-            ON ti.ti_transaction_id = t.transaction_uid
-        LEFT JOIN every_circle.profile_personal bp
-            ON t.transaction_profile_id = bp.profile_personal_uid
         WHERE COALESCE(t.transaction_type, 'sale') = 'sale'
           AND t.transaction_business_id IN ({placeholders})
-        GROUP BY
-            t.transaction_uid,
-            t.transaction_datetime,
-            t.transaction_in_escrow,
-            bp.profile_personal_first_name,
-            bp.profile_personal_last_name
-        ORDER BY t.transaction_datetime DESC
         """,
         tuple(seller_ids),
     )
-
-    rows = []
-    for sale in q.get("result") or []:
-        tx_uid = sale.get("transaction_uid")
-        if not tx_uid:
-            continue
-        eligible = compute_seller_eligible_total(db, tx_uid)
-        credited = _posted_credits_total(db, tx_uid)
-        uncredited = _round_money(eligible - _to_float(credited))
-        if uncredited <= 0.0001:
-            continue
-        rows.append(
-            {
-                **sale,
-                "uncredited_amount": uncredited,
-                "seller_eligible_total": eligible,
-                "credited_total": credited,
-            }
-        )
-    return rows
-
-
-def _normalize_uncredited_seller_proceeds_entry(row):
-    """Projected sale proceeds not yet delivery-credited to wallet_transactions."""
-    amount = _round_money(row.get("uncredited_amount"))
-    received_qty = int(row.get("received_qty") or 0)
-    order_qty = int(row.get("order_qty") or 0)
-    buyer = row.get("buyer_name") or "buyer"
-    tx_uid = row.get("transaction_uid")
-
-    if order_qty > 0 and received_qty <= 0:
-        description = f"Sale proceeds (pending verification) — {buyer}"
-    elif order_qty > 0 and received_qty < order_qty:
-        description = (
-            f"Sale proceeds (pending verification, "
-            f"{received_qty}/{order_qty}) — {buyer}"
-        )
-    else:
-        description = f"Sale proceeds (pending) — {buyer}"
-
-    return {
-        "entry_id": f"pending_proceeds:{tx_uid}",
-        "entry_source": "seller_proceeds_pending",
-        "entry_type": "sale_proceeds_held",
-        "entry_type_label": _entry_type_label("sale_proceeds_held"),
-        "amount": amount,
-        "useable_delta": 0.0,
-        "availability": "pending",
-        "currency": "USD",
-        "transaction_uid": tx_uid,
-        "transaction_original_uid": None,
-        "transaction_type": "sale",
-        "entry_datetime": row.get("transaction_datetime"),
-        "description": description,
-        "counterparty_name": buyer,
-        "purchaser_name": buyer,
-        "ti_received_qty": received_qty or None,
-        "ti_bs_qty": order_qty or None,
-    }
+    return [
+        row.get("transaction_uid")
+        for row in (q.get("result") or [])
+        if row.get("transaction_uid")
+    ]
 
 
 def _fetch_wallet_transaction_ledger_rows(db, profile_id):
@@ -528,7 +552,7 @@ def _fetch_wallet_transaction_ledger_rows(db, profile_id):
         (profile_id, wallet_id),
     )
     rows = q.get("result") or []
-    return _aggregate_sale_proceeds_rows(rows)
+    return _aggregate_sale_proceeds_rows(db, rows)
 
 
 def _fetch_wallet_spend_ledger_rows(db, profile_id):
@@ -571,9 +595,12 @@ def _attach_running_balances(entries):
     running_useable = 0.0
     for entry in chronological:
         amount = _to_float(entry.get("amount"))
-        # Projected (not yet delivery-credited) seller proceeds are shown in the
-        # Pending column but are not yet in wallet.actual_balance.
-        if (entry.get("entry_source") or "") != "seller_proceeds_pending":
+        source = entry.get("entry_source") or ""
+        include = entry.get("include_in_running_balance")
+        # Projected / audit entries are shown but not yet in wallet.actual_balance.
+        if source == "seller_proceeds_pending" or include is False:
+            pass
+        else:
             running_actual = _round_money(running_actual + amount)
         running_useable = _round_money(
             running_useable + _to_float(entry.get("useable_delta"))
@@ -585,23 +612,60 @@ def _attach_running_balances(entries):
 
 def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
     from wallet_return_reservations import fetch_reservation_ledger_rows
+    from wallet_ledger_proceeds import build_proceeds_narrative_for_profile
+    from wallet_transactions_service import (
+        WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
+        WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+        WT_TYPE_RETURN_CLAWBACK,
+    )
+    from order_quantity_context import clear_ledger_quantity_caches
+
+    clear_ledger_quantity_caches()
+
+    # Preload quantity context for every seller sale once (biggest N+1 source).
+    for order_uid in _fetch_seller_sale_uids(db, profile_id):
+        order_quantity_context(db, order_uid)
 
     bounty_rows = _fetch_bounty_ledger_rows(db, profile_id)
     wt_rows = _fetch_wallet_transaction_ledger_rows(db, profile_id)
-    pending_proceeds_rows = _fetch_uncredited_seller_proceeds_rows(db, profile_id)
     spend_rows = _fetch_wallet_spend_ledger_rows(db, profile_id)
     reservation_rows = fetch_reservation_ledger_rows(db, profile_id)
 
+    narrative_entries, narrative_order_uids = build_proceeds_narrative_for_profile(
+        db, profile_id, wt_rows, []
+    )
+    narrative_wt_types = {
+        WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+        WT_TYPE_RETURN_CLAWBACK,
+        WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
+    }
+    filtered_wt_rows = [
+        r
+        for r in wt_rows
+        if not (
+            r.get("wt_transaction_id") in narrative_order_uids
+            and (r.get("wt_type") or "") in narrative_wt_types
+        )
+    ]
+
     entries = []
-    entries.extend(_normalize_bounty_entry(r) for r in bounty_rows)
-    entries.extend(_normalize_wallet_transaction_entry(r) for r in wt_rows)
+    entries.extend(_normalize_bounty_entry(db, r) for r in bounty_rows)
+    entries.extend(narrative_entries)
     entries.extend(
-        _normalize_uncredited_seller_proceeds_entry(r) for r in pending_proceeds_rows
+        _normalize_wallet_transaction_entry(db, r) for r in filtered_wt_rows
     )
     entries.extend(_normalize_reservation_entry(r) for r in reservation_rows)
     entries.extend(_normalize_wallet_spend_entry(r) for r in spend_rows)
 
-    entries = [e for e in entries if abs(_to_float(e.get("amount"))) > 0.0001]
+    entries = [
+        e
+        for e in entries
+        if abs(_to_float(e.get("amount"))) > 0.0001
+        or (e.get("entry_type") or "") in (
+            "sale_proceeds_transfer",
+            "sale_proceeds_return_window_release",
+        )
+    ]
     entries.sort(key=_sort_key, reverse=True)
     total_entries = len(entries)
 
@@ -629,8 +693,7 @@ class WalletLedger(Resource):
 
     Returns a checking-account-style ledger of events that affect wallet balance:
       - Bounty credits and reversals (transactions_bounty) — pending until verified/released
-      - Seller sale proceeds and clawbacks (wallet_transactions)
-      - Projected seller proceeds not yet delivery-credited (pending verification)
+      - Seller sale proceeds narrative (original + per-event lines from wallet_transactions)
       - Wallet payments and refunds at checkout (transactions.transaction_wallet_amount)
 
     Query params: limit (default 100, max 500), offset, timezone/tz

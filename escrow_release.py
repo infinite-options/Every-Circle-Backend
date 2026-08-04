@@ -20,7 +20,7 @@ from datetime import datetime
 from data_ec import connect
 from wallet_ids import EC_WALLET_ID
 from wallet_service import release_bounty_to_useable
-from transaction_shipping import line_is_shippable_sql
+from transaction_shipping import line_is_shippable_sql, line_cancelled_qty_sql
 
 ESCROW_RELEASE_DAYS = 5
 
@@ -206,17 +206,22 @@ def _unshipped_shippable_lines_sql(transaction_alias="t"):
     """
     True when the sale still has a shippable line that is not fully shipped.
 
-    Matches transaction_shipping.fulfillment_list_summary_sql unshipped_item_count.
+    Accounts for pre-ship cancels (matches order_detail remaining_to_ship).
     """
     shippable = line_is_shippable_sql("ti")
+    cancelled = line_cancelled_qty_sql("ti", f"{transaction_alias}.transaction_uid")
     return f"""
         EXISTS (
             SELECT 1
             FROM every_circle.transactions_items ti
             WHERE ti.ti_transaction_id = {transaction_alias}.transaction_uid
               AND {shippable}
-              AND COALESCE(ti.ti_shipped_qty, 0)
-                  < CAST(ti.ti_bs_qty AS UNSIGNED)
+              AND GREATEST(
+                    CAST(ti.ti_bs_qty AS UNSIGNED)
+                        - COALESCE(ti.ti_shipped_qty, 0)
+                        - ({cancelled}),
+                    0
+                ) > 0
         )
     """
 
