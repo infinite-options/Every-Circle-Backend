@@ -6,6 +6,8 @@ from transactions import _is_return_list_row, _resolve_parent_sale_uid, _omit_em
 _SALE_HEADER_KEYS = frozenset(
     {
         "transaction_uid",
+        "transaction_return_requested",
+        "transaction_return_note",
         "fulfillment_status",
         "shipping_status",
         "unshipped_item_count",
@@ -16,6 +18,8 @@ _SALE_HEADER_KEYS = frozenset(
         "ti_shipped_qty",
         "ti_received_qty",
         "received_item_count",
+        "purchased_units",
+        "received_units",
         "delivered_item_count",
         "return_status",
         "refund_status",
@@ -76,6 +80,8 @@ _PENDING_RETURN_KEYS = frozenset(
     {
         "trr_uid",
         "trr_uids",
+        "trr_note",
+        "note",
         "return_status",
         "refund_status",
         "display_status",
@@ -93,8 +99,11 @@ _PENDING_ITEM_KEYS = frozenset(
         "return_quantity",
         "return_shipped_qty",
         "cancel_unshipped_qty",
+        "shipped_return_quantity",
+        "unshipped_return_quantity",
         "item_name",
         "ti_bs_id",
+        "ti_bs_cost",
     }
 )
 
@@ -102,6 +111,8 @@ _TOP_KEYS = frozenset(
     {
         "order_uid",
         "display_status",
+        "return_status",
+        "refund_status",
         "stripe_refund",
         "sale",
         "returns",
@@ -109,6 +120,8 @@ _TOP_KEYS = frozenset(
         "pending_return",
         "pending_return_items",
         "transaction_return_items",
+        "transaction_return_requested",
+        "transaction_return_note",
     }
 )
 

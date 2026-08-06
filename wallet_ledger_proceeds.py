@@ -48,11 +48,63 @@ def _format_proceeds_bucket_summary(buckets):
     return ", ".join(parts)
 
 
+def _original_status_note(buckets):
+    summary = _format_proceeds_bucket_summary(buckets)
+    return f"({summary})" if summary else ""
+
+
 def _original_description(buyer, buckets):
     summary = _format_proceeds_bucket_summary(buckets)
     if summary:
         return f"Sale proceeds ({summary}) — {buyer}"
     return f"Sale proceeds — {buyer}"
+
+
+def _sale_proceeds_status_note(description, *, counterparty_name=None):
+    """
+    Short status fragment for Order Detail chips — no prefix, no counterparty.
+    Parses legacy full descriptions; prefer building status_note at source.
+    """
+    if not description:
+        return ""
+    desc = str(description).strip()
+    paren_prefix = "Sale proceeds ("
+    if desc.startswith(paren_prefix):
+        close = desc.find(")")
+        if close > len(paren_prefix) - 1:
+            return f"({desc[len(paren_prefix):close]})"
+    dash_prefixes = ("Sale proceeds — ", "Sale proceeds reduced — ")
+    for dash_prefix in dash_prefixes:
+        if desc.startswith(dash_prefix):
+            fragment = desc[len(dash_prefix) :].strip()
+            buyer = (counterparty_name or "").strip()
+            if buyer and fragment == buyer:
+                return ""
+            return fragment
+    return ""
+
+
+def _attach_status_note(entry):
+    """Set status_note on sale_proceeds_* entries when not already present."""
+    if not isinstance(entry, dict):
+        return entry
+    entry_type = entry.get("entry_type") or ""
+    if not entry_type.startswith("sale_proceeds"):
+        return entry
+    if entry.get("status_note") is not None:
+        note = str(entry.get("status_note") or "").strip()
+        if note:
+            entry["status_note"] = note
+        else:
+            entry.pop("status_note", None)
+        return entry
+    note = _sale_proceeds_status_note(
+        entry.get("description"),
+        counterparty_name=entry.get("counterparty_name"),
+    )
+    if note:
+        entry["status_note"] = note
+    return entry
 
 
 def _bucket_snapshot_from_totals(
@@ -119,6 +171,9 @@ def _base_entry(
         "include_in_running_balance": include_in_running_balance,
     }
     entry.update(extra)
+    status_note = extra.get("status_note")
+    if status_note:
+        entry["status_note"] = status_note
     return entry
 
 
@@ -220,6 +275,7 @@ def build_order_proceeds_ledger_entries(
         amount=full_order_proceeds,
         entry_datetime=order_datetime,
         description=_original_description(buyer, current_buckets),
+        status_note=_original_status_note(current_buckets),
         parent_entry_id=None,
         event_type="order_placed",
         include_in_running_balance=True,
@@ -252,6 +308,7 @@ def build_order_proceeds_ledger_entries(
                 cancelled=cancelled_running,
                 returned=returned_running,
             )
+            cancel_note = f"{delta_qty} unit(s) cancelled before shipment"
             entries.append(
                 _base_entry(
                     order_uid,
@@ -260,9 +317,8 @@ def build_order_proceeds_ledger_entries(
                     entry_type="sale_proceeds_cancel",
                     amount=cancel_amt,
                     entry_datetime=event_dt,
-                    description=(
-                        f"Sale proceeds — {delta_qty} unit(s) cancelled before shipment"
-                    ),
+                    description=f"Sale proceeds — {cancel_note}",
+                    status_note=cancel_note,
                     parent_entry_id=parent_id,
                     event_type="cancel",
                     include_in_running_balance=True,
@@ -293,6 +349,9 @@ def build_order_proceeds_ledger_entries(
                 cancelled=cancelled_running,
                 returned=returned_running,
             )
+            claw_description = return_clawback_ledger_description(
+                db, event, delta_qty=delta_qty
+            )
             claw_entry = _base_entry(
                 order_uid,
                 buyer,
@@ -300,9 +359,8 @@ def build_order_proceeds_ledger_entries(
                 entry_type="sale_proceeds_return_clawback",
                 amount=claw_amt,
                 entry_datetime=event_dt,
-                description=return_clawback_ledger_description(
-                    db, event, delta_qty=delta_qty
-                ),
+                description=claw_description,
+                status_note=_sale_proceeds_status_note(claw_description),
                 parent_entry_id=parent_id,
                 event_type="return",
                 include_in_running_balance=True,
@@ -339,6 +397,9 @@ def build_order_proceeds_ledger_entries(
                 and not available_at
                 and credit_amt > 0.0001
             ):
+                verify_note = (
+                    f"{delta_qty} unit(s) verified (${credit_amt:.2f} now useable)"
+                )
                 verify_entry = _base_entry(
                     order_uid,
                     buyer,
@@ -350,10 +411,8 @@ def build_order_proceeds_ledger_entries(
                     entry_type="sale_proceeds_verify_transfer",
                     amount=credit_amt,
                     entry_datetime=event_dt,
-                    description=(
-                        f"Sale proceeds — {delta_qty} unit(s) verified "
-                        f"(${credit_amt:.2f} now useable)"
-                    ),
+                    description=f"Sale proceeds — {verify_note}",
+                    status_note=verify_note,
                     parent_entry_id=parent_id,
                     event_type="verify",
                     include_in_running_balance=False,
@@ -370,6 +429,9 @@ def build_order_proceeds_ledger_entries(
                 verify_entry["useable_delta"] = credit_amt
                 entries.append(verify_entry)
             elif wt_status == WT_STATUS_POSTED and available_at and credit_amt > 0.0001:
+                release_note = (
+                    f"return window expired (${credit_amt:.2f} now useable)"
+                )
                 release_entry = _base_entry(
                     order_uid,
                     buyer,
@@ -377,10 +439,8 @@ def build_order_proceeds_ledger_entries(
                     entry_type="sale_proceeds_return_window_release",
                     amount=0.0,
                     entry_datetime=event_dt,
-                    description=(
-                        f"Sale proceeds — return window expired "
-                        f"(${credit_amt:.2f} now useable)"
-                    ),
+                    description=f"Sale proceeds — {release_note}",
+                    status_note=release_note,
                     parent_entry_id=parent_id,
                     event_type="release",
                     include_in_running_balance=False,

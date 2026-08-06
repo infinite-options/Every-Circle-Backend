@@ -1,6 +1,7 @@
 from flask_restful import Resource
 from flask import request
 import json
+import re
 
 from data_ec import connect
 from transaction_shipping import (
@@ -24,6 +25,243 @@ def _parse_selected_options_field(raw):
     return []
 
 
+def _format_offering_rate_display(cost, currency):
+    """Format expertise rate like '$25/each' from snapshotted checkout fields."""
+    if cost is None or str(cost).strip() == "":
+        return None
+    display = str(cost).strip()
+    currency = (currency or "").strip()
+    if currency and currency not in display:
+        display = f"{display}{currency}"
+    if not display.startswith("$") and re.match(r"^\d", display):
+        display = f"${display}"
+    return display
+
+
+def _append_seller_filter(query, params, seller_id):
+    """Match product, expertise, or wish lines for common seller_id shapes."""
+    if not seller_id:
+        return query, params
+    if seller_id.startswith("150-"):
+        query += " AND ti.ti_bs_id = %s"
+        params.append(seller_id)
+    elif seller_id.startswith("165-"):
+        query += " AND ti.ti_bs_id = %s"
+        params.append(seller_id)
+    else:
+        query += """
+            AND (
+                bs.bs_business_id = %s
+                OR pe.profile_expertise_profile_personal_id = %s
+                OR t.transaction_business_id = %s
+            )
+        """
+        params.extend([seller_id, seller_id, seller_id])
+    return query, params
+
+
+def _enrich_receipt_line(row):
+    """Expose persisted checkout choices and aliases expected by Account receipt UI."""
+    if not isinstance(row, dict):
+        return row
+
+    ti_bs_id = row.get("ti_bs_id") or ""
+    if str(ti_bs_id).startswith("250-"):
+        row["bs_uid"] = ti_bs_id
+
+    choices_extra = row.get("ti_choices_extra_cost")
+    if choices_extra is not None:
+        row["choices_extra_cost"] = choices_extra
+
+    special = row.get("ti_special_instructions")
+    if special:
+        row["special_instructions"] = special
+
+    unit_price = row.get("ti_bs_cost")
+    if unit_price is not None:
+        row["unit_price"] = unit_price
+
+    selected_options = row.get("selected_options") or []
+    selected_choice_items = []
+    selected_choices = {}
+    selected_choice_labels = {}
+    for opt in selected_options:
+        if not isinstance(opt, dict):
+            continue
+        group = (opt.get("group_title") or opt.get("groupTitle") or "").strip()
+        label = (opt.get("label") or "").strip()
+        bso_uid = (opt.get("bso_uid") or opt.get("id") or "").strip()
+        extra_cost = opt.get("extra_cost")
+        if extra_cost is None:
+            extra_cost = 0
+        selected_choice_items.append(
+            {
+                "groupTitle": group,
+                "label": label,
+                "extra_cost": extra_cost,
+                "bso_uid": bso_uid,
+            }
+        )
+        if group:
+            if bso_uid:
+                selected_choices[group] = bso_uid
+            if label:
+                selected_choice_labels[group] = label
+
+    if selected_choice_items:
+        row["selected_choice_items"] = selected_choice_items
+        row["selected_choices"] = selected_choices
+        row["selected_choice_labels"] = selected_choice_labels
+    else:
+        row.setdefault("selected_options", [])
+
+    if str(ti_bs_id).startswith("150-"):
+        rate = _format_offering_rate_display(
+            row.get("profile_expertise_cost") or row.get("ti_bs_cost"),
+            row.get("profile_expertise_cost_currency"),
+        )
+        if rate:
+            row["offering_rate_display"] = rate
+        row["purchase_type"] = "expertise"
+
+    return row
+
+
+_RECEIPT_LINE_SELECT = """
+    SELECT
+        t.transaction_uid,
+        t.transaction_profile_id,
+        t.transaction_datetime,
+        t.transaction_total,
+        t.transaction_amount,
+        t.transaction_taxes,
+        t.transaction_fees,
+        t.transaction_shipping,
+        t.transaction_in_escrow,
+        ti.ti_uid,
+        ti.ti_bs_id,
+        ti.ti_bs_qty,
+        COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
+        ti.ti_bs_cost,
+        ti.ti_choices_extra_cost,
+        ti.ti_shipping_amount,
+        ti.ti_shipping_refundable,
+        ti.ti_special_instructions,
+        ti.ti_selected_options,
+        COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+        COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
+        ti.ti_shipped_at,
+        ti.ti_tracking_carrier,
+        ti.ti_tracking_number,
+        ti.ti_fulfillment_note,
+        ti.ti_fulfillment_method,
+        ti.ti_shipping_not_required,
+        ti.ti_line_shipping_amount,
+        ti.ti_listing_shipping,
+        CASE
+            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+            ELSE 'Unknown'
+        END AS bs_service_name,
+        CASE
+            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_business_id
+            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_uid
+            ELSE NULL
+        END AS seller_ref_id,
+        pe.profile_expertise_cost,
+        pe.profile_expertise_cost_currency,
+        COALESCE(
+            (
+                SELECT JSON_ARRAYAGG(
+                    JSON_OBJECT(
+                        'group_title', bso.bso_group_title,
+                        'option_label', bso.bso_option_label,
+                        'extra_cost',   bso.bso_extra_cost
+                    )
+                )
+                FROM every_circle.business_services_options bso
+                WHERE bso.bso_business_service_id = ti.ti_bs_id
+                AND bso.bso_is_active = 1
+                AND bso.bso_extra_cost > 0
+            ),
+            JSON_ARRAY()
+        ) AS available_options
+    FROM every_circle.transactions t
+    INNER JOIN every_circle.transactions_items ti
+        ON ti.ti_transaction_id = t.transaction_uid
+    LEFT JOIN every_circle.business_services bs
+        ON ti.ti_bs_id = bs.bs_uid
+    LEFT JOIN every_circle.profile_expertise pe
+        ON ti.ti_bs_id = pe.profile_expertise_uid
+    LEFT JOIN every_circle.profile_wish pw
+        ON ti.ti_bs_id = pw.profile_wish_uid
+    WHERE t.transaction_profile_id = %s
+        AND t.transaction_uid = %s
+"""
+
+
+def _load_receipt_lines(db, profile_id, transaction_uid, seller_id=None):
+    query = _RECEIPT_LINE_SELECT
+    params = [profile_id, transaction_uid]
+    query, params = _append_seller_filter(query, list(params), seller_id)
+    result = db.execute(query, tuple(params))
+    if result.get("code") != 200:
+        return None, result
+    return result.get("result") or [], None
+
+
+def _load_expertise_receipt_lines(db, profile_id, transaction_uid, seller_id=None):
+    """Offering lines from transactions_items when the main query returns nothing."""
+    params = [profile_id, transaction_uid]
+    seller_clause = ""
+    if seller_id:
+        if str(seller_id).startswith("150-"):
+            seller_clause = " AND ti.ti_bs_id = %s"
+            params.append(seller_id)
+        else:
+            seller_clause = """
+                AND (
+                    pe.profile_expertise_profile_personal_id = %s
+                    OR t.transaction_business_id = %s
+                )
+            """
+            params.extend([seller_id, seller_id])
+
+    q = db.execute(
+        f"""
+        {_RECEIPT_LINE_SELECT}
+          AND ti.ti_bs_id LIKE '150-%%'
+          {seller_clause}
+        ORDER BY ti.ti_uid ASC
+        """,
+        tuple(params),
+    )
+    return q.get("result") or []
+
+
+def _process_receipt_rows(rows):
+    enriched_rows = []
+    for row in rows:
+        if not row.get("ti_uid"):
+            continue
+        raw = row.get("available_options")
+        if isinstance(raw, str):
+            try:
+                row["available_options"] = json.loads(raw)
+            except Exception:
+                row["available_options"] = []
+        elif raw is None:
+            row["available_options"] = []
+
+        row["selected_options"] = _parse_selected_options_field(
+            row.pop("ti_selected_options", None)
+        )
+        row.update(fulfillment_fields_from_row(row))
+        enriched_rows.append(_enrich_receipt_line(row))
+    return enriched_rows
+
+
 class TransactionReceipt(Resource):
     def get(self, profile_id, transaction_uid):
         print(f"In TransactionReceipt GET for profile_id: {profile_id}, transaction_uid: {transaction_uid}")
@@ -32,125 +270,42 @@ class TransactionReceipt(Resource):
 
         try:
             with connect() as db:
-                query = """
-                    SELECT
-                        t.transaction_uid,
-                        t.transaction_profile_id,
-                        t.transaction_datetime,
-                        t.transaction_total,
-                        t.transaction_amount,
-                        t.transaction_taxes,
-                        t.transaction_fees,
-                        t.transaction_shipping,
-                        t.transaction_in_escrow,
-                        ti.ti_uid,
-                        ti.ti_bs_id,
-                        ti.ti_bs_qty,
-                        COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
-                        ti.ti_bs_cost,
-                        ti.ti_choices_extra_cost,
-                        ti.ti_shipping_amount,
-                        ti.ti_shipping_refundable,
-                        ti.ti_special_instructions,
-                        ti.ti_selected_options,
-                        COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
-                        COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
-                        ti.ti_shipped_at,
-                        ti.ti_tracking_carrier,
-                        ti.ti_tracking_number,
-                        ti.ti_fulfillment_note,
-                        ti.ti_fulfillment_method,
-                        ti.ti_shipping_not_required,
-                        ti.ti_line_shipping_amount,
-                        ti.ti_listing_shipping,
-                        CASE
-                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
-                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
-                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
-                            ELSE 'Unknown'
-                        END AS bs_service_name,
-                        CASE
-                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_business_id
-                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_uid
-                            ELSE NULL
-                        END AS seller_ref_id,
-                        COALESCE(
-                            (
-                                SELECT JSON_ARRAYAGG(
-                                    JSON_OBJECT(
-                                        'group_title', bso.bso_group_title,
-                                        'option_label', bso.bso_option_label,
-                                        'extra_cost',   bso.bso_extra_cost
-                                    )
-                                )
-                                FROM every_circle.business_services_options bso
-                                WHERE bso.bso_business_service_id = ti.ti_bs_id
-                                AND bso.bso_is_active = 1
-                                AND bso.bso_extra_cost > 0
-                            ),
-                            JSON_ARRAY()
-                        ) AS available_options
-                    FROM every_circle.transactions t
-                    LEFT JOIN every_circle.transactions_items ti
-                        ON ti.ti_transaction_id = t.transaction_uid
-                    LEFT JOIN every_circle.business_services bs
-                        ON ti.ti_bs_id = bs.bs_uid
-                    LEFT JOIN every_circle.profile_expertise pe
-                        ON ti.ti_bs_id = pe.profile_expertise_uid
-                    LEFT JOIN every_circle.profile_wish pw
-                        ON ti.ti_bs_id = pw.profile_wish_uid
-                    WHERE t.transaction_profile_id = %s
-                        AND t.transaction_uid = %s
-                """
-
-                params = [profile_id, transaction_uid]
-
-                if seller_id:
-                    if seller_id.startswith('150-'):
-                        query += " AND ti.ti_bs_id = %s"
-                        params.append(seller_id)
-                    elif seller_id.startswith('165-'):
-                        query += " AND ti.ti_bs_id = %s"
-                        params.append(seller_id)
-                    else:
-                        query += " AND bs.bs_business_id = %s"
-                        params.append(seller_id)
-
-                result = db.execute(query, tuple(params))
-
-                if result.get('code') == 200:
-                    rows = result.get('result', [])
-                    for row in rows:
-                        raw = row.get('available_options')
-                        if isinstance(raw, str):
-                            try:
-                                row['available_options'] = json.loads(raw)
-                            except Exception:
-                                row['available_options'] = []
-                        elif raw is None:
-                            row['available_options'] = []
-
-                        row['selected_options'] = _parse_selected_options_field(
-                            row.pop('ti_selected_options', None)
-                        )
-                        row.update(fulfillment_fields_from_row(row))
-
-                    shipping = shipping_payload_from_row(
-                        load_shipping_for_transaction(db, transaction_uid)
+                rows, err = _load_receipt_lines(
+                    db, profile_id, transaction_uid, seller_id
+                )
+                if err:
+                    response["message"] = err.get(
+                        "message", "Error retrieving transaction receipt"
                     )
+                    response["code"] = err.get("code", 500)
+                    return response, response["code"]
 
-                    response['message'] = 'Transaction receipt retrieved successfully'
-                    response['code'] = 200
-                    response['data'] = rows
-                    response.update(shipping)
-                    return response, 200
-                else:
-                    response['message'] = result.get('message', 'Error retrieving transaction receipt')
-                    response['code'] = result.get('code', 500)
-                    return response, response['code']
+                enriched_rows = _process_receipt_rows(rows)
+
+                if not enriched_rows:
+                    expertise_rows = _load_expertise_receipt_lines(
+                        db, profile_id, transaction_uid, seller_id
+                    )
+                    enriched_rows = _process_receipt_rows(expertise_rows)
+
+                if not enriched_rows and not seller_id:
+                    expertise_rows = _load_expertise_receipt_lines(
+                        db, profile_id, transaction_uid, None
+                    )
+                    enriched_rows = _process_receipt_rows(expertise_rows)
+
+                shipping = shipping_payload_from_row(
+                    load_shipping_for_transaction(db, transaction_uid)
+                )
+
+                response["message"] = "Transaction receipt retrieved successfully"
+                response["code"] = 200
+                response["data"] = enriched_rows
+                response.update(shipping)
+                return response, 200
 
         except Exception as e:
             print(f"Error in TransactionReceipt GET: {str(e)}")
-            response['message'] = f'An error occurred: {str(e)}'
-            response['code'] = 500
+            response["message"] = f"An error occurred: {str(e)}"
+            response["code"] = 500
             return response, 500

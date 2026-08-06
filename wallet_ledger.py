@@ -13,6 +13,7 @@ from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
 from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified, bounty_reversal_ledger_availability
+from wallet_ledger_proceeds import _attach_status_note
 from order_quantity_context import (
     line_quantity_context,
     order_quantity_context,
@@ -170,7 +171,7 @@ def _normalize_bounty_entry(db, row):
     }
     if qty_ctx:
         entry.update(quantity_context_fields(qty_ctx))
-    return entry
+    return _attach_status_note(entry)
 
 
 def _normalize_wallet_transaction_entry(db, row):
@@ -276,7 +277,7 @@ def _normalize_wallet_transaction_entry(db, row):
     }
     if qty_ctx:
         entry.update(quantity_context_fields(qty_ctx))
-    return entry
+    return _attach_status_note(entry)
 
 
 def _aggregate_sale_proceeds_rows(db, rows):
@@ -665,8 +666,8 @@ def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
     ]
 
     entries = []
-    entries.extend(_normalize_bounty_entry(db, r) for r in bounty_rows)
-    entries.extend(narrative_entries)
+    entries.extend(_attach_status_note(e) for e in (_normalize_bounty_entry(db, r) for r in bounty_rows))
+    entries.extend(_attach_status_note(e) for e in narrative_entries)
     entries.extend(
         _normalize_wallet_transaction_entry(db, r) for r in filtered_wt_rows
     )

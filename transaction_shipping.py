@@ -11,7 +11,6 @@ _SHIPPING_REQUIRED_FIELDS = (
     "zip",
 )
 
-
 def normalize_shipping_address(shipping):
     """Parse checkout shipping_address. Returns (row_fields_or_None, error_or_None)."""
     if shipping is None:
@@ -569,6 +568,8 @@ def apply_order_fulfillment_summary(rows):
         row["ti_shipped_qty"] = shipped_units
         row["ti_received_qty"] = received_qty
         row["received_item_count"] = received_units
+        row["purchased_units"] = order_qty
+        row["received_units"] = received_units
         row.pop("ti_bs_qty_for_received", None)
         row.pop("shippable_unit_count", None)
         cancelled_units = int(row.get("cancelled_qty") or 0)

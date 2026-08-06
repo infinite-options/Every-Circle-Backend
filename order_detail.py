@@ -8,7 +8,7 @@ from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
-from transaction_receipt import _parse_selected_options_field
+from transaction_receipt import _parse_selected_options_field, _enrich_receipt_line
 from transaction_shipping import (
     load_shipping_for_transaction,
     shipping_payload_from_row,
@@ -200,7 +200,9 @@ def _load_sale_lines(db, order_uid):
             ti.ti_listing_shipping,
             {name_case} AS item_name,
             bs.bs_service_name,
-            bs.bs_service_desc
+            bs.bs_service_desc,
+            pe.profile_expertise_cost,
+            pe.profile_expertise_cost_currency
         FROM every_circle.transactions_items ti
         LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
         LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
@@ -259,7 +261,7 @@ def _load_sale_lines(db, order_uid):
             "return_ineligible_reason": eligibility["return_ineligible_reason"],
             **fulfillment_fields_from_row(row),
         }
-        lines.append(line)
+        lines.append(_enrich_receipt_line(line))
     return lines
 
 
@@ -530,15 +532,43 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         pending_returns_payload[0] if pending_returns_payload else None
     )
 
+    transaction_return_items = []
+    for req in open_returns:
+        transaction_return_items.extend(req.get("items") or [])
+    if transaction_return_items:
+        ti_uids = [
+            e.get("transaction_item_uid") or e.get("ti_uid")
+            for e in transaction_return_items
+            if e.get("transaction_item_uid") or e.get("ti_uid")
+        ]
+        from transactions import _sale_item_names_by_ti
+
+        name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
+        enriched_return_items = []
+        for entry in transaction_return_items:
+            item = dict(entry)
+            ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+            looked = name_map.get(ti_uid) or {}
+            if looked.get("item_name") and not item.get("item_name"):
+                item["item_name"] = looked["item_name"]
+            if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
+                item["ti_bs_cost"] = looked["ti_bs_cost"]
+            enriched_return_items.append(item)
+        transaction_return_items = enriched_return_items
+
     sale_payload = dict(sale)
     sale_payload["lines"] = sale_lines
     sale_payload["pending_return"] = pending_return_payload
     sale_payload["pending_returns"] = pending_returns_payload
     if pending_return_payload:
-        sale_payload["transaction_return_note"] = pending_return_payload.get("note")
+        sale_payload["transaction_return_note"] = pending_return_payload.get(
+            "note"
+        ) or pending_return_payload.get("trr_note")
         sale_payload["transaction_return_seller_note"] = pending_return_payload.get(
             "seller_note"
         )
+    if transaction_return_items:
+        sale_payload["transaction_return_items"] = transaction_return_items
     sale_payload.update(status_fields)
     sale_payload.update(shipping)
     _apply_sale_fulfillment_rollup(sale_payload)
@@ -558,6 +588,13 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         **status_fields,
         **shipping,
     }
+    if transaction_return_items:
+        payload["transaction_return_items"] = transaction_return_items
+    if sale.get("transaction_return_requested") is not None:
+        payload["transaction_return_requested"] = sale.get("transaction_return_requested")
+    note = sale_payload.get("transaction_return_note")
+    if note:
+        payload["transaction_return_note"] = note
     if stripe_refund is not None:
         payload["stripe_refund"] = stripe_refund
     return payload

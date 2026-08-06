@@ -1622,11 +1622,50 @@ def _new_trr_uid(db):
     return uid_resp["result"][0].get("new_id")
 
 
+def _apply_return_item_split_aliases(item, *, cancel_only=False):
+    """Expose shipped vs unshipped return qty with FE-stable field names."""
+    if not isinstance(item, dict):
+        return item
+    ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+    if ti_uid:
+        item.setdefault("transaction_item_uid", ti_uid)
+        item.setdefault("ti_uid", ti_uid)
+    try:
+        rq = int(item.get("return_quantity") or 0)
+    except (TypeError, ValueError):
+        rq = 0
+    has_shipped = item.get("return_shipped_qty") is not None
+    has_cancel = item.get("cancel_unshipped_qty") is not None
+    if has_shipped or has_cancel:
+        try:
+            shipped = int(item.get("return_shipped_qty") or 0)
+        except (TypeError, ValueError):
+            shipped = 0
+        try:
+            unshipped = int(item.get("cancel_unshipped_qty") or 0)
+        except (TypeError, ValueError):
+            unshipped = 0
+    elif cancel_only:
+        shipped, unshipped = 0, rq
+    else:
+        shipped, unshipped = rq, 0
+    item["return_shipped_qty"] = shipped
+    item["shipped_return_quantity"] = shipped
+    item["cancel_unshipped_qty"] = unshipped
+    item["unshipped_return_quantity"] = unshipped
+    return item
+
+
 def _items_from_return_request_row(row):
     """
     Build the single-item (or legacy multi-item) list for a return-request row.
     Prefer columnar trr_ti_uid / trr_return_quantity; fall back to trr_items_json.
     """
+    cancel_only = bool(
+        int(row.get("trr_cancel_unshipped") or 0) == 1
+        or row.get("cancel_unshipped")
+        or row.get("pre_ship_cancel")
+    )
     ti_uid = row.get("trr_ti_uid")
     json_items = []
     try:
@@ -1654,12 +1693,18 @@ def _items_from_return_request_row(row):
                     item["cancel_unshipped_qty"] = int(first.get("cancel_unshipped_qty") or 0)
                 except (TypeError, ValueError):
                     item["cancel_unshipped_qty"] = 0
-        return [item]
+        return [_apply_return_item_split_aliases(item, cancel_only=cancel_only)]
     try:
         items = json.loads(row.get("trr_items_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
-    return items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+    return [
+        _apply_return_item_split_aliases(entry, cancel_only=cancel_only)
+        for entry in items
+        if isinstance(entry, dict)
+    ]
 
 
 def _hydrate_return_request_row(row):
@@ -3926,6 +3971,9 @@ class Transactions(Resource):
                     ) AS purchased_item,
                     SUM(ti.ti_bs_qty) AS ti_bs_qty,
                     MIN(ti.ti_uid) AS ti_uid,
+                    MIN(ti.ti_bs_cost) AS ti_bs_cost,
+                    MIN(pe.profile_expertise_cost) AS profile_expertise_cost,
+                    MIN(pe.profile_expertise_cost_currency) AS profile_expertise_cost_currency,
                     MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
                     __FULFILLMENT_SUMMARY__
                     FROM every_circle.transactions t
@@ -3968,6 +4016,26 @@ class Transactions(Resource):
 
                 if result.get("code") == 200:
                     rows = _enrich_transaction_rows(result.get("result", []))
+                    for row in rows:
+                        if (
+                            isinstance(row, dict)
+                            and row.get("purchase_type") == "Offering"
+                        ):
+                            cost = row.get("profile_expertise_cost") or row.get(
+                                "ti_bs_cost"
+                            )
+                            currency = (
+                                row.get("profile_expertise_cost_currency") or ""
+                            ).strip()
+                            if cost is not None and str(cost).strip():
+                                display = str(cost).strip()
+                                if currency and currency not in display:
+                                    display = f"{display}{currency}"
+                                if not display.startswith("$") and re.match(
+                                    r"^\d", display
+                                ):
+                                    display = f"${display}"
+                                row["offering_rate_display"] = display
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
                     from order_quantity_context import apply_list_verification_status
@@ -5817,6 +5885,25 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
         return None
     rs, fs = _pair_for_sale(sale_row, pending)
     items = pending.get("items") or []
+    ti_uids = [
+        e.get("transaction_item_uid") or e.get("ti_uid")
+        for e in items
+        if e.get("transaction_item_uid") or e.get("ti_uid")
+    ]
+    name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
+    enriched_items = []
+    for entry in items:
+        item = dict(entry)
+        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+        looked = name_map.get(ti_uid) or {}
+        if looked.get("item_name") and not item.get("item_name"):
+            item["item_name"] = looked["item_name"]
+        if looked.get("ti_bs_id") and not item.get("ti_bs_id"):
+            item["ti_bs_id"] = looked["ti_bs_id"]
+        if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
+            item["ti_bs_cost"] = looked["ti_bs_cost"]
+        enriched_items.append(item)
+    items = enriched_items
 
     estimated_refund = None
     stored_json = pending.get("trr_estimated_refund_json")
@@ -5855,9 +5942,11 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
 
     bounty_to_reclaim = _resolve_bounty_to_reclaim(db, order_uid, pending, items)
 
+    note = pending.get("trr_note") or pending.get("note")
     payload = {
         "trr_uid": pending.get("trr_uid"),
-        "note": pending.get("trr_note") or pending.get("note"),
+        "note": note,
+        "trr_note": note,
         "items": items,
         "estimated_refund": estimated_refund,
         "bounty_to_reclaim": bounty_to_reclaim,
@@ -6004,17 +6093,18 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         )
         if name:
             item_names.append(str(name))
-        return_lines.append(
-            {
-                "ti_uid": ti_uid,
-                "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
-                "item_name": name,
-                "return_quantity": abs(rq),
-                "ti_bs_cost": looked_up.get("ti_bs_cost") or entry.get("ti_bs_cost"),
-                "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
-                or entry.get("ti_bs_cost_currency"),
-            }
-        )
+        line_entry = {
+            "ti_uid": ti_uid,
+            "transaction_item_uid": ti_uid,
+            "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
+            "item_name": name,
+            "return_quantity": abs(rq),
+            "ti_bs_cost": looked_up.get("ti_bs_cost") or entry.get("ti_bs_cost"),
+            "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
+            or entry.get("ti_bs_cost_currency"),
+        }
+        _apply_return_item_split_aliases(line_entry, cancel_only=cancel_flag)
+        return_lines.append(line_entry)
 
     subtotal = round(
         sum(
@@ -6340,13 +6430,50 @@ def _enrich_list_transaction_rows(db, rows):
             out["is_pending_return"] = False
             if sale_uid:
                 sales_by_uid[sale_uid] = out
-            # Return detail lives on synthetic return list rows only.
-            # Sale keeps status flags so the purchase can show Returning/Pending.
-            out.pop("pending_returns", None)
-            out.pop("pending_return", None)
             if open_reqs:
                 rs, fs = _pair_for_sale(out, open_reqs[0])
                 out.update(_list_status_payload(rs, fs))
+                pending_returns_payload = [
+                    _pending_return_payload_for_sale(db, out, req, compact=True)
+                    for req in open_reqs
+                ]
+                pending_returns_payload = [
+                    p for p in pending_returns_payload if p
+                ]
+                if pending_returns_payload:
+                    out["pending_returns"] = pending_returns_payload
+                    out["pending_return"] = pending_returns_payload[0]
+                    note = pending_returns_payload[0].get("note") or pending_returns_payload[
+                        0
+                    ].get("trr_note")
+                    if note:
+                        out["transaction_return_note"] = note
+                return_items = []
+                for req in open_reqs:
+                    return_items.extend(req.get("items") or [])
+                if return_items:
+                    ti_uids = [
+                        e.get("transaction_item_uid") or e.get("ti_uid")
+                        for e in return_items
+                        if e.get("transaction_item_uid") or e.get("ti_uid")
+                    ]
+                    name_map = _sale_item_names_by_ti(db, sale_uid, ti_uids)
+                    enriched_return_items = []
+                    for entry in return_items:
+                        item = dict(entry)
+                        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+                        looked = name_map.get(ti_uid) or {}
+                        if looked.get("item_name") and not item.get("item_name"):
+                            item["item_name"] = looked["item_name"]
+                        if looked.get("ti_bs_cost") is not None and item.get(
+                            "ti_bs_cost"
+                        ) is None:
+                            item["ti_bs_cost"] = looked["ti_bs_cost"]
+                        enriched_return_items.append(item)
+                    out["transaction_return_items"] = enriched_return_items
+            else:
+                out.pop("pending_returns", None)
+                out.pop("pending_return", None)
 
         enriched.append(out)
 
