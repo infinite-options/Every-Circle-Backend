@@ -249,6 +249,23 @@ def line_is_shippable_row(row):
     return status != FULFILLMENT_STATUS_NOT_REQUIRED
 
 
+def effective_shipped_qty_for_line(row):
+    """
+    Shipped units for fulfillment math on a sale line.
+
+    On shipping-required lines, buyer-verified units imply delivery occurred even
+    if the seller never clicked ship (legacy verify path). Pickup/virtual lines
+    use seller-marked ti_shipped_qty only.
+    """
+    if not row:
+        return 0
+    shipped = int(row.get("ti_shipped_qty") or row.get("shipped_qty") or 0)
+    if not line_is_shippable_row(row):
+        return shipped
+    verified = int(row.get("ti_received_qty") or row.get("verified_qty") or 0)
+    return max(shipped, verified)
+
+
 def repair_verify_only_delivered_fulfillment_status(db):
     """
     One-time idempotent repair: reset lines marked delivered by buyer verify
@@ -271,9 +288,38 @@ def repair_verify_only_delivered_fulfillment_status(db):
     _VERIFY_ONLY_DELIVERED_REPAIR_DONE = True
 
 
+def repair_shipped_qty_from_received(db):
+    """
+    Backfill ti_shipped_qty from ti_received_qty when buyers verified before
+    sellers marked shipment (500-000715-style rows). Idempotent — safe to run
+    on every list/order read.
+    """
+    now = utc_now_str()
+    db.execute(
+        """
+        UPDATE every_circle.transactions_items
+        SET ti_shipped_qty = COALESCE(ti_received_qty, 0),
+            ti_shipped_at = COALESCE(ti_shipped_at, %s),
+            ti_fulfillment_status = CASE
+                WHEN COALESCE(ti_fulfillment_status, 'not_required') IN (
+                    'not_required', 'not_shipped'
+                )
+                THEN 'in_transit'
+                ELSE ti_fulfillment_status
+            END,
+            ti_shipping_not_required = 0
+        WHERE COALESCE(ti_received_qty, 0) > COALESCE(ti_shipped_qty, 0)
+          AND COALESCE(ti_fulfillment_method, 'ship') NOT IN ('pickup', 'virtual')
+        """,
+        (now,),
+        cmd="post",
+    )
+
+
 def ensure_fulfillment_list_rollups(db):
     """Run idempotent fulfillment data repairs before list rollups."""
     repair_verify_only_delivered_fulfillment_status(db)
+    repair_shipped_qty_from_received(db)
 
 # Seller may set these via PUT fulfillment_updates
 SELLER_FULFILLMENT_STATUSES = frozenset(
@@ -334,7 +380,7 @@ def fulfillment_fields_from_row(row):
             "fulfillment_note": None,
         }
     status = row.get("ti_fulfillment_status") or FULFILLMENT_STATUS_NOT_REQUIRED
-    shipped_qty = int(row.get("ti_shipped_qty") or 0)
+    shipped_qty = effective_shipped_qty_for_line(row)
     carrier = row.get("ti_tracking_carrier")
     tracking = row.get("ti_tracking_number")
     method = row.get("ti_fulfillment_method") or row.get("fulfillment_method")
@@ -428,13 +474,21 @@ def fulfillment_list_summary_sql(alias="ti", *, order_uid_sql="t.transaction_uid
         SUM(
             CASE
                 WHEN {shippable}
-                THEN COALESCE({alias}.ti_shipped_qty, 0) ELSE 0
+                THEN GREATEST(
+                    COALESCE({alias}.ti_shipped_qty, 0),
+                    COALESCE({alias}.ti_received_qty, 0)
+                )
+                ELSE 0
             END
         ) AS ti_shipped_qty,
         SUM(
             CASE
                 WHEN {shippable}
-                THEN COALESCE({alias}.ti_shipped_qty, 0) ELSE 0
+                THEN GREATEST(
+                    COALESCE({alias}.ti_shipped_qty, 0),
+                    COALESCE({alias}.ti_received_qty, 0)
+                )
+                ELSE 0
             END
         ) AS shipped_item_count,
         SUM(
@@ -442,7 +496,10 @@ def fulfillment_list_summary_sql(alias="ti", *, order_uid_sql="t.transaction_uid
                 WHEN {shippable}
                 THEN GREATEST(
                     CAST({alias}.ti_bs_qty AS UNSIGNED)
-                        - COALESCE({alias}.ti_shipped_qty, 0)
+                        - GREATEST(
+                            COALESCE({alias}.ti_shipped_qty, 0),
+                            COALESCE({alias}.ti_received_qty, 0)
+                        )
                         - ({cancelled}),
                     0
                 )
@@ -453,8 +510,10 @@ def fulfillment_list_summary_sql(alias="ti", *, order_uid_sql="t.transaction_uid
             CASE
                 WHEN {shippable}
                      AND COALESCE({alias}.ti_fulfillment_status, 'not_required') = 'delivered'
-                     AND COALESCE({alias}.ti_shipped_qty, 0)
-                         >= CAST({alias}.ti_bs_qty AS UNSIGNED)
+                     AND GREATEST(
+                         COALESCE({alias}.ti_shipped_qty, 0),
+                         COALESCE({alias}.ti_received_qty, 0)
+                     ) >= CAST({alias}.ti_bs_qty AS UNSIGNED)
                 THEN 1 ELSE 0
             END
         ) AS delivered_item_count,
@@ -512,8 +571,13 @@ def apply_order_fulfillment_summary(rows):
         row["received_item_count"] = received_units
         row.pop("ti_bs_qty_for_received", None)
         row.pop("shippable_unit_count", None)
+        cancelled_units = int(row.get("cancelled_qty") or 0)
+        receivable = max(order_qty - cancelled_units, 0) if order_qty > 0 else 0
         if order_qty > 0:
-            row["all_items_received"] = 1 if received_qty >= order_qty else 0
+            if receivable > 0:
+                row["all_items_received"] = 1 if received_qty >= receivable else 0
+            else:
+                row["all_items_received"] = 1
         else:
             row["all_items_received"] = 0
         row["needs_shipping"] = 1 if unshipped > 0 else 0

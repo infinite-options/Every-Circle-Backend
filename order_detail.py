@@ -223,6 +223,7 @@ def _load_sale_lines(db, order_uid):
             row.get("ti_uid"),
             order_qty,
             shipped_qty,
+            ti_row=row,
         )
         active_units = max(order_qty - cancelled_qty - returned_qty, 0)
         from order_quantity_context import line_quantity_context as _line_qty_ctx
@@ -405,12 +406,14 @@ def _apply_sale_fulfillment_rollup(sale_payload):
     lines = sale_payload.get("lines") or []
     shippable = unshipped = delivered = received = order_qty_total = 0
     shippable_units = shipped_units = 0
+    cancelled_total = 0
     has_in_transit = 0
 
     for line in lines:
         order_qty = int(line.get("ti_bs_qty") or 0)
         shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
         received_qty = int(line.get("ti_received_qty") or 0)
+        cancelled_total += int(line.get("cancelled_qty") or 0)
         order_qty_total += order_qty
         received += received_qty
 
@@ -445,6 +448,7 @@ def _apply_sale_fulfillment_rollup(sale_payload):
         "ti_received_qty": received,
         "ti_bs_qty": order_qty_total,
         "received_item_count": received,
+        "cancelled_qty": cancelled_total,
     }
     apply_order_fulfillment_summary([summary_row])
 
@@ -499,6 +503,9 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     Build the full order-detail payload for a sale uid.
     Used by GET /orders/:uid and account-screen order_list_hydration.
     """
+    from transaction_shipping import ensure_fulfillment_list_rollups
+
+    ensure_fulfillment_list_rollups(db)
     sale = _load_sale_header(db, order_uid)
     if not sale:
         return None

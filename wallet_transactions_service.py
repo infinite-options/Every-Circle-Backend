@@ -6,6 +6,7 @@ Statuses: posted (spendable) | held (return-window lock until wt_available_at).
 Types: partial_delivery_credit | return_clawback.
 """
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -898,6 +899,171 @@ def compute_seller_proceeds_reversal_for_line(
     return _round_money(reversal)
 
 
+def _trr_clawback_qty_split(db, trr_uid, ti_uid=None):
+    """Return (return_shipped_qty, cancel_unshipped_qty) from a TRR row."""
+    if not trr_uid:
+        return 0, 0
+    q = db.execute(
+        """
+        SELECT trr_items_json, trr_cancel_unshipped, trr_ti_uid, trr_return_quantity
+        FROM every_circle.transaction_return_requests
+        WHERE trr_uid = %s
+        LIMIT 1
+        """,
+        (trr_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0, 0
+    trr = rows[0]
+    try:
+        items = json.loads(trr.get("trr_items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        items = []
+    if not isinstance(items, list):
+        items = []
+    target_ti = ti_uid or trr.get("trr_ti_uid")
+    for entry in items:
+        if target_ti and entry.get("transaction_item_uid") != target_ti:
+            continue
+        shipped = 0
+        cancel = 0
+        if entry.get("return_shipped_qty") is not None:
+            try:
+                shipped = int(entry.get("return_shipped_qty") or 0)
+            except (TypeError, ValueError):
+                shipped = 0
+        if entry.get("cancel_unshipped_qty") is not None:
+            try:
+                cancel = int(entry.get("cancel_unshipped_qty") or 0)
+            except (TypeError, ValueError):
+                cancel = 0
+        if shipped or cancel:
+            return shipped, cancel
+        try:
+            total = int(entry.get("return_quantity") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total > 0:
+            if int(trr.get("trr_cancel_unshipped") or 0) == 1:
+                return 0, total
+            return total, 0
+    try:
+        total = int(trr.get("trr_return_quantity") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0 and int(trr.get("trr_cancel_unshipped") or 0) == 1:
+        return 0, total
+    return total, 0
+
+
+def _return_ti_clawback_split(db, return_ti_uid):
+    """Split qty for a confirmed return ledger line."""
+    if not return_ti_uid:
+        return 0, 0
+    q = db.execute(
+        """
+        SELECT ti_return_shipped_qty, ti_cancel_unshipped_qty, ti_bs_qty
+        FROM every_circle.transactions_items
+        WHERE ti_uid = %s
+        LIMIT 1
+        """,
+        (return_ti_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0, 0
+    row = rows[0]
+    if row.get("ti_return_shipped_qty") is not None or row.get("ti_cancel_unshipped_qty") is not None:
+        return int(row.get("ti_return_shipped_qty") or 0), int(
+            row.get("ti_cancel_unshipped_qty") or 0
+        )
+    qty = abs(int(row.get("ti_bs_qty") or 0))
+    return qty, 0
+
+
+def _seller_proceeds_return_window_open_at(db, ti_uid, event_dt):
+    """
+    Sum partial_delivery credits on a line whose return window had not closed
+    at event_dt (wt_available_at still in the future).
+    """
+    if not ti_uid or not event_dt:
+        return 0.0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_amount), 0) AS pending_pool
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type = %s
+          AND wt_available_at IS NOT NULL
+          AND wt_available_at > %s
+        """,
+        (ti_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, event_dt),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return max(_to_float(rows[0].get("pending_pool")), 0.0)
+
+
+def return_clawback_ledger_availability(db, event):
+    """
+    Map return_clawback wt row to ledger availability (pending vs useable).
+
+    Posted clawbacks only count as useable when reversing proceeds that were
+    already in the spendable pool. Clawbacks while the return window is still
+    open display as pending even if wt_status was incorrectly set to posted.
+    """
+    wt_status = (event.get("wt_status") or "").strip()
+    idem = (event.get("wt_idempotency_key") or "").strip()
+    claw_amt = _round_money(_to_float(event.get("wt_amount")))
+
+    if idem.endswith(":held"):
+        return "pending", 0.0
+    if idem.endswith(":posted"):
+        return "useable", claw_amt
+
+    if wt_status != WT_STATUS_POSTED:
+        return "pending", 0.0
+
+    ti_uid = event.get("wt_ti_id")
+    event_dt = event.get("wt_created_at")
+    amount_abs = abs(_to_float(event.get("wt_amount")))
+    if ti_uid and event_dt and amount_abs > 0.0001:
+        pending_pool = _seller_proceeds_return_window_open_at(db, ti_uid, event_dt)
+        if pending_pool >= amount_abs - 0.0001:
+            return "pending", 0.0
+
+    return "useable", claw_amt
+
+
+def return_clawback_ledger_description(db, event, *, delta_qty=None):
+    """Human-readable description for a return_clawback ledger row."""
+    idem = (event.get("wt_idempotency_key") or "").strip()
+    ti_uid = event.get("wt_ti_id")
+
+    if idem.startswith("return_clawback_hold:"):
+        trr_uid = idem.split(":", 1)[-1] or (event.get("wt_note") or "").strip()
+        shipped, cancel = _trr_clawback_qty_split(db, trr_uid, ti_uid)
+        if shipped or cancel:
+            return seller_proceeds_reversal_description(shipped, cancel)
+
+    note = (event.get("wt_note") or "").strip()
+    if note.startswith("return_clawback for "):
+        return_ti_uid = note.split("return_clawback for ", 1)[-1].strip()
+        shipped, cancel = _return_ti_clawback_split(db, return_ti_uid)
+        if shipped or cancel:
+            return seller_proceeds_reversal_description(shipped, cancel)
+
+    qty = delta_qty
+    if qty is None:
+        try:
+            qty = int(event.get("wt_qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+    return seller_proceeds_reversal_description(qty, 0)
+
+
 def seller_proceeds_reversal_description(
     return_shipped_qty=0, cancel_unshipped_qty=0, *, amount=None
 ):
@@ -1340,12 +1506,14 @@ def _finalize_pending_clawback_holds(
         }
 
     profile_id = holds[0].get("wt_profile_id")
-    transaction_id = holds[0].get("wt_transaction_id")
-    order_posted = order_has_posted_useable_proceeds(db, transaction_id)
+    line_net = _line_seller_proceeds_net(db, original_ti_uid)
+    posted_budget = max(_to_float(line_net.get("posted_amount")), 0.0)
     wallet = get_wallet_row(db, profile_id) or {}
     useable = _to_float(wallet.get("wallet_useable_balance"))
     now = utc_now_str()
     wt_uids = []
+    debit_posted = 0.0
+    debit_held = 0.0
     for row in holds:
         wt_uid = row.get("wt_uid")
         status = row.get("wt_status")
@@ -1353,12 +1521,17 @@ def _finalize_pending_clawback_holds(
             wt_uids.append(wt_uid)
             continue
         amount_abs = abs(_to_float(row.get("wt_amount")))
-        if order_posted:
-            new_status = WT_STATUS_POSTED if amount_abs <= useable else WT_STATUS_HELD
-            if new_status == WT_STATUS_POSTED:
-                useable = _round_money(useable - amount_abs)
+        if posted_budget <= 0.0001:
+            new_status = WT_STATUS_HELD
+            debit_held = _round_money(debit_held + amount_abs)
+        elif amount_abs <= posted_budget and amount_abs <= useable + 0.0001:
+            new_status = WT_STATUS_POSTED
+            posted_budget = _round_money(posted_budget - amount_abs)
+            useable = _round_money(useable - amount_abs)
+            debit_posted = _round_money(debit_posted + amount_abs)
         else:
             new_status = WT_STATUS_HELD
+            debit_held = _round_money(debit_held + amount_abs)
         note = row.get("wt_note") or ""
         if return_ti_uid and note and not note.startswith("return_clawback for"):
             note = f"return_clawback for {return_ti_uid}"
@@ -1379,10 +1552,36 @@ def _finalize_pending_clawback_holds(
             }
         wt_uids.append(wt_uid)
 
-    if order_posted:
-        wallet_result = debit_seller_proceeds_from_wallet(db, profile_id, total)
-    else:
-        wallet_result = debit_seller_proceeds_pending_only(db, profile_id, total)
+    wallet_result = {"code": 200}
+    if debit_posted > 0.0001:
+        wallet_result = debit_seller_proceeds_from_wallet(db, profile_id, debit_posted)
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to debit seller proceeds on return finalize"
+                ),
+                "clawed": total,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+                "wt_uids": wt_uids,
+                "wallet": wallet_result,
+            }
+    if debit_held > 0.0001:
+        held_result = debit_seller_proceeds_pending_only(db, profile_id, debit_held)
+        if held_result.get("code") != 200:
+            return {
+                "code": held_result.get("code", 500),
+                "message": held_result.get(
+                    "message", "Failed to debit seller pending on return finalize"
+                ),
+                "clawed": total,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+                "wt_uids": wt_uids,
+                "wallet": held_result,
+            }
+        wallet_result = held_result
     if wallet_result.get("code") != 200:
         return {
             "code": wallet_result.get("code", 500),
@@ -1399,8 +1598,8 @@ def _finalize_pending_clawback_holds(
     return {
         "code": 200,
         "clawed": total,
-        "held_part": total,
-        "posted_part": 0.0,
+        "held_part": debit_held,
+        "posted_part": debit_posted,
         "original_ti_uid": original_ti_uid,
         "return_ti_uid": return_ti_uid,
         "wt_profile_id": profile_id,
@@ -1568,9 +1767,8 @@ def clawback_seller_proceeds_on_return(
 
     posted_net = max(_to_float(line_net.get("posted_amount")), 0.0)
     held_net = max(_to_float(line_net.get("held_amount")), 0.0)
-    order_posted = order_has_posted_useable_proceeds(db, transaction_id)
 
-    if posted_net <= 0.0001 or not order_posted:
+    if posted_net <= 0.0001:
         held_part = clawback_amount
         posted_part = 0.0
     else:

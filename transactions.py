@@ -15,6 +15,7 @@ from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interacti
 from user_path_connection import ConnectionsPath
 from wallet_ids import EC_WALLET_ID
 from wallet_service import (
+    bounty_was_released_to_useable_at,
     credit_bounty_to_wallet,
     credit_useable_from_refund,
     debit_bounty_from_wallet,
@@ -1559,6 +1560,7 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
                COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
                COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
                COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+               ti_fulfillment_method,
                ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
                ti_fulfillment_note
         FROM every_circle.transactions_items
@@ -1577,6 +1579,7 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
                COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
                COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
                COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+               ti_fulfillment_method,
                ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
                ti_fulfillment_note
         FROM every_circle.transactions_items
@@ -1589,18 +1592,26 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
 
 
 def _all_lines_fully_received(db, transaction_uid):
-    incomplete_q = db.execute(
+    """True when every receivable unit (purchased − pre-ship cancel) is verified."""
+    from order_quantity_context import verification_complete
+
+    line_q = db.execute(
         """
-        SELECT COUNT(*) AS incomplete_count
+        SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s
           AND ti_bs_qty > 0
-          AND COALESCE(ti_received_qty, 0) < ti_bs_qty
         """,
         (transaction_uid,),
     )
-    rows = incomplete_q.get("result") or []
-    return int(rows[0].get("incomplete_count") or 0) == 0 if rows else False
+    for row in line_q.get("result") or []:
+        ti_uid = row.get("ti_uid")
+        purchased = int(row.get("ti_bs_qty") or 0)
+        verified = int(row.get("ti_received_qty") or 0)
+        cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
+        if not verification_complete(verified, purchased, cancelled):
+            return False
+    return True
 
 
 def _new_trr_uid(db):
@@ -2436,10 +2447,16 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
                 bounty_insert_count += 1
                 reversal_abs = abs(reversal)
                 if reversal_abs > 0:
+                    prefer_pending = not bounty_was_released_to_useable_at(
+                        db,
+                        line["original_ti_uid"],
+                        utc_now_str(),
+                    )
                     wallet_result = debit_bounty_from_wallet(
                         db,
                         br.get("tb_profile_id"),
                         reversal_abs,
+                        prefer_pending=prefer_pending,
                     )
                     if wallet_result.get("code") != 200:
                         print(
@@ -2629,19 +2646,34 @@ def _items_all_unshipped(db, order_uid, items_payload):
 
 
 def _remaining_to_ship_qty(
-    db, order_uid, ti_uid, order_qty, shipped_qty, exclude_trr_uid=None
+    db, order_uid, ti_uid, order_qty, shipped_qty, exclude_trr_uid=None, *, ti_row=None
 ):
     """
     Units still shippable after shipped qty and pre-ship cancels/reservations.
     Post-ship physical returns do not reduce remaining_to_ship.
-    remaining_to_ship = max(purchased - shipped - cancelled - reserved_cancel, 0)
+
+    Uses effective shipped (max ti_shipped_qty, ti_received_qty) on shipping-required
+    lines so buyer verification implies delivery even when seller never clicked ship.
+    remaining_to_ship = max(purchased - effective_shipped - cancelled - reserved_cancel, 0)
     """
+    if ti_row is None and ti_uid and order_uid:
+        ti_row = _resolve_transaction_item(db, order_uid, ti_uid) or {}
+    else:
+        ti_row = dict(ti_row or {})
+    ti_row.setdefault("ti_bs_qty", order_qty)
+    ti_row.setdefault("ti_shipped_qty", shipped_qty)
+
+    from transaction_shipping import effective_shipped_qty_for_line
+
+    effective_shipped = effective_shipped_qty_for_line(ti_row)
     cancelled = _cancelled_qty(db, order_uid, ti_uid)
     _reserved_return, reserved_cancel = _reserved_return_split(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
+    max_cancel = max(int(order_qty or 0) - effective_shipped - cancelled, 0)
+    reserved_cancel = min(int(reserved_cancel or 0), max_cancel)
     return max(
-        int(order_qty or 0) - int(shipped_qty or 0) - cancelled - reserved_cancel,
+        int(order_qty or 0) - effective_shipped - cancelled - reserved_cancel,
         0,
     )
 
@@ -3938,6 +3970,9 @@ class Transactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    from order_quantity_context import apply_list_verification_status
+
+                    rows = apply_list_verification_status(db, rows)
                     rows = _enrich_list_transaction_rows(db, rows)
                     response["message"] = "Purchase Transactions retrieved successfully"
                     response["code"] = 200
@@ -5333,9 +5368,13 @@ class Transactions(Resource):
                     ti_uid = ti_row.get("ti_uid")
                     order_qty = int(ti_row.get("ti_bs_qty") or 0)
                     current_received = int(ti_row.get("ti_received_qty") or 0)
-                    remaining = order_qty - current_received
+                    cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
+                    from order_quantity_context import receivable_units_from_totals
 
-                    if order_qty <= 0:
+                    receivable = receivable_units_from_totals(order_qty, cancelled)
+                    remaining = receivable - current_received
+
+                    if order_qty <= 0 or receivable <= 0:
                         response["message"] = (
                             f"Item {item_uid} is not eligible for delivery verification"
                         )
@@ -5343,22 +5382,52 @@ class Transactions(Resource):
                         return response, 400
                     if received_qty > remaining:
                         response["message"] = (
-                            f"received_quantity exceeds remaining qty for {item_uid} "
-                            f"(remaining: {remaining})"
+                            f"received_quantity exceeds remaining receivable qty for "
+                            f"{item_uid} (remaining: {remaining})"
                         )
                         response["code"] = 400
                         return response, 400
 
                     new_received = current_received + received_qty
 
+                    from transaction_shipping import (
+                        FULFILLMENT_STATUS_IN_TRANSIT,
+                        line_is_shippable_row,
+                    )
+
+                    ship_sets = []
+                    ship_params = []
+                    if line_is_shippable_row(ti_row):
+                        current_shipped = int(ti_row.get("ti_shipped_qty") or 0)
+                        new_shipped = max(current_shipped, new_received)
+                        if new_shipped > current_shipped:
+                            ship_sets.extend(
+                                [
+                                    "ti_shipped_qty = %s",
+                                    "ti_shipped_at = COALESCE(ti_shipped_at, %s)",
+                                ]
+                            )
+                            ship_params.extend([new_shipped, received_at])
+                            current_status = (
+                                ti_row.get("ti_fulfillment_status") or "not_shipped"
+                            )
+                            if current_status == "not_shipped":
+                                ship_sets.append("ti_fulfillment_status = %s")
+                                ship_params.append(FULFILLMENT_STATUS_IN_TRANSIT)
+
+                    set_clause = "ti_received_qty = %s, ti_received_at = %s"
+                    set_params = [new_received, received_at]
+                    if ship_sets:
+                        set_clause = f"{set_clause}, " + ", ".join(ship_sets)
+                        set_params.extend(ship_params)
+
                     ti_update = db.execute(
-                        """
+                        f"""
                         UPDATE every_circle.transactions_items
-                        SET ti_received_qty = %s,
-                            ti_received_at = %s
+                        SET {set_clause}
                         WHERE ti_uid = %s AND ti_transaction_id = %s
                         """,
-                        (new_received, received_at, ti_uid, transaction_uid),
+                        tuple(set_params + [ti_uid, transaction_uid]),
                         "post",
                     )
                     if ti_update.get("code") != 200:
@@ -6431,6 +6500,9 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    from order_quantity_context import apply_list_verification_status
+
+                    rows = apply_list_verification_status(db, rows)
                     rows = _enrich_list_transaction_rows(db, rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200

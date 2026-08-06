@@ -12,7 +12,7 @@ from flask_restful import Resource
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
-from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified
+from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified, bounty_reversal_ledger_availability
 from order_quantity_context import (
     line_quantity_context,
     order_quantity_context,
@@ -113,8 +113,9 @@ def _normalize_bounty_entry(db, row):
     fully_verified = _bounty_line_fully_verified(row, denom=denom_qty)
     if amount < 0 or tx_type == "return":
         entry_type = "bounty_reversal"
-        availability = "useable"
-        useable_delta = amount
+        availability, useable_delta = bounty_reversal_ledger_availability(
+            db, row, amount
+        )
     else:
         entry_type = "bounty_earned"
         if row.get("ti_bounty_released_at") and fully_verified:
@@ -209,17 +210,16 @@ def _normalize_wallet_transaction_entry(db, row):
     tx_uid = row.get("wt_transaction_id")
 
     if entry_type == "sale_proceeds_clawback":
-        description = _clawback_description(buyer, returned_qty=returned_qty)
-        from wallet_transactions_service import order_has_posted_useable_proceeds
+        from wallet_transactions_service import return_clawback_ledger_availability
 
-        if wt_status == "posted" and tx_uid and order_has_posted_useable_proceeds(
-            db, tx_uid
-        ):
-            availability = "useable"
-            useable_delta = amount
-        else:
-            availability = "pending"
-            useable_delta = 0.0
+        try:
+            claw_delta_qty = int(row.get("wt_qty") or 0)
+        except (TypeError, ValueError):
+            claw_delta_qty = returned_qty
+        description = return_clawback_ledger_description(
+            db, row, delta_qty=claw_delta_qty or returned_qty
+        )
+        availability, useable_delta = return_clawback_ledger_availability(db, row)
     elif entry_type == "sale_proceeds_held":
         if wt_type == "partial_delivery_credit" and per_unit > 0 and net_verified_held > 0:
             amount = _round_money(per_unit * net_verified_held)
@@ -425,6 +425,7 @@ def _fetch_bounty_ledger_rows(db, profile_id):
         """
         SELECT
             ti.ti_uid,
+            COALESCE(ti.ti_original_ti_uid, ti.ti_uid) AS source_ti_uid,
             t.transaction_uid,
             t.transaction_datetime,
             t.transaction_type,
@@ -432,6 +433,7 @@ def _fetch_bounty_ledger_rows(db, profile_id):
             COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
             ti.ti_bs_qty,
             ti.ti_bounty_released_at,
+            MAX(orig_ti.ti_bounty_released_at) AS source_bounty_released_at,
             SUM(tb.tb_amount) AS amount,
             CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name)
                 AS purchaser_name,
@@ -443,6 +445,8 @@ def _fetch_bounty_ledger_rows(db, profile_id):
         FROM every_circle.transactions_bounty tb
         INNER JOIN every_circle.transactions_items ti ON tb.tb_ti_id = ti.ti_uid
         INNER JOIN every_circle.transactions t ON ti.ti_transaction_id = t.transaction_uid
+        LEFT JOIN every_circle.transactions_items orig_ti
+            ON orig_ti.ti_uid = COALESCE(ti.ti_original_ti_uid, ti.ti_uid)
         LEFT JOIN every_circle.business b ON t.transaction_business_id = b.business_uid
         LEFT JOIN every_circle.profile_personal pp
             ON t.transaction_business_id = pp.profile_personal_uid
@@ -451,6 +455,7 @@ def _fetch_bounty_ledger_rows(db, profile_id):
         WHERE tb.tb_profile_id = %s
         GROUP BY
             ti.ti_uid,
+            source_ti_uid,
             t.transaction_uid,
             t.transaction_datetime,
             t.transaction_type,
@@ -532,6 +537,8 @@ def _fetch_wallet_transaction_ledger_rows(db, profile_id):
             wt.wt_note,
             wt.wt_available_at,
             wt.wt_created_at,
+            wt.wt_qty,
+            wt.wt_idempotency_key,
             wt.wt_received_qty_after,
             t.transaction_datetime,
             ti.ti_bs_qty,
@@ -588,20 +595,29 @@ def _sort_key(entry):
     return (str(dt), entry.get("entry_id", ""))
 
 
+def _actual_balance_delta(entry):
+    """
+    Change to total on-hand (balance_after) for one ledger row.
+
+    Pending→useable moves (verify / return-window release) set
+    include_in_running_balance=False and only update useable_delta.
+    """
+    if entry.get("include_in_running_balance") is False:
+        return 0.0
+    if (entry.get("entry_source") or "") == "seller_proceeds_pending":
+        return 0.0
+    if entry.get("actual_balance_delta") is not None:
+        return _to_float(entry.get("actual_balance_delta"))
+    return _to_float(entry.get("amount"))
+
+
 def _attach_running_balances(entries):
     """Oldest-first running totals; attach balance_after on each entry."""
     chronological = sorted(entries, key=_sort_key)
     running_actual = 0.0
     running_useable = 0.0
     for entry in chronological:
-        amount = _to_float(entry.get("amount"))
-        source = entry.get("entry_source") or ""
-        include = entry.get("include_in_running_balance")
-        # Projected / audit entries are shown but not yet in wallet.actual_balance.
-        if source == "seller_proceeds_pending" or include is False:
-            pass
-        else:
-            running_actual = _round_money(running_actual + amount)
+        running_actual = _round_money(running_actual + _actual_balance_delta(entry))
         running_useable = _round_money(
             running_useable + _to_float(entry.get("useable_delta"))
         )
@@ -664,6 +680,7 @@ def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
         or (e.get("entry_type") or "") in (
             "sale_proceeds_transfer",
             "sale_proceeds_return_window_release",
+            "sale_proceeds_verify_transfer",
         )
     ]
     entries.sort(key=_sort_key, reverse=True)

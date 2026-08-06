@@ -2,9 +2,11 @@
 
 from transactions import (
     _load_open_return_requests,
+    _remaining_to_ship_qty,
     _return_ledger_line_split,
     ensure_return_split_columns,
 )
+from transaction_shipping import effective_shipped_qty_for_line
 
 # Request-scoped caches (cleared at start of wallet_ledger build).
 _ORDER_QTY_CACHE = {}
@@ -102,8 +104,22 @@ def _reserved_return_split_from_reqs(open_reqs, ti_uid, *, exclude_trr_uid=None)
 
 
 def _returnable_verified_qty_cached(
-    db, order_uid, ti_uid, verified_qty, *, order_splits=None, open_reqs=None
+    db,
+    order_uid,
+    ti_uid,
+    verified_qty,
+    *,
+    row=None,
+    order_splits=None,
+    open_reqs=None,
 ):
+    from transactions import _as_returnable_flag
+
+    if row is not None and not _as_returnable_flag(
+        row.get("ti_bs_is_returnable"), default=True
+    ):
+        return 0
+
     splits = order_splits if order_splits is not None else _confirmed_return_splits_for_order(
         db, order_uid
     )
@@ -112,6 +128,27 @@ def _returnable_verified_qty_cached(
         open_reqs = _open_return_requests_for_order(db, order_uid)
     reserved_return, _cancel = _reserved_return_split_from_reqs(open_reqs, ti_uid)
     return max(int(verified_qty or 0) - returned - reserved_return, 0)
+
+
+def _net_verified_held_units(row, verified_qty, returned_qty, reserved_return_qty):
+    """
+    Verified units whose seller proceeds stay pending for a return window.
+
+    Non-returnable lines or lines without a positive return window → 0.
+    """
+    from transactions import _as_returnable_flag
+    from wallet_transactions_service import _parse_positive_window_days
+
+    if not _as_returnable_flag(row.get("ti_bs_is_returnable"), default=True):
+        return 0
+    if _parse_positive_window_days(row.get("ti_bs_return_window_days")) is None:
+        return 0
+    return max(
+        int(verified_qty or 0)
+        - int(returned_qty or 0)
+        - int(reserved_return_qty or 0),
+        0,
+    )
 
 
 def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None, open_reqs=None):
@@ -129,7 +166,11 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         q = db.execute(
             """
             SELECT ti_uid, ti_bs_qty, COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
-                   COALESCE(ti_received_qty, 0) AS ti_received_qty
+                   COALESCE(ti_received_qty, 0) AS ti_received_qty,
+                   ti_bs_is_returnable, ti_bs_return_window_days,
+                   COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+                   COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+                   ti_fulfillment_method
             FROM every_circle.transactions_items
             WHERE ti_uid = %s AND ti_transaction_id = %s
             """,
@@ -139,14 +180,24 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         row = rows[0] if rows else {}
 
     purchased = int(row.get("ti_bs_qty") or 0)
-    shipped = int(row.get("ti_shipped_qty") or 0)
+    shipped = effective_shipped_qty_for_line(row)
     verified = int(row.get("ti_received_qty") or 0)
     if order_splits is None:
         order_splits = _confirmed_return_splits_for_order(db, order_uid)
+    if open_reqs is None:
+        open_reqs = _open_return_requests_for_order(db, order_uid)
     returned, cancelled = order_splits.get(ti_uid, (0, 0))
+    reserved_return, _cancel = _reserved_return_split_from_reqs(open_reqs, ti_uid)
     active_units = max(purchased - cancelled - returned, 0)
     shippable_units = max(purchased - cancelled, 0)
-    remaining_to_ship = max(purchased - shipped - cancelled, 0)
+    remaining_to_ship = _remaining_to_ship_qty(
+        db,
+        order_uid,
+        ti_uid,
+        purchased,
+        int(row.get("ti_shipped_qty") or 0),
+        ti_row=row,
+    )
     net_verified_not_returned = max(verified - returned, 0)
     unverified_shipped = max((shipped - returned) - net_verified_not_returned, 0)
     pending_verification_units = remaining_to_ship + max(0, shipped - verified)
@@ -155,8 +206,12 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         order_uid,
         ti_uid,
         verified,
+        row=row,
         order_splits=order_splits,
         open_reqs=open_reqs,
+    )
+    net_verified_held = _net_verified_held_units(
+        row, verified, returned, reserved_return
     )
     max_return_shipped_qty = max(0, min(shipped, verified) - returned)
     max_cancel_unshipped_qty = max(0, (purchased - shipped) - cancelled)
@@ -173,7 +228,7 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         "unverified_shipped_qty": unverified_shipped,
         "verified_returnable_qty": verified_returnable,
         "net_verified_not_returned": net_verified_not_returned,
-        "net_verified_held": net_verified_not_returned,
+        "net_verified_held": net_verified_held,
         "pending_verification_units": pending_verification_units,
         "max_return_shipped_qty": max_return_shipped_qty,
         "max_cancel_unshipped_qty": max_cancel_unshipped_qty,
@@ -191,7 +246,11 @@ def order_quantity_context(db, order_uid):
     q = db.execute(
         """
         SELECT ti_uid, ti_bs_qty, COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
-               COALESCE(ti_received_qty, 0) AS ti_received_qty
+               COALESCE(ti_received_qty, 0) AS ti_received_qty,
+               ti_bs_is_returnable, ti_bs_return_window_days,
+               COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+               COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+               ti_fulfillment_method
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s
         ORDER BY ti_uid ASC
@@ -316,7 +375,7 @@ def compute_proceeds_buckets(ctx):
     verified = int(ctx.get("verified_qty") or 0)
     shipped = int(ctx.get("shipped_qty") or 0)
     unverified_shipped = int(ctx.get("unverified_shipped_qty") or 0)
-    pending_return_window = max(0, verified - returned)
+    pending_return_window = max(0, int(ctx.get("net_verified_held") or 0))
     pending_verification = unverified_shipped
     pending_shipment = max(
         0, purchased - cancelled - unverified_shipped - verified
@@ -334,6 +393,58 @@ def compute_proceeds_buckets(ctx):
         "pending_return_window": pending_return_window,
         "active_qty": active_qty,
     }
+
+
+def receivable_units_from_totals(purchased_qty, cancelled_qty):
+    """Units the buyer may still need to verify (purchased minus pre-ship cancels)."""
+    return max(int(purchased_qty or 0) - int(cancelled_qty or 0), 0)
+
+
+def verification_complete(received_qty, purchased_qty, cancelled_qty):
+    """True when every receivable unit has been buyer-verified."""
+    receivable = receivable_units_from_totals(purchased_qty, cancelled_qty)
+    if receivable <= 0:
+        return True
+    return int(received_qty or 0) >= receivable
+
+
+def apply_list_verification_status(db, rows):
+    """
+    Set all_items_received (and clear stale escrow) on buyer/seller list rows.
+
+    Verification completes when verified qty reaches receivable units
+    (purchased − pre-ship cancels), not full ti_bs_qty.
+    """
+    if not rows:
+        return rows
+
+    from transactions import _is_return_list_row
+
+    for row in rows:
+        if not isinstance(row, dict) or _is_return_list_row(row):
+            continue
+        order_uid = row.get("transaction_uid")
+        if not order_uid:
+            continue
+
+        qty = order_quantity_context(db, order_uid)
+        purchased = int(qty.get("purchased_qty") or 0)
+        cancelled = int(qty.get("cancelled_qty") or 0)
+        verified = int(qty.get("verified_qty") or 0)
+        all_received = verification_complete(verified, purchased, cancelled)
+
+        row["all_items_received"] = 1 if all_received else 0
+
+        if all_received and int(row.get("transaction_in_escrow") or 0) == 1:
+            upd = db.update(
+                "every_circle.transactions",
+                {"transaction_uid": order_uid},
+                {"transaction_in_escrow": 0},
+            )
+            if upd.get("code") == 200:
+                row["transaction_in_escrow"] = 0
+
+    return rows
 
 
 def quantity_context_fields(ctx):

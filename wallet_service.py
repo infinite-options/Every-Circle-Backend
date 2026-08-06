@@ -6,7 +6,7 @@ the sale line is fully verified and either (a) there is no return-window hold, o
 (b) the seller hold cron releases the line after wt_available_at.
 """
 
-from datetime_utils import utc_now_str
+from datetime_utils import parse_stored_datetime, utc_now_str
 from wallet_ids import resolve_wallet_profile_id
 
 _BOUNTY_RELEASE_COLUMN_READY = False
@@ -266,6 +266,85 @@ def line_is_fully_verified(received_qty, order_qty):
     if order_qty <= 0:
         return False
     return int(received_qty or 0) >= order_qty
+
+
+def bounty_was_released_to_useable_at(db, original_ti_uid, event_dt=None):
+    """
+    True when sale-line bounty was in the useable pool at event_dt.
+
+    Pending bounty (return window / not yet released) has NULL ti_bounty_released_at
+    or a release timestamp after the event.
+    """
+    original_ti_uid = str(original_ti_uid or "").strip()
+    if not original_ti_uid:
+        return False
+
+    ti_q = db.execute(
+        """
+        SELECT ti_bounty_released_at
+        FROM every_circle.transactions_items
+        WHERE ti_uid = %s
+        LIMIT 1
+        """,
+        (original_ti_uid,),
+    )
+    rows = ti_q.get("result") or []
+    if not rows:
+        return False
+
+    released_at = rows[0].get("ti_bounty_released_at")
+    if not released_at:
+        return False
+    if not event_dt:
+        return True
+
+    released = parse_stored_datetime(released_at)
+    event = parse_stored_datetime(event_dt)
+    if released is None or event is None:
+        return True
+    return released <= event
+
+
+def bounty_reversal_ledger_availability(db, row, amount):
+    """
+    Map bounty reversal to ledger availability (pending vs useable).
+
+    Reversals claw from the same pool the original bounty_earned occupied at
+    reversal time (ti_bounty_released_at on the source sale line).
+    """
+    amount = _round_money(amount)
+    released_at = row.get("source_bounty_released_at")
+    reversal_dt = row.get("transaction_datetime")
+    if released_at is not None or row.get("source_ti_uid"):
+        if not released_at:
+            return "pending", 0.0
+        if reversal_dt:
+            released = parse_stored_datetime(released_at)
+            event = parse_stored_datetime(reversal_dt)
+            if released is not None and event is not None and released > event:
+                return "pending", 0.0
+        return "useable", amount
+
+    original_ti_uid = row.get("source_ti_uid") or row.get("ti_uid")
+    if (row.get("transaction_type") or "").lower() == "return":
+        q = db.execute(
+            """
+            SELECT ti_original_ti_uid
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s
+            LIMIT 1
+            """,
+            (row.get("ti_uid"),),
+        )
+        ti_rows = q.get("result") or []
+        if ti_rows and ti_rows[0].get("ti_original_ti_uid"):
+            original_ti_uid = ti_rows[0].get("ti_original_ti_uid")
+
+    if bounty_was_released_to_useable_at(
+        db, original_ti_uid, reversal_dt
+    ):
+        return "useable", amount
+    return "pending", 0.0
 
 
 def release_bounty_for_line(db, ti_uid):
@@ -859,10 +938,12 @@ def release_seller_hold_to_useable(db, profile_id, amount):
     }
 
 
-def debit_bounty_from_wallet(db, bounty_profile_id, amount):
+def debit_bounty_from_wallet(db, bounty_profile_id, amount, *, prefer_pending=False):
     """
     Remove bounty on return (negative transactions_bounty row).
-    Removes from useable first, then pending, then actual/lifetime.
+
+    When prefer_pending=True (original bounty still in return window / not released),
+    debits wallet_pending first. Otherwise debits useable first, then pending.
     """
     amount = _round_money(abs(amount))
     if not bounty_profile_id or amount <= 0:
@@ -882,9 +963,14 @@ def debit_bounty_from_wallet(db, bounty_profile_id, amount):
     actual = _to_float(wallet.get("wallet_actual_balance"))
     lifetime = _to_float(wallet.get("wallet_lifetime_earning"))
 
-    from_useable = min(amount, useable)
-    remaining = amount - from_useable
-    from_pending = min(remaining, pending)
+    if prefer_pending:
+        from_pending = min(amount, pending)
+        remaining = amount - from_pending
+        from_useable = min(remaining, useable)
+    else:
+        from_useable = min(amount, useable)
+        remaining = amount - from_useable
+        from_pending = min(remaining, pending)
 
     updates = {
         "wallet_useable_balance": _round_money(useable - from_useable),
@@ -908,6 +994,8 @@ def debit_bounty_from_wallet(db, bounty_profile_id, amount):
         "code": 200,
         "wallet_profile_id": bounty_profile_id,
         "debited": amount,
+        "from_useable": from_useable,
+        "from_pending": from_pending,
     }
 
 

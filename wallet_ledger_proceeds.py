@@ -18,6 +18,8 @@ from wallet_transactions_service import (
     WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
     WT_TYPE_PARTIAL_DELIVERY_CREDIT,
     WT_TYPE_RETURN_CLAWBACK,
+    return_clawback_ledger_availability,
+    return_clawback_ledger_description,
 )
 
 
@@ -60,9 +62,11 @@ def _bucket_snapshot_from_totals(
     verified,
     cancelled,
     returned,
+    pending_return_window=None,
 ):
     unverified_shipped = max((shipped - returned) - max(verified - returned, 0), 0)
-    pending_return_window = max(0, verified - returned)
+    if pending_return_window is None:
+        pending_return_window = max(0, verified - returned)
     pending_verification = unverified_shipped
     pending_shipment = max(0, purchased - cancelled - unverified_shipped - verified)
     active_qty = max(0, purchased - cancelled - returned)
@@ -218,7 +222,7 @@ def build_order_proceeds_ledger_entries(
         description=_original_description(buyer, current_buckets),
         parent_entry_id=None,
         event_type="order_placed",
-        include_in_running_balance=False,
+        include_in_running_balance=True,
         cancelled_qty_delta=None,
         returned_qty_delta=None,
         verified_qty_delta=None,
@@ -279,12 +283,9 @@ def build_order_proceeds_ledger_entries(
             claw_amt = _round_money(_to_float(event.get("wt_amount")))
             if claw_amt == 0:
                 claw_amt = _round_money(-per_unit * delta_qty)
-            if wt_status == WT_STATUS_POSTED:
-                availability = "useable"
-                useable_delta = claw_amt
-            else:
-                availability = "pending"
-                useable_delta = 0.0
+            availability, useable_delta = return_clawback_ledger_availability(
+                db, event
+            )
             snap = _bucket_snapshot_from_totals(
                 purchased=purchased,
                 shipped=shipped,
@@ -299,7 +300,9 @@ def build_order_proceeds_ledger_entries(
                 entry_type="sale_proceeds_return_clawback",
                 amount=claw_amt,
                 entry_datetime=event_dt,
-                description=f"Sale proceeds — {delta_qty} unit(s) returned",
+                description=return_clawback_ledger_description(
+                    db, event, delta_qty=delta_qty
+                ),
                 parent_entry_id=parent_id,
                 event_type="return",
                 include_in_running_balance=True,
@@ -318,45 +321,81 @@ def build_order_proceeds_ledger_entries(
             entries.append(claw_entry)
 
         elif wt_type == WT_TYPE_PARTIAL_DELIVERY_CREDIT and delta_qty > 0:
-            # Verification is a bucket move only — original entry description reflects
-            # current pending_shipment / pending_verification / pending_return_window.
+            credit_amt = _round_money(_to_float(event.get("wt_amount")))
             available_at = event.get("wt_available_at")
-            if wt_status == WT_STATUS_POSTED and available_at:
-                release_amt = _round_money(_to_float(event.get("wt_amount")))
-                if release_amt > 0.0001:
-                    snap = _bucket_snapshot_from_totals(
-                        purchased=purchased,
-                        shipped=shipped,
-                        verified=verified,
-                        cancelled=cancelled_running,
-                        returned=returned_running,
-                    )
-                    release_entry = _base_entry(
-                        order_uid,
-                        buyer,
-                        entry_id=f"wt:{wt_uid}:release" if wt_uid else f"wt:sale:{order_uid}:release",
-                        entry_type="sale_proceeds_return_window_release",
-                        amount=0.0,
-                        entry_datetime=event_dt,
-                        description=(
-                            f"Sale proceeds — return window expired "
-                            f"(${release_amt:.2f} now useable)"
-                        ),
-                        parent_entry_id=parent_id,
-                        event_type="release",
-                        include_in_running_balance=False,
-                        per_unit_proceeds=per_unit,
-                        cancelled_qty_delta=None,
-                        returned_qty_delta=None,
-                        verified_qty_delta=None,
-                        wt_uid=wt_uid,
-                        wt_type=wt_type,
-                        wt_status=wt_status,
-                        **snap,
-                    )
-                    release_entry["availability"] = "useable"
-                    release_entry["useable_delta"] = release_amt
-                    entries.append(release_entry)
+            snap = _bucket_snapshot_from_totals(
+                purchased=purchased,
+                shipped=shipped,
+                verified=verified,
+                cancelled=cancelled_running,
+                returned=returned_running,
+                pending_return_window=int(
+                    compute_proceeds_buckets(proceeds).get("pending_return_window") or 0
+                ),
+            )
+
+            if (
+                wt_status == WT_STATUS_POSTED
+                and not available_at
+                and credit_amt > 0.0001
+            ):
+                verify_entry = _base_entry(
+                    order_uid,
+                    buyer,
+                    entry_id=(
+                        f"wt:{wt_uid}:verify"
+                        if wt_uid
+                        else f"wt:sale:{order_uid}:verify:{delta_qty}"
+                    ),
+                    entry_type="sale_proceeds_verify_transfer",
+                    amount=credit_amt,
+                    entry_datetime=event_dt,
+                    description=(
+                        f"Sale proceeds — {delta_qty} unit(s) verified "
+                        f"(${credit_amt:.2f} now useable)"
+                    ),
+                    parent_entry_id=parent_id,
+                    event_type="verify",
+                    include_in_running_balance=False,
+                    per_unit_proceeds=per_unit,
+                    cancelled_qty_delta=None,
+                    returned_qty_delta=None,
+                    verified_qty_delta=delta_qty,
+                    wt_uid=wt_uid,
+                    wt_type=wt_type,
+                    wt_status=wt_status,
+                    **snap,
+                )
+                verify_entry["availability"] = "useable"
+                verify_entry["useable_delta"] = credit_amt
+                entries.append(verify_entry)
+            elif wt_status == WT_STATUS_POSTED and available_at and credit_amt > 0.0001:
+                release_entry = _base_entry(
+                    order_uid,
+                    buyer,
+                    entry_id=f"wt:{wt_uid}:release" if wt_uid else f"wt:sale:{order_uid}:release",
+                    entry_type="sale_proceeds_return_window_release",
+                    amount=0.0,
+                    entry_datetime=event_dt,
+                    description=(
+                        f"Sale proceeds — return window expired "
+                        f"(${credit_amt:.2f} now useable)"
+                    ),
+                    parent_entry_id=parent_id,
+                    event_type="release",
+                    include_in_running_balance=False,
+                    per_unit_proceeds=per_unit,
+                    cancelled_qty_delta=None,
+                    returned_qty_delta=None,
+                    verified_qty_delta=None,
+                    wt_uid=wt_uid,
+                    wt_type=wt_type,
+                    wt_status=wt_status,
+                    **snap,
+                )
+                release_entry["availability"] = "useable"
+                release_entry["useable_delta"] = credit_amt
+                entries.append(release_entry)
 
     return entries
 
