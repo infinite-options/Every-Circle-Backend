@@ -308,7 +308,7 @@ def compute_seller_proceeds_per_unit(db, order_uid, *, qty=None, eligible_total=
     """
     Seller proceeds per purchased unit at order placement.
 
-    (merchandise + shipping − bounty) / purchased_qty — excludes tax and platform fees.
+    (merchandise + sales_tax + shipping − bounty) / purchased_qty — excludes platform fees.
     """
     from wallet_transactions_service import compute_seller_eligible_total
 
@@ -325,6 +325,181 @@ def compute_seller_proceeds_per_unit(db, order_uid, *, qty=None, eligible_total=
     return round(total / purchased, 4)
 
 
+def _load_sale_lines_for_proceeds(db, order_uid):
+    q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_qty, ti_bs_cost, ti_bs_is_taxable, ti_bs_tax_rate,
+               ti_shipping_amount
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        ORDER BY ti_uid ASC
+        """,
+        (order_uid,),
+    )
+    return q.get("result") or []
+
+
+def compute_seller_proceeds_breakdown(db, order_uid, *, qty=None):
+    """
+    Full seller proceeds breakdown from checkout line snapshots.
+
+    amount = merchandise + sales_tax + shipping + bounty_amount (bounty negative).
+    Per-unit fields use purchased_qty at order placement.
+    """
+    from transactions import _tax_amount_for_line
+    from wallet_service import _round_money, _to_float
+    from wallet_transactions_service import _order_bounty_paid, _parse_unit_cost
+
+    if qty is None:
+        qty = order_quantity_context(db, order_uid)
+
+    purchased = int(qty.get("purchased_qty") or 0)
+    merchandise = 0.0
+    sales_tax = 0.0
+    shipping = 0.0
+
+    for row in _load_sale_lines_for_proceeds(db, order_uid):
+        line_qty = int(row.get("ti_bs_qty") or 0)
+        if line_qty <= 0:
+            continue
+        unit_cost = _parse_unit_cost(row.get("ti_bs_cost"))
+        tax_per_unit = _tax_amount_for_line(
+            unit_cost,
+            row.get("ti_bs_is_taxable"),
+            row.get("ti_bs_tax_rate"),
+        )
+        ship_per_unit = _to_float(row.get("ti_shipping_amount"))
+        merchandise += unit_cost * line_qty
+        sales_tax += tax_per_unit * line_qty
+        shipping += ship_per_unit * line_qty
+
+    merchandise = _round_money(merchandise)
+    sales_tax = _round_money(sales_tax)
+    shipping = _round_money(shipping)
+    bounty_paid = _order_bounty_paid(db, order_uid)
+    bounty_amount = _round_money(-bounty_paid)
+    amount = _round_money(merchandise + sales_tax + shipping + bounty_amount)
+
+    if purchased <= 0:
+        per_unit = 0.0
+        per_unit_merchandise = 0.0
+        per_unit_sales_tax = 0.0
+        per_unit_shipping = 0.0
+        per_unit_bounty = 0.0
+    else:
+        per_unit = round(amount / purchased, 4)
+        per_unit_merchandise = round(merchandise / purchased, 4)
+        per_unit_sales_tax = round(sales_tax / purchased, 4)
+        per_unit_shipping = round(shipping / purchased, 4)
+        per_unit_bounty = round(bounty_amount / purchased, 4)
+
+    return {
+        "merchandise_amount": merchandise,
+        "sales_tax_amount": sales_tax,
+        "shipping_amount": shipping,
+        "bounty_amount": bounty_amount,
+        "amount": amount,
+        "per_unit_proceeds": per_unit,
+        "per_unit_merchandise": per_unit_merchandise,
+        "per_unit_sales_tax": per_unit_sales_tax,
+        "per_unit_shipping": per_unit_shipping,
+        "per_unit_bounty": per_unit_bounty,
+        "purchased_qty": purchased,
+    }
+
+
+def scale_proceeds_breakdown(breakdown, effective_qty, *, purchased_qty=None):
+    """
+    Scale a full-order proceeds breakdown to a partial qty (returns, cancels, etc.).
+
+    Uses ratio effective_qty / purchased_qty; signed amount follows breakdown sign.
+    """
+    from wallet_service import _round_money, _to_float
+
+    if not breakdown:
+        return {}
+    purchased = int(
+        purchased_qty if purchased_qty is not None else breakdown.get("purchased_qty") or 0
+    )
+    try:
+        effective = int(effective_qty or 0)
+    except (TypeError, ValueError):
+        effective = 0
+    if purchased <= 0 or effective <= 0:
+        return {
+            key: 0.0
+            for key in (
+                "merchandise_amount",
+                "sales_tax_amount",
+                "shipping_amount",
+                "bounty_amount",
+                "amount",
+                "per_unit_proceeds",
+                "per_unit_merchandise",
+                "per_unit_sales_tax",
+                "per_unit_shipping",
+                "per_unit_bounty",
+            )
+        }
+
+    ratio = effective / float(purchased)
+    scaled = {}
+    for key in (
+        "merchandise_amount",
+        "sales_tax_amount",
+        "shipping_amount",
+        "bounty_amount",
+        "amount",
+    ):
+        scaled[key] = _round_money(_to_float(breakdown.get(key)) * ratio)
+
+    for key in (
+        "per_unit_proceeds",
+        "per_unit_merchandise",
+        "per_unit_sales_tax",
+        "per_unit_shipping",
+        "per_unit_bounty",
+    ):
+        scaled[key] = breakdown.get(key)
+
+    return scaled
+
+
+def proceeds_breakdown_fields(
+    breakdown, *, effective_qty=None, purchased_qty=None, sign=1
+):
+    """API fields for sale_proceeds_* ledger rows."""
+    if not breakdown:
+        return {}
+    if effective_qty is not None:
+        breakdown = scale_proceeds_breakdown(
+            breakdown,
+            effective_qty,
+            purchased_qty=purchased_qty or breakdown.get("purchased_qty"),
+        )
+    fields = {
+        "merchandise_amount": breakdown.get("merchandise_amount"),
+        "sales_tax_amount": breakdown.get("sales_tax_amount"),
+        "shipping_amount": breakdown.get("shipping_amount"),
+        "bounty_amount": breakdown.get("bounty_amount"),
+        "per_unit_merchandise": breakdown.get("per_unit_merchandise"),
+        "per_unit_sales_tax": breakdown.get("per_unit_sales_tax"),
+        "per_unit_shipping": breakdown.get("per_unit_shipping"),
+        "per_unit_bounty": breakdown.get("per_unit_bounty"),
+    }
+    if int(sign or 1) < 0:
+        from wallet_service import _round_money, _to_float
+
+        for key in (
+            "merchandise_amount",
+            "sales_tax_amount",
+            "shipping_amount",
+            "bounty_amount",
+        ):
+            fields[key] = _round_money(-_to_float(fields.get(key)))
+    return fields
+
+
 def compute_seller_proceeds_ledger_amounts(db, order_uid, *, qty=None):
     """
     Split seller proceeds into pending-verification vs return-window buckets.
@@ -333,16 +508,22 @@ def compute_seller_proceeds_ledger_amounts(db, order_uid, *, qty=None):
     pending_verification_amount  = per_unit × pending_verification_units
     pending_return_window_amount = per_unit × net_verified_held
     """
+    from wallet_service import _to_float
     from wallet_transactions_service import compute_seller_eligible_total
 
     if qty is None:
         qty = order_quantity_context(db, order_uid)
     pending_verify_units = int(qty.get("pending_verification_units") or 0)
     net_verified_held = int(qty.get("net_verified_held") or 0)
-    full_order_total = compute_seller_eligible_total(db, order_uid)
-    per_unit = compute_seller_proceeds_per_unit(
-        db, order_uid, qty=qty, eligible_total=full_order_total
-    )
+    breakdown = compute_seller_proceeds_breakdown(db, order_uid, qty=qty)
+    full_order_total = _to_float(breakdown.get("amount"))
+    if full_order_total <= 0:
+        full_order_total = compute_seller_eligible_total(db, order_uid)
+    per_unit = _to_float(breakdown.get("per_unit_proceeds"))
+    if per_unit <= 0:
+        per_unit = compute_seller_proceeds_per_unit(
+            db, order_uid, qty=qty, eligible_total=full_order_total
+        )
     return {
         **qty,
         "net_seller_proceeds": full_order_total,
@@ -350,6 +531,7 @@ def compute_seller_proceeds_ledger_amounts(db, order_uid, *, qty=None):
         "seller_proceeds_per_unit": per_unit,
         "pending_verification_amount": round(per_unit * pending_verify_units, 4),
         "pending_return_window_amount": round(per_unit * net_verified_held, 4),
+        **breakdown,
     }
 
 
@@ -452,7 +634,7 @@ def quantity_context_fields(ctx):
     if not ctx:
         return {}
     buckets = compute_proceeds_buckets(ctx)
-    return {
+    fields = {
         **buckets,
         "shippable_qty": ctx.get("shippable_units"),
         "verified_returnable_qty": ctx.get("verified_returnable_qty"),
@@ -460,3 +642,5 @@ def quantity_context_fields(ctx):
         "net_verified_held": ctx.get("net_verified_held"),
         "per_unit_proceeds": ctx.get("seller_proceeds_per_unit"),
     }
+    fields.update(proceeds_breakdown_fields(ctx))
+    return fields

@@ -9,6 +9,7 @@ from order_quantity_context import (
     compute_proceeds_buckets,
     compute_seller_proceeds_ledger_amounts,
     order_quantity_context,
+    proceeds_breakdown_fields,
     quantity_context_fields,
 )
 from wallet_service import _round_money, _to_float
@@ -262,7 +263,26 @@ def build_order_proceeds_ledger_entries(
 
     buyer = buyer_name or "buyer"
     parent_id = f"wt:sale:{order_uid}:original"
-    full_order_proceeds = _round_money(per_unit * purchased)
+    breakdown = {
+        key: proceeds.get(key)
+        for key in (
+            "merchandise_amount",
+            "sales_tax_amount",
+            "shipping_amount",
+            "bounty_amount",
+            "amount",
+            "per_unit_proceeds",
+            "per_unit_merchandise",
+            "per_unit_sales_tax",
+            "per_unit_shipping",
+            "per_unit_bounty",
+            "purchased_qty",
+        )
+        if key in proceeds
+    }
+    full_order_proceeds = _round_money(
+        proceeds.get("amount") if breakdown.get("amount") is not None else per_unit * purchased
+    )
     current_buckets = compute_proceeds_buckets(proceeds)
 
     entries = []
@@ -298,9 +318,10 @@ def build_order_proceeds_ledger_entries(
 
         if wt_type == WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT and delta_qty > 0:
             cancelled_running += delta_qty
-            cancel_amt = _round_money(_to_float(event.get("wt_amount")))
-            if cancel_amt == 0:
-                cancel_amt = _round_money(-per_unit * delta_qty)
+            cancel_amt = _round_money(-per_unit * delta_qty)
+            stored_amt = _round_money(_to_float(event.get("wt_amount")))
+            if stored_amt != 0 and abs(stored_amt - cancel_amt) <= 0.02:
+                cancel_amt = stored_amt
             snap = _bucket_snapshot_from_totals(
                 purchased=purchased,
                 shipped=shipped,
@@ -330,15 +351,22 @@ def build_order_proceeds_ledger_entries(
                     wt_uid=wt_uid,
                     wt_type=wt_type,
                     wt_status=wt_status,
+                    **proceeds_breakdown_fields(
+                        breakdown,
+                        effective_qty=delta_qty,
+                        purchased_qty=purchased,
+                        sign=-1,
+                    ),
                     **snap,
                 )
             )
 
         elif wt_type == WT_TYPE_RETURN_CLAWBACK and delta_qty > 0:
             returned_running += delta_qty
-            claw_amt = _round_money(_to_float(event.get("wt_amount")))
-            if claw_amt == 0:
-                claw_amt = _round_money(-per_unit * delta_qty)
+            claw_amt = _round_money(-per_unit * delta_qty)
+            stored_amt = _round_money(_to_float(event.get("wt_amount")))
+            if stored_amt != 0 and abs(stored_amt - claw_amt) <= 0.02:
+                claw_amt = stored_amt
             availability, useable_delta = return_clawback_ledger_availability(
                 db, event
             )
@@ -372,6 +400,12 @@ def build_order_proceeds_ledger_entries(
                 wt_uid=wt_uid,
                 wt_type=wt_type,
                 wt_status=wt_status,
+                **proceeds_breakdown_fields(
+                    breakdown,
+                    effective_qty=delta_qty,
+                    purchased_qty=purchased,
+                    sign=-1,
+                ),
                 **snap,
             )
             claw_entry["availability"] = availability
@@ -379,7 +413,10 @@ def build_order_proceeds_ledger_entries(
             entries.append(claw_entry)
 
         elif wt_type == WT_TYPE_PARTIAL_DELIVERY_CREDIT and delta_qty > 0:
-            credit_amt = _round_money(_to_float(event.get("wt_amount")))
+            credit_amt = _round_money(per_unit * delta_qty)
+            stored_amt = _round_money(_to_float(event.get("wt_amount")))
+            if stored_amt > 0 and abs(stored_amt - credit_amt) > 0.02:
+                credit_amt = stored_amt
             available_at = event.get("wt_available_at")
             snap = _bucket_snapshot_from_totals(
                 purchased=purchased,
@@ -423,6 +460,11 @@ def build_order_proceeds_ledger_entries(
                     wt_uid=wt_uid,
                     wt_type=wt_type,
                     wt_status=wt_status,
+                    **proceeds_breakdown_fields(
+                        breakdown,
+                        effective_qty=delta_qty,
+                        purchased_qty=purchased,
+                    ),
                     **snap,
                 )
                 verify_entry["availability"] = "useable"
@@ -451,6 +493,11 @@ def build_order_proceeds_ledger_entries(
                     wt_uid=wt_uid,
                     wt_type=wt_type,
                     wt_status=wt_status,
+                    **proceeds_breakdown_fields(
+                        breakdown,
+                        effective_qty=delta_qty,
+                        purchased_qty=purchased,
+                    ),
                     **snap,
                 )
                 release_entry["availability"] = "useable"

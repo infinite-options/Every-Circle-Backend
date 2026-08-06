@@ -160,13 +160,16 @@ def _order_bounty_paid(db, transaction_uid):
 def compute_seller_eligible_total(db, transaction_uid):
     """
     Order-level seller pool:
-      transaction_amount + COALESCE(transaction_shipping, 0) - SUM(bounty on sale)
+      merchandise + sales_tax + shipping − bounty
+
+    Uses checkout snapshots on the sale header (transaction_amount,
+    transaction_taxes, transaction_shipping) minus bounty ledger rows.
     """
     if not transaction_uid:
         return 0.0
     tx_q = db.execute(
         """
-        SELECT transaction_amount, transaction_shipping
+        SELECT transaction_amount, transaction_taxes, transaction_shipping
         FROM every_circle.transactions
         WHERE transaction_uid = %s
         """,
@@ -177,9 +180,10 @@ def compute_seller_eligible_total(db, transaction_uid):
         return 0.0
     tx = tx_rows[0]
     amount = _to_float(tx.get("transaction_amount"))
+    taxes = _to_float(tx.get("transaction_taxes"))
     shipping = _to_float(tx.get("transaction_shipping"))
     bounty = _order_bounty_paid(db, transaction_uid)
-    return _round_money(amount + shipping - bounty)
+    return _round_money(amount + taxes + shipping - bounty)
 
 
 def compute_seller_eligible_active_total(db, transaction_uid):

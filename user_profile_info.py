@@ -792,19 +792,18 @@ def _new_per_uid():
 
 
 def _load_expertise_restock_by_trr_uid(db, trr_uid, profile_expertise_uid):
-    if not trr_uid:
-        return None
-    result = db.execute(
-        """
-        SELECT per_quantity, per_remaining
-        FROM every_circle.profile_expertise_restocks
-        WHERE per_trr_uid = %s AND per_profile_expertise_uid = %s
-        LIMIT 1
-        """,
-        (trr_uid, profile_expertise_uid),
+    """Total units already restocked for this return + offering."""
+    from inventory_restock import sum_restocked_for_trr
+
+    return sum_restocked_for_trr(
+        db,
+        table="every_circle.profile_expertise_restocks",
+        qty_column="per_quantity",
+        trr_column="per_trr_uid",
+        listing_column="per_profile_expertise_uid",
+        trr_uid=trr_uid,
+        listing_uid=profile_expertise_uid,
     )
-    rows = result.get("result") or []
-    return rows[0] if rows else None
 
 
 def _record_expertise_restock_audit(
@@ -817,7 +816,7 @@ def _record_expertise_restock_audit(
     order_uid=None,
 ):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db.insert(
+    return db.insert(
         "every_circle.profile_expertise_restocks",
         {
             "per_uid": _new_per_uid(),
@@ -902,22 +901,38 @@ class ProfileExpertiseRestock(Resource):
                 return response, 400
 
             with connect() as db:
+                restocked_total = 0
+                trr_return_qty = None
                 if trr_uid:
-                    prior = _load_expertise_restock_by_trr_uid(
+                    from inventory_restock import validate_trr_restock_capacity
+
+                    restocked_total = _load_expertise_restock_by_trr_uid(
                         db, trr_uid, profile_expertise_uid
                     )
-                    if prior:
-                        response["message"] = "Restock already applied for this trr_uid"
-                        response["code"] = 409
-                        response["profile_expertise_uid"] = profile_expertise_uid
-                        response["quantity"] = int(
-                            prior.get("per_quantity") or quantity
-                        )
-                        remaining = prior.get("per_remaining")
-                        if remaining is not None:
-                            remaining = int(remaining)
-                        response["remaining"] = remaining
-                        return response, 409
+                    allowed, cap_err, trr_return_qty = validate_trr_restock_capacity(
+                        db,
+                        trr_uid,
+                        quantity,
+                        already_restocked=restocked_total,
+                    )
+                    if not allowed:
+                        cap_err = dict(cap_err)
+                        cap_err["profile_expertise_uid"] = profile_expertise_uid
+                        cap_err["quantity"] = quantity
+                        if cap_err.get("code") == 409:
+                            offering_q = db.select(
+                                "every_circle.profile_expertise",
+                                where={"profile_expertise_uid": profile_expertise_uid},
+                            )
+                            if offering_q.get("result"):
+                                remaining = _parse_limited_quantity(
+                                    offering_q["result"][0].get(
+                                        "profile_expertise_quantity"
+                                    )
+                                )
+                                if remaining is not None:
+                                    cap_err["remaining"] = remaining
+                        return cap_err, cap_err.get("code", 400)
 
                 offering_q = db.select(
                     "every_circle.profile_expertise",
@@ -950,7 +965,7 @@ class ProfileExpertiseRestock(Resource):
                         None,
                         message="Unlimited stock — no increment needed",
                     )
-                    _record_expertise_restock_audit(
+                    audit_result = _record_expertise_restock_audit(
                         db,
                         profile_expertise_uid,
                         quantity,
@@ -959,6 +974,20 @@ class ProfileExpertiseRestock(Resource):
                         trr_uid=trr_uid,
                         order_uid=order_uid,
                     )
+                    from inventory_restock import restock_audit_insert_error
+
+                    audit_err = restock_audit_insert_error(audit_result)
+                    if audit_err:
+                        audit_err["profile_expertise_uid"] = profile_expertise_uid
+                        return audit_err, 500
+                    if trr_uid:
+                        response["trr_uid"] = trr_uid
+                        response["restocked_total"] = restocked_total + quantity
+                        if trr_return_qty is not None:
+                            response["trr_return_quantity"] = trr_return_qty
+                            response["remaining_restockable"] = max(
+                                trr_return_qty - (restocked_total + quantity), 0
+                            )
                     return response, 200
 
                 new_qty = current_qty + quantity
@@ -981,7 +1010,7 @@ class ProfileExpertiseRestock(Resource):
                 if remaining is None:
                     remaining = new_qty
 
-                _record_expertise_restock_audit(
+                audit_result = _record_expertise_restock_audit(
                     db,
                     profile_expertise_uid,
                     quantity,
@@ -990,6 +1019,12 @@ class ProfileExpertiseRestock(Resource):
                     trr_uid=trr_uid,
                     order_uid=order_uid,
                 )
+                from inventory_restock import restock_audit_insert_error
+
+                audit_err = restock_audit_insert_error(audit_result)
+                if audit_err:
+                    audit_err["profile_expertise_uid"] = profile_expertise_uid
+                    return audit_err, 500
 
                 response = _build_expertise_restock_response(
                     profile_expertise_uid,
@@ -997,6 +1032,14 @@ class ProfileExpertiseRestock(Resource):
                     remaining,
                     message="Restock recorded successfully",
                 )
+                if trr_uid:
+                    response["trr_uid"] = trr_uid
+                    response["restocked_total"] = restocked_total + quantity
+                    if trr_return_qty is not None:
+                        response["trr_return_quantity"] = trr_return_qty
+                        response["remaining_restockable"] = max(
+                            trr_return_qty - (restocked_total + quantity), 0
+                        )
                 return response, 200
 
         except Exception as e:
