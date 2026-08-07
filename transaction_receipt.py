@@ -9,6 +9,12 @@ from transaction_shipping import (
     shipping_payload_from_row,
     fulfillment_fields_from_row,
 )
+from units_ledger import (
+    sale_units_ledger,
+    attach_line_units_ledgers,
+    sale_display,
+    fulfillment_method,
+)
 
 
 def _parse_selected_options_field(raw):
@@ -294,6 +300,30 @@ def _process_receipt_rows(db, rows):
     return enriched_rows
 
 
+def _build_receipt_v2(db, order_uid, enriched_rows, shipping):
+    """v2 envelope: order-level + line-level units matching account-screen."""
+    if not enriched_rows:
+        return {}
+
+    header = dict(enriched_rows[0])
+    header.update(shipping or {})
+    if not header.get("fulfillment_method"):
+        header["fulfillment_method"] = fulfillment_method(header)
+
+    units = sale_units_ledger(db, order_uid)
+    lines = attach_line_units_ledgers(db, order_uid, enriched_rows)
+
+    v2 = {
+        "schema_version": 2,
+        "order_uid": order_uid,
+        "transaction_uid": order_uid,
+        "units": units,
+        "display": sale_display(header, units, include_qty=False),
+        "lines": lines,
+    }
+    return v2
+
+
 class TransactionReceipt(Resource):
     def get(self, profile_id, transaction_uid):
         print(f"In TransactionReceipt GET for profile_id: {profile_id}, transaction_uid: {transaction_uid}")
@@ -330,10 +360,14 @@ class TransactionReceipt(Resource):
                     load_shipping_for_transaction(db, transaction_uid)
                 )
 
+                v2 = _build_receipt_v2(db, transaction_uid, enriched_rows, shipping)
+
                 response["message"] = "Transaction receipt retrieved successfully"
                 response["code"] = 200
                 response["data"] = enriched_rows
                 response.update(shipping)
+                if v2:
+                    response.update(v2)
                 return response, 200
 
         except Exception as e:

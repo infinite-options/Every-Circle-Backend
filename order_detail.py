@@ -14,6 +14,12 @@ from transaction_shipping import (
     shipping_payload_from_row,
     fulfillment_fields_from_row,
 )
+from units_ledger import (
+    sale_units_ledger,
+    attach_line_units_ledgers,
+    sale_display,
+    fulfillment_method,
+)
 from transactions import (
     _load_return_request,
     _load_open_return_requests,
@@ -562,6 +568,61 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     return payload
 
 
+def enrich_buyer_order_v2(db, order_uid, payload):
+    """
+    Add schema v2 unit ledger to order-detail for buyer personal / Offering.
+
+    sale.units must match account-screen sale row at the same point in time.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    sale = payload.get("sale")
+    if not isinstance(sale, dict):
+        return payload
+
+    sale = dict(sale)
+    header = dict(sale)
+    header.update(
+        {
+            k: payload.get(k)
+            for k in ("requires_shipping", "fulfillment_method", "transaction_in_escrow")
+            if payload.get(k) is not None
+        }
+    )
+    if not header.get("fulfillment_method"):
+        header["fulfillment_method"] = fulfillment_method(sale)
+
+    units = sale_units_ledger(db, order_uid)
+    sale["units"] = units
+    sale["display"] = sale_display(header, units, include_qty=False)
+
+    lines = attach_line_units_ledgers(db, order_uid, sale.get("lines") or [])
+    for line in lines:
+        if isinstance(line, dict) and line.get("ti_bs_return_window_days") is not None:
+            line["return_window_days"] = line.get("ti_bs_return_window_days")
+    sale["lines"] = lines
+    if len(lines) == 1 and isinstance(lines[0], dict):
+        sale["ti_uid"] = lines[0].get("ti_uid")
+
+    payload = dict(payload)
+    payload["sale"] = sale
+    payload["schema_version"] = 2
+
+    returns = []
+    for ret in payload.get("returns") or []:
+        if not isinstance(ret, dict):
+            returns.append(ret)
+            continue
+        entry = dict(ret)
+        ret_lines = entry.get("lines") or []
+        entry["return_lines"] = ret_lines
+        returns.append(entry)
+    payload["returns"] = returns
+
+    return payload
+
+
 class OrderDetail(Resource):
     """
     GET /api/v1/orders/<transaction_uid>
@@ -611,6 +672,13 @@ class OrderDetail(Resource):
                     requested_transaction_uid=transaction_uid,
                 )
                 payload["resolved_from_return_uid"] = resolved_from_return_uid
+
+                is_buyer = (
+                    profile_id
+                    and str(sale.get("transaction_profile_id")) == str(profile_id)
+                )
+                if is_buyer:
+                    payload = enrich_buyer_order_v2(db, order_uid, payload)
 
                 tz_name = _request_timezone()
                 payload = _enrich_order_datetimes(payload, tz_name)

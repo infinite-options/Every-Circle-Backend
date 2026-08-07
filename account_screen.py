@@ -17,6 +17,7 @@ from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
 from order_list_hydration import attach_order_list_hydration
+from account_screen_purchases_v2 import build_purchases_v2_rows
 from wallet_service import build_wallet_summary
 from wallet_transactions_service import resolve_seller_wallet_profile_id
 
@@ -59,23 +60,22 @@ def _enrich_section_datetimes(body, field="transaction_datetime"):
         return body
 
     tz_name = _request_timezone()
-    data = body.get("data")
-    if not isinstance(data, list):
-        return body
-
-    enriched = []
-    for row in data:
-        if isinstance(row, dict):
-            enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
-        else:
-            enriched.append(row)
-
-    body = dict(body)
-    body["data"] = enriched
+    out = dict(body)
+    for list_key in ("data", "rows"):
+        data = body.get(list_key)
+        if not isinstance(data, list):
+            continue
+        enriched = []
+        for row in data:
+            if isinstance(row, dict):
+                enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
+            else:
+                enriched.append(row)
+        out[list_key] = enriched
     if tz_name:
-        body["timezone"] = tz_name
-    body["datetime_storage"] = "UTC"
-    return body
+        out["timezone"] = tz_name
+    out["datetime_storage"] = "UTC"
+    return out
 
 
 class AccountScreenPersonal(Resource):
@@ -100,14 +100,25 @@ class AccountScreenPersonal(Resource):
         bounty_body = _enrich_section_datetimes(bounty_body)
         seller_body = _enrich_section_datetimes(seller_body)
 
+        tz_name = _request_timezone()
         response = {
             "code": 200,
+            "schema_version": 2,
             "purchases": _merge_body_status(purchases_body, purchases_status),
             "bounty_results": _merge_body_status(bounty_body, bounty_status),
             "seller_transactions": _merge_body_status(seller_body, seller_status),
+            "profile": None,
         }
+        if tz_name:
+            response["timezone"] = tz_name
+        response["datetime_storage"] = "UTC"
+
         with connect() as db:
-            attach_order_list_hydration(response, db, mode="personal")
+            legacy_rows = (response.get("purchases") or {}).get("data") or []
+            v2_rows = build_purchases_v2_rows(db, legacy_rows)
+            if isinstance(response.get("purchases"), dict):
+                response["purchases"]["rows"] = v2_rows
+                response["purchases"]["count"] = len(v2_rows)
             response["wallet"] = build_wallet_summary(db, profile_id)
 
         return (response, 200)

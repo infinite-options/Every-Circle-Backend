@@ -1,0 +1,286 @@
+"""
+Shared v2 unit ledger for buyer personal / Offering surfaces.
+
+Used by account-screen personal, transaction receipt, and order detail so all
+three agree on shipped / verified / returnable counts after any mutation.
+"""
+
+from order_quantity_context import (
+    order_quantity_context,
+    line_quantity_context,
+    _open_return_requests_for_order,
+    _confirmed_return_splits_for_order,
+    _reserved_return_split_from_reqs,
+)
+
+
+def _order_fulfillment_method(db, order_uid):
+    q = db.execute(
+        """
+        SELECT COALESCE(MAX(ti_fulfillment_method), 'ship') AS method
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    return str(rows[0].get("method") if rows else "ship").strip().lower()
+
+
+def _line_fulfillment_method(row):
+    return str(row.get("ti_fulfillment_method") or row.get("fulfillment_method") or "ship").strip().lower()
+
+
+def _units_from_counts(
+    *,
+    purchased,
+    shipped,
+    verified,
+    cancelled_pre_ship,
+    returned_shipped,
+    returned_unshipped,
+    remaining_to_ship,
+    return_in_progress_shipped,
+    return_in_progress_unshipped,
+    is_pickup_or_virtual,
+):
+    cancelled_pre_ship_in_progress = return_in_progress_unshipped
+
+    if is_pickup_or_virtual:
+        remaining_to_ship = 0
+        shipped = verified
+
+    unverified_shipped = max(0, shipped - verified - returned_shipped)
+    verifiable_remaining = max(0, unverified_shipped - return_in_progress_shipped)
+    if is_pickup_or_virtual:
+        receivable = max(purchased - cancelled_pre_ship, 0)
+        verifiable_remaining = max(
+            0, receivable - verified - return_in_progress_shipped
+        )
+
+    active = max(
+        purchased - cancelled_pre_ship - returned_shipped - returned_unshipped, 0
+    )
+    if is_pickup_or_virtual:
+        active = max(purchased - cancelled_pre_ship, 0)
+
+    remaining_returnable = max(
+        active - return_in_progress_shipped - return_in_progress_unshipped, 0
+    )
+    if is_pickup_or_virtual:
+        remaining_returnable = max(
+            verified - returned_shipped - return_in_progress_shipped, 0
+        )
+
+    max_return_shipped = min(
+        remaining_returnable,
+        max(0, verified - returned_shipped - return_in_progress_shipped),
+    )
+    unshipped_pool = max(
+        purchased - shipped - cancelled_pre_ship - cancelled_pre_ship_in_progress,
+        0,
+    )
+    max_cancel_unshipped = min(
+        remaining_returnable,
+        max(0, unshipped_pool - return_in_progress_unshipped),
+    )
+    if is_pickup_or_virtual:
+        max_cancel_unshipped = max(
+            0,
+            purchased
+            - cancelled_pre_ship
+            - verified
+            - return_in_progress_unshipped,
+        )
+
+    return {
+        "purchased_qty": purchased,
+        "cancelled_pre_ship_qty": cancelled_pre_ship,
+        "cancelled_pre_ship_in_progress_qty": cancelled_pre_ship_in_progress,
+        "shipped_qty": shipped,
+        "remaining_to_ship_qty": remaining_to_ship,
+        "verified_qty": verified,
+        "verifiable_remaining_qty": verifiable_remaining,
+        "returned_shipped_completed_qty": returned_shipped,
+        "returned_unshipped_completed_qty": returned_unshipped,
+        "return_in_progress_shipped_qty": return_in_progress_shipped,
+        "return_in_progress_unshipped_qty": return_in_progress_unshipped,
+        "active_qty": active,
+        "remaining_returnable_qty": remaining_returnable,
+        "max_return_shipped_qty": max_return_shipped,
+        "max_cancel_unshipped_qty": max_cancel_unshipped,
+    }
+
+
+def line_units_ledger(
+    db,
+    order_uid,
+    ti_uid,
+    row=None,
+    *,
+    order_splits=None,
+    open_reqs=None,
+):
+    """Per-line v2 unit buckets (must sum to order-level for multi-line orders)."""
+    ctx = line_quantity_context(
+        db,
+        order_uid,
+        ti_uid,
+        row=row,
+        order_splits=order_splits,
+        open_reqs=open_reqs,
+    )
+    if row is None:
+        q = db.execute(
+            """
+            SELECT ti_fulfillment_method
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s AND ti_transaction_id = %s
+            """,
+            (ti_uid, order_uid),
+        )
+        rows = q.get("result") or []
+        row = rows[0] if rows else {}
+
+    if open_reqs is None:
+        open_reqs = _open_return_requests_for_order(db, order_uid)
+    return_in_progress_shipped, return_in_progress_unshipped = (
+        _reserved_return_split_from_reqs(open_reqs, ti_uid)
+    )
+
+    method = _line_fulfillment_method(row)
+    return _units_from_counts(
+        purchased=int(ctx.get("purchased_qty") or 0),
+        shipped=int(ctx.get("shipped_qty") or 0),
+        verified=int(ctx.get("verified_qty") or 0),
+        cancelled_pre_ship=int(ctx.get("cancelled_qty") or 0),
+        returned_shipped=int(ctx.get("returned_qty") or 0),
+        returned_unshipped=0,
+        remaining_to_ship=int(ctx.get("remaining_to_ship") or 0),
+        return_in_progress_shipped=return_in_progress_shipped,
+        return_in_progress_unshipped=return_in_progress_unshipped,
+        is_pickup_or_virtual=method in ("pickup", "virtual"),
+    )
+
+
+def sale_units_ledger(db, order_uid):
+    """Order-level v2 unit buckets (matches account-screen sale row units)."""
+    qty = order_quantity_context(db, order_uid)
+    open_reqs = _open_return_requests_for_order(db, order_uid)
+    fulfillment = _order_fulfillment_method(db, order_uid)
+    is_pickup_or_virtual = fulfillment in ("pickup", "virtual")
+
+    return_in_progress_shipped = 0
+    return_in_progress_unshipped = 0
+    for line in qty.get("lines") or []:
+        ti_uid = line.get("ti_uid")
+        rs, cu = _reserved_return_split_from_reqs(open_reqs, ti_uid)
+        return_in_progress_shipped += rs
+        return_in_progress_unshipped += cu
+
+    return _units_from_counts(
+        purchased=int(qty.get("purchased_qty") or 0),
+        shipped=int(qty.get("shipped_qty") or 0),
+        verified=int(qty.get("verified_qty") or 0),
+        cancelled_pre_ship=int(qty.get("cancelled_qty") or 0),
+        returned_shipped=int(qty.get("returned_qty") or 0),
+        returned_unshipped=0,
+        remaining_to_ship=int(qty.get("remaining_to_ship") or 0),
+        return_in_progress_shipped=return_in_progress_shipped,
+        return_in_progress_unshipped=return_in_progress_unshipped,
+        is_pickup_or_virtual=is_pickup_or_virtual,
+    )
+
+
+def attach_line_units_ledgers(db, order_uid, lines):
+    """Add units to each sale line; shares one DB pass for splits/open requests."""
+    if not lines:
+        return lines
+    order_splits = _confirmed_return_splits_for_order(db, order_uid)
+    open_reqs = _open_return_requests_for_order(db, order_uid)
+    out = []
+    for line in lines:
+        if not isinstance(line, dict):
+            out.append(line)
+            continue
+        row = dict(line)
+        ti_uid = row.get("ti_uid")
+        if ti_uid:
+            row["units"] = line_units_ledger(
+                db,
+                order_uid,
+                ti_uid,
+                row=row,
+                order_splits=order_splits,
+                open_reqs=open_reqs,
+            )
+        out.append(row)
+    return out
+
+
+def fulfillment_method(row):
+    method = (
+        row.get("fulfillment_method")
+        or row.get("ti_fulfillment_method")
+        or "ship"
+    )
+    return str(method).strip().lower()
+
+
+def requires_shipping(row):
+    if row.get("requires_shipping") is not None:
+        return bool(row.get("requires_shipping"))
+    return fulfillment_method(row) not in ("pickup", "virtual", "not_required")
+
+
+def sale_display(row, units, *, include_qty=True):
+    """Precomputed chip labels (FE renders verbatim)."""
+    active = int(units.get("active_qty") or 0)
+    purchased = int(units.get("purchased_qty") or 0)
+    shipped = int(units.get("shipped_qty") or 0)
+    verified = int(units.get("verified_qty") or 0)
+    remaining_to_ship = int(units.get("remaining_to_ship_qty") or 0)
+    verifiable = int(units.get("verifiable_remaining_qty") or 0)
+    in_escrow = int(row.get("transaction_in_escrow") or 0) == 1
+    requires_ship = requires_shipping(row)
+    method = fulfillment_method(row)
+
+    if method in ("pickup", "virtual"):
+        delivered_label = "Ready" if verified > 0 else "—"
+    elif remaining_to_ship > 0:
+        denom = active if active > 0 else purchased
+        delivered_label = f"{shipped}/{denom}"
+    elif shipped <= 0:
+        delivered_label = "Not Shipped"
+    elif in_escrow:
+        delivered_label = "Shipped"
+    else:
+        delivered_label = "Delivered"
+
+    received_action = None
+    if verified >= active and active > 0:
+        received_label = "Yes"
+    elif verified <= 0:
+        received_label = "No"
+        if requires_ship and shipped > 0:
+            received_action = "verify"
+    elif verifiable > 0 or (requires_ship and verified < active and shipped > verified):
+        received_label = "Verify"
+        received_action = "verify"
+    else:
+        received_label = f"{verified}/{active}" if active > 0 else "Partial"
+
+    display = {
+        "delivered_label": delivered_label,
+        "received_label": received_label,
+    }
+    if received_action:
+        display["received_action"] = received_action
+    if include_qty:
+        display["qty"] = purchased if active <= 0 else max(active, purchased)
+
+    open_returns = row.get("open_returns") or []
+    if open_returns:
+        display["order_return_summary"] = open_returns[0].get("display_status")
+
+    return display
