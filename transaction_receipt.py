@@ -240,7 +240,38 @@ def _load_expertise_receipt_lines(db, profile_id, transaction_uid, seller_id=Non
     return q.get("result") or []
 
 
-def _process_receipt_rows(rows):
+def _enrich_receipt_fulfillment_line(db, row):
+    """Line-level cancel/ship fields aligned with order detail sale.lines."""
+    from transactions import _confirmed_return_split, _remaining_to_ship_qty
+
+    order_uid = row.get("transaction_uid")
+    ti_uid = row.get("ti_uid")
+    if not order_uid or not ti_uid:
+        return row
+
+    order_qty = int(row.get("ti_bs_qty") or 0)
+    shipped_qty = int(row.get("ti_shipped_qty") or 0)
+    returned_qty, cancelled_qty = _confirmed_return_split(db, order_uid, ti_uid)
+    remaining_to_ship = _remaining_to_ship_qty(
+        db,
+        order_uid,
+        ti_uid,
+        order_qty,
+        shipped_qty,
+        ti_row=row,
+    )
+    active_units = max(order_qty - cancelled_qty - returned_qty, 0)
+    row["cancelled_qty"] = cancelled_qty
+    row["cancel_unshipped_qty"] = cancelled_qty
+    row["returned_qty"] = returned_qty
+    row["returned_qty_total"] = cancelled_qty + returned_qty
+    row["remaining_qty"] = active_units
+    row["remaining_to_ship"] = remaining_to_ship
+    row.update(fulfillment_fields_from_row(row))
+    return row
+
+
+def _process_receipt_rows(db, rows):
     enriched_rows = []
     for row in rows:
         if not row.get("ti_uid"):
@@ -257,8 +288,9 @@ def _process_receipt_rows(rows):
         row["selected_options"] = _parse_selected_options_field(
             row.pop("ti_selected_options", None)
         )
-        row.update(fulfillment_fields_from_row(row))
-        enriched_rows.append(_enrich_receipt_line(row))
+        enriched_rows.append(
+            _enrich_receipt_line(_enrich_receipt_fulfillment_line(db, row))
+        )
     return enriched_rows
 
 
@@ -280,19 +312,19 @@ class TransactionReceipt(Resource):
                     response["code"] = err.get("code", 500)
                     return response, response["code"]
 
-                enriched_rows = _process_receipt_rows(rows)
+                enriched_rows = _process_receipt_rows(db, rows)
 
                 if not enriched_rows:
                     expertise_rows = _load_expertise_receipt_lines(
                         db, profile_id, transaction_uid, seller_id
                     )
-                    enriched_rows = _process_receipt_rows(expertise_rows)
+                    enriched_rows = _process_receipt_rows(db, expertise_rows)
 
                 if not enriched_rows and not seller_id:
                     expertise_rows = _load_expertise_receipt_lines(
                         db, profile_id, transaction_uid, None
                     )
-                    enriched_rows = _process_receipt_rows(expertise_rows)
+                    enriched_rows = _process_receipt_rows(db, expertise_rows)
 
                 shipping = shipping_payload_from_row(
                     load_shipping_for_transaction(db, transaction_uid)

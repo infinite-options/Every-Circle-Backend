@@ -187,7 +187,9 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
     if open_reqs is None:
         open_reqs = _open_return_requests_for_order(db, order_uid)
     returned, cancelled = order_splits.get(ti_uid, (0, 0))
-    reserved_return, _cancel = _reserved_return_split_from_reqs(open_reqs, ti_uid)
+    reserved_return, pending_cancel = _reserved_return_split_from_reqs(
+        open_reqs, ti_uid
+    )
     active_units = max(purchased - cancelled - returned, 0)
     shippable_units = max(purchased - cancelled, 0)
     remaining_to_ship = _remaining_to_ship_qty(
@@ -232,6 +234,7 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         "pending_verification_units": pending_verification_units,
         "max_return_shipped_qty": max_return_shipped_qty,
         "max_cancel_unshipped_qty": max_cancel_unshipped_qty,
+        "pending_cancellation_units": pending_cancel,
     }
     if order_splits is None and open_reqs is None:
         _LINE_QTY_CACHE[cache_key] = ctx
@@ -270,6 +273,7 @@ def order_quantity_context(db, order_uid):
         "verified_returnable_qty": 0,
         "net_verified_held": 0,
         "pending_verification_units": 0,
+        "pending_cancellation_units": 0,
         "lines": [],
     }
     order_splits = _confirmed_return_splits_for_order(db, order_uid)
@@ -298,6 +302,7 @@ def order_quantity_context(db, order_uid):
             "verified_returnable_qty",
             "net_verified_held",
             "pending_verification_units",
+            "pending_cancellation_units",
         ):
             totals[key] += int(ctx.get(key) or 0)
     _ORDER_QTY_CACHE[order_uid] = totals
@@ -547,7 +552,8 @@ def compute_proceeds_buckets(ctx):
     """
     Live bucket counts for seller-proceeds ledger (source of truth).
 
-    pending_shipment + pending_verification + pending_return_window = active_qty
+    pending_shipment + pending_cancellation + pending_verification
+        + pending_return_window = active_qty
     """
     if not ctx:
         return {}
@@ -557,10 +563,16 @@ def compute_proceeds_buckets(ctx):
     verified = int(ctx.get("verified_qty") or 0)
     shipped = int(ctx.get("shipped_qty") or 0)
     unverified_shipped = int(ctx.get("unverified_shipped_qty") or 0)
+    pending_cancellation = max(0, int(ctx.get("pending_cancellation_units") or 0))
     pending_return_window = max(0, int(ctx.get("net_verified_held") or 0))
     pending_verification = unverified_shipped
     pending_shipment = max(
-        0, purchased - cancelled - unverified_shipped - verified
+        0,
+        purchased
+        - cancelled
+        - unverified_shipped
+        - verified
+        - pending_cancellation,
     )
     active_qty = max(0, purchased - cancelled - returned)
     return {
@@ -571,6 +583,7 @@ def compute_proceeds_buckets(ctx):
         "shipped_qty": shipped,
         "unverified_shipped_qty": unverified_shipped,
         "pending_shipment": pending_shipment,
+        "pending_cancellation": pending_cancellation,
         "pending_verification": pending_verification,
         "pending_return_window": pending_return_window,
         "active_qty": active_qty,

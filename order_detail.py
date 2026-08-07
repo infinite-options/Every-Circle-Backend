@@ -13,8 +13,6 @@ from transaction_shipping import (
     load_shipping_for_transaction,
     shipping_payload_from_row,
     fulfillment_fields_from_row,
-    apply_order_fulfillment_summary,
-    line_is_shippable_row,
 )
 from transactions import (
     _load_return_request,
@@ -403,65 +401,29 @@ def _enrich_return_transactions_with_status(db, order_uid, sale, returns):
     return enriched
 
 
-def _apply_sale_fulfillment_rollup(sale_payload):
-    """Order-level shipping/received counts from sale lines (matches list rollups)."""
-    lines = sale_payload.get("lines") or []
-    shippable = unshipped = delivered = received = order_qty_total = 0
-    shippable_units = shipped_units = 0
-    cancelled_total = 0
-    has_in_transit = 0
+def _apply_sale_fulfillment_rollup(db, sale_payload):
+    """Order-level shipping/received counts (shared with account-screen list rows)."""
+    from transaction_shipping import build_order_fulfillment_summary
 
-    for line in lines:
-        order_qty = int(line.get("ti_bs_qty") or 0)
-        shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
-        received_qty = int(line.get("ti_received_qty") or 0)
-        cancelled_total += int(line.get("cancelled_qty") or 0)
-        order_qty_total += order_qty
-        received += received_qty
+    order_uid = sale_payload.get("transaction_uid")
+    if not order_uid:
+        return sale_payload
 
-        if not line_is_shippable_row(line):
-            continue
+    summary_row = build_order_fulfillment_summary(db, order_uid)
+    if not summary_row:
+        return sale_payload
 
-        status = (
-            line.get("ti_fulfillment_status")
-            or line.get("fulfillment_status")
-            or "not_required"
-        )
-
-        shippable += 1
-        shippable_units += order_qty
-        shipped_units += shipped_qty
-        line_unshipped = int(line.get("remaining_to_ship") or 0)
-        unshipped += line_unshipped
-        if status == "delivered" and line_unshipped <= 0:
-            delivered += 1
-        if status == "in_transit":
-            has_in_transit = 1
-
-    summary_row = {
-        "shippable_item_count": shippable,
-        "shipped_item_count": shipped_units,
-        "unshipped_item_count": unshipped,
-        "delivered_item_count": delivered,
-        "has_in_transit": has_in_transit,
-        "has_shippable_items": 1 if shippable > 0 else 0,
-        "ti_shipped_qty": shipped_units,
-        "shippable_unit_count": shippable_units,
-        "ti_received_qty": received,
-        "ti_bs_qty": order_qty_total,
-        "received_item_count": received,
-        "cancelled_qty": cancelled_total,
-    }
-    apply_order_fulfillment_summary([summary_row])
-
-    sale_payload["transaction_uid"] = sale_payload.get("transaction_uid")
+    sale_payload["transaction_uid"] = order_uid
     sale_payload["shippable_item_count"] = summary_row["shippable_item_count"]
     sale_payload["shipped_item_count"] = summary_row["shipped_item_count"]
     sale_payload["unshipped_item_count"] = summary_row["unshipped_item_count"]
     sale_payload["delivered_item_count"] = summary_row["delivered_item_count"]
     sale_payload["ti_shipped_qty"] = summary_row.get("ti_shipped_qty", 0)
-    sale_payload["ti_received_qty"] = received
-    sale_payload["received_item_count"] = received
+    sale_payload["ti_received_qty"] = summary_row.get("ti_received_qty", 0)
+    sale_payload["received_item_count"] = summary_row.get("received_item_count", 0)
+    sale_payload["purchased_units"] = summary_row.get("purchased_units", 0)
+    sale_payload["received_units"] = summary_row.get("received_units", 0)
+    sale_payload["cancelled_qty"] = summary_row.get("cancelled_qty", 0)
     sale_payload["all_items_received"] = summary_row["all_items_received"]
     sale_payload["all_items_shipped"] = summary_row["all_items_shipped"]
     sale_payload["has_shippable_items"] = summary_row["has_shippable_items"]
@@ -571,7 +533,7 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         sale_payload["transaction_return_items"] = transaction_return_items
     sale_payload.update(status_fields)
     sale_payload.update(shipping)
-    _apply_sale_fulfillment_rollup(sale_payload)
+    _apply_sale_fulfillment_rollup(db, sale_payload)
 
     stripe_refund = _stripe_refund_summary(
         status_fields, pending_returns_payload, returns

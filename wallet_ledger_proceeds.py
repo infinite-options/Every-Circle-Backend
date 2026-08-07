@@ -40,6 +40,7 @@ def _format_proceeds_bucket_summary(buckets):
     parts = []
     for key, label in (
         ("pending_shipment", "pending shipment"),
+        ("pending_cancellation", "pending cancellation"),
         ("pending_verification", "pending verification"),
         ("pending_return_window", "pending return window"),
     ):

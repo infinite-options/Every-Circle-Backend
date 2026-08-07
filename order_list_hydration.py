@@ -20,6 +20,7 @@ _SALE_HEADER_KEYS = frozenset(
         "received_item_count",
         "purchased_units",
         "received_units",
+        "cancelled_qty",
         "delivered_item_count",
         "return_status",
         "refund_status",
@@ -46,10 +47,15 @@ _SALE_LINE_KEYS = frozenset(
         "ti_shipped_qty",
         "remaining_to_ship",
         "cancelled_qty",
+        "cancel_unshipped_qty",
         "returned_qty",
         "remaining_qty",
         "returned_qty_total",
         "ti_received_qty",
+        "tracking_carrier",
+        "tracking_number",
+        "ti_tracking_carrier",
+        "ti_tracking_number",
     }
 )
 

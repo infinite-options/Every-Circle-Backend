@@ -530,6 +530,117 @@ def fulfillment_list_summary_sql(alias="ti", *, order_uid_sql="t.transaction_uid
     """
 
 
+def build_order_fulfillment_summary(db, order_uid):
+    """
+    Authoritative order-level shipping/received counts from line quantity context.
+
+    Shared by account-screen list rows, order detail headers, and order_list_hydration.
+    """
+    from order_quantity_context import order_quantity_context
+
+    qty = order_quantity_context(db, order_uid)
+    line_ctx = qty.get("lines") or []
+    if not line_ctx:
+        return {}
+
+    line_rows_q = db.execute(
+        """
+        SELECT
+            ti_uid,
+            COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
+            ti_fulfillment_method,
+            COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        """,
+        (order_uid,),
+    )
+    line_rows = {
+        row.get("ti_uid"): row for row in (line_rows_q.get("result") or [])
+    }
+
+    purchased = int(qty.get("purchased_qty") or 0)
+    cancelled = int(qty.get("cancelled_qty") or 0)
+    received = int(qty.get("verified_qty") or 0)
+    shippable_lines = 0
+    shippable_units = 0
+    shipped_units = 0
+    unshipped_units = 0
+    delivered_lines = 0
+    has_in_transit = 0
+
+    for ctx in line_ctx:
+        ti_uid = ctx.get("ti_uid")
+        line_row = line_rows.get(ti_uid) or {}
+        if not line_is_shippable_row(line_row):
+            continue
+
+        shippable_lines += 1
+        shippable_units += int(ctx.get("shippable_units") or 0)
+        shipped_units += int(ctx.get("shipped_qty") or 0)
+        remaining = int(ctx.get("remaining_to_ship") or 0)
+        unshipped_units += remaining
+
+        status = str(
+            line_row.get("ti_fulfillment_status") or FULFILLMENT_STATUS_NOT_REQUIRED
+        ).strip().lower()
+        if status == FULFILLMENT_STATUS_DELIVERED and remaining <= 0:
+            delivered_lines += 1
+        if status == FULFILLMENT_STATUS_IN_TRANSIT:
+            has_in_transit = 1
+
+    summary_row = {
+        "shippable_item_count": shippable_lines,
+        "shipped_item_count": shipped_units,
+        "unshipped_item_count": unshipped_units,
+        "delivered_item_count": delivered_lines,
+        "has_in_transit": has_in_transit,
+        "has_shippable_items": 1 if shippable_lines > 0 else 0,
+        "ti_shipped_qty": shipped_units,
+        "shippable_unit_count": shippable_units,
+        "ti_received_qty": received,
+        "ti_bs_qty": purchased,
+        "ti_bs_qty_for_received": purchased,
+        "received_item_count": received,
+        "cancelled_qty": cancelled,
+        "purchased_units": purchased,
+        "received_units": received,
+    }
+    apply_order_fulfillment_summary([summary_row])
+    return summary_row
+
+
+def sync_list_rows_fulfillment_from_context(db, rows):
+    """
+    Overwrite list-row shipping summaries with per-order quantity context.
+
+    Keeps ti_bs_qty / ti_shipped_qty / purchased_units / shipped_item_count aligned
+    on each sale row (no cross-order or product-wide aggregation).
+    """
+    if not rows:
+        return rows
+
+    from transactions import _is_return_list_row
+
+    cache = {}
+    for row in rows:
+        if not isinstance(row, dict) or _is_return_list_row(row):
+            continue
+        order_uid = row.get("transaction_uid")
+        if not order_uid:
+            continue
+        if order_uid not in cache:
+            cache[order_uid] = build_order_fulfillment_summary(db, order_uid) or {}
+        summary = cache[order_uid]
+        if not summary:
+            continue
+        for key, value in summary.items():
+            if key in ("shippable_unit_count", "ti_bs_qty_for_received"):
+                continue
+            row[key] = value
+    return rows
+
+
 def apply_order_fulfillment_summary(rows):
     """
     Normalize order-level fulfillment fields on seller/buyer list rows.
@@ -548,21 +659,22 @@ def apply_order_fulfillment_summary(rows):
         shippable_units = int(
             row.get("shippable_unit_count") or row.get("ti_bs_qty") or 0
         )
-        shipped = int(row.get("shipped_item_count") or row.get("ti_shipped_qty") or 0)
+        order_qty = int(
+            row.get("ti_bs_qty") or row.get("ti_bs_qty_for_received") or 0
+        )
+        shipped_units = int(
+            row.get("ti_shipped_qty") or row.get("shipped_item_count") or 0
+        )
         unshipped = int(row.get("unshipped_item_count") or 0)
-        shipped_units = int(row.get("ti_shipped_qty") or shipped)
         delivered = int(row.get("delivered_item_count") or 0)
         received_qty = int(row.get("ti_received_qty") or 0)
-        order_qty = int(
-            row.get("ti_bs_qty_for_received") or row.get("ti_bs_qty") or 0
-        )
         received_units = int(row.get("received_item_count") or received_qty)
         has_in_transit = int(row.get("has_in_transit") or 0)
 
         # Return rows inherit sale shipping address via order_uid, but fulfillment
         # counts come from the return's own lines (usually not_required).
         row["shippable_item_count"] = shippable
-        row["shipped_item_count"] = shipped
+        row["shipped_item_count"] = shipped_units
         row["unshipped_item_count"] = unshipped
         row["delivered_item_count"] = delivered
         row["ti_shipped_qty"] = shipped_units
@@ -599,11 +711,11 @@ def apply_order_fulfillment_summary(rows):
             row["fulfillment_status"] = FULFILLMENT_STATUS_DELIVERED
         elif unshipped <= 0 and has_in_transit:
             row["fulfillment_status"] = FULFILLMENT_STATUS_IN_TRANSIT
-        elif unshipped <= 0 and shipped >= shippable:
+        elif unshipped <= 0 and shipped_units >= shippable:
             row["fulfillment_status"] = FULFILLMENT_STATUS_IN_TRANSIT
-        elif shipped > 0 and unshipped > 0:
+        elif shipped_units > 0 and unshipped > 0:
             row["fulfillment_status"] = FULFILLMENT_STATUS_PARTIAL
-        elif shipped <= 0:
+        elif shipped_units <= 0:
             row["fulfillment_status"] = FULFILLMENT_STATUS_NOT_SHIPPED
         else:
             row["fulfillment_status"] = FULFILLMENT_STATUS_IN_TRANSIT

@@ -34,6 +34,7 @@ from transaction_shipping import (
     insert_transaction_shipping,
     attach_shipping_to_transaction_rows,
     apply_order_fulfillment_summary,
+    sync_list_rows_fulfillment_from_context,
     fulfillment_list_summary_sql,
     ensure_fulfillment_list_rollups,
     append_fulfillment_field,
@@ -2539,22 +2540,53 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
                 )
 
         cancel_adjust_result = None
+        cancel_hold_result = None
         if cancel_unshipped_qty > 0 and not (
             clawback_result and clawback_result.get("finalized_request_hold")
         ):
-            from wallet_transactions_service import adjust_seller_proceeds_on_cancel_unshipped
-
-            cancel_adjust_result = adjust_seller_proceeds_on_cancel_unshipped(
-                db,
-                original_ti_uid=line["original_ti_uid"],
-                return_ti_uid=new_ti_uid,
-                cancel_qty=cancel_unshipped_qty,
-                transaction_uid=original_tx_uid,
+            from wallet_transactions_service import (
+                _finalize_pending_clawback_holds,
+                adjust_seller_proceeds_on_cancel_unshipped,
             )
-            if cancel_adjust_result.get("code") != 200:
+
+            line_trr_uid = (trr_by_ti or {}).get(line["original_ti_uid"])
+            if return_shipped_qty <= 0:
+                cancel_hold_result = _finalize_pending_clawback_holds(
+                    db,
+                    original_ti_uid=line["original_ti_uid"],
+                    return_ti_uid=new_ti_uid,
+                    trr_uid=line_trr_uid,
+                )
+            if not (
+                cancel_hold_result
+                and _to_float(cancel_hold_result.get("clawed")) > 0
+            ):
+                cancel_adjust_result = adjust_seller_proceeds_on_cancel_unshipped(
+                    db,
+                    original_ti_uid=line["original_ti_uid"],
+                    return_ti_uid=new_ti_uid,
+                    cancel_qty=cancel_unshipped_qty,
+                    transaction_uid=original_tx_uid,
+                )
+            cancel_clawed = 0.0
+            if cancel_hold_result and cancel_hold_result.get("code") == 200:
+                cancel_clawed = _to_float(cancel_hold_result.get("clawed"))
+            elif cancel_adjust_result and cancel_adjust_result.get("code") == 200:
+                cancel_clawed = _to_float(cancel_adjust_result.get("adjusted"))
+            if cancel_clawed > 0:
+                total_seller_clawed = round(total_seller_clawed + cancel_clawed, 4)
+            if cancel_adjust_result and cancel_adjust_result.get("code") != 200:
                 print(
                     "Warning: Failed to adjust seller proceeds for cancel on "
                     f"{line['original_ti_uid']}: {cancel_adjust_result}"
+                )
+            elif cancel_hold_result and cancel_hold_result.get("code") not in (
+                None,
+                200,
+            ):
+                print(
+                    "Warning: Failed to finalize cancel clawback hold on "
+                    f"{line['original_ti_uid']}: {cancel_hold_result}"
                 )
 
         response_lines.append(
@@ -4038,6 +4070,7 @@ class Transactions(Resource):
                                 row["offering_rate_display"] = display
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = sync_list_rows_fulfillment_from_context(db, rows)
                     from order_quantity_context import apply_list_verification_status
 
                     rows = apply_list_verification_status(db, rows)
@@ -6627,6 +6660,7 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = sync_list_rows_fulfillment_from_context(db, rows)
                     from order_quantity_context import apply_list_verification_status
 
                     rows = apply_list_verification_status(db, rows)
