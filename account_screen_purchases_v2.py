@@ -7,6 +7,7 @@ so the frontend never infers shipped / verified / return splits.
 
 from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping
 from order_display import build_return_ledger_display
+from account_screen_v2_contract import _units_for_return_row
 from order_quantity_context import _open_return_requests_for_order
 from transactions import (
     _is_return_list_row,
@@ -218,6 +219,7 @@ def _transform_return_row(db, row):
     qty = sum(int(l.get("return_quantity") or 0) for l in return_lines)
     display = build_return_ledger_display(out, qty=qty or abs(int(out.get("return_quantity_total") or 0)))
     out["display"] = display
+    out["units"] = _units_for_return_row(out)
 
     for key in (
         "is_return",
@@ -281,6 +283,7 @@ def _transform_pending_return_row(db, row):
     out["display"] = api.get("display") or build_return_ledger_display(
         out, qty=qty or abs(int(out.get("return_quantity_total") or 0))
     )
+    out["units"] = _units_for_return_row(out)
 
     for key in (
         "pending_return",

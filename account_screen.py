@@ -19,6 +19,10 @@ from datetime_utils import enrich_datetime_fields
 from order_list_hydration import attach_order_list_hydration
 from account_screen_purchases_v2 import build_purchases_v2_rows
 from account_screen_seller_v2 import build_seller_transactions_v2_rows
+from account_screen_v2_contract import (
+    build_purchases_v2_section,
+    finalize_account_screen_rows,
+)
 from user_profile_info import build_account_screen_profile
 from wallet_service import build_wallet_summary
 from wallet_transactions_service import resolve_seller_wallet_profile_id
@@ -56,24 +60,36 @@ def _merge_body_status(body, status):
     return out
 
 
-def _enrich_section_datetimes(body, field="transaction_datetime"):
-    """Ensure nested account-screen lists expose UTC (+ optional local) datetimes."""
+def _enrich_rows_datetimes(rows, field="transaction_datetime"):
+    """Enrich v2 row datetimes in place."""
+    if not rows:
+        return rows
+    tz_name = _request_timezone()
+    enriched = []
+    for row in rows:
+        if isinstance(row, dict):
+            enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
+        else:
+            enriched.append(row)
+    return enriched
+
+
+def _enrich_section_datetimes_legacy(body, field="transaction_datetime"):
+    """Datetime enrichment for bounty / seller subsections that still use data[]."""
     if not isinstance(body, dict):
         return body
 
     tz_name = _request_timezone()
     out = dict(body)
-    for list_key in ("data", "rows"):
-        data = body.get(list_key)
-        if not isinstance(data, list):
-            continue
+    data = body.get("data")
+    if isinstance(data, list):
         enriched = []
         for row in data:
             if isinstance(row, dict):
                 enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
             else:
                 enriched.append(row)
-        out[list_key] = enriched
+        out["data"] = enriched
     if tz_name:
         out["timezone"] = tz_name
     out["datetime_storage"] = "UTC"
@@ -84,10 +100,11 @@ class AccountScreenPersonal(Resource):
     """
     GET /api/v1/account-screen/personal/<profile_id>
 
-    Combines:
-      - GET /api/v1/transactions/<profile_id>  (purchases)
-      - GET /api/bountyresults/<profile_id>
-      - GET /api/v1/transactions/seller/<profile_id>  (seller / expertise lines)
+    Schema v2 personal payload. FE reads purchases.rows[] only (no purchases.data[],
+    no order_list_hydration). Each row includes units + display chips.
+
+    Combines legacy fetches for purchases, bounty, and seller-side lines, then
+    emits v2 rows for purchases and seller_transactions.
     """
 
     def get(self, profile_id):
@@ -98,15 +115,14 @@ class AccountScreenPersonal(Resource):
         bounty_body, bounty_status = BountyResults().get(profile_id)
         seller_body, seller_status = SellerTransactions().get(profile_id)
 
-        purchases_body = _enrich_section_datetimes(purchases_body)
-        bounty_body = _enrich_section_datetimes(bounty_body)
-        seller_body = _enrich_section_datetimes(seller_body)
+        bounty_body = _enrich_section_datetimes_legacy(bounty_body)
+        seller_body = _enrich_section_datetimes_legacy(seller_body)
 
         tz_name = _request_timezone()
         response = {
             "code": 200,
             "schema_version": 2,
-            "purchases": _merge_body_status(purchases_body, purchases_status),
+            "purchases": None,
             "bounty_results": _merge_body_status(bounty_body, bounty_status),
             "seller_transactions": _merge_body_status(seller_body, seller_status),
             "profile": None,
@@ -116,19 +132,26 @@ class AccountScreenPersonal(Resource):
         response["datetime_storage"] = "UTC"
 
         with connect() as db:
-            legacy_rows = (response.get("purchases") or {}).get("data") or []
-            v2_rows = build_purchases_v2_rows(db, legacy_rows)
-            if isinstance(response.get("purchases"), dict):
-                response["purchases"]["rows"] = v2_rows
-                response["purchases"]["count"] = len(v2_rows)
+            purchase_rows = (purchases_body or {}).get("rows")
+            if not purchase_rows:
+                legacy = (purchases_body or {}).get("data") or []
+                purchase_rows = build_purchases_v2_rows(db, legacy)
+            purchase_rows = _enrich_rows_datetimes(purchase_rows)
+            response["purchases"] = build_purchases_v2_section(
+                code=purchases_status,
+                message=(purchases_body or {}).get("message"),
+                rows=purchase_rows,
+            )
 
             seller_legacy = (response.get("seller_transactions") or {}).get("data") or []
-            seller_v2_rows = build_seller_transactions_v2_rows(db, seller_legacy)
+            seller_v2_rows = finalize_account_screen_rows(
+                build_seller_transactions_v2_rows(db, seller_legacy)
+            )
+            seller_v2_rows = _enrich_rows_datetimes(seller_v2_rows)
             if isinstance(response.get("seller_transactions"), dict):
-                # FE Offering Product Summary reads seller_transactions.data[]
                 response["seller_transactions"]["data"] = seller_v2_rows
-                response["seller_transactions"]["rows"] = seller_v2_rows
                 response["seller_transactions"]["count"] = len(seller_v2_rows)
+                response["seller_transactions"].pop("rows", None)
 
             response["wallet"] = build_wallet_summary(db, profile_id)
             response["profile"] = build_account_screen_profile(db, profile_id)
@@ -154,8 +177,8 @@ class AccountScreenBusiness(Resource):
         bounty_body, bounty_status = BusinessBountyResults().get(business_uid)
         info_body, info_status = BusinessInfo().get(business_uid)
 
-        seller_body = _enrich_section_datetimes(seller_body)
-        bounty_body = _enrich_section_datetimes(bounty_body)
+        seller_body = _enrich_section_datetimes_legacy(seller_body)
+        bounty_body = _enrich_section_datetimes_legacy(bounty_body)
 
         response = {
             "code": 200,

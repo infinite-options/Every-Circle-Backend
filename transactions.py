@@ -4171,10 +4171,15 @@ class Transactions(Resource):
 
                     rows = apply_list_verification_status(db, rows)
                     rows = _enrich_list_transaction_rows(db, rows)
+                    from account_screen_purchases_v2 import build_purchases_v2_rows
+
+                    v2_rows = build_purchases_v2_rows(db, rows)
                     response["message"] = "Purchase Transactions retrieved successfully"
                     response["code"] = 200
-                    response["data"] = rows
-                    response["count"] = len(rows)
+                    response["schema_version"] = 2
+                    response["data"] = v2_rows
+                    response["rows"] = v2_rows
+                    response["count"] = len(v2_rows)
                     if _request_timezone():
                         response["timezone"] = _request_timezone()
                     response["datetime_storage"] = "UTC"
