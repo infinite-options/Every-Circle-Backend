@@ -363,6 +363,135 @@ def _filter_and_enrich_expertise_info(
     return visible
 
 
+def load_expertise_info_for_profile(
+    db,
+    profile_id,
+    *,
+    is_owner_view=True,
+    viewer_profile_uid=None,
+    viewer_is_admin=False,
+    owner_moderated=None,
+):
+    """
+    Shared expertise_info builder for userprofileinfo and account-screen personal.
+
+    Reads live profile_expertise_quantity from DB (updated on purchase/return/restock).
+    """
+    if owner_moderated is None:
+        owner_moderated = get_user_moderated_value(db, profile_id)
+
+    owner_content_hidden = False
+    if not viewer_is_admin:
+        if owner_moderated == MODERATED_ACKNOWLEDGED:
+            owner_content_hidden = True
+        elif (
+            not is_owner_view
+            and owner_moderated
+            in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW)
+        ):
+            owner_content_hidden = True
+    if owner_content_hidden:
+        return []
+
+    moderated_filter = ""
+    if not is_owner_view and not viewer_is_admin:
+        moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
+
+    expertise_query = f"""
+        SELECT profile_expertise.*,
+            (
+                SELECT COUNT(*)
+                FROM every_circle.expertise_response er
+                WHERE er.er_profile_expertise_id = profile_expertise.profile_expertise_uid
+            ) AS expertise_responses,
+            (
+                SELECT COALESCE(SUM(ti.ti_bs_qty), 0)
+                FROM every_circle.transactions_items ti
+                INNER JOIN every_circle.transactions t
+                    ON t.transaction_uid = ti.ti_transaction_id
+                WHERE ti.ti_bs_id = profile_expertise.profile_expertise_uid
+                  AND COALESCE(t.transaction_type, 'sale') IN ('sale', 'return')
+            ) AS expertise_sales
+        FROM every_circle.profile_expertise
+        WHERE profile_expertise_profile_personal_id = %s
+          AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
+          {moderated_filter}
+    """
+    expertise_info = db.execute(expertise_query, (profile_id,))
+    expertise_rows = expertise_info.get("result") or []
+
+    effective_viewer_uid = profile_id if is_owner_view else viewer_profile_uid
+    return _filter_and_enrich_expertise_info(
+        db,
+        expertise_rows,
+        profile_id,
+        viewer_profile_uid=effective_viewer_uid,
+        viewer_is_admin=viewer_is_admin,
+        owner_moderated=owner_moderated,
+    )
+
+
+def seller_has_offerings(db, profile_id):
+    """True when profile has at least one non-deleted offering row."""
+    q = db.execute(
+        """
+        SELECT 1
+        FROM every_circle.profile_expertise
+        WHERE profile_expertise_profile_personal_id = %s
+          AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
+        LIMIT 1
+        """,
+        (profile_id,),
+    )
+    return bool(q.get("result"))
+
+
+def build_account_screen_profile(db, profile_id):
+    """
+    Profile subset for GET account-screen/personal — live offering inventory.
+
+    Returns None when the profile has no offerings; otherwise includes expertise_info
+    matching GET userprofileinfo for the same profile.
+    """
+    if not profile_id or not seller_has_offerings(db, profile_id):
+        return None
+
+    profile_response = db.select(
+        "every_circle.profile_personal",
+        where={"profile_personal_uid": profile_id},
+    )
+    rows = profile_response.get("result") or []
+    if not rows:
+        return None
+
+    personal = rows[0]
+    email_id = None
+    user_uid = personal.get("profile_personal_user_id")
+    if user_uid:
+        user_response = db.select(
+            "every_circle.users", where={"user_uid": user_uid}
+        )
+        user_rows = user_response.get("result") or []
+        if user_rows:
+            email_id = user_rows[0].get("user_email_id")
+
+    expertise_info = load_expertise_info_for_profile(
+        db,
+        profile_id,
+        is_owner_view=True,
+        viewer_profile_uid=profile_id,
+        viewer_is_admin=False,
+    )
+
+    return {
+        "user_email": email_id,
+        "personal_info": _enrich_personal_info_for_owner(
+            db, personal, profile_id, is_owner_view=True
+        ),
+        "expertise_info": expertise_info,
+    }
+
+
 def _filter_and_enrich_wish_info(
     db,
     wish_rows,
@@ -1199,10 +1328,21 @@ class UserProfileInfo(Resource):
                                             where={'profile_experience_profile_personal_id': profile_id})
                 response['experience_info'] = experience_info['result'] if experience_info['result'] else []
                 
-                # Get expertise info - returning all expertise entries for this profile with message response counts
-                # When the profile owner is pending_review / taken_down, hide offerings from
-                # other users. When acknowledged (3), hide from everyone including the owner.
-                # Offering/seeking moderation rows are never changed — filter-only.
+                response['expertise_info'] = load_expertise_info_for_profile(
+                    db,
+                    profile_id,
+                    is_owner_view=is_owner_view,
+                    viewer_profile_uid=viewer_profile_uid,
+                    viewer_is_admin=viewer_is_admin,
+                    owner_moderated=owner_moderated,
+                )
+
+                # Get education info - returning all education entries for this profile
+                education_info = db.select('every_circle.profile_education', 
+                                        where={'profile_education_profile_personal_id': profile_id})
+                response['education_info'] = education_info['result'] if education_info['result'] else []
+
+                # Get wishes info - returning all wishes entries for this profile with response counts
                 owner_content_hidden = False
                 if not viewer_is_admin:
                     if owner_moderated == MODERATED_ACKNOWLEDGED:
@@ -1213,57 +1353,6 @@ class UserProfileInfo(Resource):
                         in (MODERATED_TAKEN_DOWN, MODERATED_PENDING_REVIEW)
                     ):
                         owner_content_hidden = True
-                if owner_content_hidden:
-                    response['expertise_info'] = []
-                else:
-                    moderated_filter = ""
-                    if not is_owner_view and not viewer_is_admin:
-                        moderated_filter = " AND COALESCE(profile_expertise_moderated, 0) = 0"
-                    expertise_query = f"""
-                        SELECT profile_expertise.*,
-                            (
-                                SELECT COUNT(*)
-                                FROM every_circle.expertise_response er
-                                WHERE er.er_profile_expertise_id = profile_expertise.profile_expertise_uid
-                            ) AS expertise_responses,
-                            (
-                                SELECT COALESCE(SUM(ti.ti_bs_qty), 0)
-                                FROM every_circle.transactions_items ti
-                                INNER JOIN every_circle.transactions t
-                                    ON t.transaction_uid = ti.ti_transaction_id
-                                WHERE ti.ti_bs_id = profile_expertise.profile_expertise_uid
-                                  AND COALESCE(t.transaction_type, 'sale') IN ('sale', 'return')
-                            ) AS expertise_sales
-                        FROM every_circle.profile_expertise
-                        WHERE profile_expertise_profile_personal_id = %s
-                          AND (profile_expertise_is_deleted IS NULL OR profile_expertise_is_deleted = 0)
-                          {moderated_filter}
-                    """
-                    expertise_info = db.execute(expertise_query, (profile_id,))
-                    expertise_rows = (
-                        expertise_info['result'] if expertise_info.get('result') else []
-                    )
-                    # Self-lookup via user_uid/email has no viewer_profile_uid query param;
-                    # treat the profile owner as the viewer so pending_review/taken_down
-                    # content remains visible to them (acknowledged is still hidden above).
-                    effective_viewer_uid = (
-                        profile_id if is_owner_view else viewer_profile_uid
-                    )
-                    response['expertise_info'] = _filter_and_enrich_expertise_info(
-                        db,
-                        expertise_rows,
-                        profile_id,
-                        viewer_profile_uid=effective_viewer_uid,
-                        viewer_is_admin=viewer_is_admin,
-                        owner_moderated=owner_moderated,
-                    )
-
-                # Get education info - returning all education entries for this profile
-                education_info = db.select('every_circle.profile_education', 
-                                        where={'profile_education_profile_personal_id': profile_id})
-                response['education_info'] = education_info['result'] if education_info['result'] else []
-
-                # Get wishes info - returning all wishes entries for this profile with response counts
                 if owner_content_hidden:
                     response['wishes_info'] = []
                 else:

@@ -1127,16 +1127,9 @@ def _normalize_status_pair(return_status=None, refund_status=None):
 
 def _is_cancel_unshipped_request(req):
     """True when this TRR is a pre-ship cancel (not a physical return)."""
-    if not req:
-        return False
-    if req.get("cancel_unshipped") or req.get("pre_ship_cancel") or req.get(
-        "is_cancel_before_ship"
-    ):
-        return True
-    if req.get("trr_cancel_unshipped") in (1, "1", True, "true"):
-        return True
-    rs = (req.get("return_status") or req.get("trr_return_status") or "").strip().lower()
-    return rs == RETURN_STATUS_CANCELLED
+    from order_display import is_cancel_request
+
+    return is_cancel_request(req)
 
 
 def _status_payload(return_status, refund_status):
@@ -1158,6 +1151,109 @@ def _list_status_payload(return_status, refund_status):
         "refund_status": fs,
         "display_status": _display_return_status(rs, fs),
     }
+
+
+def _awaiting_seller_confirm(req):
+    """True when return request is open and not yet ledgered."""
+    from order_display import is_awaiting_seller
+
+    return is_awaiting_seller(req)
+
+
+def _display_status_label(return_status, refund_status, *, cancel_unshipped=False):
+    """Human label; e.g. 'Cancelling - Pending'. Prefer order_display.return_request_display_status."""
+    from order_display import return_request_display_status
+
+    if isinstance(return_status, dict):
+        return return_request_display_status(return_status)
+    f = (refund_status or "").strip().capitalize()
+    if cancel_unshipped:
+        r = "Cancelled"
+    else:
+        r = (return_status or "").strip().capitalize()
+    if r and f:
+        return f"{r} - {f}"
+    return r or f or None
+
+
+def _pending_return_chip_labels(req, refund_status):
+    """Purchases / seller table chips — delegates to order_display."""
+    from order_display import return_request_delivered_chip, return_request_received_chip
+
+    return return_request_delivered_chip(req), return_request_received_chip(req)
+
+
+def _api_status_for_return_request(req):
+    """Shared API status for buyer/seller pending-return payloads."""
+    from order_display import build_return_request_display
+
+    result = build_return_request_display(req)
+    return result or {}
+
+
+def _return_request_status_payload(req):
+    """Compact return/refund/display_status fields from a TRR row."""
+    api = _api_status_for_return_request(req)
+    return {
+        "return_status": api.get("return_status"),
+        "refund_status": api.get("refund_status"),
+        "display_status": api.get("display_status"),
+    }
+
+
+_PARENT_SALE_RETURN_STATUS_KEYS = (
+    "return_status",
+    "refund_status",
+    "display_status",
+    "transaction_return_status",
+    "transaction_refund_status",
+)
+
+
+def _has_open_pending_return(pending_req):
+    """True when TRR is open and not yet ledgered (awaiting seller / refund)."""
+    if not pending_req or pending_req.get("trr_return_transaction_uid"):
+        return False
+    rs, fs = _normalize_status_pair(
+        pending_req.get("return_status") or pending_req.get("trr_return_status"),
+        pending_req.get("refund_status") or pending_req.get("trr_refund_status"),
+    )
+    if not rs:
+        rs, fs = _normalize_status_pair(pending_req.get("trr_status"), None)
+    return _is_open_return(rs, fs)
+
+
+def _clear_parent_sale_return_status(row):
+    """Remove return/refund status from parent sale rows while TRR is open."""
+    if isinstance(row, dict):
+        for key in _PARENT_SALE_RETURN_STATUS_KEYS:
+            row.pop(key, None)
+    return row
+
+
+def _return_request_public_payload(req, *, qty=None):
+    """
+    Status + display.* for one TRR — pending_return rows, open_returns[], list rows.
+
+    Single source of truth so orders/:uid, purchases.rows[], and seller_transactions[]
+    agree for the same trr_uid.
+    """
+    from order_display import build_return_request_display
+
+    api = build_return_request_display(req, qty=qty)
+    if not api:
+        return {}
+    out = {
+        "return_status": api.get("return_status"),
+        "refund_status": api.get("refund_status"),
+        "display_status": api.get("display_status"),
+    }
+    if api.get("display"):
+        out["display"] = dict(api["display"])
+    for flag in ("cancel_unshipped", "pre_ship_cancel", "is_cancel_before_ship"):
+        if api.get(flag):
+            out[flag] = True
+    return out
 
 
 def _is_return_list_row(row):
@@ -3450,7 +3546,7 @@ class ReturnTransaction(Resource):
     """
     POST: buyer requests a return → creates one trr_uid row per item.
     Physical returns start as Returning - Pending.
-    Unshipped / cancel_unshipped requests start as Cancelled - Pending.
+    Unshipped / cancel_unshipped requests start as Cancelling - Pending (API chips).
 
     Does NOT write the return ledger or refund via Stripe. Seller confirms via
     ConfirmReturnTransaction (trr_uid or trr_uids) → Returned/Cancelled - *.
@@ -5916,7 +6012,6 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             f"uid (trr_uid={pending.get('trr_uid')!r})"
         )
         return None
-    rs, fs = _pair_for_sale(sale_row, pending)
     items = pending.get("items") or []
     ti_uids = [
         e.get("transaction_item_uid") or e.get("ti_uid")
@@ -5997,7 +6092,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
         payload["estimated_total"] = estimated_refund["total"]
 
     if compact:
-        payload.update(_list_status_payload(rs, fs))
+        payload.update(_return_request_public_payload(pending))
         return _omit_empty(payload)
 
     payload["seller_note"] = seller_note
@@ -6012,7 +6107,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
     payload["return_transaction_uid"] = pending.get("trr_return_transaction_uid")
     payload["stripe_refund_id"] = pending.get("trr_stripe_refund_id")
     payload["updated_at"] = pending.get("trr_updated_at")
-    payload.update(_status_payload(rs, fs))
+    payload.update(_return_request_public_payload(pending))
     return payload
 
 
@@ -6098,8 +6193,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         if payload:
             bounty_total += _to_float(payload.get("bounty_to_reclaim"))
 
-    rs, fs = _pair_for_sale(sale_row, primary)
-    status_fields = _list_status_payload(rs, fs)
+    status_fields = _return_request_status_payload(primary)
     cancel_flag = any(_is_cancel_unshipped_request(p) for p in pending_reqs)
 
     items = []
@@ -6138,6 +6232,8 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         }
         _apply_return_item_split_aliases(line_entry, cancel_only=cancel_flag)
         return_lines.append(line_entry)
+
+    api_status = _return_request_public_payload(primary, qty=qty_total)
 
     subtotal = round(
         sum(
@@ -6215,26 +6311,10 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         "is_cancel_before_ship": cancel_flag,
         "estimated_total": credit,
         "estimated_refund": batch_estimated_refund,
-        # Keep a slim pending_return for FE helpers that still read pending_return.*.
-        "pending_return": _omit_empty(
-            {
-                "trr_uid": trr_uids[0] if len(trr_uids) == 1 else None,
-                "trr_uids": trr_uids,
-                "trr_transaction_uid": order_uid,
-                "note": primary.get("trr_note"),
-                "items": items,
-                "estimated_total": credit,
-                "estimated_refund": batch_estimated_refund,
-                "bounty_to_reclaim": round(bounty_total, 4),
-                "created_at": primary.get("trr_created_at"),
-                "cancel_unshipped": cancel_flag,
-                "pre_ship_cancel": cancel_flag,
-                "is_cancel_before_ship": cancel_flag,
-                **status_fields,
-            }
-        ),
         **status_fields,
     }
+    if api_status.get("display"):
+        row["display"] = api_status["display"]
     if len(trr_uids) == 1:
         row["trr_uid"] = trr_uids[0]
         row["transaction_uid"] = trr_uids[0]
@@ -6464,8 +6544,7 @@ def _enrich_list_transaction_rows(db, rows):
             if sale_uid:
                 sales_by_uid[sale_uid] = out
             if open_reqs:
-                rs, fs = _pair_for_sale(out, open_reqs[0])
-                out.update(_list_status_payload(rs, fs))
+                _clear_parent_sale_return_status(out)
                 pending_returns_payload = [
                     _pending_return_payload_for_sale(db, out, req, compact=True)
                     for req in open_reqs

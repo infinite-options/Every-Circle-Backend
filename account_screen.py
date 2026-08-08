@@ -18,6 +18,8 @@ from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
 from order_list_hydration import attach_order_list_hydration
 from account_screen_purchases_v2 import build_purchases_v2_rows
+from account_screen_seller_v2 import build_seller_transactions_v2_rows
+from user_profile_info import build_account_screen_profile
 from wallet_service import build_wallet_summary
 from wallet_transactions_service import resolve_seller_wallet_profile_id
 
@@ -119,7 +121,17 @@ class AccountScreenPersonal(Resource):
             if isinstance(response.get("purchases"), dict):
                 response["purchases"]["rows"] = v2_rows
                 response["purchases"]["count"] = len(v2_rows)
+
+            seller_legacy = (response.get("seller_transactions") or {}).get("data") or []
+            seller_v2_rows = build_seller_transactions_v2_rows(db, seller_legacy)
+            if isinstance(response.get("seller_transactions"), dict):
+                # FE Offering Product Summary reads seller_transactions.data[]
+                response["seller_transactions"]["data"] = seller_v2_rows
+                response["seller_transactions"]["rows"] = seller_v2_rows
+                response["seller_transactions"]["count"] = len(seller_v2_rows)
+
             response["wallet"] = build_wallet_summary(db, profile_id)
+            response["profile"] = build_account_screen_profile(db, profile_id)
 
         return (response, 200)
 

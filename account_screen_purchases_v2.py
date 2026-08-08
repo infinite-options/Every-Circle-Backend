@@ -6,12 +6,13 @@ so the frontend never infers shipped / verified / return splits.
 """
 
 from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping
+from order_display import build_return_ledger_display
 from order_quantity_context import _open_return_requests_for_order
 from transactions import (
     _is_return_list_row,
     _is_open_return,
-    _pair_for_sale,
-    _display_return_status,
+    _return_request_public_payload,
+    _clear_parent_sale_return_status,
     _return_ledger_line_split,
     _pending_return_payload_for_sale,
     _resolve_parent_sale_uid,
@@ -71,7 +72,7 @@ def _open_return_summary(db, sale_row, pending_req):
     if not payload:
         return None
 
-    rs, fs = _pair_for_sale(sale_row, pending_req)
+    api = _return_request_public_payload(pending_req)
     items = []
     cancel_only = bool(
         pending_req.get("cancel_unshipped") or pending_req.get("pre_ship_cancel")
@@ -96,12 +97,18 @@ def _open_return_summary(db, sale_row, pending_req):
     estimated = payload.get("estimated_refund") or {}
     summary = {
         "trr_uid": pending_req.get("trr_uid"),
-        "return_status": rs,
-        "refund_status": fs,
-        "display_status": _display_return_status(rs, fs),
+        "return_status": api.get("return_status"),
+        "refund_status": api.get("refund_status"),
+        "display_status": api.get("display_status"),
         "note": payload.get("note") or pending_req.get("trr_note"),
         "items": items,
     }
+    if api.get("display"):
+        summary["display"] = api["display"]
+    if cancel_only:
+        summary["cancel_unshipped"] = True
+        summary["pre_ship_cancel"] = True
+        summary["is_cancel_before_ship"] = True
     if estimated.get("total") is not None:
         summary["estimated_refund_total"] = estimated.get("total")
     return summary
@@ -153,6 +160,7 @@ def _transform_sale_row(db, row):
             open_returns.append(summary)
     if open_returns:
         out["open_returns"] = open_returns
+        _clear_parent_sale_return_status(out)
 
     out["display"] = _sale_display(out, units)
 
@@ -208,13 +216,8 @@ def _transform_return_row(db, row):
     out.pop("lines", None)
 
     qty = sum(int(l.get("return_quantity") or 0) for l in return_lines)
-    out["display"] = {
-        "qty": qty or abs(int(out.get("return_quantity_total") or 0)),
-        "delivered_label": "Returned",
-        "received_label": "Refunded"
-        if (out.get("refund_status") or "").lower() == "refunded"
-        else out.get("display_status") or "Pending",
-    }
+    display = build_return_ledger_display(out, qty=qty or abs(int(out.get("return_quantity_total") or 0)))
+    out["display"] = display
 
     for key in (
         "is_return",
@@ -257,11 +260,27 @@ def _transform_pending_return_row(db, row):
     out["return_lines"] = return_lines
 
     qty = sum(int(l.get("return_quantity") or 0) for l in return_lines)
-    out["display"] = {
-        "qty": qty or abs(int(out.get("return_quantity_total") or 0)),
-        "delivered_label": "Returning",
-        "received_label": "Pending",
-    }
+    req_view = dict(out)
+    req_view.setdefault("trr_uid", trr_uid)
+    req_view["trr_return_transaction_uid"] = None
+    api = _return_request_public_payload(
+        req_view, qty=qty or abs(int(out.get("return_quantity_total") or 0))
+    )
+    out.update(
+        {
+            k: api[k]
+            for k in ("return_status", "refund_status", "display_status")
+            if k in api
+        }
+    )
+    if api.get("cancel_unshipped"):
+        out["cancel_unshipped"] = True
+        out["pre_ship_cancel"] = True
+        out["is_cancel_before_ship"] = True
+
+    out["display"] = api.get("display") or build_return_ledger_display(
+        out, qty=qty or abs(int(out.get("return_quantity_total") or 0))
+    )
 
     for key in (
         "pending_return",

@@ -53,19 +53,27 @@ def _units_from_counts(
     unverified_shipped = max(0, shipped - verified - returned_shipped)
     verifiable_remaining = max(0, unverified_shipped - return_in_progress_shipped)
     if is_pickup_or_virtual:
-        receivable = max(purchased - cancelled_pre_ship, 0)
+        receivable = max(
+            purchased - cancelled_pre_ship - cancelled_pre_ship_in_progress,
+            0,
+        )
         verifiable_remaining = max(
             0, receivable - verified - return_in_progress_shipped
         )
 
+    # active_qty: fulfillment chip denominator = purchased minus completed and
+    # in-progress pre-ship cancels (Cancelling + Cancelled). Returns do not reduce it.
     active = max(
-        purchased - cancelled_pre_ship - returned_shipped - returned_unshipped, 0
+        purchased - cancelled_pre_ship - cancelled_pre_ship_in_progress,
+        0,
     )
-    if is_pickup_or_virtual:
-        active = max(purchased - cancelled_pre_ship, 0)
 
     remaining_returnable = max(
-        active - return_in_progress_shipped - return_in_progress_unshipped, 0
+        active
+        - returned_shipped
+        - returned_unshipped
+        - return_in_progress_shipped,
+        0,
     )
     if is_pickup_or_virtual:
         remaining_returnable = max(
@@ -110,6 +118,10 @@ def _units_from_counts(
         "max_return_shipped_qty": max_return_shipped,
         "max_cancel_unshipped_qty": max_cancel_unshipped,
     }
+
+
+def order_fulfillment_method(db, order_uid):
+    return _order_fulfillment_method(db, order_uid)
 
 
 def line_units_ledger(
@@ -233,54 +245,64 @@ def requires_shipping(row):
     return fulfillment_method(row) not in ("pickup", "virtual", "not_required")
 
 
-def sale_display(row, units, *, include_qty=True):
-    """Precomputed chip labels (FE renders verbatim)."""
+def shippable_total(units):
+    """Units used as the denominator for ship-progress fractions on sale rows."""
     active = int(units.get("active_qty") or 0)
     purchased = int(units.get("purchased_qty") or 0)
-    shipped = int(units.get("shipped_qty") or 0)
-    verified = int(units.get("verified_qty") or 0)
-    remaining_to_ship = int(units.get("remaining_to_ship_qty") or 0)
-    verifiable = int(units.get("verifiable_remaining_qty") or 0)
-    in_escrow = int(row.get("transaction_in_escrow") or 0) == 1
-    requires_ship = requires_shipping(row)
+    return active if active > 0 else purchased
+
+
+def sale_display(row, units, *, include_qty=True):
+    """Buyer purchase chip labels (FE renders verbatim)."""
+    from order_display import build_sale_display
+
+    return build_sale_display(row, units, audience="buyer", include_qty=include_qty)
+
+
+def seller_sale_display(row, units, *, include_qty=True):
+    """Seller / Offering Product Summary chip labels (FE renders verbatim)."""
+    from order_display import build_sale_display
+
+    return build_sale_display(row, units, audience="seller", include_qty=include_qty)
+
+
+def enrich_sale_row_v2(db, row, *, audience="buyer"):
+    """
+    Shared v2 enrichment for sale list rows and order-detail sale headers.
+
+    audience: "buyer" | "seller"
+    """
+    order_uid = row.get("transaction_uid")
+    if not order_uid:
+        return row
+
+    out = dict(row)
     method = fulfillment_method(row)
+    if method == "ship" and not row.get("ti_fulfillment_method"):
+        method = order_fulfillment_method(db, order_uid)
+    out["fulfillment_method"] = method
+    out["requires_shipping"] = requires_shipping(out)
 
-    if method in ("pickup", "virtual"):
-        delivered_label = "Ready" if verified > 0 else "—"
-    elif remaining_to_ship > 0:
-        denom = active if active > 0 else purchased
-        delivered_label = f"{shipped}/{denom}"
-    elif shipped <= 0:
-        delivered_label = "Not Shipped"
-    elif in_escrow:
-        delivered_label = "Shipped"
-    else:
-        delivered_label = "Delivered"
+    units = sale_units_ledger(db, order_uid)
+    out["units"] = units
+    display_fn = seller_sale_display if audience == "seller" else sale_display
+    out["display"] = display_fn(
+        out, units, include_qty=(audience == "seller")
+    )
+    if audience == "seller":
+        sync_legacy_unit_fields(out, units)
+    return out
 
-    received_action = None
-    if verified >= active and active > 0:
-        received_label = "Yes"
-    elif verified <= 0:
-        received_label = "No"
-        if requires_ship and shipped > 0:
-            received_action = "verify"
-    elif verifiable > 0 or (requires_ship and verified < active and shipped > verified):
-        received_label = "Verify"
-        received_action = "verify"
-    else:
-        received_label = f"{verified}/{active}" if active > 0 else "Partial"
 
-    display = {
-        "delivered_label": delivered_label,
-        "received_label": received_label,
-    }
-    if received_action:
-        display["received_action"] = received_action
-    if include_qty:
-        display["qty"] = purchased if active <= 0 else max(active, purchased)
-
-    open_returns = row.get("open_returns") or []
-    if open_returns:
-        display["order_return_summary"] = open_returns[0].get("display_status")
-
-    return display
+def sync_legacy_unit_fields(row, units):
+    """Align legacy count fields with units ledger (avoid shippable_item_count confusion)."""
+    if not isinstance(row, dict) or not units:
+        return row
+    row["ti_shipped_qty"] = int(units.get("shipped_qty") or 0)
+    row["unshipped_item_count"] = int(units.get("remaining_to_ship_qty") or 0)
+    row["purchased_units"] = int(units.get("purchased_qty") or 0)
+    row["shipped_item_count"] = int(units.get("shipped_qty") or 0)
+    row["ti_received_qty"] = int(units.get("verified_qty") or 0)
+    row["received_item_count"] = int(units.get("verified_qty") or 0)
+    row.pop("shippable_item_count", None)
+    return row

@@ -18,7 +18,11 @@ from units_ledger import (
     sale_units_ledger,
     attach_line_units_ledgers,
     sale_display,
+    seller_sale_display,
+    sync_legacy_unit_fields,
+    enrich_sale_row_v2,
     fulfillment_method,
+    order_fulfillment_method,
 )
 from transactions import (
     _load_return_request,
@@ -489,8 +493,7 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     pending_return = (
         open_returns[0] if open_returns else _load_return_request(db, order_uid)
     )
-    return_status, refund_status = _pair_for_sale(sale, pending_return)
-    status_fields = _status_payload(return_status, refund_status)
+    has_open_pending = bool(open_returns)
 
     pending_returns_payload = [
         _pending_payload_for_order(db, sale, req, compact=True)
@@ -499,6 +502,12 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     pending_return_payload = (
         pending_returns_payload[0] if pending_returns_payload else None
     )
+
+    if has_open_pending:
+        status_fields = {}
+    else:
+        return_status, refund_status = _pair_for_sale(sale, pending_return)
+        status_fields = _status_payload(return_status, refund_status)
 
     transaction_return_items = []
     for req in open_returns:
@@ -542,7 +551,14 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     _apply_sale_fulfillment_rollup(db, sale_payload)
 
     stripe_refund = _stripe_refund_summary(
-        status_fields, pending_returns_payload, returns
+        status_fields
+        or (
+            {"refund_status": pending_return_payload.get("refund_status")}
+            if pending_return_payload
+            else {}
+        ),
+        pending_returns_payload,
+        returns,
     )
 
     payload = {
@@ -568,11 +584,12 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     return payload
 
 
-def enrich_buyer_order_v2(db, order_uid, payload):
+def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
     """
-    Add schema v2 unit ledger to order-detail for buyer personal / Offering.
+    Add schema v2 unit ledger to order-detail.
 
-    sale.units must match account-screen sale row at the same point in time.
+    audience: "buyer" | "seller" — controls display label rules.
+    sale.units must match account-screen row for the same order at the same time.
     """
     if not isinstance(payload, dict):
         return payload
@@ -591,11 +608,19 @@ def enrich_buyer_order_v2(db, order_uid, payload):
         }
     )
     if not header.get("fulfillment_method"):
-        header["fulfillment_method"] = fulfillment_method(sale)
+        method = fulfillment_method(sale)
+        if method == "ship" and not sale.get("ti_fulfillment_method"):
+            method = order_fulfillment_method(db, order_uid)
+        header["fulfillment_method"] = method
 
-    units = sale_units_ledger(db, order_uid)
+    enriched = enrich_sale_row_v2(db, header, audience=audience)
+    units = enriched["units"]
     sale["units"] = units
-    sale["display"] = sale_display(header, units, include_qty=False)
+    sale["display"] = enriched["display"]
+    sale["requires_shipping"] = enriched.get("requires_shipping")
+    sale["fulfillment_method"] = enriched.get("fulfillment_method")
+    if audience == "seller":
+        sync_legacy_unit_fields(sale, units)
 
     lines = attach_line_units_ledgers(db, order_uid, sale.get("lines") or [])
     for line in lines:
@@ -621,6 +646,11 @@ def enrich_buyer_order_v2(db, order_uid, payload):
     payload["returns"] = returns
 
     return payload
+
+
+def enrich_buyer_order_v2(db, order_uid, payload):
+    """Backward-compat alias."""
+    return enrich_order_v2(db, order_uid, payload, audience="buyer")
 
 
 class OrderDetail(Resource):
@@ -677,8 +707,18 @@ class OrderDetail(Resource):
                     profile_id
                     and str(sale.get("transaction_profile_id")) == str(profile_id)
                 )
+                is_seller = bool(
+                    (business_uid and str(sale.get("transaction_business_id")) == str(business_uid))
+                    or (
+                        profile_id
+                        and str(sale.get("transaction_business_id")) == str(profile_id)
+                        and not is_buyer
+                    )
+                )
                 if is_buyer:
-                    payload = enrich_buyer_order_v2(db, order_uid, payload)
+                    payload = enrich_order_v2(db, order_uid, payload, audience="buyer")
+                elif is_seller:
+                    payload = enrich_order_v2(db, order_uid, payload, audience="seller")
 
                 tz_name = _request_timezone()
                 payload = _enrich_order_datetimes(payload, tz_name)
