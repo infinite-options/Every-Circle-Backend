@@ -75,14 +75,23 @@ def sale_received_label(row, units, *, audience="buyer"):
     shipped = int(units.get("shipped_qty") or 0)
     verified = int(units.get("verified_qty") or 0)
     verifiable = int(units.get("verifiable_remaining_qty") or 0)
+    returned = int(units.get("returned_shipped_completed_qty") or 0) + int(
+        units.get("returned_unshipped_completed_qty") or 0
+    )
     requires_ship = _requires_shipping(row)
+
+    # Verified + completed returns cover all active units (e.g. 2 verified + 1 returned, active 3).
+    resolved = verified + returned
+    if resolved >= active and active > 0:
+        return "Yes", None
 
     if verified >= active and active > 0:
         return "Yes", None
 
-    if audience == "buyer" and (
-        verifiable > 0 or (requires_ship and verified < active and shipped > verified)
-    ):
+    if audience == "buyer" and verifiable > 0:
+        return "Verify", "verify"
+
+    if audience == "buyer" and requires_ship and verified < active and shipped > verified:
         return "Verify", "verify"
 
     if verified <= 0:
