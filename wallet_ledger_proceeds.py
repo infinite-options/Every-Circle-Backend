@@ -6,11 +6,14 @@ Append-only audit trail: immutable original sale entry plus per-event lines
 """
 
 from order_quantity_context import (
-    compute_proceeds_buckets,
     compute_seller_proceeds_ledger_amounts,
     order_quantity_context,
     proceeds_breakdown_fields,
     quantity_context_fields,
+)
+from units_ledger import (
+    proceeds_buckets_from_sale_units,
+    sale_proceeds_original_availability,
 )
 from wallet_service import _round_money, _to_float
 from wallet_transactions_service import (
@@ -118,9 +121,11 @@ def _bucket_snapshot_from_totals(
     returned,
     pending_return_window=None,
 ):
-    unverified_shipped = max((shipped - returned) - max(verified - returned, 0), 0)
+    unverified_shipped = max(shipped - verified - returned, 0)
     if pending_return_window is None:
-        pending_return_window = max(0, verified - returned)
+        unverified_pool = max(0, shipped - verified)
+        returned_verified = returned - min(returned, unverified_pool)
+        pending_return_window = max(0, verified - returned_verified)
     pending_verification = unverified_shipped
     pending_shipment = max(0, purchased - cancelled - unverified_shipped - verified)
     active_qty = max(0, purchased - cancelled - returned)
@@ -284,9 +289,12 @@ def build_order_proceeds_ledger_entries(
     full_order_proceeds = _round_money(
         proceeds.get("amount") if breakdown.get("amount") is not None else per_unit * purchased
     )
-    current_buckets = compute_proceeds_buckets(proceeds)
+    current_buckets = proceeds_buckets_from_sale_units(db, order_uid, qty_ctx=qty)
 
     entries = []
+
+    ctx_fields = quantity_context_fields(proceeds)
+    ctx_fields.update(current_buckets)
 
     original = _base_entry(
         order_uid,
@@ -303,8 +311,9 @@ def build_order_proceeds_ledger_entries(
         cancelled_qty_delta=None,
         returned_qty_delta=None,
         verified_qty_delta=None,
-        **quantity_context_fields(proceeds),
+        **ctx_fields,
     )
+    original["availability"] = sale_proceeds_original_availability(current_buckets)
     entries.append(original)
 
     cancelled_running = 0
@@ -426,7 +435,10 @@ def build_order_proceeds_ledger_entries(
                 cancelled=cancelled_running,
                 returned=returned_running,
                 pending_return_window=int(
-                    compute_proceeds_buckets(proceeds).get("pending_return_window") or 0
+                    proceeds_buckets_from_sale_units(db, order_uid, qty_ctx=qty).get(
+                        "pending_return_window"
+                    )
+                    or 0
                 ),
             )
 

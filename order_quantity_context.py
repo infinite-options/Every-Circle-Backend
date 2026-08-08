@@ -201,7 +201,12 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         ti_row=row,
     )
     net_verified_not_returned = max(verified - returned, 0)
-    unverified_shipped = max((shipped - returned) - net_verified_not_returned, 0)
+    # Align with v2 units_ledger: returned unverified units do not count as pending verify.
+    unverified_shipped = max(shipped - verified - returned, 0)
+    unverified_pool = max(0, shipped - verified)
+    unverified_returned = min(returned, unverified_pool)
+    returned_verified = returned - unverified_returned
+    verified_for_return_window = max(0, verified - returned_verified)
     pending_verification_units = remaining_to_ship + max(0, shipped - verified)
     verified_returnable = _returnable_verified_qty_cached(
         db,
@@ -213,7 +218,7 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         open_reqs=open_reqs,
     )
     net_verified_held = _net_verified_held_units(
-        row, verified, returned, reserved_return
+        row, verified_for_return_window, 0, reserved_return
     )
     max_return_shipped_qty = max(0, min(shipped, verified) - returned)
     max_cancel_unshipped_qty = max(0, (purchased - shipped) - cancelled)
@@ -548,13 +553,21 @@ def verification_denominator(ctx):
     return int(ctx.get("purchased_qty") or 0)
 
 
-def compute_proceeds_buckets(ctx):
+def compute_proceeds_buckets(ctx, *, db=None, order_uid=None):
     """
     Live bucket counts for seller-proceeds ledger (source of truth).
+
+    When db and order_uid are provided, buckets are derived from v2 sale_units_ledger
+    (same canonical ledger as order-detail / account-screen units).
 
     pending_shipment + pending_cancellation + pending_verification
         + pending_return_window = active_qty
     """
+    if db and order_uid:
+        from units_ledger import proceeds_buckets_from_sale_units
+
+        return proceeds_buckets_from_sale_units(db, order_uid, qty_ctx=ctx)
+
     if not ctx:
         return {}
     purchased = int(ctx.get("purchased_qty") or 0)
@@ -590,14 +603,21 @@ def compute_proceeds_buckets(ctx):
     }
 
 
-def receivable_units_from_totals(purchased_qty, cancelled_qty):
-    """Units the buyer may still need to verify (purchased minus pre-ship cancels)."""
-    return max(int(purchased_qty or 0) - int(cancelled_qty or 0), 0)
+def receivable_units_from_totals(purchased_qty, cancelled_qty, returned_qty=0):
+    """Units the buyer may still need to verify (purchased − cancels − returns)."""
+    return max(
+        int(purchased_qty or 0)
+        - int(cancelled_qty or 0)
+        - int(returned_qty or 0),
+        0,
+    )
 
 
-def verification_complete(received_qty, purchased_qty, cancelled_qty):
+def verification_complete(received_qty, purchased_qty, cancelled_qty, returned_qty=0):
     """True when every receivable unit has been buyer-verified."""
-    receivable = receivable_units_from_totals(purchased_qty, cancelled_qty)
+    receivable = receivable_units_from_totals(
+        purchased_qty, cancelled_qty, returned_qty
+    )
     if receivable <= 0:
         return True
     return int(received_qty or 0) >= receivable
@@ -608,7 +628,7 @@ def apply_list_verification_status(db, rows):
     Set all_items_received (and clear stale escrow) on buyer/seller list rows.
 
     Verification completes when verified qty reaches receivable units
-    (purchased − pre-ship cancels), not full ti_bs_qty.
+    (purchased − pre-ship cancels − completed returns), not full ti_bs_qty.
     """
     if not rows:
         return rows
@@ -625,8 +645,11 @@ def apply_list_verification_status(db, rows):
         qty = order_quantity_context(db, order_uid)
         purchased = int(qty.get("purchased_qty") or 0)
         cancelled = int(qty.get("cancelled_qty") or 0)
+        returned = int(qty.get("returned_qty") or 0)
         verified = int(qty.get("verified_qty") or 0)
-        all_received = verification_complete(verified, purchased, cancelled)
+        all_received = verification_complete(
+            verified, purchased, cancelled, returned
+        )
 
         row["all_items_received"] = 1 if all_received else 0
 

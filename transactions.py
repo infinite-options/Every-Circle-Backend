@@ -1706,7 +1706,8 @@ def _all_lines_fully_received(db, transaction_uid):
         purchased = int(row.get("ti_bs_qty") or 0)
         verified = int(row.get("ti_received_qty") or 0)
         cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
-        if not verification_complete(verified, purchased, cancelled):
+        returned = _already_returned_qty(db, transaction_uid, ti_uid)
+        if not verification_complete(verified, purchased, cancelled, returned):
             return False
     return True
 
@@ -5571,9 +5572,12 @@ class Transactions(Resource):
                     order_qty = int(ti_row.get("ti_bs_qty") or 0)
                     current_received = int(ti_row.get("ti_received_qty") or 0)
                     cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
+                    returned = _already_returned_qty(db, transaction_uid, ti_uid)
                     from order_quantity_context import receivable_units_from_totals
 
-                    receivable = receivable_units_from_totals(order_qty, cancelled)
+                    receivable = receivable_units_from_totals(
+                        order_qty, cancelled, returned
+                    )
                     remaining = receivable - current_received
 
                     if order_qty <= 0 or receivable <= 0:

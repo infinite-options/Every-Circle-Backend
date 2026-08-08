@@ -603,6 +603,7 @@ def build_order_fulfillment_summary(db, order_uid):
         "ti_bs_qty_for_received": purchased,
         "received_item_count": received,
         "cancelled_qty": cancelled,
+        "returned_qty": int(qty.get("returned_qty") or 0),
         "purchased_units": purchased,
         "received_units": received,
     }
@@ -685,12 +686,17 @@ def apply_order_fulfillment_summary(rows):
         row.pop("ti_bs_qty_for_received", None)
         row.pop("shippable_unit_count", None)
         cancelled_units = int(row.get("cancelled_qty") or 0)
-        receivable = max(order_qty - cancelled_units, 0) if order_qty > 0 else 0
+        returned_units = int(row.get("returned_qty") or 0)
+        from order_quantity_context import verification_complete
+
         if order_qty > 0:
-            if receivable > 0:
-                row["all_items_received"] = 1 if received_qty >= receivable else 0
-            else:
-                row["all_items_received"] = 1
+            row["all_items_received"] = (
+                1
+                if verification_complete(
+                    received_qty, order_qty, cancelled_units, returned_units
+                )
+                else 0
+            )
         else:
             row["all_items_received"] = 0
         row["needs_shipping"] = 1 if unshipped > 0 else 0

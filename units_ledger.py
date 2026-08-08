@@ -175,6 +175,97 @@ def line_units_ledger(
     )
 
 
+def _held_return_window_units(db, order_uid):
+    """Units with seller proceeds still held for return-window escrow (wallet source of truth)."""
+    from wallet_transactions_service import (
+        WT_STATUS_HELD,
+        WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+    )
+
+    if not order_uid:
+        return 0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_qty), 0) AS held_units
+        FROM every_circle.wallet_transactions
+        WHERE wt_transaction_id = %s
+          AND wt_type = %s
+          AND wt_status = %s
+        """,
+        (order_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, WT_STATUS_HELD),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0
+    return max(int(rows[0].get("held_units") or 0), 0)
+
+
+def proceeds_buckets_from_sale_units(db, order_uid, *, qty_ctx=None):
+    """
+    Seller-proceeds bucket counts derived from v2 sale_units_ledger.
+
+    Same canonical unit ledger as purchases.rows[].units / order-detail sale.units.
+    pending_return_window uses wallet held rows when buyer verification is caught up.
+    """
+    if not order_uid:
+        return {}
+
+    units = sale_units_ledger(db, order_uid)
+    if qty_ctx is None:
+        qty_ctx = order_quantity_context(db, order_uid)
+
+    pending_verification = int(units.get("verifiable_remaining_qty") or 0)
+    pending_cancellation = int(units.get("cancelled_pre_ship_in_progress_qty") or 0)
+    pending_shipment = int(units.get("remaining_to_ship_qty") or 0)
+    return_in_progress_shipped = int(units.get("return_in_progress_shipped_qty") or 0)
+    returned_shipped = int(units.get("returned_shipped_completed_qty") or 0)
+    verified = int(units.get("verified_qty") or 0)
+    shipped = int(units.get("shipped_qty") or 0)
+
+    if pending_verification == 0 and return_in_progress_shipped == 0:
+        if returned_shipped > 0 and (verified + returned_shipped) >= shipped:
+            # Every shipped unit is verified or returned — no verify/return-window narrative.
+            pending_return_window = 0
+        else:
+            pending_return_window = _held_return_window_units(db, order_uid)
+    else:
+        pending_return_window = max(0, int(qty_ctx.get("net_verified_held") or 0))
+
+    purchased = int(units.get("purchased_qty") or 0)
+    cancelled = int(units.get("cancelled_pre_ship_qty") or 0)
+    returned = returned_shipped + int(units.get("returned_unshipped_completed_qty") or 0)
+    active_qty = int(units.get("active_qty") or 0)
+    unverified_shipped = max(0, shipped - verified - returned)
+
+    return {
+        "purchased_qty": purchased,
+        "cancelled_qty": cancelled,
+        "returned_qty": returned,
+        "verified_qty": verified,
+        "shipped_qty": shipped,
+        "unverified_shipped_qty": unverified_shipped,
+        "pending_shipment": pending_shipment,
+        "pending_cancellation": pending_cancellation,
+        "pending_verification": pending_verification,
+        "pending_return_window": pending_return_window,
+        "active_qty": active_qty,
+    }
+
+
+def sale_proceeds_original_availability(buckets):
+    """Map live proceeds buckets to ledger availability on the immutable original row."""
+    pending_total = sum(
+        int(buckets.get(key) or 0)
+        for key in (
+            "pending_shipment",
+            "pending_cancellation",
+            "pending_verification",
+            "pending_return_window",
+        )
+    )
+    return "useable" if pending_total == 0 else "pending"
+
+
 def sale_units_ledger(db, order_uid):
     """Order-level v2 unit buckets (matches account-screen sale row units)."""
     qty = order_quantity_context(db, order_uid)
