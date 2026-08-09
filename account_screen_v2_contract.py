@@ -18,7 +18,8 @@ _ORDER_LEVEL_FINANCIAL_KEYS = frozenset(
     }
 )
 
-# Legacy list fields the FE must not rely on (stripped from v2 rows).
+# Legacy list fields stripped from v2 rows (sale rows). Return/cancel rows keep
+# refund money fields and pending_return payloads — see _legacy_keys_for_row().
 _LEGACY_ROW_KEYS = frozenset(
     {
         "pending_return",
@@ -47,9 +48,36 @@ _LEGACY_ROW_KEYS = frozenset(
         "transaction_refund_status",
         "parent_sale_resolve_error",
         "lines",
-        "estimated_refund",
     }
 )
+
+# Return/cancel rows keep refund + pending payloads for Purchases Amount column.
+_RETURN_ROW_PRESERVED_KEYS = frozenset(
+    {
+        "pending_return",
+        "estimated_refund",
+        "is_return",
+        "is_pending_return",
+        "transaction_total",
+        "transaction_amount",
+        "transaction_taxes",
+        "transaction_fees",
+        "transaction_shipping",
+        "refund_amount",
+        "refund_total",
+        "return_total",
+        "returned_total",
+        "estimated_total",
+        "bounty_to_reclaim",
+    }
+)
+
+
+def _legacy_keys_for_row(kind):
+    keys = set(_LEGACY_ROW_KEYS)
+    if kind in ("return", "pending_return"):
+        keys -= _RETURN_ROW_PRESERVED_KEYS
+    return keys
 
 _UNITS_DEFAULTS = {
     "purchased_qty": 0,
@@ -200,7 +228,7 @@ def finalize_account_screen_row(row):
     out["display"] = _ensure_display(out)
     out.update(_modal_copy_fields(out))
 
-    for key in _LEGACY_ROW_KEYS:
+    for key in _legacy_keys_for_row(kind):
         out.pop(key, None)
 
     return out

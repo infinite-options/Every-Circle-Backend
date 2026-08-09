@@ -8,10 +8,7 @@ so the frontend never infers shipped / verified / return splits.
 from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping
 from order_display import build_return_ledger_display
 from account_screen_v2_contract import _units_for_return_row
-from account_screen_line_rows import (
-    _ORDER_LEVEL_FINANCIAL_KEYS,
-    _scoped_return_line_fields,
-)
+from account_screen_line_rows import _scoped_return_line_fields
 from order_quantity_context import _open_return_requests_for_order
 from transactions import (
     _is_return_list_row,
@@ -21,7 +18,117 @@ from transactions import (
     _return_ledger_line_split,
     _pending_return_payload_for_sale,
     _resolve_parent_sale_uid,
+    _to_float,
 )
+
+
+def _round_money(value):
+    return round(_to_float(value), 2)
+
+
+def _normalize_completed_return_money(out):
+    """
+    Expose customer refund credit on completed return/cancel list rows.
+
+    FE resolveReturnRowMoney() reads transaction_total (preferred) or component
+    fields — values are positive magnitudes; the client displays them as negative.
+    """
+    total = abs(_to_float(out.get("transaction_total")))
+    if total <= 0:
+        total = abs(_to_float(out.get("refund_amount")))
+    if total <= 0:
+        total = abs(_to_float(out.get("refund_total") or out.get("return_total")))
+
+    amount = abs(_to_float(out.get("transaction_amount")))
+    taxes = abs(_to_float(out.get("transaction_taxes")))
+    shipping = abs(_to_float(out.get("transaction_shipping")))
+    if total <= 0 and (amount > 0 or taxes > 0 or shipping > 0):
+        total = amount + taxes + shipping
+
+    if total > 0:
+        out["transaction_total"] = _round_money(total)
+        out["refund_total"] = out["transaction_total"]
+        out["return_total"] = out["transaction_total"]
+        out["refund_amount"] = out["transaction_total"]
+    if amount > 0:
+        out["transaction_amount"] = _round_money(amount)
+    if taxes > 0:
+        out["transaction_taxes"] = _round_money(taxes)
+    if shipping > 0 or out.get("transaction_shipping") is not None:
+        out["transaction_shipping"] = _round_money(shipping)
+    fees = abs(_to_float(out.get("transaction_fees")))
+    if fees > 0:
+        out["transaction_fees"] = _round_money(fees)
+    return out
+
+
+def _attach_pending_return_money(db, out):
+    """
+    Wrap estimated_refund on pending return/cancel rows for FE Amount column.
+
+    Synthetic list rows store estimated_refund at the top level; purchases v2
+    exposes it under pending_return.estimated_refund.
+    """
+    pending_return = dict(out.get("pending_return") or {})
+    estimated = out.get("estimated_refund") or pending_return.get("estimated_refund")
+
+    if not estimated and out.get("trr_uid"):
+        sale_uid = (
+            out.get("trr_transaction_uid")
+            or out.get("order_uid")
+            or out.get("original_transaction_uid")
+        )
+        if sale_uid:
+            reqs = _open_return_requests_for_order(db, sale_uid) or []
+            match = next(
+                (r for r in reqs if r.get("trr_uid") == out.get("trr_uid")),
+                None,
+            )
+            if match:
+                payload = _pending_return_payload_for_sale(
+                    db,
+                    {"transaction_uid": sale_uid, **out},
+                    match,
+                    compact=True,
+                )
+                if payload:
+                    pending_return = {**pending_return, **payload}
+                    estimated = payload.get("estimated_refund")
+
+    if estimated:
+        pending_return["estimated_refund"] = estimated
+    for key in (
+        "trr_uid",
+        "trr_uids",
+        "note",
+        "trr_note",
+        "items",
+        "bounty_to_reclaim",
+        "cancel_unshipped",
+        "pre_ship_cancel",
+        "is_cancel_before_ship",
+        "seller_note",
+    ):
+        if out.get(key) is not None and key not in pending_return:
+            pending_return[key] = out.get(key)
+
+    credit = abs(
+        _to_float(
+            (estimated or {}).get("total_customer_credit")
+            or (estimated or {}).get("total")
+            or out.get("estimated_total")
+            or pending_return.get("estimated_total")
+        )
+    )
+    if credit > 0:
+        pending_return.setdefault("estimated_total", _round_money(credit))
+        out["transaction_total"] = _round_money(credit)
+        out["refund_amount"] = out["transaction_total"]
+        out["refund_total"] = out["transaction_total"]
+
+    if pending_return.get("estimated_refund") or credit > 0:
+        out["pending_return"] = pending_return
+    return out
 
 
 def _fulfillment_method(row):
@@ -114,6 +221,8 @@ def _open_return_summary(db, sale_row, pending_req):
         summary["cancel_unshipped"] = True
         summary["pre_ship_cancel"] = True
         summary["is_cancel_before_ship"] = True
+    if estimated:
+        summary["estimated_refund"] = estimated
     if estimated.get("total") is not None:
         summary["estimated_refund_total"] = estimated.get("total")
     return summary
@@ -225,12 +334,10 @@ def _transform_return_row(db, row):
     display = build_return_ledger_display(out, qty=qty or abs(int(out.get("return_quantity_total") or 0)))
     out["display"] = display
     out["units"] = _units_for_return_row(out)
-
-    for key in _ORDER_LEVEL_FINANCIAL_KEYS:
-        out.pop(key, None)
+    out["is_return"] = 1
+    _normalize_completed_return_money(out)
 
     for key in (
-        "is_return",
         "is_pending_return",
         "ti_shipped_qty",
         "shippable_item_count",
@@ -311,15 +418,15 @@ def _transform_pending_return_row(db, row):
     if out.get("order_uid") and out.get("ti_uid"):
         out["row_uid"] = out.get("row_uid") or f"{trr_uid}:{out['ti_uid']}"
 
-    for key in _ORDER_LEVEL_FINANCIAL_KEYS:
-        out.pop(key, None)
+    out["is_pending_return"] = True
+    out["is_return"] = 1
+    _attach_pending_return_money(db, out)
 
     for key in (
-        "pending_return",
         "pending_returns",
         "transaction_return_items",
-        "is_return",
         "estimated_refund",
+        "estimated_total",
         "lines",
     ):
         out.pop(key, None)
