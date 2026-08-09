@@ -277,6 +277,13 @@ def _normalize_wallet_transaction_entry(db, row):
     }
     if qty_ctx:
         entry.update(quantity_context_fields(qty_ctx))
+    if tx_uid and entry_type in ("sale_proceeds", "sale_proceeds_held"):
+        from line_commerce_fields import build_order_proceeds_line_breakdowns
+
+        proceeds_lines = build_order_proceeds_line_breakdowns(db, tx_uid)
+        if proceeds_lines:
+            entry["lines"] = proceeds_lines
+        entry["order_uid"] = tx_uid
     return _attach_status_note(entry)
 
 

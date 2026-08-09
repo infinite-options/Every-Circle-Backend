@@ -7,6 +7,17 @@ Every row must ship units + display; missing chip labels → FE shows NA.
 
 from order_display import is_awaiting_seller, is_cancel_request
 
+_ORDER_LEVEL_FINANCIAL_KEYS = frozenset(
+    {
+        "transaction_total",
+        "transaction_amount",
+        "transaction_taxes",
+        "transaction_fees",
+        "transaction_shipping",
+        "order_bounty_paid",
+    }
+)
+
 # Legacy list fields the FE must not rely on (stripped from v2 rows).
 _LEGACY_ROW_KEYS = frozenset(
     {
@@ -164,6 +175,8 @@ def finalize_account_screen_row(row):
         if out.get("is_pending_return")
         else "return"
         if out.get("is_return") or (out.get("transaction_type") or "").lower() == "return"
+        else "sale_line"
+        if out.get("ti_uid") and (out.get("transaction_type") or "sale").lower() == "sale"
         else "sale"
     )
     out["row_kind"] = kind
@@ -173,7 +186,13 @@ def finalize_account_screen_row(row):
         for key in ("return_status", "refund_status", "display_status"):
             if out.get(key) is None and kind == "pending_return":
                 out.setdefault(key, "")
-    else:
+    elif kind == "sale_line":
+        units = dict(_UNITS_DEFAULTS)
+        units.update(out.get("units") or {})
+        out["units"] = units
+        for key in _ORDER_LEVEL_FINANCIAL_KEYS:
+            out.pop(key, None)
+    elif kind == "sale":
         units = dict(_UNITS_DEFAULTS)
         units.update(out.get("units") or {})
         out["units"] = units

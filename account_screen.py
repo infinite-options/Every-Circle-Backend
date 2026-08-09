@@ -16,7 +16,6 @@ from transactions import Transactions, SellerTransactions
 from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
-from order_list_hydration import attach_order_list_hydration
 from account_screen_purchases_v2 import build_purchases_v2_rows
 from account_screen_seller_v2 import build_seller_transactions_v2_rows
 from account_screen_v2_contract import (
@@ -182,14 +181,28 @@ class AccountScreenBusiness(Resource):
 
         response = {
             "code": 200,
+            "schema_version": 2,
             "seller_transactions": _merge_body_status(seller_body, seller_status),
             "business_bounty_results": _merge_body_status(
                 bounty_body, bounty_status
             ),
             "business_info": _merge_body_status(info_body, info_status),
         }
+        tz_name = _request_timezone()
+        if tz_name:
+            response["timezone"] = tz_name
+        response["datetime_storage"] = "UTC"
+
         with connect() as db:
-            attach_order_list_hydration(response, db, mode="business")
+            seller_legacy = (response.get("seller_transactions") or {}).get("data") or []
+            seller_v2_rows = finalize_account_screen_rows(
+                build_seller_transactions_v2_rows(db, seller_legacy)
+            )
+            seller_v2_rows = _enrich_rows_datetimes(seller_v2_rows)
+            if isinstance(response.get("seller_transactions"), dict):
+                response["seller_transactions"]["data"] = seller_v2_rows
+                response["seller_transactions"]["count"] = len(seller_v2_rows)
+
             wallet_profile_id = resolve_seller_wallet_profile_id(db, business_uid)
             if wallet_profile_id:
                 response["wallet"] = build_wallet_summary(db, wallet_profile_id)

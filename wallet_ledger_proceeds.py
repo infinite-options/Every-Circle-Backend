@@ -314,6 +314,12 @@ def build_order_proceeds_ledger_entries(
         **ctx_fields,
     )
     original["availability"] = sale_proceeds_original_availability(current_buckets)
+    from line_commerce_fields import build_order_proceeds_line_breakdowns
+
+    proceeds_lines = build_order_proceeds_line_breakdowns(db, order_uid)
+    if proceeds_lines:
+        original["lines"] = proceeds_lines
+    original["order_uid"] = order_uid
     entries.append(original)
 
     cancelled_running = 0

@@ -8,6 +8,10 @@ so the frontend never infers shipped / verified / return splits.
 from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping
 from order_display import build_return_ledger_display
 from account_screen_v2_contract import _units_for_return_row
+from account_screen_line_rows import (
+    _ORDER_LEVEL_FINANCIAL_KEYS,
+    _scoped_return_line_fields,
+)
 from order_quantity_context import _open_return_requests_for_order
 from transactions import (
     _is_return_list_row,
@@ -215,11 +219,15 @@ def _transform_return_row(db, row):
     ]
     out["return_lines"] = return_lines
     out.pop("lines", None)
+    _scoped_return_line_fields(out, return_lines)
 
     qty = sum(int(l.get("return_quantity") or 0) for l in return_lines)
     display = build_return_ledger_display(out, qty=qty or abs(int(out.get("return_quantity_total") or 0)))
     out["display"] = display
     out["units"] = _units_for_return_row(out)
+
+    for key in _ORDER_LEVEL_FINANCIAL_KEYS:
+        out.pop(key, None)
 
     for key in (
         "is_return",
@@ -260,6 +268,7 @@ def _transform_pending_return_row(db, row):
         _return_line_with_split(db, line, cancel_only=cancel_only) for line in lines
     ]
     out["return_lines"] = return_lines
+    _scoped_return_line_fields(out, return_lines)
 
     qty = sum(int(l.get("return_quantity") or 0) for l in return_lines)
     req_view = dict(out)
@@ -284,6 +293,15 @@ def _transform_pending_return_row(db, row):
         out, qty=qty or abs(int(out.get("return_quantity_total") or 0))
     )
     out["units"] = _units_for_return_row(out)
+
+    if out.get("ti_uid"):
+        out["line_uid"] = out["ti_uid"]
+        out["offering_uid"] = out.get("ti_bs_id")
+    if out.get("order_uid") and out.get("ti_uid"):
+        out["row_uid"] = out.get("row_uid") or f"{trr_uid}:{out['ti_uid']}"
+
+    for key in _ORDER_LEVEL_FINANCIAL_KEYS:
+        out.pop(key, None)
 
     for key in (
         "pending_return",

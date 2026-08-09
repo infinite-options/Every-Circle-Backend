@@ -978,24 +978,45 @@ def _refund_shipping_for_line(
     """
     Shipping credit for a product line.
 
-    ti_shipping_amount is the per-unit shipping charge snapshotted at checkout.
-
-    Refundable: per_unit × return_qty (all returned units, shipped or cancelled).
-    Non-refundable: per_unit × cancel_unshipped_qty only (shipped returns = $0).
+    Per-unit model (Buyer Fixed): per_unit × eligible return qty.
+    Flat line model: full line shipping only when the entire line is returned.
     """
-    per_unit = _to_float(ti_row.get("ti_shipping_amount"))
-    if per_unit <= 0:
+    from line_commerce_fields import is_per_unit_shipping_model, line_shipping_charge
+
+    if not ti_row:
         return 0.0
 
-    if _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0) == 1:
-        qty = int(return_qty or 0)
+    try:
+        rq = int(return_qty or 0)
+    except (TypeError, ValueError):
+        rq = 0
+    if rq <= 0:
+        return 0.0
+
+    refundable = (
+        _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0) == 1
+    )
+    if refundable:
+        eligible_qty = rq
     else:
-        qty = int(cancel_unshipped_qty or 0)
+        eligible_qty = int(cancel_unshipped_qty or 0)
 
-    if qty <= 0:
+    if eligible_qty <= 0:
         return 0.0
 
-    return round(per_unit * qty, 2)
+    if is_per_unit_shipping_model(ti_row):
+        per_unit = _to_float(ti_row.get("ti_shipping_amount"))
+        if per_unit <= 0:
+            return 0.0
+        return round(per_unit * eligible_qty, 2)
+
+    line_ship = line_shipping_charge(ti_row)
+    if line_ship <= 0:
+        return 0.0
+    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+    if original_qty <= 0 or rq < original_qty:
+        return 0.0
+    return round(line_ship, 2)
 
 
 def _items_all_cancel_only(items_payload, *, order_cancel=False):
@@ -6039,6 +6060,17 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             item["ti_bs_id"] = looked["ti_bs_id"]
         if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
             item["ti_bs_cost"] = looked["ti_bs_cost"]
+        from line_commerce_fields import pending_return_item_commerce_fields
+
+        ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid) if ti_uid else None
+        item.update(
+            pending_return_item_commerce_fields(
+                db,
+                order_uid,
+                item,
+                ti_row=ti_row,
+            )
+        )
         enriched_items.append(item)
     items = enriched_items
 

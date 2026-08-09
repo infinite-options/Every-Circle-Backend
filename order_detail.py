@@ -24,6 +24,7 @@ from units_ledger import (
     fulfillment_method,
     order_fulfillment_method,
 )
+from line_commerce_fields import attach_sale_lines_commerce, round_money
 from transactions import (
     _load_return_request,
     _load_open_return_requests,
@@ -38,6 +39,7 @@ from transactions import (
     _is_return_list_row,
     _resolve_parent_sale_uid,
     line_return_eligibility,
+    _order_bounty_paid,
     RETURN_STATUS_RETURNED,
     REFUND_STATUS_REFUNDED,
 )
@@ -56,6 +58,27 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _attach_sale_commerce_fields(db, sale_payload, order_uid, *, buyer_profile_id=None):
+    """Order + line bounty/shipping fields for order detail."""
+    if not isinstance(sale_payload, dict) or not order_uid:
+        return sale_payload
+
+    lines = sale_payload.get("lines") or []
+    attach_sale_lines_commerce(db, lines, buyer_profile_id=buyer_profile_id)
+
+    line_bounty_sum = sum(round_money(line.get("line_bounty_paid")) for line in lines if isinstance(line, dict))
+    order_bounty = round_money(_order_bounty_paid(db, order_uid))
+    if not order_bounty and line_bounty_sum:
+        order_bounty = line_bounty_sum
+
+    sale_payload["order_bounty_paid"] = order_bounty
+    if order_bounty:
+        sale_payload["bounty_amount"] = round_money(-order_bounty)
+
+    sale_payload.setdefault("transaction_fees", sale_payload.get("transaction_fees"))
+    return sale_payload
 
 
 def _enrich_order_datetimes(payload, tz_name):
@@ -209,8 +232,12 @@ def _load_sale_lines(db, order_uid):
             {name_case} AS item_name,
             bs.bs_service_name,
             bs.bs_service_desc,
+            bs.bs_bounty,
+            bs.bs_bounty_type,
             pe.profile_expertise_cost,
-            pe.profile_expertise_cost_currency
+            pe.profile_expertise_cost_currency,
+            pe.profile_expertise_bounty,
+            pe.profile_expertise_bounty_type
         FROM every_circle.transactions_items ti
         LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
         LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
@@ -535,6 +562,12 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
 
     sale_payload = dict(sale)
     sale_payload["lines"] = sale_lines
+    _attach_sale_commerce_fields(
+        db,
+        sale_payload,
+        order_uid,
+        buyer_profile_id=sale.get("transaction_profile_id"),
+    )
     sale_payload["pending_return"] = pending_return_payload
     sale_payload["pending_returns"] = pending_returns_payload
     if pending_return_payload:

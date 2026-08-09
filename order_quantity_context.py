@@ -339,7 +339,7 @@ def _load_sale_lines_for_proceeds(db, order_uid):
     q = db.execute(
         """
         SELECT ti_uid, ti_bs_qty, ti_bs_cost, ti_bs_is_taxable, ti_bs_tax_rate,
-               ti_shipping_amount
+               ti_shipping_amount, ti_line_shipping_amount, ti_listing_shipping
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s
         ORDER BY ti_uid ASC
@@ -378,10 +378,15 @@ def compute_seller_proceeds_breakdown(db, order_uid, *, qty=None):
             row.get("ti_bs_is_taxable"),
             row.get("ti_bs_tax_rate"),
         )
-        ship_per_unit = _to_float(row.get("ti_shipping_amount"))
+        from line_commerce_fields import is_per_unit_shipping_model, line_shipping_charge
+
+        if is_per_unit_shipping_model(row):
+            ship_line = round(_to_float(row.get("ti_shipping_amount")) * line_qty, 2)
+        else:
+            ship_line = line_shipping_charge(row)
         merchandise += unit_cost * line_qty
         sales_tax += tax_per_unit * line_qty
-        shipping += ship_per_unit * line_qty
+        shipping += ship_line
 
     merchandise = _round_money(merchandise)
     sales_tax = _round_money(sales_tax)
