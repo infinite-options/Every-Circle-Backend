@@ -100,19 +100,26 @@ def _quantity_context_for_entry(db, row):
 
 
 def _normalize_bounty_entry(db, row):
+    from units_ledger import line_units_ledger, pending_bounty_units
+
     amount = _round_money(row.get("amount"))
     tx_type = (row.get("transaction_type") or "sale").lower()
     order_uid = row.get("transaction_original_uid") or row.get("transaction_uid")
     ti_uid = row.get("ti_uid")
     qty_ctx = None
+    units = {}
     if order_uid and ti_uid:
         qty_ctx = line_quantity_context(db, order_uid, ti_uid, row=row)
+        units = line_units_ledger(db, order_uid, ti_uid, row=row)
 
     received_qty = int(row.get("ti_received_qty") or 0)
     denom_qty = int(row.get("ti_bs_qty") or 0)
     if qty_ctx:
         received_qty = int(qty_ctx.get("verified_qty") or received_qty)
         denom_qty = int(qty_ctx.get("active_units") or qty_ctx.get("purchased_qty") or denom_qty)
+    if units:
+        received_qty = int(units.get("verified_qty") or received_qty)
+        denom_qty = int(units.get("active_qty") or units.get("purchased_qty") or denom_qty)
 
     fully_verified = _bounty_line_fully_verified(row, denom=denom_qty)
     if amount < 0 or tx_type == "return":
@@ -120,14 +127,27 @@ def _normalize_bounty_entry(db, row):
         availability, useable_delta = bounty_reversal_ledger_availability(
             db, row, amount
         )
+        display_amount = amount
     else:
         entry_type = "bounty_earned"
         if row.get("ti_bounty_released_at") and fully_verified:
             availability = "useable"
             useable_delta = amount
+            display_amount = amount
         else:
             availability = "pending"
             useable_delta = 0.0
+            pending_units = pending_bounty_units(units)
+            if (
+                not fully_verified
+                and denom_qty > 0
+                and pending_units < denom_qty
+            ):
+                display_amount = _round_money(
+                    amount * (pending_units / float(denom_qty))
+                )
+            else:
+                display_amount = amount
 
     counterparty = row.get("counterparty_name") or "Unknown"
     if entry_type == "bounty_reversal":
@@ -137,7 +157,7 @@ def _normalize_bounty_entry(db, row):
     elif fully_verified and denom_qty > 0:
         description = f"Bounty earned (pending return window) — {counterparty}"
     elif received_qty > 0 and denom_qty > 0:
-        pending_units = int((qty_ctx or {}).get("pending_verification_units") or 0)
+        pending_units = pending_bounty_units(units)
         if pending_units > 0:
             description = (
                 f"Bounty earned (pending verification, {pending_units} units) — "
@@ -149,14 +169,21 @@ def _normalize_bounty_entry(db, row):
                 f"{received_qty}/{denom_qty}) — {counterparty}"
             )
     else:
-        description = f"Bounty earned (pending verification) — {counterparty}"
+        pending_units = pending_bounty_units(units)
+        if pending_units > 0 and denom_qty > 0:
+            description = (
+                f"Bounty earned (pending verification, {pending_units} units) — "
+                f"{counterparty}"
+            )
+        else:
+            description = f"Bounty earned (pending verification) — {counterparty}"
 
     entry = {
         "entry_id": f"bounty:{row.get('ti_uid')}:{row.get('transaction_uid')}",
         "entry_source": "transactions_bounty",
         "entry_type": entry_type,
         "entry_type_label": _entry_type_label(entry_type),
-        "amount": amount,
+        "amount": display_amount,
         "useable_delta": useable_delta,
         "availability": availability,
         "currency": "USD",
@@ -172,6 +199,8 @@ def _normalize_bounty_entry(db, row):
         "ti_bs_qty": denom_qty or None,
         "bounty_released_at": row.get("ti_bounty_released_at"),
     }
+    if units:
+        entry["units"] = units
     if qty_ctx:
         entry.update(quantity_context_fields(qty_ctx))
     return _attach_status_note(entry)

@@ -131,10 +131,10 @@ class AccountScreenPersonal(Resource):
         response["datetime_storage"] = "UTC"
 
         with connect() as db:
-            purchase_rows = (purchases_body or {}).get("rows")
-            if not purchase_rows:
-                legacy = (purchases_body or {}).get("data") or []
-                purchase_rows = build_purchases_v2_rows(db, legacy)
+            # Always rebuild v2 rows from the purchases list so units/display match
+            # transactionreceipt and wallet_ledger after delivery verification PUTs.
+            source_rows = (purchases_body or {}).get("data") or []
+            purchase_rows = build_purchases_v2_rows(db, source_rows)
             purchase_rows = _enrich_rows_datetimes(purchase_rows)
             response["purchases"] = build_purchases_v2_section(
                 code=purchases_status,

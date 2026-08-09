@@ -91,9 +91,6 @@ def sale_received_label(row, units, *, audience="buyer"):
     if audience == "buyer" and verifiable > 0:
         return "Verify", "verify"
 
-    if audience == "buyer" and requires_ship and verified < active and shipped > verified:
-        return "Verify", "verify"
-
     if verified <= 0:
         return "No", None
 
@@ -114,6 +111,8 @@ def build_sale_display(row, units, *, audience="buyer", include_qty=True):
     }
     if received_action:
         display["received_action"] = received_action
+    elif audience == "buyer":
+        display["received_action"] = "status"
     if audience == "seller":
         display["received_action"] = "status"
     if include_qty:

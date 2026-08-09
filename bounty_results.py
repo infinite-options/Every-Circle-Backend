@@ -6,6 +6,7 @@ import traceback
 
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
+from line_commerce_fields import enrich_bounty_result_rows
 
 
 def _request_timezone():
@@ -84,7 +85,9 @@ class BountyResults(Resource):
                 bounty_response = db.execute(bounty_query, (profile_id,))
 
                 if bounty_response["code"] == 200:
-                    rows = _enrich_bounty_rows(bounty_response["result"])
+                    rows = enrich_bounty_result_rows(
+                        db, _enrich_bounty_rows(bounty_response["result"])
+                    )
                     response["code"] = 200
                     response["message"] = "Bounty results retrieved successfully"
                     response["data"] = rows

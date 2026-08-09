@@ -347,6 +347,20 @@ def shippable_total(units):
     return active if active > 0 else purchased
 
 
+def pending_bounty_units(units):
+    """
+    Units whose bounty is still pending shipment and/or buyer verification.
+
+    Same v2 ledger fields as purchases.rows[].units — single- and multi-unit orders
+    use the identical shape (a qty-1 order is a multi-unit order of one).
+    """
+    if not units:
+        return 0
+    return int(units.get("remaining_to_ship_qty") or 0) + int(
+        units.get("verifiable_remaining_qty") or 0
+    )
+
+
 def sale_display(row, units, *, include_qty=True):
     """Buyer purchase chip labels (FE renders verbatim)."""
     from order_display import build_sale_display

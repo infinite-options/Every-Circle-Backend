@@ -132,11 +132,20 @@ def attach_line_commerce_fields(
 
     unit, bounty_type = _catalog_bounty_unit_and_type(line)
     if unit > 0:
-        line["bs_bounty"] = round_money(unit)
+        unit = round_money(unit)
+        line["bs_bounty"] = unit
+        line["ti_bs_bounty"] = unit
+        line["bounty_amount"] = unit
+        line["item_bounty"] = unit
         line["bs_bounty_type"] = bounty_type
+        line["ti_bs_bounty_type"] = bounty_type
     else:
         line.pop("bs_bounty", None)
+        line.pop("ti_bs_bounty", None)
+        line.pop("bounty_amount", None)
+        line.pop("item_bounty", None)
         line.pop("bs_bounty_type", None)
+        line.pop("ti_bs_bounty_type", None)
         line.pop("profile_expertise_bounty", None)
         line.pop("profile_expertise_bounty_type", None)
 
@@ -151,6 +160,88 @@ def attach_line_commerce_fields(
 
     _strip_legacy_line_shipping_fields(line)
     return line
+
+
+def attach_bounty_pool_fields(line, *, catalog_row=None):
+    """
+    Seller line bounty pool fields for FE Total column (unit × qty semantics).
+
+    Same snapshot as receipt / order-detail sale lines. bounty_earned / tb_amount
+    remain the buyer share; pool fields are the unit catalog bounty at purchase.
+    """
+    if not isinstance(line, dict):
+        return line
+
+    source = catalog_row if isinstance(catalog_row, dict) else line
+    try:
+        qty = int(source.get("ti_bs_qty") or line.get("ti_bs_qty") or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    if qty > 0:
+        line["ti_bs_qty"] = qty
+
+    unit, bounty_type = _catalog_bounty_unit_and_type(source)
+    if unit > 0:
+        unit = round_money(unit)
+        line["bs_bounty"] = unit
+        line["ti_bs_bounty"] = unit
+        line["bounty_amount"] = unit
+        line["item_bounty"] = unit
+        line["bs_bounty_type"] = bounty_type
+        line["ti_bs_bounty_type"] = bounty_type
+    return line
+
+
+def _batch_catalog_rows_for_bounty(db, ti_uids):
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT
+            ti.ti_uid,
+            ti.ti_bs_id,
+            ti.ti_bs_qty,
+            bs.bs_bounty,
+            bs.bs_bounty_type,
+            pe.profile_expertise_bounty,
+            pe.profile_expertise_bounty_type
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.business_services bs
+            ON ti.ti_bs_id = bs.bs_uid
+        LEFT JOIN every_circle.profile_expertise pe
+            ON ti.ti_bs_id = pe.profile_expertise_uid
+        WHERE ti.ti_uid IN ({placeholders})
+        """,
+        tuple(uids),
+    )
+    return {
+        row.get("ti_uid"): row
+        for row in (q.get("result") or [])
+        if row.get("ti_uid")
+    }
+
+
+def enrich_bounty_result_rows(db, rows):
+    """Attach line bounty pool fields to bounty_results.data[] rows."""
+    if not rows:
+        return rows
+
+    catalog_map = _batch_catalog_rows_for_bounty(
+        db,
+        [row.get("ti_uid") for row in rows if isinstance(row, dict)],
+    )
+    enriched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+        out = dict(row)
+        ti_uid = out.get("ti_uid")
+        attach_bounty_pool_fields(out, catalog_row=catalog_map.get(ti_uid))
+        enriched.append(out)
+    return enriched
 
 
 def attach_sale_lines_commerce(db, lines, *, buyer_profile_id=None):
