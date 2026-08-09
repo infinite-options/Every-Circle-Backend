@@ -221,6 +221,141 @@ def compute_line_proceeds_breakdown(db, order_uid, line_row):
     }
 
 
+def load_commerce_sale_line(db, order_uid, ti_uid):
+    """One sale line row with commerce joins, or None."""
+    if not order_uid or not ti_uid:
+        return None
+    for row in _load_commerce_sale_lines(db, order_uid):
+        if row.get("ti_uid") == ti_uid:
+            return row
+    return None
+
+
+def compute_line_event_proceeds_breakdown(
+    db,
+    order_uid,
+    line_row,
+    *,
+    return_shipped_qty=0,
+    cancel_unshipped_qty=0,
+    verified_qty=0,
+    line_bounty_ledger=None,
+):
+    """
+    Exact seller-proceeds component amounts for one ledger event on a sale line.
+
+    No order-level proration — uses stored line snapshots and return split fields.
+    Returns signed-ready positive magnitudes; caller applies sign for reversals.
+    """
+    if not isinstance(line_row, dict):
+        return None
+
+    ti_uid = line_row.get("ti_uid")
+    try:
+        return_shipped_qty = int(return_shipped_qty or 0)
+        cancel_unshipped_qty = int(cancel_unshipped_qty or 0)
+        verified_qty = int(verified_qty or 0)
+    except (TypeError, ValueError):
+        return None
+
+    event_qty = return_shipped_qty + cancel_unshipped_qty + verified_qty
+    if event_qty <= 0:
+        return None
+
+    from transactions import (
+        _refund_shipping_for_line,
+        _seller_bounty_to_reclaim_for_line,
+        _tax_amount_for_line,
+    )
+
+    if line_bounty_ledger is None and ti_uid:
+        line_bounty_ledger = _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0)
+
+    unit_merch = _parse_unit_cost(line_row.get("ti_bs_cost"))
+    if unit_merch <= 0:
+        from order_quantity_context import wallet_ledger_data_issue
+
+        wallet_ledger_data_issue(
+            "line missing ti_bs_cost for proceeds breakdown",
+            order_uid=order_uid,
+            ti_uid=ti_uid,
+        )
+    unit_tax = _tax_amount_for_line(
+        unit_merch,
+        line_row.get("ti_bs_is_taxable"),
+        line_row.get("ti_bs_tax_rate"),
+    )
+    line_qty = max(int(line_row.get("ti_bs_qty") or 0), 1)
+
+    return_qty = return_shipped_qty + cancel_unshipped_qty
+    if return_qty > 0 and verified_qty > 0:
+        return None
+
+    if return_qty > 0:
+        merchandise = round_money(unit_merch * return_qty)
+        sales_tax = round_money(unit_tax * return_qty)
+        shipping = round_money(
+            _refund_shipping_for_line(
+                line_row,
+                return_qty,
+                return_shipped_qty=return_shipped_qty,
+                cancel_unshipped_qty=cancel_unshipped_qty,
+            )
+        )
+        bounty_paid = round_money(
+            _seller_bounty_to_reclaim_for_line(
+                line_row,
+                return_qty,
+                line_bounty_ledger=line_bounty_ledger or 0.0,
+            )
+        )
+        event_qty = return_qty
+    elif verified_qty > 0:
+        merchandise = round_money(unit_merch * verified_qty)
+        sales_tax = round_money(unit_tax * verified_qty)
+        if is_per_unit_shipping_model(line_row):
+            shipping = round_money(
+                _to_float(line_row.get("ti_shipping_amount")) * verified_qty
+            )
+        elif verified_qty >= line_qty:
+            shipping = round_money(line_shipping_charge(line_row))
+        else:
+            from order_quantity_context import wallet_ledger_data_issue
+
+            wallet_ledger_data_issue(
+                "partial verify on non-per-unit shipping line: shipping unavailable",
+                order_uid=order_uid,
+                ti_uid=ti_uid,
+                verified_qty=verified_qty,
+                line_qty=line_qty,
+            )
+            shipping = 0.0
+        bounty_paid = round_money(
+            _seller_bounty_to_reclaim_for_line(
+                line_row,
+                verified_qty,
+                line_bounty_ledger=line_bounty_ledger or 0.0,
+            )
+        )
+        event_qty = verified_qty
+    else:
+        return None
+
+    bounty_amount = round_money(-bounty_paid)
+    amount = round_money(merchandise + sales_tax + shipping + bounty_amount)
+
+    return {
+        "merchandise_amount": merchandise,
+        "sales_tax_amount": sales_tax,
+        "shipping_amount": shipping,
+        "bounty_amount": bounty_amount,
+        "amount": amount,
+        "purchased_qty": event_qty,
+        "ti_uid": ti_uid,
+        "ti_bs_id": line_row.get("ti_bs_id"),
+    }
+
+
 def build_order_proceeds_line_breakdowns(db, order_uid, *, buyer_profile_id=None, lines=None):
     """lines[] for wallet ledger sale_proceeds header."""
     if lines is None:

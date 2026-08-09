@@ -1,5 +1,7 @@
 """Order line quantity context for proceeds, ledger descriptions, and rollups."""
 
+import logging
+
 from transactions import (
     _load_open_return_requests,
     _remaining_to_ship_qty,
@@ -492,26 +494,235 @@ def proceeds_breakdown_fields(
             effective_qty,
             purchased_qty=purchased_qty or breakdown.get("purchased_qty"),
         )
+    return ledger_proceeds_api_fields(breakdown, sign=sign, include_per_unit=True)
+
+
+LEDGER_PROCEEDS_COMPONENT_KEYS = frozenset(
+    {
+        "amount",
+        "merchandise_amount",
+        "sales_tax_amount",
+        "shipping_amount",
+        "bounty_amount",
+        "purchased_qty",
+        "per_unit_merchandise",
+        "per_unit_sales_tax",
+        "per_unit_shipping",
+        "per_unit_bounty",
+        "per_unit_proceeds",
+    }
+)
+
+
+def omit_ledger_proceeds_component_fields(fields):
+    """Drop dollar/qty component keys before merging ledger context dicts."""
+    return {
+        k: v
+        for k, v in (fields or {}).items()
+        if k not in LEDGER_PROCEEDS_COMPONENT_KEYS
+    }
+
+
+_WALLET_LEDGER_LOGGER = logging.getLogger(__name__)
+
+
+def wallet_ledger_data_issue(message, *, order_uid=None, event=None, **extra):
+    """Log missing/invalid wallet ledger proceeds data — no silent fallbacks."""
+    ctx = {
+        "order_uid": order_uid,
+        "wt_uid": (event or {}).get("wt_uid"),
+        "wt_type": (event or {}).get("wt_type"),
+        "ti_uid": (event or {}).get("wt_ti_id"),
+        "wt_qty": (event or {}).get("wt_qty"),
+        **extra,
+    }
+    detail = ", ".join(f"{k}={v}" for k, v in ctx.items() if v is not None and v != "")
+    _WALLET_LEDGER_LOGGER.error("wallet_ledger: %s (%s)", message, detail)
+    print(f"wallet_ledger DATA GAP: {message} ({detail})")
+
+
+def sum_ledger_proceeds_components(fields):
+    """Signed total from scoped merchandise + tax + shipping + bounty fields."""
+    from wallet_service import _round_money, _to_float
+
+    if not fields:
+        return 0.0
+    return _round_money(
+        _to_float(fields.get("merchandise_amount"))
+        + _to_float(fields.get("sales_tax_amount"))
+        + _to_float(fields.get("shipping_amount"))
+        + _to_float(fields.get("bounty_amount"))
+    )
+
+
+def wallet_ledger_event_amount(db, order_uid, event, *, sign=1):
+    """
+    Line-exact signed amount + component fields for one wallet_transactions event.
+
+    Never order-level proration. Missing data → zero amount and error log.
+    """
+    from wallet_service import _round_money, _to_float
+
+    fields = wallet_ledger_event_proceeds_fields(db, order_uid, event, sign=sign)
+    if not fields:
+        wallet_ledger_data_issue(
+            "no line-exact proceeds fields for wallet event",
+            order_uid=order_uid,
+            event=event,
+        )
+        return 0.0, {}
+
+    amount = sum_ledger_proceeds_components(fields)
+    stored = _round_money(_to_float((event or {}).get("wt_amount")))
+    if stored and abs(abs(stored) - abs(amount)) > 0.02:
+        wallet_ledger_data_issue(
+            "wt_amount does not match line-exact component sum",
+            order_uid=order_uid,
+            event=event,
+            wt_amount=stored,
+            line_exact_amount=amount,
+        )
+
+    return amount, fields
+
+
+def ledger_proceeds_api_fields(breakdown, *, sign=1, include_per_unit=False, include_amount=True):
+    """Map a proceeds breakdown dict to wallet_ledger sale_proceeds* API fields."""
+    if not breakdown:
+        return {}
+
+    from wallet_service import _round_money, _to_float
+
     fields = {
         "merchandise_amount": breakdown.get("merchandise_amount"),
         "sales_tax_amount": breakdown.get("sales_tax_amount"),
         "shipping_amount": breakdown.get("shipping_amount"),
         "bounty_amount": breakdown.get("bounty_amount"),
-        "per_unit_merchandise": breakdown.get("per_unit_merchandise"),
-        "per_unit_sales_tax": breakdown.get("per_unit_sales_tax"),
-        "per_unit_shipping": breakdown.get("per_unit_shipping"),
-        "per_unit_bounty": breakdown.get("per_unit_bounty"),
     }
-    if int(sign or 1) < 0:
-        from wallet_service import _round_money, _to_float
+    if include_amount and breakdown.get("amount") is not None:
+        fields["amount"] = breakdown.get("amount")
+    if breakdown.get("purchased_qty") is not None:
+        fields["purchased_qty"] = breakdown.get("purchased_qty")
 
+    if include_per_unit:
+        fields.update(
+            {
+                "per_unit_merchandise": breakdown.get("per_unit_merchandise"),
+                "per_unit_sales_tax": breakdown.get("per_unit_sales_tax"),
+                "per_unit_shipping": breakdown.get("per_unit_shipping"),
+                "per_unit_bounty": breakdown.get("per_unit_bounty"),
+                "per_unit_proceeds": breakdown.get("per_unit_proceeds"),
+            }
+        )
+
+    if int(sign or 1) < 0:
         for key in (
             "merchandise_amount",
             "sales_tax_amount",
             "shipping_amount",
             "bounty_amount",
+            "amount",
         ):
-            fields[key] = _round_money(-_to_float(fields.get(key)))
+            if fields.get(key) is not None:
+                fields[key] = _round_money(-_to_float(fields.get(key)))
+    return fields
+
+
+def wallet_ledger_event_proceeds_fields(db, order_uid, event, *, sign=1):
+    """
+    Exact scoped proceeds breakdown for one wallet_transactions ledger event.
+
+    Uses line-level commerce snapshots — no order-level qty proration.
+    """
+    from line_commerce_fields import (
+        compute_line_event_proceeds_breakdown,
+        load_commerce_sale_line,
+    )
+    from wallet_transactions_service import (
+        WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
+        WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+        WT_TYPE_RETURN_CLAWBACK,
+        _trr_clawback_qty_split,
+    )
+
+    if not order_uid or not event:
+        return {}
+
+    wt_type = event.get("wt_type") or ""
+    ti_uid = event.get("wt_ti_id")
+    try:
+        event_qty = int(event.get("wt_qty") or 0)
+    except (TypeError, ValueError):
+        event_qty = 0
+
+    return_shipped_qty = 0
+    cancel_unshipped_qty = 0
+    verified_qty = 0
+
+    if wt_type == WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT:
+        cancel_unshipped_qty = event_qty
+    elif wt_type == WT_TYPE_RETURN_CLAWBACK:
+        idem = (event.get("wt_idempotency_key") or "").strip()
+        trr_uid = ""
+        if idem.startswith("return_clawback_hold:"):
+            trr_uid = idem.split(":", 1)[-1]
+        if trr_uid:
+            return_shipped_qty, cancel_unshipped_qty = _trr_clawback_qty_split(
+                db, trr_uid, ti_uid
+            )
+        if return_shipped_qty <= 0 and cancel_unshipped_qty <= 0:
+            wallet_ledger_data_issue(
+                "return_clawback missing TRR qty split",
+                order_uid=order_uid,
+                event=event,
+                trr_uid=trr_uid or None,
+            )
+            return {}
+    elif wt_type == WT_TYPE_PARTIAL_DELIVERY_CREDIT:
+        verified_qty = event_qty
+    else:
+        return {}
+
+    if not ti_uid:
+        wallet_ledger_data_issue(
+            "wallet event missing wt_ti_id for line-exact proceeds",
+            order_uid=order_uid,
+            event=event,
+        )
+        return {}
+
+    line_row = load_commerce_sale_line(db, order_uid, ti_uid)
+    if not line_row:
+        wallet_ledger_data_issue(
+            "sale line not found for wallet event",
+            order_uid=order_uid,
+            event=event,
+            ti_uid=ti_uid,
+        )
+        return {}
+
+    breakdown = compute_line_event_proceeds_breakdown(
+        db,
+        order_uid,
+        line_row,
+        return_shipped_qty=return_shipped_qty,
+        cancel_unshipped_qty=cancel_unshipped_qty,
+        verified_qty=verified_qty,
+    )
+    if not breakdown:
+        wallet_ledger_data_issue(
+            "could not compute line event proceeds breakdown",
+            order_uid=order_uid,
+            event=event,
+            ti_uid=ti_uid,
+            return_shipped_qty=return_shipped_qty,
+            cancel_unshipped_qty=cancel_unshipped_qty,
+            verified_qty=verified_qty,
+        )
+        return {}
+
+    fields = ledger_proceeds_api_fields(breakdown, sign=sign, include_amount=False)
+    fields["ti_uid"] = ti_uid
     return fields
 
 

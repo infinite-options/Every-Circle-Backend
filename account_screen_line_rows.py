@@ -8,7 +8,11 @@ Offering / Purchases UIs can show separate chips per offering (150-*).
 from line_commerce_fields import attach_line_commerce_fields
 from order_display import build_sale_display
 from order_quantity_context import _open_return_requests_for_order
-from transactions import _clear_parent_sale_return_status, _line_bounty_totals, _to_float
+from transactions import (
+    _clear_parent_sale_return_status,
+    _line_bounty_totals,
+    _to_float,
+)
 from units_ledger import (
     fulfillment_method,
     line_units_ledger,
@@ -124,14 +128,28 @@ def split_row_by_return_lines(row):
         entry["ti_uid"] = ti_uid
         entry["ti_bs_id"] = line.get("ti_bs_id")
         entry["purchased_item"] = line.get("item_name") or entry.get("purchased_item")
-        if idx < len(trr_uids) and trr_uids[idx]:
-            entry["trr_uid"] = trr_uids[idx]
+        line_trr = line.get("trr_uid") or (
+            trr_uids[idx] if idx < len(trr_uids) else None
+        )
+        if line_trr:
+            entry["trr_uid"] = line_trr
+            entry["trr_uids"] = [line_trr]
+            entry["transaction_uid"] = line_trr
+        try:
+            line_rq = int(line.get("return_quantity") or 0)
+        except (TypeError, ValueError):
+            line_rq = 0
+        entry["return_quantity_total"] = line_rq
+        entry["ti_bs_qty"] = line_rq
+        if line_rq and entry.get("refund_amount") and int(row.get("return_quantity_total") or 0) > line_rq:
+            ratio = line_rq / float(row.get("return_quantity_total"))
+            entry["refund_amount"] = round(_to_float(entry.get("refund_amount")) * ratio, 4)
+            entry["estimated_total"] = round(_to_float(entry.get("estimated_total")) * ratio, 4)
+            entry["bounty_to_reclaim"] = round(
+                _to_float(entry.get("bounty_to_reclaim")) * ratio, 4
+            )
         base_uid = entry.get("trr_uid") or entry.get("transaction_uid") or ""
         entry["row_uid"] = f"{base_uid}:{ti_uid}" if ti_uid else base_uid
-        try:
-            entry["return_quantity_total"] = int(line.get("return_quantity") or 0)
-        except (TypeError, ValueError):
-            entry["return_quantity_total"] = 0
         results.append(entry)
     return results
 

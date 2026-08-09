@@ -222,12 +222,16 @@ def proceeds_buckets_from_sale_units(db, order_uid, *, qty_ctx=None):
     verified = int(units.get("verified_qty") or 0)
     shipped = int(units.get("shipped_qty") or 0)
 
-    if pending_verification == 0 and return_in_progress_shipped == 0:
+    held_return_window = _held_return_window_units(db, order_uid)
+    if held_return_window > 0:
+        # Wallet held partial_delivery_credit rows (wt_available_at in future) win over
+        # unit-ledger shortcuts — verified units can still be in the return window.
+        pending_return_window = held_return_window
+    elif pending_verification == 0 and return_in_progress_shipped == 0:
         if returned_shipped > 0 and (verified + returned_shipped) >= shipped:
-            # Every shipped unit is verified or returned — no verify/return-window narrative.
             pending_return_window = 0
         else:
-            pending_return_window = _held_return_window_units(db, order_uid)
+            pending_return_window = held_return_window
     else:
         pending_return_window = max(0, int(qty_ctx.get("net_verified_held") or 0))
 

@@ -859,6 +859,8 @@ def fetch_reservation_ledger_rows(db, profile_id):
             wt.wt_type,
             wt.wt_status,
             wt.wt_amount,
+            wt.wt_qty,
+            wt.wt_idempotency_key,
             wt.wt_currency,
             wt.wt_note,
             wt.wt_created_at,

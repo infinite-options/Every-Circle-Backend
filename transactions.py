@@ -1741,8 +1741,8 @@ def _new_trr_uid(db):
     return uid_resp["result"][0].get("new_id")
 
 
-def _apply_return_item_split_aliases(item, *, cancel_only=False):
-    """Expose shipped vs unshipped return qty with FE-stable field names."""
+def _apply_return_item_split(item, *, cancel_only=False):
+    """Normalize return_quantity = return_shipped_qty + cancel_unshipped_qty on one item."""
     if not isinstance(item, dict):
         return item
     ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
@@ -1769,9 +1769,7 @@ def _apply_return_item_split_aliases(item, *, cancel_only=False):
     else:
         shipped, unshipped = rq, 0
     item["return_shipped_qty"] = shipped
-    item["shipped_return_quantity"] = shipped
     item["cancel_unshipped_qty"] = unshipped
-    item["unshipped_return_quantity"] = unshipped
     return item
 
 
@@ -1812,7 +1810,7 @@ def _items_from_return_request_row(row):
                     item["cancel_unshipped_qty"] = int(first.get("cancel_unshipped_qty") or 0)
                 except (TypeError, ValueError):
                     item["cancel_unshipped_qty"] = 0
-        return [_apply_return_item_split_aliases(item, cancel_only=cancel_only)]
+        return [_apply_return_item_split(item, cancel_only=cancel_only)]
     try:
         items = json.loads(row.get("trr_items_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -1820,7 +1818,7 @@ def _items_from_return_request_row(row):
     if not isinstance(items, list):
         return []
     return [
-        _apply_return_item_split_aliases(entry, cancel_only=cancel_only)
+        _apply_return_item_split(entry, cancel_only=cancel_only)
         for entry in items
         if isinstance(entry, dict)
     ]
@@ -6246,33 +6244,43 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
     item_names = []
     return_lines = []
     qty_total = 0
-    for entry in items:
-        ti_uid = entry.get("transaction_item_uid")
-        try:
-            rq = int(entry.get("return_quantity") or 0)
-        except (TypeError, ValueError):
-            rq = 0
-        qty_total += abs(rq)
-        looked_up = name_map.get(ti_uid) or {}
-        name = (
-            entry.get("item_name")
-            or entry.get("bs_service_name")
-            or looked_up.get("item_name")
-        )
-        if name:
-            item_names.append(str(name))
-        line_entry = {
-            "ti_uid": ti_uid,
-            "transaction_item_uid": ti_uid,
-            "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
-            "item_name": name,
-            "return_quantity": abs(rq),
-            "ti_bs_cost": looked_up.get("ti_bs_cost") or entry.get("ti_bs_cost"),
-            "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
-            or entry.get("ti_bs_cost_currency"),
-        }
-        _apply_return_item_split_aliases(line_entry, cancel_only=cancel_flag)
-        return_lines.append(line_entry)
+    for req in pending_reqs:
+        req_cancel = _is_cancel_unshipped_request(req)
+        for entry in req.get("items") or []:
+            ti_uid = entry.get("transaction_item_uid") or entry.get("ti_uid")
+            try:
+                rq = int(entry.get("return_quantity") or 0)
+            except (TypeError, ValueError):
+                rq = 0
+            qty_total += abs(rq)
+            looked_up = name_map.get(ti_uid) or {}
+            name = (
+                entry.get("item_name")
+                or entry.get("bs_service_name")
+                or looked_up.get("item_name")
+            )
+            if name:
+                item_names.append(str(name))
+            line_entry = {
+                "ti_uid": ti_uid,
+                "transaction_item_uid": ti_uid,
+                "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
+                "item_name": name,
+                "return_quantity": abs(rq),
+                "ti_bs_cost": looked_up.get("ti_bs_cost") or entry.get("ti_bs_cost"),
+                "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
+                or entry.get("ti_bs_cost_currency"),
+            }
+            if entry.get("return_shipped_qty") is not None:
+                line_entry["return_shipped_qty"] = int(entry.get("return_shipped_qty") or 0)
+            if entry.get("cancel_unshipped_qty") is not None:
+                line_entry["cancel_unshipped_qty"] = int(
+                    entry.get("cancel_unshipped_qty") or 0
+                )
+            if req.get("trr_uid"):
+                line_entry["trr_uid"] = req.get("trr_uid")
+            _apply_return_item_split(line_entry, cancel_only=req_cancel)
+            return_lines.append(line_entry)
 
     api_status = _return_request_public_payload(primary, qty=qty_total)
 
@@ -6633,9 +6641,10 @@ def _enrich_list_transaction_rows(db, rows):
     synthetic = []
     for sale_uid, sale_row in sales_by_uid.items():
         for batch in _group_open_return_batches(return_req_map.get(sale_uid) or []):
-            row = _synthetic_pending_return_row(db, sale_row, batch)
-            if row:
-                synthetic.append(row)
+            for req in batch:
+                row = _synthetic_pending_return_row(db, sale_row, [req])
+                if row:
+                    synthetic.append(row)
 
     if synthetic:
         enriched.extend(synthetic)

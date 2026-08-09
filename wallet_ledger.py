@@ -18,7 +18,10 @@ from order_quantity_context import (
     line_quantity_context,
     order_quantity_context,
     compute_seller_proceeds_ledger_amounts,
+    omit_ledger_proceeds_component_fields,
     quantity_context_fields,
+    wallet_ledger_data_issue,
+    wallet_ledger_event_amount,
 )
 
 
@@ -178,6 +181,7 @@ def _normalize_wallet_transaction_entry(db, row):
     amount = _round_money(row.get("wt_amount"))
     wt_type = row.get("wt_type") or ""
     wt_status = row.get("wt_status") or "posted"
+    tx_uid = row.get("wt_transaction_id")
 
     if wt_type == "return_clawback":
         entry_type = "sale_proceeds_clawback"
@@ -194,21 +198,34 @@ def _normalize_wallet_transaction_entry(db, row):
     qty_ctx = row.get("_qty_ctx") or row.get("_proceeds_ctx")
     if qty_ctx is None:
         qty_ctx = _quantity_context_for_entry(db, row)
-    if qty_ctx and not row.get("_proceeds_ctx"):
-        tx_uid = row.get("wt_transaction_id")
-        if tx_uid:
-            try:
-                qty_ctx = {**qty_ctx, **compute_seller_proceeds_ledger_amounts(db, tx_uid)}
-            except Exception:
-                pass
 
     cancelled_qty = int((qty_ctx or {}).get("cancelled_qty") or 0)
     returned_qty = int((qty_ctx or {}).get("returned_qty") or 0)
     net_verified_held = int((qty_ctx or {}).get("net_verified_held") or 0)
     verified_qty = int((qty_ctx or {}).get("verified_qty") or 0)
     active_units = int((qty_ctx or {}).get("active_units") or 0)
-    per_unit = _to_float((qty_ctx or {}).get("seller_proceeds_per_unit") or 0)
-    tx_uid = row.get("wt_transaction_id")
+
+    event_fields = {}
+    if tx_uid and wt_type in (
+        "return_clawback",
+        "cancel_unshipped_adjustment",
+        "partial_delivery_credit",
+    ):
+        if entry_type == "sale_proceeds_held" and wt_type == "partial_delivery_credit":
+            wallet_ledger_data_issue(
+                "aggregated held partial_delivery_credit: using stored wt_amount only",
+                order_uid=tx_uid,
+                event=row,
+            )
+        else:
+            event_sign = (
+                -1
+                if wt_type in ("return_clawback", "cancel_unshipped_adjustment")
+                else 1
+            )
+            amount, event_fields = wallet_ledger_event_amount(
+                db, tx_uid, row, sign=event_sign
+            )
 
     if entry_type == "sale_proceeds_clawback":
         from wallet_transactions_service import return_clawback_ledger_availability
@@ -216,14 +233,18 @@ def _normalize_wallet_transaction_entry(db, row):
         try:
             claw_delta_qty = int(row.get("wt_qty") or 0)
         except (TypeError, ValueError):
-            claw_delta_qty = returned_qty
+            claw_delta_qty = 0
+        if claw_delta_qty <= 0:
+            wallet_ledger_data_issue(
+                "return_clawback row missing wt_qty",
+                order_uid=tx_uid,
+                event=row,
+            )
         description = return_clawback_ledger_description(
-            db, row, delta_qty=claw_delta_qty or returned_qty
+            db, row, delta_qty=claw_delta_qty
         )
         availability, useable_delta = return_clawback_ledger_availability(db, row)
     elif entry_type == "sale_proceeds_held":
-        if wt_type == "partial_delivery_credit" and per_unit > 0 and net_verified_held > 0:
-            amount = _round_money(per_unit * net_verified_held)
         description = _pending_return_window_description(buyer, net_verified_held)
         availability = "pending"
         useable_delta = 0.0
@@ -261,6 +282,7 @@ def _normalize_wallet_transaction_entry(db, row):
         "availability": availability,
         "currency": row.get("wt_currency") or "USD",
         "transaction_uid": tx_uid,
+        "order_uid": tx_uid,
         "transaction_original_uid": None,
         "transaction_type": "sale",
         "entry_datetime": entry_dt,
@@ -272,18 +294,14 @@ def _normalize_wallet_transaction_entry(db, row):
         "wt_status": wt_status,
         "wt_note": row.get("wt_note"),
         "wt_available_at": row.get("wt_available_at"),
+        "ti_uid": row.get("wt_ti_id"),
         "ti_received_qty": verified_qty or None,
         "ti_bs_qty": active_units or None,
     }
     if qty_ctx:
-        entry.update(quantity_context_fields(qty_ctx))
-    if tx_uid and entry_type in ("sale_proceeds", "sale_proceeds_held"):
-        from line_commerce_fields import build_order_proceeds_line_breakdowns
-
-        proceeds_lines = build_order_proceeds_line_breakdowns(db, tx_uid)
-        if proceeds_lines:
-            entry["lines"] = proceeds_lines
-        entry["order_uid"] = tx_uid
+        entry.update(omit_ledger_proceeds_component_fields(quantity_context_fields(qty_ctx)))
+    if event_fields:
+        entry.update(event_fields)
     return _attach_status_note(entry)
 
 
@@ -352,7 +370,7 @@ def _aggregate_sale_proceeds_rows(db, rows):
     return other_rows + aggregated
 
 
-def _normalize_reservation_entry(row):
+def _normalize_reservation_entry(db, row):
     wt_type = row.get("wt_type") or ""
     amount_raw = _round_money(row.get("wt_amount"))
     buyer = row.get("buyer_name") or row.get("wt_buyer_id") or "buyer"
@@ -368,7 +386,7 @@ def _normalize_reservation_entry(row):
     signed_amount = _round_money(-amount_raw)
     tx_uid = row.get("wt_transaction_id")
 
-    return {
+    entry = {
         "entry_id": f"reservation:{row.get('wt_uid')}",
         "entry_source": "wallet_transactions",
         "entry_type": entry_type,
@@ -378,6 +396,7 @@ def _normalize_reservation_entry(row):
         "availability": "pending",
         "currency": row.get("wt_currency") or "USD",
         "transaction_uid": tx_uid,
+        "order_uid": tx_uid,
         "transaction_original_uid": None,
         "transaction_type": "sale",
         "entry_datetime": row.get("wt_created_at") or row.get("transaction_datetime"),
@@ -390,6 +409,22 @@ def _normalize_reservation_entry(row):
         "trr_uid": trr_uid,
         "ti_uid": row.get("wt_ti_id"),
     }
+    if entry_type == "sale_proceeds_clawback" and tx_uid:
+        event_row = {
+            "wt_type": "return_clawback",
+            "wt_ti_id": row.get("wt_ti_id"),
+            "wt_qty": row.get("wt_qty"),
+            "wt_amount": row.get("wt_amount"),
+            "wt_idempotency_key": row.get("wt_idempotency_key")
+            or (f"return_clawback_hold:{trr_uid}" if trr_uid else ""),
+            "wt_note": trr_uid,
+        }
+        line_amount, event_fields = wallet_ledger_event_amount(
+            db, tx_uid, event_row, sign=-1
+        )
+        entry.update(event_fields)
+        entry["amount"] = line_amount
+    return entry
 
 
 def _normalize_wallet_spend_entry(row):
@@ -678,7 +713,7 @@ def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
     entries.extend(
         _normalize_wallet_transaction_entry(db, r) for r in filtered_wt_rows
     )
-    entries.extend(_normalize_reservation_entry(r) for r in reservation_rows)
+    entries.extend(_normalize_reservation_entry(db, r) for r in reservation_rows)
     entries.extend(_normalize_wallet_spend_entry(r) for r in spend_rows)
 
     entries = [

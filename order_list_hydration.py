@@ -105,8 +105,6 @@ _PENDING_ITEM_KEYS = frozenset(
         "return_quantity",
         "return_shipped_qty",
         "cancel_unshipped_qty",
-        "shipped_return_quantity",
-        "unshipped_return_quantity",
         "item_name",
         "ti_bs_id",
         "ti_bs_cost",

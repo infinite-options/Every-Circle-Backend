@@ -264,9 +264,20 @@ def _transform_pending_return_row(db, row):
 
     cancel_only = bool(out.get("cancel_unshipped") or out.get("pre_ship_cancel"))
     lines = out.get("return_lines") or []
-    return_lines = [
-        _return_line_with_split(db, line, cancel_only=cancel_only) for line in lines
-    ]
+    return_lines = []
+    for line in lines:
+        line_cancel = cancel_only
+        if not line_cancel:
+            try:
+                shipped = int(line.get("return_shipped_qty") or 0)
+                cancel = int(line.get("cancel_unshipped_qty") or 0)
+            except (TypeError, ValueError):
+                shipped = cancel = 0
+            if cancel > 0 and shipped == 0:
+                line_cancel = True
+        return_lines.append(
+            _return_line_with_split(db, line, cancel_only=line_cancel)
+        )
     out["return_lines"] = return_lines
     _scoped_return_line_fields(out, return_lines)
 
