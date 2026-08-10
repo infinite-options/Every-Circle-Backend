@@ -5,7 +5,7 @@ Each purchases.rows[] entry is a Purchases-table row with an explicit unit ledge
 so the frontend never infers shipped / verified / return splits.
 """
 
-from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping
+from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping, sync_legacy_unit_fields
 from order_display import build_return_ledger_display
 from account_screen_v2_contract import _units_for_return_row
 from account_screen_line_rows import _scoped_return_line_fields
@@ -277,6 +277,7 @@ def _transform_sale_row(db, row):
         _clear_parent_sale_return_status(out)
 
     out["display"] = _sale_display(out, units)
+    sync_legacy_unit_fields(out, units)
 
     completed = _completed_return_uids(db, order_uid)
     if completed:

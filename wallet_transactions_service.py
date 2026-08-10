@@ -186,25 +186,6 @@ def compute_seller_eligible_total(db, transaction_uid):
     return _round_money(amount + taxes + shipping - bounty)
 
 
-def compute_seller_eligible_active_total(db, transaction_uid):
-    """
-    Seller pool adjusted for pre-ship cancels and post-ship returns.
-
-    Scales the full-order eligible total by active_units / purchased_qty.
-    """
-    from order_quantity_context import order_quantity_context
-
-    base = compute_seller_eligible_total(db, transaction_uid)
-    ctx = order_quantity_context(db, transaction_uid)
-    purchased = int(ctx.get("purchased_qty") or 0)
-    active = int(ctx.get("active_units") or 0)
-    if base <= 0 or purchased <= 0:
-        return base
-    if active <= 0:
-        return 0.0
-    return _round_money(base * active / purchased)
-
-
 def _business_owner_profile_uid(db, business_uid):
     """First profile_personal_uid linked to a business via business_user."""
     business_uid = str(business_uid or "").strip()
@@ -371,41 +352,6 @@ def _total_order_qty(db, transaction_uid):
         return 0
 
 
-def compute_partial_delivery_credit_amount(
-    seller_eligible_total,
-    transaction_amount,
-    qty,
-    unit_cost,
-    total_order_qty,
-    already_credited,
-):
-    """
-    Proportional share of seller_eligible_total for a receive delta.
-
-    Normal: seller_eligible_total * (qty * unit_cost / transaction_amount)
-    If transaction_amount is 0: equal split by qty / total_order_qty.
-    Capped so cumulative held+posted credits never exceed seller_eligible_total.
-    """
-    eligible = _round_money(seller_eligible_total)
-    if eligible <= 0 or qty <= 0:
-        return 0.0
-
-    tx_amount = _to_float(transaction_amount)
-    if tx_amount > 0:
-        delta_value = _to_float(qty) * _to_float(unit_cost)
-        raw = eligible * (delta_value / tx_amount)
-    else:
-        order_qty = int(total_order_qty or 0)
-        if order_qty <= 0:
-            return 0.0
-        raw = eligible * (_to_float(qty) / order_qty)
-
-    remaining = _round_money(eligible - _to_float(already_credited))
-    if remaining <= 0:
-        return 0.0
-    return _round_money(min(raw, remaining))
-
-
 def _fetch_wt_by_idempotency_key(db, idempotency_key):
     q = db.execute(
         """
@@ -467,6 +413,9 @@ def _attach_bounty_release_to_credit_result(
 def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after):
     """
     Insert a partial_delivery_credit ledger row and credit the seller wallet.
+
+    Amount is line-exact (merchandise + tax + line shipping − bounty per stored
+    snapshots). Returns an error when line snapshots cannot produce a credit.
 
     Idempotency key: ``{ti_uid}:{received_qty_after}``. Duplicate key is a
     success/no-op (existing row returned, wallet not re-credited).
@@ -544,25 +493,45 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
             "ti_uid": ti_uid,
         }
 
-    seller_eligible = compute_seller_eligible_active_total(db, transaction_uid)
+    from line_commerce_fields import (
+        compute_line_event_proceeds_breakdown,
+        load_commerce_sale_line,
+    )
+
     unit_cost = _parse_unit_cost(ti.get("ti_bs_cost"))
-    transaction_amount = _to_float(tx.get("transaction_amount"))
-    from order_quantity_context import line_quantity_context
-
-    line_ctx = line_quantity_context(db, transaction_uid, ti_uid, row=ti)
-    total_order_qty = int(line_ctx.get("active_units") or 0) or _total_order_qty(
-        db, transaction_uid
+    line_row = load_commerce_sale_line(db, transaction_uid, ti_uid)
+    if not line_row:
+        return {
+            "code": 500,
+            "message": f"Sale line not found for partial delivery credit: {ti_uid}",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+    breakdown = compute_line_event_proceeds_breakdown(
+        db,
+        transaction_uid,
+        line_row,
+        verified_qty=qty,
     )
-    already_credited = _posted_credits_total(db, transaction_uid)
-
-    credit_amount = compute_partial_delivery_credit_amount(
-        seller_eligible_total=seller_eligible,
-        transaction_amount=transaction_amount,
-        qty=qty,
-        unit_cost=unit_cost,
-        total_order_qty=total_order_qty,
-        already_credited=already_credited,
-    )
+    if not breakdown:
+        return {
+            "code": 500,
+            "message": (
+                "Cannot compute line-exact seller proceeds for delivery verification"
+            ),
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
+    credit_amount = _round_money(breakdown.get("amount"))
+    if credit_amount <= 0:
+        return {
+            "code": 500,
+            "message": "Line-exact seller proceeds credit is zero or negative",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
 
     if (
         existing
@@ -818,24 +787,6 @@ def _line_seller_proceeds_net(db, ti_uid):
         "wt_currency": (meta.get("wt_currency") or "USD"),
         "wt_unit_cost": _round_money(meta.get("wt_unit_cost")),
     }
-
-
-def compute_return_clawback_amount(net_amount, net_qty, return_qty):
-    """
-    Legacy proportional clawback of net credited proceeds for a returned qty.
-
-    Prefer ``compute_seller_proceeds_reversal_for_line`` for return/cancel splits.
-    """
-    net_amount = _round_money(net_amount)
-    try:
-        net_qty = int(net_qty or 0)
-        return_qty = int(return_qty or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    if net_amount <= 0 or net_qty <= 0 or return_qty <= 0:
-        return 0.0
-    qty = min(return_qty, net_qty)
-    return _round_money(net_amount * (qty / float(net_qty)))
 
 
 def _sale_line_reversal_context(db, ti_uid, transaction_uid=None):
@@ -1626,8 +1577,8 @@ def clawback_seller_proceeds_on_return(
     """
     Reverse seller proceeds for returned (previously credited) quantity.
 
-    Computes clawback proportional to return_qty vs net credited qty/amount on
-    the original sale line. Inserts negative ``return_clawback`` row(s) and
+    Computes clawback from line-exact stored snapshots on the original sale line.
+    Inserts negative ``return_clawback`` row(s) and
     debits the seller wallet (pending first, then useable).
 
     Idempotency key: ``clawback:{return_ti_uid}`` (and ``:held`` / ``:posted``
@@ -1705,12 +1656,16 @@ def clawback_seller_proceeds_on_return(
         line_bounty_ledger=line_bounty,
     )
     if clawback_amount <= 0:
-        clawback_amount = compute_return_clawback_amount(
-            line_net["net_amount"], line_net["net_qty"], return_qty
-        )
-        per_unit = line_net.get("wt_unit_cost") or 0.0
-    else:
-        per_unit = _round_money(clawback_amount / return_qty) if return_qty > 0 else 0.0
+        return {
+            "code": 500,
+            "message": (
+                "Cannot compute line-exact seller proceeds clawback for return"
+            ),
+            "clawed": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+    per_unit = _round_money(clawback_amount / return_qty) if return_qty > 0 else 0.0
 
     net_credited = max(_to_float(line_net.get("net_amount")), 0.0)
     if net_credited > 0:

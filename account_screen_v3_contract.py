@@ -75,6 +75,79 @@ def format_money_label(amount):
     return f"${value:,.2f}"
 
 
+def format_signed_pool_label(delta):
+    """Pending/useable column label: '+$24.00', '−$66.00', or '—'."""
+    try:
+        value = round_money(delta)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(value) < 0.0001:
+        return "—"
+    formatted = f"${abs(value):,.2f}"
+    if value > 0:
+        return f"+{formatted}"
+    return f"−{formatted}"
+
+
+def _ledger_float(value):
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def ledger_entry_pool_deltas(entry):
+    """
+    Signed pending-pool and useable-pool impacts for one ledger row.
+
+    Prefer explicit pending_delta / useable_delta when present; otherwise derive
+    from amount, availability, and include_in_running_balance.
+    """
+    if not isinstance(entry, dict):
+        return 0.0, 0.0
+
+    amount = round_money(_ledger_float(entry.get("amount")))
+
+    if entry.get("useable_delta") is not None:
+        useable_delta = round_money(_ledger_float(entry.get("useable_delta")))
+    else:
+        useable_delta = 0.0
+
+    if entry.get("pending_delta") is not None:
+        pending_delta = round_money(_ledger_float(entry.get("pending_delta")))
+        return pending_delta, useable_delta
+
+    availability = (entry.get("availability") or "").strip().lower()
+    include_in_balance = entry.get("include_in_running_balance") is not False
+
+    if useable_delta != 0:
+        if include_in_balance:
+            pending_delta = round_money(amount - useable_delta)
+        else:
+            pending_delta = 0.0
+    elif availability == "pending" and amount != 0:
+        pending_delta = amount
+    elif amount != 0 and include_in_balance:
+        pending_delta = amount
+    else:
+        pending_delta = 0.0
+
+    return pending_delta, useable_delta
+
+
+def build_ledger_entry_display(entry, tz_name=None):
+    """Wallet ledger table display.* block — pending/useable column labels."""
+    pending_delta, useable_delta = ledger_entry_pool_deltas(entry)
+    return {
+        "date_label": format_date_label(entry.get("entry_datetime"), tz_name) or "—",
+        "pending_amount_label": format_signed_pool_label(pending_delta),
+        "useable_amount_label": format_signed_pool_label(useable_delta),
+        "type_label": entry.get("entry_type_label") or "—",
+    }
+
+
 def normalize_tb_percentage_display(pct):
     """
     Bounty share for API display: integer 0–100.
@@ -193,6 +266,10 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
         "amount_label": format_money_label(amount) if amount is not None else "NA",
         "type_label": type_label,
     }
+    if v2_display.get("received_action"):
+        display["received_action"] = v2_display["received_action"]
+    elif audience == "buyer" and kind not in _RETURN_ROW_KINDS:
+        display["received_action"] = "status"
 
     if audience == "seller":
         kind = map_row_kind_v3(row.get("row_kind"))

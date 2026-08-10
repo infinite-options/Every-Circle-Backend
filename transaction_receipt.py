@@ -184,6 +184,10 @@ _RECEIPT_LINE_SELECT = """
         END AS seller_ref_id,
         pe.profile_expertise_cost,
         pe.profile_expertise_cost_currency,
+        bs.bs_bounty,
+        bs.bs_bounty_type,
+        pe.profile_expertise_bounty,
+        pe.profile_expertise_bounty_type,
         COALESCE(
             (
                 SELECT JSON_ARRAYAGG(
@@ -307,6 +311,80 @@ def _process_receipt_rows(db, rows):
     return enriched_rows
 
 
+def _attach_receipt_bounty_fields(db, lines, profile_id):
+    """Per-line seller bounty pool + optional buyer referrer share (receipt Bounty column)."""
+    from line_commerce_fields import attach_sale_lines_commerce, round_money
+    from transactions import _seller_bounty_pool_for_line_row
+    from account_screen_v3_contract import normalize_tb_percentage_display
+
+    if not lines:
+        return lines
+
+    attach_sale_lines_commerce(db, lines, buyer_profile_id=profile_id)
+
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        pool = round_money(line.get("line_bounty_paid"))
+        if pool <= 0:
+            pool = round_money(_seller_bounty_pool_for_line_row(line))
+            if pool > 0:
+                line["line_bounty_paid"] = pool
+
+        if pool <= 0:
+            for key in (
+                "line_bounty_paid",
+                "ti_bs_bounty",
+                "ti_bs_bounty_type",
+                "bs_bounty",
+                "bs_bounty_type",
+                "bounty_amount",
+                "item_bounty",
+                "bounty_earned",
+                "tb_amount",
+                "tb_percentage",
+            ):
+                line.pop(key, None)
+            continue
+
+        pct = line.get("tb_percentage")
+        if pct is not None:
+            normalized = normalize_tb_percentage_display(pct)
+            if normalized is not None:
+                line["tb_percentage"] = normalized
+
+    return lines
+
+
+def _attach_receipt_bounty_totals(rows, payload):
+    """Transaction-level bounty footer fields from line pools."""
+    from line_commerce_fields import round_money
+
+    if not rows:
+        return payload
+
+    total_pool = round_money(
+        sum(round_money(row.get("line_bounty_paid")) for row in rows if isinstance(row, dict))
+    )
+    if total_pool <= 0:
+        return payload
+
+    payload["bounty_paid"] = total_pool
+    payload["total_bounty_paid"] = total_pool
+    payload["transaction_bounty"] = total_pool
+
+    header = rows[0] if isinstance(rows[0], dict) else {}
+    amount = round_money(header.get("transaction_amount"))
+    taxes = round_money(header.get("transaction_taxes"))
+    shipping = round_money(header.get("transaction_shipping"))
+    fees = round_money(header.get("transaction_fees"))
+    total_paid = round_money(amount + taxes + shipping + fees)
+    if total_paid > 0:
+        payload["total_amount_paid"] = total_paid
+
+    return payload
+
+
 def _build_receipt_v2(db, order_uid, enriched_rows, shipping):
     """v2 envelope: order-level + line-level units matching account-screen."""
     if not enriched_rows:
@@ -363,6 +441,8 @@ class TransactionReceipt(Resource):
                     )
                     enriched_rows = _process_receipt_rows(db, expertise_rows)
 
+                _attach_receipt_bounty_fields(db, enriched_rows, profile_id)
+
                 shipping = shipping_payload_from_row(
                     load_shipping_for_transaction(db, transaction_uid)
                 )
@@ -375,6 +455,9 @@ class TransactionReceipt(Resource):
                 response.update(shipping)
                 if v2:
                     response.update(v2)
+                _attach_receipt_bounty_totals(enriched_rows, response)
+                if v2:
+                    _attach_receipt_bounty_totals(enriched_rows, v2)
                 return response, 200
 
         except Exception as e:

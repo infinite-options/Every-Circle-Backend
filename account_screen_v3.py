@@ -20,7 +20,7 @@ from line_commerce_fields import (
     round_money,
 )
 from transactions import _to_float
-from wallet_ledger import get_wallet_ledger
+from wallet_ledger import apply_ledger_entry_display, get_wallet_ledger
 from wallet_service import build_wallet_summary, compute_wallet_from_bounty_ledger
 
 from account_screen_v3_contract import (
@@ -139,6 +139,7 @@ def _ledger_money_keys():
         "per_unit_shipping",
         "per_unit_bounty",
         "useable_delta",
+        "pending_delta",
         "balance_after",
         "useable_balance_after",
         "merchandise",
@@ -207,26 +208,6 @@ def _ledger_entry_breakdown(entry):
     }
 
 
-def _ledger_entry_display(entry, tz_name):
-    amount = _to_float(entry.get("amount"))
-    availability = entry.get("availability") or "useable"
-    pending = amount if availability == "pending" and amount > 0 else 0.0
-    useable = amount if availability == "useable" and amount != 0 else 0.0
-
-    pending_label = format_money_label(pending) if pending else "—"
-    if pending and pending > 0:
-        pending_label = f"+{pending_label}"
-
-    useable_label = format_money_label(useable) if useable else "—"
-
-    return {
-        "date_label": format_date_label(entry.get("entry_datetime"), tz_name) or "—",
-        "pending_amount_label": pending_label,
-        "useable_amount_label": useable_label,
-        "type_label": entry.get("entry_type_label") or "—",
-    }
-
-
 def build_wallet_ledger_v3(db, profile_id, *, offset=0, limit=50, tz_name=None):
     raw = get_wallet_ledger(db, profile_id, limit=limit, offset=offset)
     entries = []
@@ -244,7 +225,7 @@ def build_wallet_ledger_v3(db, profile_id, *, offset=0, limit=50, tz_name=None):
             entry["transaction_uid"] = entry["order_uid"]
         entry = _round_ledger_entry(entry)
         entry["breakdown"] = _ledger_entry_breakdown(entry)
-        entry["display"] = _ledger_entry_display(entry, tz_name)
+        entry = apply_ledger_entry_display(entry, tz_name)
         if tz_name and entry.get("entry_datetime"):
             enriched = enrich_datetime_fields(entry, "entry_datetime", tz_name)
             entry["entry_datetime_local"] = enriched.get("entry_datetime_local")
@@ -490,7 +471,30 @@ def _sale_line_for_row(row, snap_map):
     return None
 
 
+def build_buyer_purchase_row_v3(db, profile_id, order_uid, *, tz_name=None):
+    """
+    One account-screen v3 purchases.rows[] element after a buyer purchase mutation.
+
+    Clears qty caches and reloads from DB so verification fields match post-write state.
+    """
+    from account_screen_purchases_v2 import build_purchases_v2_rows
+    from datetime_utils import enrich_datetime_fields
+    from transactions import fetch_buyer_purchase_list_row
+
+    raw = fetch_buyer_purchase_list_row(db, profile_id, order_uid)
+    if not raw:
+        return None
+    row = enrich_datetime_fields(dict(raw), "transaction_datetime", tz_name)
+    v2_rows = build_purchases_v2_rows(db, [row])
+    if not v2_rows:
+        return None
+    return transform_purchase_row_v3(v2_rows[0], db=db, tz_name=tz_name)
+
+
 def build_purchases_v3(db, rows, *, tz_name=None):
+    from order_quantity_context import clear_ledger_quantity_caches
+
+    clear_ledger_quantity_caches()
     enriched = attach_line_snapshots_to_rows(db, rows)
     snap_map = batch_line_checkout_snapshots(
         db, [r.get("ti_uid") for r in enriched if isinstance(r, dict)]
@@ -507,6 +511,17 @@ def build_purchases_v3(db, rows, *, tz_name=None):
     return {"rows": transformed}
 
 
+def _gross_order_qty_for_sold(raw, units):
+    """Original units ordered — never net of in-progress returns/cancels."""
+    line_units = raw.get("units") or {}
+    return int(
+        line_units.get("purchased_qty")
+        or raw.get("ti_bs_qty")
+        or units.get("purchased_qty")
+        or 0
+    )
+
+
 def _net_quantity_sold_by_offering(enriched, transactions):
     """Net lifetime units sold per offering (orders minus completed returns/cancels)."""
     sold = defaultdict(int)
@@ -514,10 +529,13 @@ def _net_quantity_sold_by_offering(enriched, transactions):
         offering_uid = raw.get("ti_bs_id") or raw.get("offering_uid")
         if not offering_uid:
             continue
+        raw_kind = raw.get("row_kind")
+        if raw.get("is_pending_return") or raw_kind == "pending_return":
+            continue
         units = tx.get("units") or build_v3_units(raw)
         if tx.get("row_kind") == "order":
-            sold[offering_uid] += int(units.get("purchased_qty") or 0)
-        elif tx.get("row_kind") == "return":
+            sold[offering_uid] += _gross_order_qty_for_sold(raw, units)
+        elif tx.get("row_kind") == "return" and raw_kind == "return":
             sold[offering_uid] -= int(units.get("return_shipped_qty") or 0)
             sold[offering_uid] -= int(units.get("cancel_unshipped_qty") or 0)
     return sold

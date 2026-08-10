@@ -276,6 +276,178 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(rounded["lines"][0]["net_amount"], 140.0)
         self.assertEqual(rounded["lines"][0]["bounty_amount"], -8.0)
 
+    def test_quantity_sold_ignores_pending_returns(self):
+        from account_screen_v3 import _net_quantity_sold_by_offering
+        from account_screen_v3_contract import build_v3_units, map_row_kind_v3
+
+        def _tx(row):
+            return {
+                "row_kind": map_row_kind_v3(row.get("row_kind")),
+                "units": build_v3_units(row),
+            }
+
+        sale_rows = [
+            {
+                "row_kind": "sale_line",
+                "ti_bs_id": "150-000136",
+                "ti_bs_qty": 3,
+                "units": {"purchased_qty": 3, "active_qty": 2},
+            },
+            {
+                "row_kind": "sale_line",
+                "ti_bs_id": "150-000137",
+                "ti_bs_qty": 3,
+                "units": {"purchased_qty": 3, "active_qty": 2},
+            },
+        ]
+        pending_rows = [
+            {
+                "row_kind": "pending_return",
+                "is_pending_return": True,
+                "ti_bs_id": "150-000136",
+                "return_lines": [
+                    {
+                        "return_quantity": 2,
+                        "return_shipped_qty": 1,
+                        "cancel_unshipped_qty": 1,
+                    }
+                ],
+                "units": {
+                    "return_shipped_qty": 1,
+                    "return_unshipped_qty": 1,
+                },
+            },
+            {
+                "row_kind": "pending_return",
+                "is_pending_return": True,
+                "ti_bs_id": "150-000137",
+                "return_lines": [
+                    {
+                        "return_quantity": 1,
+                        "return_shipped_qty": 0,
+                        "cancel_unshipped_qty": 1,
+                    }
+                ],
+                "units": {
+                    "return_shipped_qty": 0,
+                    "return_unshipped_qty": 1,
+                },
+            },
+        ]
+        enriched = sale_rows + pending_rows
+        transactions = [_tx(r) for r in enriched]
+        sold = _net_quantity_sold_by_offering(enriched, transactions)
+        self.assertEqual(sold["150-000136"], 3)
+        self.assertEqual(sold["150-000137"], 3)
+
+    def test_quantity_sold_subtracts_completed_returns_only(self):
+        from account_screen_v3 import _net_quantity_sold_by_offering
+        from account_screen_v3_contract import build_v3_units, map_row_kind_v3
+
+        def _tx(row):
+            return {
+                "row_kind": map_row_kind_v3(row.get("row_kind")),
+                "units": build_v3_units(row),
+            }
+
+        sale_row = {
+            "row_kind": "sale_line",
+            "ti_bs_id": "150-000136",
+            "ti_bs_qty": 3,
+            "units": {"purchased_qty": 3},
+        }
+        completed_return = {
+            "row_kind": "return",
+            "is_pending_return": False,
+            "ti_bs_id": "150-000136",
+            "return_lines": [
+                {
+                    "return_quantity": 2,
+                    "return_shipped_qty": 1,
+                    "cancel_unshipped_qty": 1,
+                }
+            ],
+            "units": {"return_shipped_qty": 1, "return_unshipped_qty": 1},
+        }
+        enriched = [sale_row, completed_return]
+        transactions = [_tx(r) for r in enriched]
+        sold = _net_quantity_sold_by_offering(enriched, transactions)
+        self.assertEqual(sold["150-000136"], 1)
+
+    def test_ledger_display_return_clawback_pending_debit(self):
+        from account_screen_v3_contract import (
+            build_ledger_entry_display,
+            ledger_entry_pool_deltas,
+        )
+        from wallet_ledger import apply_ledger_entry_display
+
+        entry = {
+            "entry_type": "sale_proceeds_return_clawback",
+            "event_type": "return",
+            "amount": -66,
+            "availability": "pending",
+            "useable_delta": 0.0,
+            "include_in_running_balance": True,
+            "entry_type_label": "Sale proceeds",
+            "description": "Sale proceeds — 1 returned, 1 cancelled",
+        }
+        pending_delta, useable_delta = ledger_entry_pool_deltas(entry)
+        self.assertEqual(pending_delta, -66.0)
+        self.assertEqual(useable_delta, 0.0)
+        display = build_ledger_entry_display(entry)
+        self.assertEqual(display["pending_amount_label"], "−$66.00")
+        self.assertEqual(display["useable_amount_label"], "—")
+
+        enriched = apply_ledger_entry_display(entry)
+        self.assertEqual(enriched["pending_delta"], -66.0)
+        self.assertEqual(enriched["display"]["pending_amount_label"], "−$66.00")
+
+    def test_ledger_display_cancel_and_verify_transfer(self):
+        from account_screen_v3_contract import build_ledger_entry_display, ledger_entry_pool_deltas
+
+        cancel = {
+            "entry_type": "sale_proceeds_cancel",
+            "amount": -43,
+            "availability": "pending",
+            "useable_delta": 0.0,
+            "include_in_running_balance": True,
+        }
+        pending_delta, _ = ledger_entry_pool_deltas(cancel)
+        self.assertEqual(pending_delta, -43.0)
+        display = build_ledger_entry_display(cancel)
+        self.assertEqual(display["pending_amount_label"], "−$43.00")
+        self.assertEqual(display["useable_amount_label"], "—")
+
+        verify = {
+            "entry_type": "sale_proceeds_verify_transfer",
+            "amount": 24,
+            "availability": "useable",
+            "useable_delta": 24.0,
+            "include_in_running_balance": False,
+        }
+        _, useable_delta = ledger_entry_pool_deltas(verify)
+        self.assertEqual(useable_delta, 24.0)
+        display = build_ledger_entry_display(verify)
+        self.assertEqual(display["pending_amount_label"], "—")
+        self.assertEqual(display["useable_amount_label"], "+$24.00")
+
+    def test_ledger_display_original_sale_pending_credit(self):
+        from account_screen_v3_contract import build_ledger_entry_display, ledger_entry_pool_deltas
+
+        original = {
+            "entry_type": "sale_proceeds_original",
+            "amount": 282,
+            "availability": "pending",
+            "useable_delta": 0.0,
+            "include_in_running_balance": True,
+        }
+        pending_delta, useable_delta = ledger_entry_pool_deltas(original)
+        self.assertEqual(pending_delta, 282.0)
+        self.assertEqual(useable_delta, 0.0)
+        display = build_ledger_entry_display(original)
+        self.assertEqual(display["pending_amount_label"], "+$282.00")
+        self.assertEqual(display["useable_amount_label"], "—")
+
 
 if __name__ == "__main__":
     unittest.main()

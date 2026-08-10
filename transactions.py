@@ -4187,24 +4187,11 @@ class ConfirmReturnTransaction(Resource):
             return response, 500
 
 
-class Transactions(Resource):
-
-    def get(self, profile_id=None):
-        print(f"In Transactions GET with profile_id: {profile_id}")
-        response = {}
-
-        try:
-            if not profile_id:
-                response["message"] = "profile_id is required"
-                response["code"] = 400
-                return response, 400
-
-            with connect() as db:
-                ensure_fulfillment_list_rollups(db)
-                fulfillment_summary = fulfillment_list_summary_sql("ti")
-                # Execute query with parameterized profile_id for security
-                query = (
-                    """
+def _buyer_purchase_list_query(*, order_uid_filter=False):
+    fulfillment_summary = fulfillment_list_summary_sql("ti")
+    order_filter = " AND t.transaction_uid = %s" if order_uid_filter else ""
+    return (
+        f"""
                     SELECT
                     t.transaction_uid,
                     t.transaction_original_uid,
@@ -4221,7 +4208,6 @@ class Transactions(Resource):
                     t.transaction_return_requested,
                     t.transaction_return_note,
                     t.transaction_business_id AS seller_id,
-                    -- ti.*,
                     CASE
                         WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
                         WHEN ti.ti_bs_id LIKE '150-%%' THEN
@@ -4252,7 +4238,7 @@ class Transactions(Resource):
                     MIN(pe.profile_expertise_cost) AS profile_expertise_cost,
                     MIN(pe.profile_expertise_cost_currency) AS profile_expertise_cost_currency,
                     MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
-                    __FULFILLMENT_SUMMARY__
+                    {fulfillment_summary}
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                     ON t.transaction_uid = ti.ti_transaction_id
@@ -4260,7 +4246,6 @@ class Transactions(Resource):
                     ON ti.ti_bs_id = bs.bs_uid
                     LEFT JOIN every_circle.business biz
                     ON bs.bs_business_id = biz.business_uid
-                    
                     LEFT JOIN every_circle.profile_personal seller_pp
                     ON t.transaction_business_id = seller_pp.profile_personal_user_id
                     LEFT JOIN every_circle.profile_expertise pe
@@ -4273,8 +4258,7 @@ class Transactions(Resource):
                     ON wr.wr_profile_wish_id = pw.profile_wish_uid
                     LEFT JOIN every_circle.profile_personal wish_pp
                     ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
-                    WHERE t.transaction_profile_id = %s
-                    -- WHERE t.transaction_profile_id = '110-000014'
+                    WHERE t.transaction_profile_id = %s{order_filter}
                     GROUP BY
                     t.transaction_uid,
                     t.transaction_datetime,
@@ -4285,997 +4269,86 @@ class Transactions(Resource):
                     purchase_type
                     ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
-                ).replace("__FULFILLMENT_SUMMARY__", fulfillment_summary)
+    )
 
-                print(f"Executing query for profile_id: {profile_id}")
-                result = db.execute(query, (profile_id,))
-                # print(f"Query result: {result}")
 
-                if result.get("code") == 200:
-                    rows = _enrich_transaction_rows(result.get("result", []))
-                    for row in rows:
-                        if (
-                            isinstance(row, dict)
-                            and row.get("purchase_type") == "Offering"
-                        ):
-                            cost = row.get("profile_expertise_cost") or row.get(
-                                "ti_bs_cost"
-                            )
-                            if cost is not None and str(cost).strip():
-                                from line_commerce_fields import format_offering_rate_display
+def _query_buyer_purchase_list_rows(db, profile_id, *, order_uid=None):
+    ensure_fulfillment_list_rollups(db)
+    query = _buyer_purchase_list_query(order_uid_filter=bool(order_uid))
+    params = [profile_id]
+    if order_uid:
+        params.append(order_uid)
+    result = db.execute(query, tuple(params))
+    if result.get("code") != 200:
+        return []
+    return result.get("result") or []
 
-                                row["offering_rate_display"] = (
-                                    format_offering_rate_display(cost)
-                                )
-                    rows = attach_shipping_to_transaction_rows(db, rows)
-                    rows = apply_order_fulfillment_summary(rows)
-                    rows = sync_list_rows_fulfillment_from_context(db, rows)
-                    from order_quantity_context import apply_list_verification_status
 
-                    rows = apply_list_verification_status(db, rows)
-                    rows = _enrich_list_transaction_rows(db, rows)
-                    from account_screen_purchases_v2 import build_purchases_v2_rows
+def _finalize_buyer_purchase_list_rows(db, rows):
+    """Enrich buyer purchase list rows with shipping, fulfillment, and return linkage."""
+    from order_quantity_context import apply_list_verification_status, clear_ledger_quantity_caches
+    from line_commerce_fields import format_offering_rate_display
 
-                    v2_rows = build_purchases_v2_rows(db, rows)
-                    response["message"] = "Purchase Transactions retrieved successfully"
-                    response["code"] = 200
-                    response["schema_version"] = 2
-                    response["data"] = v2_rows
-                    response["rows"] = v2_rows
-                    response["count"] = len(v2_rows)
-                    if _request_timezone():
-                        response["timezone"] = _request_timezone()
-                    response["datetime_storage"] = "UTC"
-                else:
-                    response["message"] = result.get(
-                        "message", "Query execution failed"
-                    )
-                    response["code"] = result.get("code", 500)
-                    response["error"] = result.get("error", "Unknown error")
-                    return response, response["code"]
+    clear_ledger_quantity_caches()
+    if not rows:
+        return []
+    rows = _enrich_transaction_rows(rows)
+    for row in rows:
+        if (
+            isinstance(row, dict)
+            and row.get("purchase_type") == "Offering"
+        ):
+            cost = row.get("profile_expertise_cost") or row.get("ti_bs_cost")
+            if cost is not None and str(cost).strip():
+                row["offering_rate_display"] = format_offering_rate_display(cost)
+    rows = attach_shipping_to_transaction_rows(db, rows)
+    rows = apply_order_fulfillment_summary(rows)
+    rows = sync_list_rows_fulfillment_from_context(db, rows)
+    rows = apply_list_verification_status(db, rows)
+    return _enrich_list_transaction_rows(db, rows)
 
+
+def fetch_buyer_purchase_list_row(db, profile_id, order_uid):
+    """One buyer purchase list row after post-write enrichment (account-screen v2 shape)."""
+    if not profile_id or not order_uid:
+        return None
+    rows = _query_buyer_purchase_list_rows(db, profile_id, order_uid=order_uid)
+    rows = _finalize_buyer_purchase_list_rows(db, rows)
+    return rows[0] if rows else None
+
+
+class Transactions(Resource):
+
+    def get(self, profile_id=None):
+        print(f"In Transactions GET with profile_id: {profile_id}")
+        response = {}
+
+        try:
+            if not profile_id:
+                response["message"] = "profile_id is required"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                rows = _finalize_buyer_purchase_list_rows(
+                    db, _query_buyer_purchase_list_rows(db, profile_id)
+                )
+                from account_screen_purchases_v2 import build_purchases_v2_rows
+
+                v2_rows = build_purchases_v2_rows(db, rows)
+                response["message"] = "Purchase Transactions retrieved successfully"
+                response["code"] = 200
+                response["schema_version"] = 2
+                response["data"] = v2_rows
+                response["rows"] = v2_rows
+                response["count"] = len(v2_rows)
+                if _request_timezone():
+                    response["timezone"] = _request_timezone()
+                response["datetime_storage"] = "UTC"
                 return response, 200
 
         except Exception as e:
             print(f"Error in Transactions GET: {str(e)}")
-            print(traceback.format_exc())
-            response["message"] = f"An error occurred: {str(e)}"
-            response["code"] = 500
-            return response, 500
-
-    def post(self):
-        print("In Transactions POST New")
-        response = {}
-
-        try:
-            # Get JSON payload from request
-            payload = request.get_json()
-            print(payload)
-
-            # Enter Data in Transactions Table
-            # Validate required fields
-            required_fields = [
-                "profile_id",
-                "total_amount_paid",
-                "total_costs",
-                "items",
-            ]
-            missing_fields = [
-                field for field in required_fields if not payload.get(field)
-                and payload.get(field) != 0
-            ]
-
-            if missing_fields:
-                response["message"] = (
-                    f"Missing required fields: {', '.join(missing_fields)}"
-                )
-                response["code"] = 400
-                return response, 400
-            print("No Missing Fields")
-
-            wallet_amount = _parse_wallet_amount(
-                payload.get("wallet_amount")
-                if payload.get("wallet_amount") is not None
-                else payload.get("wallet_amount_applied")
-            )
-            if wallet_amount is None:
-                response["message"] = "wallet_amount must be a non-negative number"
-                response["code"] = 400
-                return response, 400
-
-            total_amount_paid = round(_to_float(payload.get("total_amount_paid")), 4)
-            if total_amount_paid < 0:
-                response["message"] = "total_amount_paid must be non-negative"
-                response["code"] = 400
-                return response, 400
-
-            if wallet_amount - total_amount_paid > 1e-9:
-                response["message"] = (
-                    "wallet_amount cannot exceed total_amount_paid"
-                )
-                response["code"] = 400
-                return response, 400
-
-            card_amount = round(total_amount_paid - wallet_amount, 4)
-            stripe_pi = _normalize_stripe_payment_intent_id(
-                payload.get("stripe_payment_intent")
-            )
-            if card_amount >= 0.01 and not stripe_pi:
-                response["message"] = (
-                    "stripe_payment_intent is required when card charge is greater than zero"
-                )
-                response["code"] = 400
-                return response, 400
-
-            shipping_fields, shipping_error = normalize_shipping_address(
-                payload.get("shipping_address")
-            )
-            if shipping_error:
-                response["message"] = shipping_error
-                response["code"] = 400
-                return response, 400
-
-            # Extract required fields from payload
-            transaction = {
-                "transaction_profile_id": payload.get("profile_id"),
-                "transaction_business_id": payload.get("business_id"),
-                # Always store pi_… (never a client secret) so refunds can use this field
-                "transaction_stripe_pi": stripe_pi,
-                "transaction_total": payload.get("total_amount_paid"),
-                "transaction_amount": payload.get("total_costs"),
-                "transaction_taxes": payload.get("total_taxes"),
-                "transaction_fees": payload.get("total_fees"),
-                "transaction_wallet_amount": wallet_amount,
-                "transaction_in_escrow": (
-                    1 if payload.get("transaction_in_escrow") else 0
-                ),
-                "transaction_type": "sale",
-            }
-
-            with connect() as db:
-                from line_commerce_fields import ensure_line_tax_amount_column
-
-                ensure_line_tax_amount_column(db)
-
-                if stripe_pi:
-                    existing_sale = _find_existing_sale_by_stripe_pi(db, stripe_pi)
-                    if existing_sale:
-                        response["message"] = "Transaction already recorded"
-                        response["code"] = 200
-                        response["transaction_uid"] = existing_sale.get(
-                            "transaction_uid"
-                        )
-                        response["idempotent"] = True
-                        return response, 200
-
-                plan_ok, plan_err, checkout_plan = _plan_checkout(
-                    db,
-                    payload.get("items", []),
-                    payload,
-                    shipping_fields,
-                )
-                if not plan_ok:
-                    return plan_err, plan_err.get("code", 400)
-
-                if checkout_plan.get("shipping_actual_pending"):
-                    transaction["transaction_shipping_actual_pending"] = 1
-
-                plan_by_index = {
-                    entry["item_index"]: entry for entry in checkout_plan["lines"]
-                }
-
-                wallet_debited = 0.0
-                if wallet_amount >= 0.01:
-                    wallet_debit = debit_useable_for_purchase(
-                        db,
-                        payload.get("profile_id"),
-                        wallet_amount,
-                    )
-                    if wallet_debit.get("code") != 200:
-                        response["message"] = wallet_debit.get(
-                            "message", "Failed to apply wallet balance"
-                        )
-                        response["code"] = wallet_debit.get("code", 400)
-                        response["wallet"] = wallet_debit
-                        return response, response["code"]
-                    wallet_debited = _to_float(wallet_debit.get("debited"))
-                    response["wallet_applied"] = wallet_debit
-                else:
-                    response["wallet_applied"] = {
-                        "code": 200,
-                        "skipped": True,
-                        "debited": 0.0,
-                    }
-                response["card_amount"] = card_amount
-                response["wallet_amount"] = wallet_amount
-
-                def _rollback_wallet_debit():
-                    if wallet_debited < 0.01:
-                        return
-                    restore = credit_useable_from_refund(
-                        db, payload.get("profile_id"), wallet_debited
-                    )
-                    if restore.get("code") != 200:
-                        print(
-                            "Warning: Failed to restore wallet after checkout failure: "
-                            f"{restore}"
-                        )
-
-                # Generate new transaction UID
-                transaction_stored_procedure_response = db.call(
-                    procedure="new_transaction_uid"
-                )
-                if (
-                    not transaction_stored_procedure_response.get("result")
-                    or len(transaction_stored_procedure_response["result"]) == 0
-                ):
-                    _rollback_wallet_debit()
-                    response["message"] = "Failed to generate transaction UID"
-                    response["code"] = 500
-                    return response, 500
-
-                new_transaction_uid = transaction_stored_procedure_response["result"][0]["new_id"]
-                transaction["transaction_uid"] = new_transaction_uid
-                transactions_datetime = utc_now_str()
-                transaction["transaction_datetime"] = transactions_datetime
-
-                # Insert transaction
-                transaction_response = db.insert(
-                    "every_circle.transactions", transaction
-                )
-                print("transaction post response: ", transaction_response)
-
-                if transaction_response.get("code") != 200:
-                    _rollback_wallet_debit()
-                    response["message"] = transaction_response.get(
-                        "message", "Failed to insert transaction"
-                    )
-                    response["code"] = transaction_response.get("code", 500)
-                    return response, response["code"]
-
-                response["transaction"] = transaction_response
-                response["transaction_uid"] = new_transaction_uid
-
-                if checkout_plan.get("any_ship") and shipping_fields:
-                    shipping_response = insert_transaction_shipping(
-                        db, new_transaction_uid, shipping_fields
-                    )
-                    print("transaction_shipping post response: ", shipping_response)
-                    if shipping_response.get("code") != 200:
-                        response["message"] = shipping_response.get(
-                            "message", "Failed to insert shipping address"
-                        )
-                        response["code"] = shipping_response.get("code", 500)
-                        return response, response["code"]
-                    response["ts_uid"] = shipping_response.get("ts_uid")
-                    response["shipping_address"] = shipping_response.get(
-                        "shipping_address"
-                    )
-
-                # Enter Data in Transactions_ItemsTable
-                print("items: ", payload.get("items"))
-                items_count = 0
-                bounty_count = 0
-                order_shipping_total = 0.0
-                inventory_updates = []
-                for item_idx, item in enumerate(payload.get("items", [])):
-                    print(item)
-                    # {'bs_uid': '250-000021', 'quantity': 9, 'recommender_profile_id': '110-000231'}
-
-                    # Validate required item fields
-                    if (
-                        not item.get("bs_uid")
-                        and not item.get("expertise_uid")
-                        and not item.get("wish_response_uid")
-                    ):
-                        print(
-                            f"Warning: Skipping item missing bs_uid or expertise_uid or wish_response_uid: {item}"
-                        )
-                        continue
-
-                    # Generate new transaction item UID
-                    transaction_item_stored_procedure_response = db.call(
-                        procedure="new_transaction_item_uid"
-                    )
-                    if (
-                        not transaction_item_stored_procedure_response.get("result")
-                        or len(transaction_item_stored_procedure_response["result"])
-                        == 0
-                    ):
-                        print(
-                            f"Warning: Failed to generate transaction item UID for item: {item}"
-                        )
-                        continue
-
-                    new_transaction_item_uid = (
-                        transaction_item_stored_procedure_response["result"][0]["new_id"]
-                    )
-                    print(
-                        "new_transaction_item_uid: ",
-                        new_transaction_item_uid,
-                        type(new_transaction_item_uid),
-                    )
-
-                    # Load transaction item data from payload
-                    tx_item = {
-                        "ti_uid": new_transaction_item_uid,
-                        "ti_transaction_id": new_transaction_uid,
-                        "ti_bs_id": item.get("bs_uid")
-                        or item.get("expertise_uid")
-                        or item.get("wish_response_uid"),
-                        "ti_bs_qty": item.get("quantity"),
-                    }
-                    print("tx_item: ", tx_item)
-                    ti_bs_id = tx_item.get("ti_bs_id")
-                    # item_bounty_type = "per_item"
-                    item_bounty_type = item.get("bounty_type", "per_item")
-                    is_wish_item = False
-                    stock_decrement = None
-
-                    if ti_bs_id and str(ti_bs_id).startswith("250"):
-                        print("ti_bs_id is a business service")
-                        bs_query = """
-                           SELECT *
-                           FROM every_circle.business_services
-                           WHERE bs_uid = %s
-                       """
-                        bs_response = db.execute(bs_query, ti_bs_id)
-                        print("bs_response: ", bs_response)
-
-                        if (
-                            not bs_response.get("result")
-                            or len(bs_response["result"]) == 0
-                        ):
-                            response["message"] = (
-                                f"Business service not found: {item.get('bs_uid')}"
-                            )
-                            response["code"] = 404
-                            return response, 404
-
-                        bs_data = bs_response["result"][0]
-                        tx_item["ti_bs_cost"] = _normalize_stored_cost(bs_data.get("bs_cost"))
-                        tx_item["ti_bs_cost_currency"] = bs_data.get("bs_cost_currency")
-                        tx_item["ti_bs_sku"] = bs_data.get("bs_sku")
-                        tx_item["ti_bs_is_taxable"] = bs_data.get("bs_is_taxable")
-                        tx_item["ti_bs_tax_rate"] = bs_data.get("bs_tax_rate")
-                        tx_item["ti_bs_refund_policy"] = bs_data.get("bs_refund_policy")
-                        tx_item["ti_bs_return_window_days"] = bs_data.get(
-                            "bs_return_window_days"
-                        )
-                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
-                            bs_data.get("bs_is_returnable")
-                        )
-                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
-                        item_bounty_type = (
-                            bs_data.get("bs_bounty_type", "per_item") or "per_item"
-                        )
-                        print("tx_item: ", tx_item)
-
-                    elif ti_bs_id and str(ti_bs_id).startswith("150"):
-                        print("ti_bs_id is an expertise")
-                        # Get other item details from expertise table using parameterized query
-                        expertise_query = """
-                           SELECT *
-                           FROM every_circle.profile_expertise
-                           WHERE profile_expertise_uid = %s
-                       """
-                        bs_response = db.execute(expertise_query, ti_bs_id)
-                        print("expertise_response: ", bs_response)
-                        # Check if expertise exists
-                        if (
-                            not bs_response.get("result")
-                            or len(bs_response["result"]) == 0
-                        ):
-                            response["message"] = (
-                                f"Expertise not found: {item.get('profile_expertise_uid')}"
-                            )
-                            response["code"] = 404
-                            return response, 404
-
-                        bs_data = bs_response["result"][0]
-                        if (
-                            int(bs_data.get("profile_expertise_moderated") or 0)
-                            != MODERATED_ACTIVE
-                        ):
-                            response["message"] = "Offering is not available"
-                            response["code"] = 403
-                            return response, 403
-
-                        owner_uid = bs_data.get("profile_expertise_profile_personal_id")
-                        if not is_owner_available_for_public_interaction(db, owner_uid):
-                            response["message"] = "Offering is not available"
-                            response["code"] = 403
-                            return response, 403
-
-                        tx_item["ti_bs_cost"] = _normalize_stored_cost(
-                            bs_data.get("profile_expertise_cost")
-                        )
-                        tx_item["ti_bs_cost_currency"] = bs_data.get(
-                            "profile_expertise_cost_currency"
-                        )
-                        tx_item["ti_bs_sku"] = bs_data.get(
-                            "profile_expertise_sku"
-                        )  # Doesn't exist
-                        tx_item["ti_bs_is_taxable"] = bs_data.get(
-                            "profile_expertise_is_taxable"
-                        )
-                        tx_item["ti_bs_tax_rate"] = bs_data.get(
-                            "profile_expertise_tax_rate"
-                        )
-                        tx_item["ti_bs_refund_policy"] = bs_data.get(
-                            "profile_expertise_refund_policy"
-                        )
-                        tx_item["ti_bs_return_window_days"] = bs_data.get(
-                            "profile_expertise_return_window_days"
-                        )
-                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
-                            bs_data.get("profile_expertise_is_returnable")
-                        )
-                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
-                        item_bounty_type = (
-                            bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
-                        )
-                        print("tx_item: ", tx_item)
-
-                        purchased_qty = _purchase_qty(item)
-                        available_qty = _parse_limited_quantity(
-                            bs_data.get("profile_expertise_quantity")
-                        )
-                        stock_err = _validate_purchase_quantity(
-                            available_qty, purchased_qty
-                        )
-                        if stock_err:
-                            _rollback_wallet_debit()
-                            response.update(stock_err[0])
-                            return response, stock_err[1]
-                        stock_decrement = {
-                            "table": "profile_expertise",
-                            "uid_column": "profile_expertise_uid",
-                            "qty_column": "profile_expertise_quantity",
-                            "uid": ti_bs_id,
-                            "purchased_qty": purchased_qty,
-                            "limited": available_qty is not None,
-                        }
-
-                    elif ti_bs_id and str(ti_bs_id).startswith("165"):
-                        print("ti_bs_id is a wish")
-                        is_wish_item = True
-                        # Get other item details from wish table using parameterized query
-                        wish_query = """
-                           SELECT wish_response.wish_response_uid, profile_wish.*
-                           FROM every_circle.profile_wish
-                           LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
-                           WHERE wish_response_uid = %s
-                       """
-                        bs_response = db.execute(
-                            wish_query, (item.get("wish_response_uid"),)
-                        )
-                        print("wish_response: ", bs_response)
-                        # Check if wish exists
-                        if (
-                            not bs_response.get("result")
-                            or len(bs_response["result"]) == 0
-                        ):
-                            response["message"] = (
-                                f"Wish not found: {item.get('wish_response_uid')}"
-                            )
-                            response["code"] = 404
-                            return response, 404
-
-                        bs_data = bs_response["result"][0]
-                        if (
-                            int(bs_data.get("profile_wish_moderated") or 0)
-                            != MODERATED_ACTIVE
-                        ):
-                            response["message"] = "Seeking post is not available"
-                            response["code"] = 403
-                            return response, 403
-
-                        owner_uid = bs_data.get("profile_wish_profile_personal_id")
-                        if not is_owner_available_for_public_interaction(db, owner_uid):
-                            response["message"] = "Seeking post is not available"
-                            response["code"] = 403
-                            return response, 403
-
-                        tx_item["ti_bs_cost"] = _normalize_stored_cost(
-                            bs_data.get("profile_wish_cost")
-                        )
-                        tx_item["ti_bs_cost_currency"] = bs_data.get(
-                            "profile_wish_cost_currency"
-                        )
-                        tx_item["ti_bs_sku"] = bs_data.get(
-                            "profile_wish_sku"
-                        )  # Doesn't exist
-                        tx_item["ti_bs_is_taxable"] = bs_data.get(
-                            "profile_wish_is_taxable"
-                        )
-                        tx_item["ti_bs_tax_rate"] = bs_data.get("profile_wish_tax_rate")
-                        tx_item["ti_bs_refund_policy"] = bs_data.get(
-                            "profile_wish_refund_policy"
-                        )
-                        tx_item["ti_bs_return_window_days"] = bs_data.get(
-                            "profile_wish_return_window_days"
-                        )
-                        tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
-                            bs_data.get("profile_wish_is_returnable")
-                        )
-                        _apply_line_shipping_snapshot(tx_item, item)
-                        item_bounty_type = (
-                            bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
-                        )
-                        print("tx_item: ", tx_item)
-
-                        purchased_qty = _purchase_qty(item)
-                        available_qty = _parse_limited_quantity(
-                            bs_data.get("profile_wish_quantity")
-                        )
-                        stock_err = _validate_purchase_quantity(
-                            available_qty, purchased_qty
-                        )
-                        if stock_err:
-                            _rollback_wallet_debit()
-                            response.update(stock_err[0])
-                            return response, stock_err[1]
-                        stock_decrement = {
-                            "table": "profile_wish",
-                            "uid_column": "profile_wish_uid",
-                            "qty_column": "profile_wish_quantity",
-                            "uid": bs_data.get("profile_wish_uid"),
-                            "purchased_qty": purchased_qty,
-                            "limited": available_qty is not None,
-                        }
-
-                    else:
-                        print("ti_bs_id is not a valid ID")
-                        continue
-
-                    _apply_item_options_to_tx_item(tx_item, item, ti_bs_id)
-
-                    line_plan = plan_by_index.get(item_idx)
-                    if line_plan:
-                        _apply_checkout_fulfillment(tx_item, line_plan, bs_data)
-
-                    _apply_line_tax_snapshot(tx_item, item, bs_data)
-
-                    line_qty = int(tx_item.get("ti_bs_qty") or 1)
-                    if line_plan:
-                        order_shipping_total += _to_float(
-                            line_plan.get("line_shipping_amount")
-                        )
-                    else:
-                        order_shipping_total += (
-                            _to_float(tx_item.get("ti_shipping_amount") or 0) * line_qty
-                        )
-
-                    # Insert transaction item
-                    # bs_query = """
-                    #     SELECT *
-                    #     FROM every_circle.business_services
-                    #     WHERE bs_uid = %s
-                    # """
-                    # bs_response = db.execute(bs_query, (item.get('bs_uid'),))
-                    # print("bs_response: ", bs_response)
-
-                    # # Check if business service exists
-                    # if not bs_response.get('result') or len(bs_response['result']) == 0:
-                    #     response['message'] = f"Business service not found: {item.get('bs_uid')}"
-                    #     response['code'] = 404
-                    #     return response, 404
-
-                    # bs_data = bs_response['result'][0]
-                    # tx_item['ti_bs_cost'] = bs_data.get('bs_cost')
-                    # tx_item['ti_bs_cost_currency'] = bs_data.get('bs_cost_currency')
-                    # tx_item['ti_bs_sku'] = bs_data.get('bs_sku')
-                    # tx_item['ti_bs_is_taxable'] = bs_data.get('bs_is_taxable')
-                    # tx_item['ti_bs_tax_rate'] = bs_data.get('bs_tax_rate')
-                    # tx_item['ti_bs_refund_policy'] = bs_data.get('bs_refund_policy')
-                    # tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
-                    # print("tx_item: ", tx_item)
-
-                    remaining_after = None
-                    if stock_decrement:
-                        _, remaining_after, dec_err = _decrement_tracked_quantity(
-                            db,
-                            stock_decrement["table"],
-                            stock_decrement["uid_column"],
-                            stock_decrement["qty_column"],
-                            stock_decrement["uid"],
-                            stock_decrement["purchased_qty"],
-                        )
-                        if dec_err:
-                            _rollback_wallet_debit()
-                            for prior in inventory_updates:
-                                if not prior.get("limited"):
-                                    continue
-                                _increment_tracked_quantity(
-                                    db,
-                                    prior["table"],
-                                    prior["uid_column"],
-                                    prior["qty_column"],
-                                    prior["uid"],
-                                    prior["purchased_qty"],
-                                )
-                            response.update(dec_err[0])
-                            return response, dec_err[1]
-                        inv_entry = _inventory_update_payload(
-                            stock_decrement, remaining_after
-                        )
-                        if inv_entry:
-                            inventory_updates.append(
-                                {
-                                    **stock_decrement,
-                                    **inv_entry,
-                                }
-                            )
-                            print(
-                                f"Decremented {stock_decrement['table']} "
-                                f"{stock_decrement['uid']} to {remaining_after}"
-                            )
-
-                    # Insert transaction item
-                    transaction_item_response = db.insert(
-                        "every_circle.transactions_items", tx_item
-                    )
-                    print("transaction_item post response: ", transaction_item_response)
-
-                    if transaction_item_response.get("code") == 200:
-                        items_count += 1
-                    else:
-                        if stock_decrement and stock_decrement.get("limited"):
-                            _increment_tracked_quantity(
-                                db,
-                                stock_decrement["table"],
-                                stock_decrement["uid_column"],
-                                stock_decrement["qty_column"],
-                                stock_decrement["uid"],
-                                stock_decrement["purchased_qty"],
-                            )
-                            inventory_updates.pop()
-                        print(
-                            f"Warning: Failed to insert transaction item: {transaction_item_response}"
-                        )
-                        continue
-
-                    # Process bounty if applicable
-                    bounty_amount = item.get("bounty", 0)
-                    # item_bounty_type = item.get("bounty_type", "per_item")
-                    if bounty_amount and float(bounty_amount) > 0:
-                        quantity = item.get("quantity", 1) or 1
-                        # Determine effective bounty based on type:
-                        # 'total'    -> fixed bounty for the whole order (ignore quantity)
-                        # 'per_item' -> bounty per unit, multiply by quantity
-                        if item_bounty_type == "total":
-                            effective_bounty = float(bounty_amount)
-                            print(
-                                f"Bounty type: total (fixed), bounty_amount: {bounty_amount}, effective_bounty: {effective_bounty}"
-                            )
-                        else:
-                            effective_bounty = float(bounty_amount) * int(quantity)
-                            print(
-                                f"Bounty type: per_item, bounty_amount: {bounty_amount}, quantity: {quantity}, effective_bounty: {effective_bounty}"
-                            )
-                        print("Processing bounty: ", effective_bounty)
-
-                        recommender_profile_id = item.get("recommender_profile_id")
-                        if not recommender_profile_id:
-                            print("Warning: No recommender_profile_id provided")
-                            recommender_profile_id = payload.get("profile_id")
-
-                        profile_id = payload.get("profile_id")
-                        buyer_is_recommender = (
-                            profile_id
-                            and recommender_profile_id
-                            and profile_id == recommender_profile_id
-                        )
-                        is_expertise_item = (
-                            ti_bs_id and str(ti_bs_id).startswith("150")
-                        )
-
-                        if is_expertise_item:
-                            seller_profile_id = (
-                                bs_data.get("profile_expertise_profile_personal_id")
-                                or payload.get("business_id")
-                            )
-                            path_from, path_to = seller_profile_id, profile_id
-                        elif is_wish_item:
-                            path_from, path_to = profile_id, recommender_profile_id
-                        else:
-                            path_from, path_to = profile_id, recommender_profile_id
-
-                        combined_path = _fetch_connection_path(path_from, path_to)
-
-                        known_participants = []
-                        if is_expertise_item:
-                            if profile_id:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
-                                )
-                        elif is_wish_item:
-                            if buyer_is_recommender:
-                                if profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.40),
-                                        }
-                                    )
-                            else:
-                                if profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        else:
-                            if buyer_is_recommender:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
-                                )
-                            else:
-                                if profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        known_participants.append(
-                            {
-                                "tb_profile_id": EC_WALLET_ID,
-                                **_bounty_pct_amount(effective_bounty, 0.20),
-                            }
-                        )
-                        seen = {
-                            p["tb_profile_id"]
-                            for p in known_participants
-                            if p["tb_profile_id"]
-                        }
-
-                        middle_nodes = _middle_path_nodes(combined_path, seen)
-                        if is_expertise_item or is_wish_item:
-                            network_participants = _network_participants_capped(
-                                middle_nodes, effective_bounty
-                            )
-                        else:
-                            network_participants = _network_participants_business(
-                                middle_nodes, effective_bounty, seen
-                            )
-                        print("network_participants: ", network_participants)
-
-                        # Process known participants (buyer, recommender, ec-wallet)
-                        for participant in known_participants:
-                            participant_id = participant.get("tb_profile_id")
-                            if not participant_id:
-                                continue
-
-                            print(f"Processing known participant: {participant_id}")
-
-                            try:
-                                transaction_bounty_stored_procedure_response = db.call(
-                                    procedure="new_transaction_bounty_uid"
-                                )
-                                if (
-                                    not transaction_bounty_stored_procedure_response.get(
-                                        "result"
-                                    )
-                                    or len(
-                                        transaction_bounty_stored_procedure_response[
-                                            "result"
-                                        ]
-                                    )
-                                    == 0
-                                ):
-                                    print(
-                                        f"Warning: Failed to generate bounty UID for participant: {participant_id}"
-                                    )
-                                    continue
-
-                                new_transaction_bounty_uid = (
-                                    transaction_bounty_stored_procedure_response[
-                                        "result"
-                                    ][0]["new_id"]
-                                )
-                                print(
-                                    "new_transaction_bounty_uid: ",
-                                    new_transaction_bounty_uid,
-                                    type(new_transaction_bounty_uid),
-                                )
-
-                                # Create new dictionary for each bounty to avoid data leakage
-                                tx_bounty = {
-                                    "tb_uid": new_transaction_bounty_uid,
-                                    "tb_ti_id": new_transaction_item_uid,
-                                    "tb_profile_id": participant_id,
-                                    "tb_percentage": participant["tb_percentage"],
-                                    "tb_amount": participant["tb_amount"],
-                                }
-                                print("tx_bounty: ", tx_bounty)
-
-                                bounty_response = db.insert(
-                                    "every_circle.transactions_bounty", tx_bounty
-                                )
-                                print(
-                                    "transaction_bounty post response: ",
-                                    bounty_response,
-                                )
-
-                                if bounty_response.get("code") == 200:
-                                    bounty_count += 1
-
-                                    print("bounty_count: ", bounty_count)
-
-                                    bounty_amount = tx_bounty["tb_amount"]
-                                    wallet_result = credit_bounty_to_wallet(
-                                        db,
-                                        participant_id,
-                                        bounty_amount,
-                                        in_escrow=True,
-                                    )
-                                    print("wallet_result: ", wallet_result)
-                                    if wallet_result.get("code") != 200:
-                                        print(
-                                            f"Warning: Failed to update wallet for "
-                                            f"participant {participant_id}: {wallet_result}"
-                                        )
-                                    
-                                else:
-                                    print(
-                                        f"Warning: Failed to insert bounty for participant {participant_id}: {bounty_response}"
-                                    )
-                            except Exception as e:
-                                print(
-                                    f"Error processing bounty for participant {participant_id}: {str(e)}"
-                                )
-                                continue
-
-                        # Process network participants
-                        for participant in network_participants:
-                            participant_id = participant.get("tb_profile_id")
-                            if not participant_id:
-                                continue
-
-                            print(f"Processing network participant: {participant_id}")
-
-                            try:
-                                transaction_bounty_stored_procedure_response = db.call(
-                                    procedure="new_transaction_bounty_uid"
-                                )
-                                if (
-                                    not transaction_bounty_stored_procedure_response.get(
-                                        "result"
-                                    )
-                                    or len(
-                                        transaction_bounty_stored_procedure_response[
-                                            "result"
-                                        ]
-                                    )
-                                    == 0
-                                ):
-                                    print(
-                                        f"Warning: Failed to generate bounty UID for network participant: {participant_id}"
-                                    )
-                                    continue
-
-                                new_transaction_bounty_uid = (
-                                    transaction_bounty_stored_procedure_response[
-                                        "result"
-                                    ][0]["new_id"]
-                                )
-                                print(
-                                    "new_transaction_bounty_uid: ",
-                                    new_transaction_bounty_uid,
-                                    type(new_transaction_bounty_uid),
-                                )
-
-                                tx_bounty = {
-                                    "tb_uid": new_transaction_bounty_uid,
-                                    "tb_ti_id": new_transaction_item_uid,
-                                    "tb_profile_id": participant_id,
-                                    "tb_percentage": participant["tb_percentage"],
-                                    "tb_amount": participant["tb_amount"],
-                                }
-                                print("tx_bounty: ", tx_bounty)
-
-                                bounty_response = db.insert(
-                                    "every_circle.transactions_bounty", tx_bounty
-                                )
-                                print(
-                                    "transaction_bounty post response: ",
-                                    bounty_response,
-                                )
-
-                                if bounty_response.get("code") == 200:
-                                    bounty_count += 1
-
-                                    print("bounty_count: ", bounty_count)
-
-                                    bounty_amount = tx_bounty["tb_amount"]
-                                    wallet_result = credit_bounty_to_wallet(
-                                        db,
-                                        participant_id,
-                                        bounty_amount,
-                                        in_escrow=True,
-                                    )
-                                    print("wallet_result: ", wallet_result)
-                                    if wallet_result.get("code") != 200:
-                                        print(
-                                            f"Warning: Failed to update wallet for "
-                                            f"network participant {participant_id}: {wallet_result}"
-                                        )
-
-                                else:
-                                    print(
-                                        f"Warning: Failed to insert bounty for network participant {participant_id}: {bounty_response}"
-                                    )
-                            except Exception as e:
-                                print(
-                                    f"Error processing bounty for network participant {participant_id}: {str(e)}"
-                                )
-                                continue
-
-                if payload.get("total_shipping") is not None:
-                    parsed_total = _parse_line_shipping_amount(payload.get("total_shipping"))
-                    order_shipping = 0.0 if parsed_total is None else parsed_total
-                else:
-                    order_shipping = checkout_plan.get("order_shipping")
-                    if order_shipping is None:
-                        order_shipping = round(order_shipping_total, 2)
-
-                db.update(
-                    "every_circle.transactions",
-                    {"transaction_uid": new_transaction_uid},
-                    {"transaction_shipping": order_shipping},
-                )
-                response["transaction_shipping"] = order_shipping
-                response["shipping_actual_pending"] = bool(
-                    checkout_plan.get("shipping_actual_pending")
-                )
-
-                response["transaction_items"] = items_count
-                response["transaction_bounty_count"] = bounty_count
-                if inventory_updates:
-                    response["inventory_updates"] = [
-                        {
-                            k: v
-                            for k, v in entry.items()
-                            if k
-                            not in (
-                                "table",
-                                "uid_column",
-                                "qty_column",
-                                "limited",
-                                "purchased_qty",
-                            )
-                        }
-                        for entry in inventory_updates
-                    ]
-                response["message"] = "Transaction completed successfully"
-                response["code"] = 200
-                return response, 200
-
-        except Exception as e:
-            print(f"Error in Transactions POST: {str(e)}")
             print(traceback.format_exc())
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
@@ -5849,6 +4922,18 @@ class Transactions(Resource):
                 response.update(update_fields)
                 response["delivery_verification_items"] = updated_lines
                 response["all_items_received"] = all_received
+
+                from account_screen_v3 import build_buyer_purchase_row_v3
+
+                tz_name = request.args.get("timezone") or request.args.get("tz")
+                purchase_row = build_buyer_purchase_row_v3(
+                    db,
+                    buyer_profile_id,
+                    transaction_uid,
+                    tz_name=tz_name,
+                )
+                if purchase_row:
+                    response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:

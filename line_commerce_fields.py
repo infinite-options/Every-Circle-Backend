@@ -715,6 +715,12 @@ def build_purchase_line_v3_entry(line_row):
     ship = _line_shipping_snapshot(line_row)
     if ship is not None:
         entry["ti_line_shipping_amount"] = ship
+    received = line_row.get("ti_received_qty")
+    if received is not None:
+        entry["ti_received_qty"] = int(received or 0)
+    shipped = line_row.get("ti_shipped_qty")
+    if shipped is not None:
+        entry["ti_shipped_qty"] = int(shipped or 0)
     return entry
 
 

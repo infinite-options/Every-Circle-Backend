@@ -698,6 +698,23 @@ def _attach_running_balances(entries):
     return entries
 
 
+def apply_ledger_entry_display(entry, tz_name=None):
+    """Attach pending_delta, useable_delta, and display.* to one ledger entry."""
+    from account_screen_v3_contract import (
+        build_ledger_entry_display,
+        ledger_entry_pool_deltas,
+    )
+
+    if not isinstance(entry, dict):
+        return entry
+    pending_delta, useable_delta = ledger_entry_pool_deltas(entry)
+    out = dict(entry)
+    out["pending_delta"] = pending_delta
+    out["useable_delta"] = useable_delta
+    out["display"] = build_ledger_entry_display(out, tz_name)
+    return out
+
+
 def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
     from wallet_return_reservations import fetch_reservation_ledger_rows
     from wallet_ledger_proceeds import build_proceeds_narrative_for_profile
@@ -802,9 +819,8 @@ class WalletLedger(Resource):
             enriched = []
             for row in result.get("data") or []:
                 if isinstance(row, dict):
-                    enriched.append(
-                        enrich_datetime_fields(dict(row), "entry_datetime", tz_name)
-                    )
+                    row = enrich_datetime_fields(dict(row), "entry_datetime", tz_name)
+                    enriched.append(apply_ledger_entry_display(row, tz_name))
                 else:
                     enriched.append(row)
             result["data"] = enriched

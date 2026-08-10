@@ -125,8 +125,11 @@ class AccountScreenPersonal(Resource):
 
         with connect() as db:
             source_rows = (purchases_body or {}).get("data") or []
-            purchase_rows = build_purchases_v2_rows(db, source_rows)
-            purchase_rows = _enrich_rows_datetimes(purchase_rows)
+            if (purchases_body or {}).get("schema_version") == 2:
+                purchase_rows = _enrich_rows_datetimes(source_rows)
+            else:
+                purchase_rows = build_purchases_v2_rows(db, source_rows)
+                purchase_rows = _enrich_rows_datetimes(purchase_rows)
             response["purchases"] = build_purchases_v3(db, purchase_rows, tz_name=tz_name)
 
             seller_legacy = (seller_body or {}).get("data") or []
