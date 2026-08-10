@@ -61,7 +61,9 @@ class BountyResults(Resource):
                         SELECT 
                             tb.*,
                             ti.*,
-                            t.transaction_datetime, t.transaction_profile_id, t.transaction_business_id, 
+                            t.transaction_datetime,
+                            t.transaction_uid,
+                            t.transaction_profile_id, t.transaction_business_id, 
                             IF (t.transaction_in_escrow = 1,1,0) AS in_escrow,
                             CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS purchaser_name,
                             IF(
@@ -78,7 +80,7 @@ class BountyResults(Resource):
                         LEFT JOIN every_circle.profile_personal p ON t.transaction_profile_id = p.profile_personal_uid
                         WHERE tb_profile_id = %s
                     ) AS bounty_results
-                    GROUP BY bounty_results.ti_uid
+                    GROUP BY bounty_results.ti_uid, bounty_results.transaction_uid
                     ORDER BY bounty_results.transaction_datetime DESC
                 """
                 

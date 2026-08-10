@@ -33,14 +33,21 @@ def _parse_selected_options_field(raw):
 
 def _format_offering_rate_display(cost, currency):
     """Format expertise rate like '$25/each' from snapshotted checkout fields."""
+    from line_commerce_fields import format_offering_rate_display
+
     if cost is None or str(cost).strip() == "":
         return None
+    rate = format_offering_rate_display(cost)
+    if rate:
+        return rate
     display = str(cost).strip()
     currency = (currency or "").strip()
     if currency and currency not in display:
         display = f"{display}{currency}"
     if not display.startswith("$") and re.match(r"^\d", display):
         display = f"${display}"
+    if "/each" not in display:
+        display = f"{display}/each"
     return display
 
 

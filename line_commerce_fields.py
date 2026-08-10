@@ -281,18 +281,19 @@ def compute_line_proceeds_breakdown(db, order_uid, line_row):
 
     unit = _parse_unit_cost(line_row.get("ti_bs_cost"))
     merchandise = round_money(unit * qty)
-    tax_per_unit = _tax_amount_for_line(
-        unit,
-        line_row.get("ti_bs_is_taxable"),
-        line_row.get("ti_bs_tax_rate"),
-    )
-    tax_amount = round_money(tax_per_unit * qty)
+    tax_amount = _line_tax_snapshot(line_row)
+    if tax_amount is None:
+        tax_amount = round_money(
+            _tax_amount_for_line(
+                merchandise,
+                line_row.get("ti_bs_is_taxable"),
+                line_row.get("ti_bs_tax_rate"),
+            )
+        )
 
-    ship_fields = line_shipping_api_fields(line_row)
-    if "ti_shipping_amount_per_unit" in ship_fields:
-        shipping_amount = round_money(ship_fields["ti_shipping_amount_per_unit"] * qty)
-    else:
-        shipping_amount = round_money(ship_fields.get("ti_shipping_amount_per_line", 0))
+    shipping_amount = _line_shipping_snapshot(line_row)
+    if shipping_amount is None:
+        shipping_amount = round_money(line_shipping_charge(line_row))
 
     line_bounty = round_money(
         _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0) if ti_uid else 0.0
@@ -473,6 +474,8 @@ def _load_commerce_sale_lines(db, order_uid):
             ti.ti_bs_cost,
             ti.ti_bs_is_taxable,
             ti.ti_bs_tax_rate,
+            ti.ti_line_tax_amount,
+            ti.ti_tax_amount,
             ti.ti_shipping_amount,
             ti.ti_line_shipping_amount,
             ti.ti_listing_shipping,
@@ -532,3 +535,465 @@ def pending_return_item_commerce_fields(db, order_uid, item, *, ti_row=None):
         out["line_shipping_refund"] = round_money(ship_refund)
 
     return out
+
+
+_LINE_TAX_AMOUNT_COLUMN_READY = False
+_LINE_TAX_AMOUNT_V2_COLUMN_READY = False
+
+
+def ensure_line_tax_amount_column(db):
+    """Add ti_line_tax_amount (+ legacy ti_tax_amount) checkout snapshot columns."""
+    global _LINE_TAX_AMOUNT_COLUMN_READY, _LINE_TAX_AMOUNT_V2_COLUMN_READY
+    if not _LINE_TAX_AMOUNT_COLUMN_READY:
+        db.execute(
+            "ALTER TABLE every_circle.transactions_items "
+            "ADD COLUMN ti_line_tax_amount DECIMAL(12,2) NULL",
+            cmd="post",
+        )
+        _LINE_TAX_AMOUNT_COLUMN_READY = True
+    if not _LINE_TAX_AMOUNT_V2_COLUMN_READY:
+        db.execute(
+            "ALTER TABLE every_circle.transactions_items "
+            "ADD COLUMN ti_tax_amount DECIMAL(12,2) NULL",
+            cmd="post",
+        )
+        _LINE_TAX_AMOUNT_V2_COLUMN_READY = True
+        # Backfill preferred column from legacy name when present.
+        db.execute(
+            """
+            UPDATE every_circle.transactions_items
+            SET ti_line_tax_amount = ti_tax_amount
+            WHERE ti_line_tax_amount IS NULL
+              AND ti_tax_amount IS NOT NULL
+            """,
+            cmd="post",
+        )
+
+
+def _line_snapshot_qty(row):
+    try:
+        return int(row.get("ti_bs_qty") or (row.get("units") or {}).get("purchased_qty") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _snapshot_present(value):
+    return value is not None and value != ""
+
+
+def _line_tax_snapshot(row):
+    """
+    Resolve line tax from stored snapshots only.
+
+    Priority: ti_line_tax_amount → ti_tax_amount → rate × line merchandise.
+    Never allocates from order-level transaction_taxes.
+    """
+    if not isinstance(row, dict):
+        return None
+    for key in ("ti_line_tax_amount", "line_tax_amount", "ti_tax_amount"):
+        if _snapshot_present(row.get(key)):
+            return round_money(row.get(key))
+
+    qty = _line_snapshot_qty(row)
+    unit = _parse_unit_cost(row.get("ti_bs_cost") or row.get("unit_price"))
+    if qty <= 0 or unit <= 0:
+        return None
+    rate = row.get("ti_bs_tax_rate") or row.get("ti_tax_rate")
+    if not _snapshot_present(rate):
+        return None
+    merchandise = round_money(unit * qty)
+    tax = round_money(
+        _tax_amount_for_line(merchandise, row.get("ti_bs_is_taxable"), rate)
+    )
+    return tax if tax >= 0 else None
+
+
+def _line_shipping_snapshot(row):
+    """
+    Resolve line shipping from stored snapshots only.
+
+    Priority: ti_line_shipping_amount → ti_shipping_amount_per_unit × qty.
+    Never allocates from order-level transaction_shipping.
+    """
+    if not isinstance(row, dict):
+        return None
+    line_total = row.get("ti_line_shipping_amount") or row.get("line_shipping_amount")
+    if _snapshot_present(line_total):
+        return round_money(line_total)
+
+    qty = _line_snapshot_qty(row)
+    if qty <= 0:
+        return None
+    per_unit = row.get("ti_shipping_amount_per_unit")
+    if not _snapshot_present(per_unit):
+        per_unit = row.get("ti_shipping_amount")
+    if _snapshot_present(per_unit):
+        return round_money(_to_float(per_unit) * qty)
+    return None
+
+
+def line_snapshot_api_fields(row):
+    """Normalized snapshot fields for account-screen rows."""
+    if not isinstance(row, dict):
+        return {}
+    qty = _line_snapshot_qty(row)
+    unit = row.get("ti_bs_cost") or row.get("unit_price")
+    out = {}
+    if _snapshot_present(unit):
+        out["ti_bs_cost"] = _normalize_stored_cost_value(unit)
+    if qty > 0:
+        out["ti_bs_qty"] = qty
+    rate = row.get("ti_bs_tax_rate") or row.get("ti_tax_rate")
+    if _snapshot_present(rate):
+        out["ti_bs_tax_rate"] = rate
+    tax = _line_tax_snapshot(row)
+    if tax is not None:
+        out["ti_line_tax_amount"] = tax
+    per_unit = row.get("ti_shipping_amount_per_unit")
+    if not _snapshot_present(per_unit):
+        per_unit = row.get("ti_shipping_amount")
+    if _snapshot_present(per_unit):
+        out["ti_shipping_amount_per_unit"] = round_money(per_unit)
+        out["ti_shipping_amount"] = round_money(per_unit)
+    ship = _line_shipping_snapshot(row)
+    if ship is not None:
+        out["ti_line_shipping_amount"] = ship
+    return out
+
+
+def _normalize_stored_cost_value(value):
+    try:
+        return str(round(_parse_unit_cost(value), 2)).rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return value
+
+
+def format_offering_rate_display(unit_cost):
+    """Purchase/line display rate — always '$X/each'."""
+    unit = _parse_unit_cost(unit_cost)
+    if unit <= 0:
+        return None
+    if unit == int(unit):
+        return f"${int(unit)}/each"
+    return f"${unit:.2f}/each"
+
+
+def format_profile_expertise_cost_label(unit_cost):
+    """Catalog-style unit rate without currency prefix — 'X/each'."""
+    unit = _parse_unit_cost(unit_cost)
+    if unit <= 0:
+        return None
+    if unit == int(unit):
+        return f"{int(unit)}/each"
+    return f"{unit:.2f}/each"
+
+
+def build_purchase_line_v3_entry(line_row):
+    """Enriched purchases.rows[].lines[] element from persisted line snapshots."""
+    if not isinstance(line_row, dict):
+        return {}
+    unit = _parse_unit_cost(line_row.get("ti_bs_cost"))
+    item_name = line_row.get("item_name") or line_row.get("purchased_item")
+    entry = {
+        "ti_uid": line_row.get("ti_uid"),
+        "ti_bs_id": line_row.get("ti_bs_id"),
+        "item_name": item_name,
+        "purchased_item": item_name,
+        "ti_bs_qty": int(line_row.get("ti_bs_qty") or 0),
+        "unit_price": unit if unit > 0 else None,
+        "money": order_money_from_line_snapshots(line_row),
+    }
+    cost_str = _normalize_stored_cost_value(line_row.get("ti_bs_cost"))
+    if cost_str is not None:
+        entry["ti_bs_cost"] = cost_str
+    if unit > 0:
+        entry["profile_expertise_cost"] = format_profile_expertise_cost_label(unit)
+        entry["offering_rate_display"] = format_offering_rate_display(unit)
+    tax = _line_tax_snapshot(line_row)
+    if tax is not None:
+        entry["ti_line_tax_amount"] = tax
+    ship = _line_shipping_snapshot(line_row)
+    if ship is not None:
+        entry["ti_line_shipping_amount"] = ship
+    return entry
+
+
+def build_purchase_order_lines_v3(db, order_uid):
+    """Load and enrich all sale lines for a buyer purchase order row."""
+    from account_screen_line_rows import load_order_sale_lines
+
+    if not db or not order_uid:
+        return []
+    return [
+        build_purchase_line_v3_entry(line)
+        for line in load_order_sale_lines(db, order_uid)
+    ]
+
+
+def order_money_from_line_snapshots(row):
+    """
+    Build v3 order money from stored checkout snapshots only.
+
+    No order-level allocation or rate recomputation on read.
+    """
+    qty = _line_snapshot_qty(row)
+    unit = _parse_unit_cost(row.get("ti_bs_cost") or row.get("unit_price"))
+    tax_amt = _line_tax_snapshot(row)
+    ship_amt = _line_shipping_snapshot(row)
+
+    if qty <= 0 or unit <= 0 or tax_amt is None or ship_amt is None:
+        return {
+            "merchandise": None,
+            "tax": None,
+            "shipping": None,
+            "customer_total": None,
+            "customer_credit": None,
+            "known": False,
+        }
+
+    merchandise = round_money(unit * qty)
+    total = round_money(merchandise + tax_amt + ship_amt)
+
+    return {
+        "merchandise": merchandise,
+        "tax": tax_amt,
+        "shipping": ship_amt,
+        "customer_total": total,
+        "customer_credit": None,
+        "known": True,
+    }
+
+
+def aggregate_order_customer_money(db, order_uid, *, order_row=None):
+    """
+    Sum persisted line snapshots for a multi-item buyer order row.
+
+    customer_total = merchandise + tax + shipping (excludes card fees).
+    Exposes money.fees and money.customer_total_with_fees when order fees exist.
+    """
+    if not order_uid:
+        return {
+            "merchandise": None,
+            "tax": None,
+            "shipping": None,
+            "customer_total": None,
+            "customer_credit": None,
+            "known": False,
+        }
+
+    q = db.execute(
+        """
+        SELECT ti_uid
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        ORDER BY ti_uid ASC
+        """,
+        (order_uid,),
+    )
+    ti_uids = [r.get("ti_uid") for r in (q.get("result") or []) if r.get("ti_uid")]
+    if not ti_uids:
+        return {
+            "merchandise": None,
+            "tax": None,
+            "shipping": None,
+            "customer_total": None,
+            "customer_credit": None,
+            "known": False,
+        }
+
+    snap_map = batch_line_checkout_snapshots(db, ti_uids)
+    total_merch = total_tax = total_ship = 0.0
+    for ti_uid in ti_uids:
+        line_money = order_money_from_line_snapshots(snap_map.get(ti_uid) or {})
+        if not line_money.get("known"):
+            return {
+                "merchandise": None,
+                "tax": None,
+                "shipping": None,
+                "customer_total": None,
+                "customer_credit": None,
+                "known": False,
+            }
+        total_merch += _to_float(line_money.get("merchandise"))
+        total_tax += _to_float(line_money.get("tax"))
+        total_ship += _to_float(line_money.get("shipping"))
+
+    customer_total = round_money(total_merch + total_tax + total_ship)
+    out = {
+        "merchandise": round_money(total_merch),
+        "tax": round_money(total_tax),
+        "shipping": round_money(total_ship),
+        "customer_total": customer_total,
+        "customer_credit": None,
+        "known": True,
+    }
+    fees = round_money((order_row or {}).get("transaction_fees"))
+    if fees > 0:
+        out["fees"] = fees
+        out["customer_total_with_fees"] = round_money(customer_total + fees)
+    return out
+
+
+def is_consolidated_purchase_order_row(row):
+    """True for buyer list rows aggregated at order level (not per-line sale_line)."""
+    if not isinstance(row, dict):
+        return False
+    kind = row.get("row_kind")
+    if kind == "sale_line":
+        return False
+    if kind in ("return", "pending_return"):
+        return False
+    return bool(row.get("order_uid") or row.get("transaction_uid"))
+
+
+def return_money_from_line_snapshots(row, *, sale_line=None):
+    """
+    Build v3 return money by prorating original sale line snapshots.
+
+    Uses per-unit economics from checkout — not order-level totals.
+    """
+    source = sale_line if isinstance(sale_line, dict) else row
+    units = row.get("units") or {}
+    return_qty = int(units.get("return_shipped_qty") or 0) + int(
+        units.get("cancel_unshipped_qty") or units.get("return_unshipped_qty") or 0
+    )
+    if return_qty <= 0:
+        return_qty = int(units.get("purchased_qty") or row.get("return_quantity_total") or 0)
+    if return_qty <= 0:
+        try:
+            return_qty = int(row.get("ti_bs_qty") or 0)
+        except (TypeError, ValueError):
+            return_qty = 0
+
+    orig_qty = _line_snapshot_qty(source)
+    unit = _parse_unit_cost(source.get("ti_bs_cost") or source.get("unit_price"))
+    line_tax = _line_tax_snapshot(source)
+
+    if return_qty <= 0 or orig_qty <= 0 or unit <= 0 or line_tax is None:
+        pending = row.get("pending_return") or {}
+        estimated = pending.get("estimated_refund") or row.get("estimated_refund") or {}
+        if estimated:
+            merchandise = -abs(round_money(estimated.get("subtotal")))
+            tax = -abs(round_money(estimated.get("taxes")))
+            shipping = -abs(
+                round_money(estimated.get("shipping_refund") or estimated.get("shipping"))
+            )
+            credit = -abs(
+                round_money(
+                    estimated.get("total_customer_credit") or estimated.get("total")
+                )
+            )
+            if credit == 0 and (merchandise or tax or shipping):
+                credit = round_money(merchandise + tax + shipping)
+            if credit:
+                return {
+                    "merchandise": merchandise,
+                    "tax": tax,
+                    "shipping": shipping,
+                    "customer_total": None,
+                    "customer_credit": credit,
+                    "known": True,
+                }
+        return {
+            "merchandise": None,
+            "tax": None,
+            "shipping": None,
+            "customer_total": None,
+            "customer_credit": None,
+            "known": False,
+        }
+
+    merchandise = round_money(unit * return_qty)
+    tax_amt = round_money(_to_float(line_tax) * return_qty / orig_qty)
+    return_shipped = int(units.get("return_shipped_qty") or 0)
+    cancel_unshipped = int(
+        units.get("cancel_unshipped_qty") or units.get("return_unshipped_qty") or 0
+    )
+    shipping_credit = round_money(
+        _refund_shipping_for_line(
+            source,
+            return_qty,
+            return_shipped_qty=return_shipped,
+            cancel_unshipped_qty=cancel_unshipped,
+        )
+    )
+    credit = round_money(-(merchandise + tax_amt + shipping_credit))
+
+    return {
+        "merchandise": round_money(-merchandise),
+        "tax": round_money(-tax_amt),
+        "shipping": round_money(-shipping_credit),
+        "customer_total": None,
+        "customer_credit": credit,
+        "known": True,
+    }
+
+
+def batch_line_checkout_snapshots(db, ti_uids):
+    """Load persisted checkout snapshots for account-screen money blocks."""
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+    ensure_line_tax_amount_column(db)
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT
+            ti_uid,
+            ti_bs_id,
+            ti_bs_cost,
+            ti_bs_qty,
+            ti_bs_is_taxable,
+            ti_bs_tax_rate,
+            ti_line_tax_amount,
+            ti_tax_amount,
+            ti_shipping_amount,
+            ti_line_shipping_amount,
+            ti_shipping_refundable,
+            ti_listing_shipping
+        FROM every_circle.transactions_items
+        WHERE ti_uid IN ({placeholders})
+        """,
+        tuple(uids),
+    )
+    return {
+        row.get("ti_uid"): row
+        for row in (q.get("result") or [])
+        if row.get("ti_uid")
+    }
+
+
+def attach_line_snapshots_to_rows(db, rows):
+    """Merge stored line snapshots onto account-screen rows (in place copy)."""
+    ti_uids = [r.get("ti_uid") for r in (rows or []) if isinstance(r, dict) and r.get("ti_uid")]
+    snap_map = batch_line_checkout_snapshots(db, ti_uids)
+    enriched = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+        out = dict(row)
+        snap = snap_map.get(out.get("ti_uid"))
+        if snap:
+            skip_qty = out.get("row_kind") in ("return", "pending_return")
+            for key in (
+                "ti_bs_id",
+                "ti_bs_cost",
+                "ti_bs_qty",
+                "ti_bs_is_taxable",
+                "ti_bs_tax_rate",
+                "ti_line_tax_amount",
+                "ti_tax_amount",
+                "ti_shipping_amount",
+                "ti_line_shipping_amount",
+                "ti_shipping_refundable",
+                "ti_listing_shipping",
+            ):
+                if skip_qty and key == "ti_bs_qty":
+                    continue
+                if out.get(key) is None and snap.get(key) is not None:
+                    out[key] = snap.get(key)
+            if out.get("ti_line_tax_amount") is None and snap.get("ti_tax_amount") is not None:
+                out["ti_line_tax_amount"] = snap.get("ti_tax_amount")
+        enriched.append(out)
+    return enriched

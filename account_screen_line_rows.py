@@ -76,6 +76,8 @@ def load_order_sale_lines(db, order_uid):
             ti.ti_shipping_not_required,
             ti.ti_shipping_amount,
             ti.ti_line_shipping_amount,
+            ti.ti_line_tax_amount,
+            ti.ti_tax_amount,
             ti.ti_listing_shipping,
             ti.ti_shipping_refundable,
             bs.bs_bounty,

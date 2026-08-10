@@ -288,7 +288,9 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
 
     ti_shipping_amount is stored as the per-unit shipping charge for the line.
     """
-    raw_amt = item.get("shipping_amount")
+    raw_amt = item.get("ti_shipping_amount_per_unit")
+    if raw_amt is None:
+        raw_amt = item.get("shipping_amount")
     if raw_amt is None:
         raw_amt = item.get("ti_shipping_amount")
 
@@ -316,6 +318,48 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
 
 def _money_close(a, b, tol=0.02):
     return abs(round(_to_float(a), 2) - round(_to_float(b), 2)) <= tol
+
+
+def _listing_unit_cost(bs_data):
+    if not bs_data:
+        return 0.0
+    for key in ("bs_cost", "profile_expertise_cost", "profile_wish_cost"):
+        if bs_data.get(key) is not None:
+            return round(_to_float(bs_data.get(key)), 2)
+    return 0.0
+
+
+def _listing_tax_config(bs_data):
+    if not bs_data:
+        return 0, 0.0
+    if bs_data.get("bs_is_taxable") is not None:
+        return bs_data.get("bs_is_taxable"), bs_data.get("bs_tax_rate")
+    if bs_data.get("profile_expertise_is_taxable") is not None:
+        return bs_data.get("profile_expertise_is_taxable"), bs_data.get(
+            "profile_expertise_tax_rate"
+        )
+    return bs_data.get("profile_wish_is_taxable"), bs_data.get("profile_wish_tax_rate")
+
+
+def _apply_line_tax_snapshot(tx_item, item, bs_data=None):
+    """Persist per-line tax snapshot from checkout payload."""
+    raw_tax = item.get("line_tax_amount")
+    if raw_tax is None or raw_tax == "":
+        raw_tax = item.get("ti_line_tax_amount")
+    if raw_tax is not None and raw_tax != "":
+        amount = round(_to_float(raw_tax), 2)
+        tx_item["ti_line_tax_amount"] = amount
+        tx_item["ti_tax_amount"] = amount
+
+    raw_rate = item.get("ti_tax_rate")
+    if raw_rate is not None and raw_rate != "":
+        tx_item["ti_bs_tax_rate"] = raw_rate
+    elif bs_data is not None and tx_item.get("ti_bs_tax_rate") is None:
+        _taxable, rate = _listing_tax_config(bs_data)
+        if rate is not None:
+            tx_item["ti_bs_tax_rate"] = rate
+        if _taxable is not None:
+            tx_item["ti_bs_is_taxable"] = _taxable
 
 
 VALID_FULFILLMENT_METHODS = ("ship", "pickup", "virtual")
@@ -761,6 +805,8 @@ def _plan_checkout(db, items, payload, shipping_fields):
 
     lines = []
     order_shipping = 0.0
+    order_merchandise = 0.0
+    order_tax = 0.0
     shipping_actual_pending = 0
     any_ship = False
 
@@ -785,6 +831,35 @@ def _plan_checkout(db, items, payload, shipping_fields):
         if method is None:
             return False, {"message": err_msg, "code": 400}, None
 
+        declared_unit = item.get("unit_price")
+        if declared_unit is not None and declared_unit != "":
+            unit_cost = round(_to_float(declared_unit), 2)
+        else:
+            unit_cost = _listing_unit_cost(bs_data)
+        line_merchandise = round(unit_cost * qty, 2)
+        order_merchandise += line_merchandise
+
+        line_tax_raw = item.get("line_tax_amount")
+        if line_tax_raw is None or line_tax_raw == "":
+            return False, {
+                "message": f"line_tax_amount is required for item {ti_bs_id}",
+                "code": 400,
+            }, None
+        line_tax = round(_to_float(line_tax_raw), 2)
+        is_taxable, catalog_rate = _listing_tax_config(bs_data)
+        rate_raw = item.get("ti_tax_rate")
+        tax_rate = _to_float(rate_raw) if rate_raw is not None and rate_raw != "" else _to_float(catalog_rate)
+        expected_tax = round(_tax_amount_for_line(line_merchandise, is_taxable, tax_rate), 2)
+        if not _money_close(line_tax, expected_tax):
+            return False, {
+                "message": (
+                    f"line_tax_amount mismatch for item {ti_bs_id} "
+                    f"(expected {expected_tax:.2f}, got {line_tax:.2f})"
+                ),
+                "code": 400,
+            }, None
+        order_tax += line_tax
+
         if method == "ship" and not _listing_supports_ship(listing_mode, bs_data):
             return False, {
                 "message": f"Ship fulfillment is not allowed for item {ti_bs_id}",
@@ -802,6 +877,10 @@ def _plan_checkout(db, items, payload, shipping_fields):
             }, None
 
         expected_line_ship = _compute_expected_line_shipping(method, bs_data, qty)
+        per_unit_ship = item.get("ti_shipping_amount_per_unit")
+        if per_unit_ship is None:
+            per_unit_ship = item.get("ti_shipping_amount")
+
         declared_raw = item.get("line_shipping_amount")
         if declared_raw is not None and declared_raw != "":
             declared_line_ship = _parse_line_shipping_amount(declared_raw)
@@ -810,7 +889,18 @@ def _plan_checkout(db, items, payload, shipping_fields):
                     "message": f"Invalid line_shipping_amount for item {ti_bs_id}",
                     "code": 400,
                 }, None
-            if not _money_close(declared_line_ship, expected_line_ship):
+            if per_unit_ship is not None and per_unit_ship != "":
+                expected_from_unit = round(_to_float(per_unit_ship) * qty, 2)
+                if not _money_close(declared_line_ship, expected_from_unit):
+                    return False, {
+                        "message": (
+                            f"line_shipping_amount must equal ti_shipping_amount_per_unit × "
+                            f"quantity for item {ti_bs_id} "
+                            f"(expected {expected_from_unit:.2f}, got {declared_line_ship:.2f})"
+                        ),
+                        "code": 400,
+                    }, None
+            elif method == "ship" and not _money_close(declared_line_ship, expected_line_ship):
                 return False, {
                     "message": (
                         f"line_shipping_amount mismatch for item {ti_bs_id} "
@@ -821,7 +911,7 @@ def _plan_checkout(db, items, payload, shipping_fields):
         else:
             legacy_unit = item.get("shipping_amount")
             if legacy_unit is None:
-                legacy_unit = item.get("ti_shipping_amount")
+                legacy_unit = per_unit_ship
             if legacy_unit is not None and legacy_unit != "":
                 unit_amt = _parse_line_shipping_amount(legacy_unit)
                 declared_line_ship = round((unit_amt or 0.0) * qty, 2)
@@ -868,6 +958,11 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "ti_bs_id": ti_bs_id,
                 "fulfillment_method": method,
                 "line_shipping_amount": declared_line_ship,
+                "line_tax_amount": line_tax,
+                "line_merchandise": line_merchandise,
+                "unit_price": unit_cost,
+                "ti_tax_rate": tax_rate,
+                "ti_shipping_amount_per_unit": per_unit_ship,
                 "qty": qty,
             }
         )
@@ -882,6 +977,29 @@ def _plan_checkout(db, items, payload, shipping_fields):
         }, None
 
     order_shipping = round(order_shipping, 2)
+    order_merchandise = round(order_merchandise, 2)
+    order_tax = round(order_tax, 2)
+
+    if not _money_close(_to_float(payload.get("total_costs")), order_merchandise):
+        return False, {
+            "message": (
+                f"total_costs mismatch (expected {order_merchandise:.2f}, "
+                f"got {_to_float(payload.get('total_costs')):.2f})"
+            ),
+            "code": 400,
+        }, None
+
+    payload_taxes = payload.get("total_taxes")
+    if payload_taxes is not None and payload_taxes != "":
+        if not _money_close(_to_float(payload_taxes), order_tax):
+            return False, {
+                "message": (
+                    f"total_taxes mismatch (expected {order_tax:.2f}, "
+                    f"got {_to_float(payload_taxes):.2f})"
+                ),
+                "code": 400,
+            }, None
+
     payload_shipping = payload.get("total_shipping")
     if payload_shipping is not None:
         if not _money_close(_to_float(payload_shipping), order_shipping):
@@ -917,6 +1035,8 @@ def _plan_checkout(db, items, payload, shipping_fields):
     return True, None, {
         "lines": lines,
         "order_shipping": order_shipping,
+        "order_merchandise": order_merchandise,
+        "order_tax": order_tax,
         "any_ship": any_ship,
         "shipping_actual_pending": shipping_actual_pending,
     }
@@ -1484,7 +1604,7 @@ def _apply_item_options_to_tx_item(tx_item, item, ti_bs_id):
         tx_item["ti_choices_extra_cost"] = _to_float(item.get("choices_extra_cost"))
 
     unit_price = item.get("unit_price")
-    if unit_price is not None and ti_bs_id and str(ti_bs_id).startswith("250"):
+    if unit_price is not None:
         tx_item["ti_bs_cost"] = _normalize_stored_cost(unit_price)
 
 
@@ -2227,11 +2347,20 @@ def _validate_and_price_return_items(
             }, None
 
         line_subtotal = round(unit_cost * rq, 4)
-        line_tax = _tax_amount_for_line(
-            line_subtotal,
-            ti_row.get("ti_bs_is_taxable"),
-            ti_row.get("ti_bs_tax_rate"),
-        )
+        from line_commerce_fields import _line_tax_snapshot
+
+        prorated_row = dict(ti_row)
+        prorated_row["ti_bs_qty"] = rq
+        stored_line_tax = _line_tax_snapshot(ti_row)
+        orig_qty = int(ti_row.get("ti_bs_qty") or 0)
+        if stored_line_tax is not None and orig_qty > 0:
+            line_tax = round(_to_float(stored_line_tax) * rq / orig_qty, 4)
+        else:
+            line_tax = _tax_amount_for_line(
+                line_subtotal,
+                ti_row.get("ti_bs_is_taxable"),
+                ti_row.get("ti_bs_tax_rate"),
+            )
         line_shipping = _refund_shipping_for_line(
             ti_row,
             rq,
@@ -4172,18 +4301,12 @@ class Transactions(Resource):
                             cost = row.get("profile_expertise_cost") or row.get(
                                 "ti_bs_cost"
                             )
-                            currency = (
-                                row.get("profile_expertise_cost_currency") or ""
-                            ).strip()
                             if cost is not None and str(cost).strip():
-                                display = str(cost).strip()
-                                if currency and currency not in display:
-                                    display = f"{display}{currency}"
-                                if not display.startswith("$") and re.match(
-                                    r"^\d", display
-                                ):
-                                    display = f"${display}"
-                                row["offering_rate_display"] = display
+                                from line_commerce_fields import format_offering_rate_display
+
+                                row["offering_rate_display"] = (
+                                    format_offering_rate_display(cost)
+                                )
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
                     rows = sync_list_rows_fulfillment_from_context(db, rows)
@@ -4310,6 +4433,10 @@ class Transactions(Resource):
             }
 
             with connect() as db:
+                from line_commerce_fields import ensure_line_tax_amount_column
+
+                ensure_line_tax_amount_column(db)
+
                 if stripe_pi:
                     existing_sale = _find_existing_sale_by_stripe_pi(db, stripe_pi)
                     if existing_sale:
@@ -4707,6 +4834,8 @@ class Transactions(Resource):
                     line_plan = plan_by_index.get(item_idx)
                     if line_plan:
                         _apply_checkout_fulfillment(tx_item, line_plan, bs_data)
+
+                    _apply_line_tax_snapshot(tx_item, item, bs_data)
 
                     line_qty = int(tx_item.get("ti_bs_qty") or 1)
                     if line_plan:
