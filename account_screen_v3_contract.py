@@ -236,6 +236,56 @@ def build_row_money(row, *, sale_line=None):
     return build_order_money(row)
 
 
+def _return_line_display_qty(line):
+    """Units in one return line (physical return + pre-ship cancel)."""
+    if not isinstance(line, dict):
+        return 0
+    try:
+        rq = line.get("return_quantity")
+        if rq is not None:
+            v = int(rq or 0)
+            if v > 0:
+                return v
+    except (TypeError, ValueError):
+        pass
+    try:
+        shipped = int(line.get("return_shipped_qty") or 0)
+        cancel = int(line.get("cancel_unshipped_qty") or 0)
+    except (TypeError, ValueError):
+        shipped = cancel = 0
+    if shipped or cancel:
+        return shipped + cancel
+    for key in ("ti_bs_qty", "quantity"):
+        if line.get(key) is not None:
+            try:
+                return int(line.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def _return_row_display_qty(row, units=None):
+    """Total return qty for one product on a purchases list row."""
+    lines = row.get("return_lines") or []
+    if lines:
+        total = sum(_return_line_display_qty(line) for line in lines)
+        if total:
+            return total
+    if units is None:
+        units = build_v3_units(row)
+    try:
+        shipped = int(units.get("return_shipped_qty") or 0)
+        cancel = int(units.get("cancel_unshipped_qty") or 0)
+    except (TypeError, ValueError):
+        shipped = cancel = 0
+    if shipped or cancel:
+        return shipped + cancel
+    try:
+        return int(row.get("return_quantity_total") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_v3_display(row, money, *, audience="buyer", tz_name=None):
     """Backend-owned display labels for list rows."""
     kind = row.get("row_kind")
@@ -244,21 +294,23 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
     dt = row.get("transaction_datetime") or row.get("entry_datetime")
 
     if kind in _RETURN_ROW_KINDS:
-        qty = units.get("return_shipped_qty") or 0
-        cancelled = units.get("cancel_unshipped_qty") or 0
+        qty = _return_row_display_qty(row, units)
+        cancelled = int(units.get("cancel_unshipped_qty") or 0)
         if kind == "pending_return":
             type_label = "Cancel" if row.get("is_cancel_before_ship") else "Return"
         else:
             type_label = "Return"
         amount = money.get("customer_credit")
     else:
-        qty = units.get("purchased_qty") or 0
+        qty = int(units.get("purchased_qty") or 0)
         cancelled = 0
         type_label = "Order"
         amount = money.get("customer_total")
 
+    qty = max(int(qty or 0), 0)
     display = {
         "date_label": format_date_label(dt, tz_name) or v2_display.get("date_label") or "—",
+        "qty": qty,
         "qty_label": str(qty) if qty else "—",
         "cancelled_label": str(cancelled) if cancelled else "—",
         "delivered_label": v2_display.get("delivered_label") or "—",
