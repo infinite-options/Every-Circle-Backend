@@ -136,6 +136,25 @@ def _enrich_receipt_line(row):
         if rate:
             row["offering_rate_display"] = rate
         row["purchase_type"] = "expertise"
+    elif str(ti_bs_id).startswith("250-"):
+        rate = _format_offering_rate_display(row.get("ti_bs_cost"))
+        if rate:
+            row["offering_rate_display"] = rate
+        row["purchase_type"] = "service"
+
+    from line_commerce_fields import (
+        line_merchandise_total_from_row,
+        line_snapshot_api_fields,
+        order_money_from_line_snapshots,
+    )
+
+    money = order_money_from_line_snapshots(row)
+    if money.get("known"):
+        row["money"] = money
+        row.update(line_snapshot_api_fields(row))
+        merch_total = line_merchandise_total_from_row(row)
+        if merch_total is not None:
+            row["line_merchandise_total"] = merch_total
 
     return row
 
@@ -399,7 +418,7 @@ def _build_receipt_v2(db, order_uid, enriched_rows, shipping):
     lines = attach_line_units_ledgers(db, order_uid, enriched_rows)
 
     v2 = {
-        "schema_version": 2,
+        "schema_version": 3,
         "order_uid": order_uid,
         "transaction_uid": order_uid,
         "units": units,

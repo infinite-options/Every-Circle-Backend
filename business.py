@@ -761,7 +761,13 @@ class BusinessTagSearch(Resource):
 
 class BusinessServicePurchase(Resource):
     def post(self):
-        """Decrement bs_quantity when a purchase is made. Atomic SQL to prevent race conditions."""
+        """
+        Decrement bs_quantity when a purchase is made.
+
+        Legacy fallback — primary inventory decrement is in POST /api/v1/transactions.
+        When transaction_uid is supplied, this endpoint is idempotent: if the sale
+        line already exists with sufficient qty, no second decrement is performed.
+        """
         print("In BusinessServicePurchase POST")
         response = {}
 
@@ -770,6 +776,7 @@ class BusinessServicePurchase(Resource):
             payload = getattr(request, '_decrypted_json', None) or request.get_json(force=True) or {}
             bs_uid = payload.get("bs_uid", "").strip()
             qty_purchased = payload.get("quantity", 1)
+            transaction_uid = (payload.get("transaction_uid") or "").strip()
 
             if not bs_uid:
                 response["message"] = "bs_uid is required"
@@ -786,6 +793,34 @@ class BusinessServicePurchase(Resource):
                 return response, 400
 
             with connect() as db:
+                if transaction_uid:
+                    ti_q = db.execute(
+                        """
+                        SELECT COALESCE(SUM(ti_bs_qty), 0) AS purchased_qty
+                        FROM every_circle.transactions_items
+                        WHERE ti_transaction_id = %s AND ti_bs_id = %s
+                        """,
+                        (transaction_uid, bs_uid),
+                    )
+                    rows = (ti_q or {}).get("result") or []
+                    recorded_qty = int(rows[0].get("purchased_qty") or 0) if rows else 0
+                    if recorded_qty >= qty_purchased:
+                        svc_query = db.select(
+                            "every_circle.business_services", where={"bs_uid": bs_uid}
+                        )
+                        remaining = None
+                        if svc_query.get("result"):
+                            remaining = svc_query["result"][0].get("bs_quantity")
+                        response["message"] = (
+                            "Purchase already recorded via checkout"
+                        )
+                        response["remaining"] = remaining
+                        response["bs_uid"] = bs_uid
+                        response["transaction_uid"] = transaction_uid
+                        response["idempotent"] = True
+                        response["code"] = 200
+                        return response, 200
+
                 # Fetch current service
                 svc_query = db.select(
                     "every_circle.business_services", where={"bs_uid": bs_uid}

@@ -315,8 +315,8 @@ def transform_purchase_row_v3(row, *, db=None, tz_name=None, sale_line=None):
 def _normalize_purchase_type(row):
     """Lowercase v3 purchase_type enum."""
     raw = str(row.get("purchase_type") or "").strip().lower()
-    if raw in ("service", "wish"):
-        return raw
+    if raw in ("service", "wish", "business"):
+        return "service" if raw in ("service", "business") else raw
     if raw in ("offering", "expertise", "product"):
         return "offering"
     return _purchase_type(row)
@@ -652,11 +652,14 @@ def build_sales_products_v3(db, business_uid, seller_rows, *, tz_name=None, prod
         uid = item.get("bs_uid") or item.get("product_uid")
         if not uid:
             continue
-        try:
-            qty_avail = int(item.get("bs_quantity") or item.get("quantity_available") or 0)
-        except (TypeError, ValueError):
-            qty_avail = 0
-        unlimited = qty_avail <= 0
+        raw_qty = item.get("bs_quantity")
+        if raw_qty is None or raw_qty == "":
+            raw_qty = item.get("quantity_available")
+        from transactions import _parse_limited_quantity
+
+        parsed_qty = _parse_limited_quantity(raw_qty)
+        unlimited = parsed_qty is None
+        qty_avail = parsed_qty if parsed_qty is not None else 0
         products.append(
             {
                 "product_uid": uid,

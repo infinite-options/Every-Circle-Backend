@@ -666,16 +666,28 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
         sync_legacy_unit_fields(sale, units)
 
     lines = attach_line_units_ledgers(db, order_uid, sale.get("lines") or [])
+    from line_commerce_fields import (
+        line_merchandise_total_from_row,
+        line_snapshot_api_fields,
+        order_money_from_line_snapshots,
+    )
+
     for line in lines:
         if isinstance(line, dict) and line.get("ti_bs_return_window_days") is not None:
             line["return_window_days"] = line.get("ti_bs_return_window_days")
+        if isinstance(line, dict):
+            line["money"] = order_money_from_line_snapshots(line)
+            line.update(line_snapshot_api_fields(line))
+            merch_total = line_merchandise_total_from_row(line)
+            if merch_total is not None:
+                line["line_merchandise_total"] = merch_total
     sale["lines"] = lines
     if len(lines) == 1 and isinstance(lines[0], dict):
         sale["ti_uid"] = lines[0].get("ti_uid")
 
     payload = dict(payload)
     payload["sale"] = sale
-    payload["schema_version"] = 2
+    payload["schema_version"] = 3
 
     returns = []
     for ret in payload.get("returns") or []:

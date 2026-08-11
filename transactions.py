@@ -11,7 +11,12 @@ import requests as http_requests
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
-from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interaction
+from moderation import (
+    MODERATED_ACTIVE,
+    get_business,
+    is_business_publicly_visible,
+    is_owner_available_for_public_interaction,
+)
 from user_path_connection import ConnectionsPath
 from wallet_ids import EC_WALLET_ID
 from wallet_service import (
@@ -187,6 +192,43 @@ def _increment_tracked_quantity(db, table, uid_column, qty_column, uid, qty):
         """,
         (qty, uid),
         cmd="post",
+    )
+
+
+def _validate_business_service_available(db, bs_data):
+    """Gate checkout on business service + parent business visibility."""
+    if not bs_data:
+        return {"message": "Business service not found", "code": 404}
+
+    if int(bs_data.get("bs_is_visible") or 0) != 1:
+        return {"message": "Product is not available", "code": 403}
+
+    status = str(bs_data.get("bs_status") or "active").strip().lower()
+    if status in ("out_of_stock", "inactive", "deleted", "removed"):
+        return {"message": "Product is not available", "code": 403}
+
+    business_uid = bs_data.get("bs_business_id")
+    if business_uid:
+        business = get_business(db, business_uid)
+        if not business or not is_business_publicly_visible(business):
+            return {"message": "Business is not available", "code": 403}
+
+    return None
+
+
+def _apply_business_sold_out_if_needed(db, stock_decrement, remaining_after):
+    """Hide business products when tracked inventory reaches zero."""
+    if not stock_decrement or stock_decrement.get("table") != "business_services":
+        return
+    if not stock_decrement.get("limited"):
+        return
+    remaining = _parse_limited_quantity(remaining_after)
+    if remaining is None or remaining > 0:
+        return
+    db.update(
+        "every_circle.business_services",
+        {"bs_uid": stock_decrement["uid"]},
+        {"bs_is_visible": 0, "bs_status": "out_of_stock", "bs_updated_at": utc_now_str()},
     )
 
 
@@ -736,6 +778,9 @@ def _fetch_listing_for_checkout_item(db, item):
                 "code": 404,
             }
         bs_data = bs_response["result"][0]
+        avail_err = _validate_business_service_available(db, bs_data)
+        if avail_err:
+            return None, ti_bs_id, None, False, avail_err
         listing_mode = _business_listing_mode(bs_data)
         if listing_mode is None:
             return None, ti_bs_id, None, False, {
@@ -836,7 +881,10 @@ def _plan_checkout(db, items, payload, shipping_fields):
             unit_cost = round(_to_float(declared_unit), 2)
         else:
             unit_cost = _listing_unit_cost(bs_data)
-        line_merchandise = round(unit_cost * qty, 2)
+        choices_extra = 0.0
+        if str(ti_bs_id).startswith("250"):
+            choices_extra = _to_float(item.get("choices_extra_cost") or 0)
+        line_merchandise = round(unit_cost * qty + choices_extra, 2)
         order_merchandise += line_merchandise
 
         line_tax_raw = item.get("line_tax_amount")
@@ -4294,13 +4342,11 @@ def _finalize_buyer_purchase_list_rows(db, rows):
         return []
     rows = _enrich_transaction_rows(rows)
     for row in rows:
-        if (
-            isinstance(row, dict)
-            and row.get("purchase_type") == "Offering"
-        ):
-            cost = row.get("profile_expertise_cost") or row.get("ti_bs_cost")
-            if cost is not None and str(cost).strip():
-                row["offering_rate_display"] = format_offering_rate_display(cost)
+        if not isinstance(row, dict):
+            continue
+        cost = row.get("profile_expertise_cost") or row.get("ti_bs_cost")
+        if cost is not None and str(cost).strip():
+            row["offering_rate_display"] = format_offering_rate_display(cost)
     rows = attach_shipping_to_transaction_rows(db, rows)
     rows = apply_order_fulfillment_summary(rows)
     rows = sync_list_rows_fulfillment_from_context(db, rows)
@@ -4640,6 +4686,13 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response["result"][0]
+                        avail_err = _validate_business_service_available(db, bs_data)
+                        if avail_err:
+                            _rollback_wallet_debit()
+                            response["message"] = avail_err["message"]
+                            response["code"] = avail_err["code"]
+                            return response, avail_err["code"]
+
                         tx_item["ti_bs_cost"] = _normalize_stored_cost(bs_data.get("bs_cost"))
                         tx_item["ti_bs_cost_currency"] = bs_data.get("bs_cost_currency")
                         tx_item["ti_bs_sku"] = bs_data.get("bs_sku")
@@ -4658,6 +4711,24 @@ class Transactions(Resource):
                             bs_data.get("bs_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
+
+                        purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(bs_data.get("bs_quantity"))
+                        stock_err = _validate_purchase_quantity(
+                            available_qty, purchased_qty
+                        )
+                        if stock_err:
+                            _rollback_wallet_debit()
+                            response.update(stock_err[0])
+                            return response, stock_err[1]
+                        stock_decrement = {
+                            "table": "business_services",
+                            "uid_column": "bs_uid",
+                            "qty_column": "bs_quantity",
+                            "uid": ti_bs_id,
+                            "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
+                        }
 
                     elif ti_bs_id and str(ti_bs_id).startswith("150"):
                         print("ti_bs_id is an expertise")
@@ -4918,6 +4989,9 @@ class Transactions(Resource):
                             print(
                                 f"Decremented {stock_decrement['table']} "
                                 f"{stock_decrement['uid']} to {remaining_after}"
+                            )
+                            _apply_business_sold_out_if_needed(
+                                db, stock_decrement, remaining_after
                             )
 
                     # Insert transaction item
@@ -5280,6 +5354,24 @@ class Transactions(Resource):
                     ]
                 response["message"] = "Transaction completed successfully"
                 response["code"] = 200
+                response["schema_version"] = 3
+                purchase_row = None
+                try:
+                    from account_screen_v3 import build_buyer_purchase_row_v3
+
+                    purchase_row = build_buyer_purchase_row_v3(
+                        db,
+                        payload.get("profile_id"),
+                        new_transaction_uid,
+                        tz_name=_request_timezone(),
+                    )
+                except Exception as purchase_row_err:
+                    print(
+                        "Warning: Failed to build v3 purchase_row after checkout: "
+                        f"{purchase_row_err}"
+                    )
+                if purchase_row:
+                    response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:

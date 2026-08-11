@@ -279,8 +279,9 @@ def compute_line_proceeds_breakdown(db, order_uid, line_row):
     if qty <= 0:
         return None
 
-    unit = _parse_unit_cost(line_row.get("ti_bs_cost"))
-    merchandise = round_money(unit * qty)
+    merchandise = line_merchandise_total_from_row(line_row)
+    if merchandise is None:
+        return None
     tax_amount = _line_tax_snapshot(line_row)
     if tax_amount is None:
         tax_amount = round_money(
@@ -384,7 +385,7 @@ def compute_line_event_proceeds_breakdown(
         return None
 
     if return_qty > 0:
-        merchandise = round_money(unit_merch * return_qty)
+        merchandise = _line_merchandise_for_qty(line_row, return_qty) or 0.0
         sales_tax = round_money(unit_tax * return_qty)
         shipping = round_money(
             _refund_shipping_for_line(
@@ -403,7 +404,7 @@ def compute_line_event_proceeds_breakdown(
         )
         event_qty = return_qty
     elif verified_qty > 0:
-        merchandise = round_money(unit_merch * verified_qty)
+        merchandise = _line_merchandise_for_qty(line_row, verified_qty) or 0.0
         sales_tax = round_money(unit_tax * verified_qty)
         if is_per_unit_shipping_model(line_row):
             shipping = round_money(
@@ -565,9 +566,8 @@ def _split_row_refund_money(
             "line_bounty_reclaim": 0.0,
         }
 
-    unit_cost = _parse_unit_cost(ti_row.get("ti_bs_cost"))
+    line_merchandise_refund = _line_merchandise_for_qty(ti_row, rq) or 0.0
     orig_qty = int(ti_row.get("ti_bs_qty") or 0)
-    line_merchandise_refund = round_money(unit_cost * rq)
 
     stored_line_tax = _line_tax_snapshot(ti_row)
     if stored_line_tax is not None and orig_qty > 0:
@@ -849,6 +849,52 @@ def _line_snapshot_qty(row):
         return 0
 
 
+def _line_choices_extra_total(row):
+    """Total choice add-on dollars stored on the line (not per unit)."""
+    if not isinstance(row, dict):
+        return 0.0
+    raw = row.get("ti_choices_extra_cost")
+    if raw is None or raw == "":
+        raw = row.get("choices_extra_cost")
+    if raw is None or raw == "":
+        return 0.0
+    return round_money(_to_float(raw))
+
+
+def line_merchandise_total_from_row(row):
+    """
+    Line merchandise from checkout snapshots: unit cost × qty + choice extras.
+
+    ti_bs_cost is the base unit price at purchase; ti_choices_extra_cost is the
+    total add-on for the line when business options were selected.
+    """
+    if not isinstance(row, dict):
+        return None
+    qty = _line_snapshot_qty(row)
+    return _line_merchandise_for_qty(row, qty)
+
+
+def _line_merchandise_for_qty(row, qty):
+    """Merchandise dollars for qty units of a sale line (prorates choice extras)."""
+    if not isinstance(row, dict):
+        return None
+    try:
+        qty = int(qty or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
+        return None
+    unit = _parse_unit_cost(row.get("ti_bs_cost") or row.get("unit_price"))
+    if unit <= 0:
+        return None
+    base = round_money(unit * qty)
+    extra = _line_choices_extra_total(row)
+    orig_qty = _line_snapshot_qty(row)
+    if extra > 0 and orig_qty > 0:
+        return round_money(base + extra * qty / orig_qty)
+    return base
+
+
 def _snapshot_present(value):
     return value is not None and value != ""
 
@@ -867,13 +913,12 @@ def _line_tax_snapshot(row):
             return round_money(row.get(key))
 
     qty = _line_snapshot_qty(row)
-    unit = _parse_unit_cost(row.get("ti_bs_cost") or row.get("unit_price"))
-    if qty <= 0 or unit <= 0:
+    merchandise = line_merchandise_total_from_row(row)
+    if merchandise is None:
         return None
     rate = row.get("ti_bs_tax_rate") or row.get("ti_tax_rate")
     if not _snapshot_present(rate):
         return None
-    merchandise = round_money(unit * qty)
     tax = round_money(
         _tax_amount_for_line(merchandise, row.get("ti_bs_is_taxable"), rate)
     )
@@ -930,6 +975,12 @@ def line_snapshot_api_fields(row):
     ship = _line_shipping_snapshot(row)
     if ship is not None:
         out["ti_line_shipping_amount"] = ship
+    merch_total = line_merchandise_total_from_row(row)
+    if merch_total is not None:
+        out["line_merchandise_total"] = merch_total
+    choices_extra = _line_choices_extra_total(row)
+    if choices_extra > 0:
+        out["ti_choices_extra_cost"] = choices_extra
     return out
 
 
@@ -966,6 +1017,7 @@ def build_purchase_line_v3_entry(line_row):
         return {}
     unit = _parse_unit_cost(line_row.get("ti_bs_cost"))
     item_name = line_row.get("item_name") or line_row.get("purchased_item")
+    merch_total = line_merchandise_total_from_row(line_row)
     entry = {
         "ti_uid": line_row.get("ti_uid"),
         "ti_bs_id": line_row.get("ti_bs_id"),
@@ -975,6 +1027,8 @@ def build_purchase_line_v3_entry(line_row):
         "unit_price": unit if unit > 0 else None,
         "money": order_money_from_line_snapshots(line_row),
     }
+    if merch_total is not None:
+        entry["line_merchandise_total"] = merch_total
     cost_str = _normalize_stored_cost_value(line_row.get("ti_bs_cost"))
     if cost_str is not None:
         entry["ti_bs_cost"] = cost_str
@@ -1014,12 +1068,11 @@ def order_money_from_line_snapshots(row):
 
     No order-level allocation or rate recomputation on read.
     """
-    qty = _line_snapshot_qty(row)
-    unit = _parse_unit_cost(row.get("ti_bs_cost") or row.get("unit_price"))
+    merchandise = line_merchandise_total_from_row(row)
     tax_amt = _line_tax_snapshot(row)
     ship_amt = _line_shipping_snapshot(row)
 
-    if qty <= 0 or unit <= 0 or tax_amt is None or ship_amt is None:
+    if merchandise is None or tax_amt is None or ship_amt is None:
         return {
             "merchandise": None,
             "tax": None,
@@ -1029,7 +1082,6 @@ def order_money_from_line_snapshots(row):
             "known": False,
         }
 
-    merchandise = round_money(unit * qty)
     total = round_money(merchandise + tax_amt + ship_amt)
 
     return {

@@ -257,6 +257,21 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
 
         self.assertEqual(_normalize_purchase_type({"purchase_type": "Offering"}), "offering")
         self.assertEqual(_normalize_purchase_type({"ti_bs_id": "250-000001"}), "service")
+        self.assertEqual(_normalize_purchase_type({"purchase_type": "Business"}), "service")
+
+    def test_business_line_money_with_choices(self):
+        row = {
+            "ti_bs_cost": 15.0,
+            "ti_bs_qty": 2,
+            "ti_choices_extra_cost": 6.0,
+            "ti_line_tax_amount": 2.64,
+            "ti_line_shipping_amount": 5.0,
+            "ti_shipping_amount": 2.5,
+        }
+        money = order_money_from_line_snapshots(row)
+        self.assertTrue(money["known"])
+        self.assertEqual(money["merchandise"], 36.0)
+        self.assertEqual(money["customer_total"], 43.64)
 
     def test_round_ledger_entry_to_cents(self):
         from account_screen_v3 import _round_ledger_entry
