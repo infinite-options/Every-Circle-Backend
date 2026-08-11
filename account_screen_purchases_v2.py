@@ -5,7 +5,7 @@ Each purchases.rows[] entry is a Purchases-table row with an explicit unit ledge
 so the frontend never infers shipped / verified / return splits.
 """
 
-from units_ledger import sale_units_ledger, sale_display, fulfillment_method, requires_shipping, sync_legacy_unit_fields
+from line_commerce_fields import collapse_return_lines_for_list_row
 from order_display import build_return_ledger_display
 from account_screen_v2_contract import _units_for_return_row
 from account_screen_line_rows import _scoped_return_line_fields
@@ -321,12 +321,13 @@ def _transform_return_row(db, row):
 
     cancel_only = bool(out.get("cancel_unshipped") or out.get("pre_ship_cancel"))
     lines = out.get("return_lines") or out.get("lines") or []
-    return_lines = [
+    split_lines = [
         _return_line_with_split(
             db, line, return_tx_uid=tx_uid, cancel_only=cancel_only
         )
         for line in lines
     ]
+    return_lines = collapse_return_lines_for_list_row(split_lines)
     out["return_lines"] = return_lines
     out.pop("lines", None)
     _scoped_return_line_fields(out, return_lines)
@@ -372,7 +373,7 @@ def _transform_pending_return_row(db, row):
 
     cancel_only = bool(out.get("cancel_unshipped") or out.get("pre_ship_cancel"))
     lines = out.get("return_lines") or []
-    return_lines = []
+    split_lines = []
     for line in lines:
         line_cancel = cancel_only
         if not line_cancel:
@@ -383,9 +384,10 @@ def _transform_pending_return_row(db, row):
                 shipped = cancel = 0
             if cancel > 0 and shipped == 0:
                 line_cancel = True
-        return_lines.append(
+        split_lines.append(
             _return_line_with_split(db, line, cancel_only=line_cancel)
         )
+    return_lines = collapse_return_lines_for_list_row(split_lines)
     out["return_lines"] = return_lines
     _scoped_return_line_fields(out, return_lines)
 

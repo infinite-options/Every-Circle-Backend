@@ -360,6 +360,8 @@ def _load_return_transactions(db, order_uid):
                 {
                     "ti_uid": row.get("ti_uid"),
                     "ti_original_ti_uid": row.get("ti_original_ti_uid"),
+                    "transaction_item_uid": row.get("ti_original_ti_uid")
+                    or row.get("ti_uid"),
                     "ti_bs_id": row.get("ti_bs_id"),
                     "ti_bs_qty": qty,
                     "return_quantity": abs(qty),
@@ -378,6 +380,10 @@ def _load_return_transactions(db, order_uid):
                     ),
                 }
             )
+
+        from line_commerce_fields import expand_return_lines_list
+
+        return_lines = expand_return_lines_list(db, order_uid, return_lines)
 
         returns.append(
             {
@@ -558,7 +564,11 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
             if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
                 item["ti_bs_cost"] = looked["ti_bs_cost"]
             enriched_return_items.append(item)
-        transaction_return_items = enriched_return_items
+        from line_commerce_fields import expand_return_lines_list
+
+        transaction_return_items = expand_return_lines_list(
+            db, order_uid, enriched_return_items
+        )
 
     sale_payload = dict(sale)
     sale_payload["lines"] = sale_lines

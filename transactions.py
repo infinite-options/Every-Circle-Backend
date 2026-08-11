@@ -6208,19 +6208,28 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             item["ti_bs_id"] = looked["ti_bs_id"]
         if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
             item["ti_bs_cost"] = looked["ti_bs_cost"]
-        from line_commerce_fields import pending_return_item_commerce_fields
+        enriched_items.append(item)
+    cancel_only = bool(
+        pending.get("cancel_unshipped")
+        or pending.get("pre_ship_cancel")
+        or pending.get("is_cancel_before_ship")
+    )
+    from line_commerce_fields import expand_return_line_splits
 
+    expanded_items = []
+    for item in enriched_items:
+        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
         ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid) if ti_uid else None
-        item.update(
-            pending_return_item_commerce_fields(
+        expanded_items.extend(
+            expand_return_line_splits(
                 db,
                 order_uid,
                 item,
                 ti_row=ti_row,
+                cancel_only=cancel_only,
             )
         )
-        enriched_items.append(item)
-    items = enriched_items
+    items = expanded_items
 
     estimated_refund = None
     stored_json = pending.get("trr_estimated_refund_json")
@@ -6230,7 +6239,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
         except (TypeError, ValueError, json.JSONDecodeError):
             estimated_refund = None
 
-    if estimated_refund is None and items:
+    if estimated_refund is None and enriched_items:
         ok, _err, ctx = _validate_and_price_return_items(
             db,
             order_uid,
@@ -6242,7 +6251,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
                         or pending.get("pre_ship_cancel")
                     ),
                 }
-                for entry in items
+                for entry in enriched_items
             ],
             exclude_trr_uid=pending.get("trr_uid"),
             enforce_return_eligibility=False,
@@ -6257,7 +6266,9 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             if stored:
                 estimated_refund = {"total": round(stored, 4)}
 
-    bounty_to_reclaim = _resolve_bounty_to_reclaim(db, order_uid, pending, items)
+    bounty_to_reclaim = _resolve_bounty_to_reclaim(
+        db, order_uid, pending, enriched_items
+    )
 
     note = pending.get("trr_note") or pending.get("note")
     payload = {
@@ -6392,7 +6403,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
     name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
 
     item_names = []
-    return_lines = []
+    raw_lines = []
     qty_total = 0
     for req in pending_reqs:
         req_cancel = _is_cancel_unshipped_request(req)
@@ -6430,7 +6441,11 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
             if req.get("trr_uid"):
                 line_entry["trr_uid"] = req.get("trr_uid")
             _apply_return_item_split(line_entry, cancel_only=req_cancel)
-            return_lines.append(line_entry)
+            raw_lines.append(line_entry)
+
+    from line_commerce_fields import collapse_return_lines_for_list_row
+
+    return_lines = collapse_return_lines_for_list_row(raw_lines)
 
     api_status = _return_request_public_payload(primary, qty=qty_total)
 
@@ -6585,21 +6600,30 @@ def _batch_return_lines(db, return_tx_uids):
     for row in q.get("result") or []:
         tx_uid = row.get("return_transaction_uid")
         qty = int(_to_float(row.get("ti_bs_qty")))
+        return_shipped_qty, cancel_unshipped_qty = _return_ledger_line_split(
+            db, tx_uid, row
+        )
         out.setdefault(tx_uid, []).append(
             {
                 "ti_uid": row.get("ti_uid"),
                 "ti_original_ti_uid": row.get("ti_original_ti_uid"),
+                "transaction_item_uid": row.get("ti_original_ti_uid")
+                or row.get("ti_uid"),
                 "ti_bs_id": row.get("ti_bs_id"),
                 "item_name": row.get("item_name"),
                 "quantity": qty,
                 "return_quantity": abs(qty),
+                "return_shipped_qty": return_shipped_qty,
+                "cancel_unshipped_qty": cancel_unshipped_qty,
                 "unit_cost": _to_float(row.get("ti_bs_cost")),
             }
         )
     return out
 
 
-def _normalize_completed_return_row(out, linked_req=None, return_lines=None):
+def _normalize_completed_return_row(
+    out, linked_req=None, return_lines=None, *, db=None
+):
     """Ensure completed reverse-txn rows have FE-stable return fields."""
     out["transaction_type"] = "return"
     out["is_return"] = True
@@ -6639,6 +6663,10 @@ def _normalize_completed_return_row(out, linked_req=None, return_lines=None):
             )
 
     lines = return_lines or []
+    if db and parent_sale and lines:
+        from line_commerce_fields import collapse_return_lines_for_list_row
+
+        lines = collapse_return_lines_for_list_row(lines)
     out["return_lines"] = lines
     out["lines"] = lines
     if lines and not out.get("purchased_item"):
@@ -6732,6 +6760,7 @@ def _enrich_list_transaction_rows(db, rows):
                 out,
                 linked_req=linked,
                 return_lines=return_lines_map.get(out.get("transaction_uid")) or [],
+                db=db,
             )
             if linked_reqs:
                 out["trr_uids"] = [
@@ -6781,7 +6810,11 @@ def _enrich_list_transaction_rows(db, rows):
                         ) is None:
                             item["ti_bs_cost"] = looked["ti_bs_cost"]
                         enriched_return_items.append(item)
-                    out["transaction_return_items"] = enriched_return_items
+                    from line_commerce_fields import expand_return_lines_list
+
+                    out["transaction_return_items"] = expand_return_lines_list(
+                        db, sale_uid, enriched_return_items
+                    )
             else:
                 out.pop("pending_returns", None)
                 out.pop("pending_return", None)

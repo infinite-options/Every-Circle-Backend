@@ -108,15 +108,23 @@ def split_row_by_return_lines(row):
     Split a pending/return list row with multiple return_lines into one row per line.
 
     Preserves trr_uid per line when trr_uids[] is parallel to return_lines.
+    Hybrid return/cancel on the same product stays one row (merged by ti_uid).
     """
     if not isinstance(row, dict):
         return [row]
-    lines = row.get("return_lines") or []
+    from line_commerce_fields import collapse_return_lines_for_list_row
+
+    lines = collapse_return_lines_for_list_row(row.get("return_lines") or [])
     if len(lines) <= 1:
         out = dict(row)
+        out["return_lines"] = lines
         if lines:
             line = lines[0]
-            out["ti_uid"] = line.get("ti_uid") or line.get("ti_original_ti_uid")
+            out["ti_uid"] = (
+                line.get("transaction_item_uid")
+                or line.get("ti_original_ti_uid")
+                or line.get("ti_uid")
+            )
             out["ti_bs_id"] = line.get("ti_bs_id")
             out["purchased_item"] = line.get("item_name") or out.get("purchased_item")
         return [out]

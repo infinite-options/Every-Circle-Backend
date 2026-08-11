@@ -519,6 +519,46 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["qty"], 2)
         self.assertEqual(display["qty_label"], "2")
 
+    def test_seller_display_qty_hybrid_shows_shipped_only(self):
+        from account_screen_v3_contract import build_v3_display
+
+        money = {"customer_credit": -66.0, "customer_total": None}
+        row = {
+            "row_kind": "pending_return",
+            "return_lines": [
+                {
+                    "return_shipped_qty": 1,
+                    "cancel_unshipped_qty": 1,
+                    "return_quantity": 2,
+                }
+            ],
+            "units": {"return_shipped_qty": 1, "return_unshipped_qty": 1},
+        }
+        display = build_v3_display(row, money, audience="seller")
+        self.assertEqual(display["qty"], 1)
+        self.assertEqual(display["qty_label"], "1")
+        self.assertEqual(display["cancelled_label"], "1")
+
+    def test_buyer_display_qty_hybrid_sums_shipped_and_cancel(self):
+        from account_screen_v3_contract import build_v3_display
+
+        money = {"customer_credit": -66.0, "customer_total": None}
+        row = {
+            "row_kind": "return",
+            "return_lines": [
+                {
+                    "return_shipped_qty": 1,
+                    "cancel_unshipped_qty": 1,
+                    "return_quantity": 2,
+                }
+            ],
+            "units": {"return_shipped_qty": 1, "return_unshipped_qty": 1},
+        }
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["qty"], 2)
+        self.assertEqual(display["qty_label"], "2")
+        self.assertEqual(display["cancelled_label"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ _V2_STRIP_KEYS = frozenset(
         "unit_price",
         "line_bounty_paid",
         "bounty_to_reclaim",
+        "return_kind",
         "cancel_unshipped",
         "pre_ship_cancel",
         "is_cancel_before_ship",
@@ -264,13 +265,8 @@ def _return_line_display_qty(line):
     return 0
 
 
-def _return_row_display_qty(row, units=None):
-    """Total return qty for one product on a purchases list row."""
-    lines = row.get("return_lines") or []
-    if lines:
-        total = sum(_return_line_display_qty(line) for line in lines)
-        if total:
-            return total
+def _return_row_display_qty(row, units=None, *, audience="buyer"):
+    """Return qty for list-row display — buyer sums hybrid; seller shows shipped only."""
     if units is None:
         units = build_v3_units(row)
     try:
@@ -278,6 +274,23 @@ def _return_row_display_qty(row, units=None):
         cancel = int(units.get("cancel_unshipped_qty") or 0)
     except (TypeError, ValueError):
         shipped = cancel = 0
+
+    if audience == "seller":
+        if shipped > 0:
+            return shipped
+        lines = row.get("return_lines") or []
+        if lines:
+            return sum(int(l.get("return_shipped_qty") or 0) for l in lines)
+        return int(units.get("purchased_qty") or 0)
+
+    lines = row.get("return_lines") or []
+    if lines:
+        from line_commerce_fields import collapse_return_lines_for_list_row
+
+        collapsed = collapse_return_lines_for_list_row(lines)
+        total = sum(_return_line_display_qty(line) for line in collapsed)
+        if total:
+            return total
     if shipped or cancel:
         return shipped + cancel
     try:
@@ -294,7 +307,7 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
     dt = row.get("transaction_datetime") or row.get("entry_datetime")
 
     if kind in _RETURN_ROW_KINDS:
-        qty = _return_row_display_qty(row, units)
+        qty = _return_row_display_qty(row, units, audience=audience)
         cancelled = int(units.get("cancel_unshipped_qty") or 0)
         if kind == "pending_return":
             type_label = "Cancel" if row.get("is_cancel_before_ship") else "Return"

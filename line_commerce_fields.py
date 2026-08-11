@@ -495,46 +495,318 @@ def _load_commerce_sale_lines(db, order_uid):
     return q.get("result") or []
 
 
-def pending_return_item_commerce_fields(db, order_uid, item, *, ti_row=None):
-    """line_bounty_reclaim + line_shipping_refund for pending_returns.items[]."""
-    if not isinstance(item, dict):
-        return {}
-
-    ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
-    if not ti_uid:
-        return {}
-
+def _return_line_split_specs(*, return_shipped_qty=0, cancel_unshipped_qty=0, cancel_only=False):
+    """Split one hybrid return line into per-kind API rows."""
     try:
-        rq = int(item.get("return_quantity") or 0)
+        shipped = int(return_shipped_qty or 0)
+        cancel = int(cancel_unshipped_qty or 0)
+    except (TypeError, ValueError):
+        shipped = cancel = 0
+
+    if shipped > 0 and cancel > 0:
+        return [
+            {
+                "return_kind": "return",
+                "return_quantity": shipped,
+                "return_shipped_qty": shipped,
+                "cancel_unshipped_qty": 0,
+            },
+            {
+                "return_kind": "cancel",
+                "return_quantity": cancel,
+                "return_shipped_qty": 0,
+                "cancel_unshipped_qty": cancel,
+            },
+        ]
+    if cancel > 0 or cancel_only:
+        qty = cancel if cancel > 0 else 0
+        if qty <= 0:
+            return []
+        return [
+            {
+                "return_kind": "cancel",
+                "return_quantity": qty,
+                "return_shipped_qty": 0,
+                "cancel_unshipped_qty": qty,
+            }
+        ]
+    if shipped > 0:
+        return [
+            {
+                "return_kind": "return",
+                "return_quantity": shipped,
+                "return_shipped_qty": shipped,
+                "cancel_unshipped_qty": 0,
+            }
+        ]
+    return []
+
+
+def _split_row_refund_money(
+    db,
+    order_uid,
+    ti_row,
+    *,
+    return_qty,
+    return_shipped_qty=0,
+    cancel_unshipped_qty=0,
+    line_bounty_ledger=None,
+):
+    """Exact refund components for one return/cancel split row."""
+    try:
+        rq = int(return_qty or 0)
     except (TypeError, ValueError):
         rq = 0
+    if rq <= 0 or not isinstance(ti_row, dict):
+        return {
+            "line_merchandise_refund": 0.0,
+            "line_tax_refund": 0.0,
+            "line_shipping_refund": 0.0,
+            "line_bounty_reclaim": 0.0,
+        }
 
-    return_shipped = int(item.get("return_shipped_qty") or 0)
-    cancel_unshipped = int(item.get("cancel_unshipped_qty") or 0)
+    unit_cost = _parse_unit_cost(ti_row.get("ti_bs_cost"))
+    orig_qty = int(ti_row.get("ti_bs_qty") or 0)
+    line_merchandise_refund = round_money(unit_cost * rq)
 
-    if ti_row is None:
+    stored_line_tax = _line_tax_snapshot(ti_row)
+    if stored_line_tax is not None and orig_qty > 0:
+        line_tax_refund = round_money(_to_float(stored_line_tax) * rq / orig_qty)
+    else:
+        line_tax_refund = round_money(
+            _tax_amount_for_line(
+                line_merchandise_refund,
+                ti_row.get("ti_bs_is_taxable"),
+                ti_row.get("ti_bs_tax_rate"),
+            )
+        )
+
+    line_shipping_refund = round_money(
+        _refund_shipping_for_line(
+            ti_row,
+            rq,
+            return_shipped_qty=return_shipped_qty,
+            cancel_unshipped_qty=cancel_unshipped_qty,
+        )
+    )
+
+    ti_uid = ti_row.get("ti_uid")
+    line_bounty_reclaim = round_money(
+        _bounty_to_reclaim_for_line(
+            db,
+            order_uid,
+            ti_uid,
+            rq,
+            ti_row=ti_row,
+            line_bounty_ledger=line_bounty_ledger,
+        )
+    )
+
+    return {
+        "line_merchandise_refund": line_merchandise_refund,
+        "line_tax_refund": line_tax_refund,
+        "line_shipping_refund": line_shipping_refund,
+        "line_bounty_reclaim": line_bounty_reclaim,
+    }
+
+
+def _attach_split_row_money(row, money):
+    row.update(money)
+    row["money"] = {
+        "merchandise": money["line_merchandise_refund"],
+        "tax": money["line_tax_refund"],
+        "shipping": money["line_shipping_refund"],
+        "bounty": money["line_bounty_reclaim"],
+    }
+    return row
+
+
+def expand_return_line_splits(db, order_uid, line, *, ti_row=None, cancel_only=False):
+    """
+    Expand one return line into 1+ API rows with per-split qty and money.
+
+    Hybrid lines (shipped + cancel on the same ti_uid) become two rows so the FE
+    can render Return · must receive and Cancellation · not shipped without
+    client-side proration.
+    """
+    if not isinstance(line, dict):
+        return []
+
+    out = dict(line)
+    ti_uid = out.get("transaction_item_uid") or out.get("ti_uid")
+    if ti_uid:
+        out.setdefault("transaction_item_uid", ti_uid)
+        out.setdefault("ti_uid", ti_uid)
+
+    has_split = (
+        out.get("return_shipped_qty") is not None
+        or out.get("cancel_unshipped_qty") is not None
+    )
+    try:
+        shipped = int(out.get("return_shipped_qty") or 0) if has_split else 0
+        cancel = int(out.get("cancel_unshipped_qty") or 0) if has_split else 0
+        rq = int(out.get("return_quantity") or 0)
+    except (TypeError, ValueError):
+        shipped = cancel = rq = 0
+
+    if not has_split:
+        if cancel_only:
+            shipped, cancel = 0, rq
+        else:
+            shipped, cancel = rq, 0
+
+    specs = _return_line_split_specs(
+        return_shipped_qty=shipped,
+        cancel_unshipped_qty=cancel,
+        cancel_only=cancel_only and cancel <= 0 and shipped <= 0,
+    )
+    if not specs:
+        return []
+
+    if ti_row is None and ti_uid:
         from transactions import _fetch_ti_row_for_bounty
 
         ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid)
 
-    out = {}
-    if ti_row and rq > 0:
-        reclaim = _bounty_to_reclaim_for_line(
-            db, order_uid, ti_uid, rq, ti_row=ti_row
-        )
-        if reclaim:
-            out["line_bounty_reclaim"] = round_money(reclaim)
+    line_bounty_ledger = None
+    if ti_uid:
+        line_bounty_ledger = _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0)
 
-    if ti_row:
-        ship_refund = _refund_shipping_for_line(
+    results = []
+    for spec in specs:
+        row = dict(out)
+        row.update(spec)
+        money = _split_row_refund_money(
+            db,
+            order_uid,
             ti_row,
-            rq,
-            return_shipped_qty=return_shipped,
-            cancel_unshipped_qty=cancel_unshipped,
+            return_qty=spec["return_quantity"],
+            return_shipped_qty=spec["return_shipped_qty"],
+            cancel_unshipped_qty=spec["cancel_unshipped_qty"],
+            line_bounty_ledger=line_bounty_ledger,
         )
-        out["line_shipping_refund"] = round_money(ship_refund)
+        results.append(_attach_split_row_money(row, money))
+    return results
 
-    return out
+
+def collapse_return_lines_for_list_row(lines):
+    """
+    One return line per product for account-screen list rows.
+
+    Merges hybrid return/cancel API splits (same ti_uid, different return_kind)
+    back into a single line with combined qty and money fields.
+    """
+    if not lines:
+        return []
+
+    def _group_key(line):
+        return (
+            line.get("transaction_item_uid")
+            or line.get("ti_original_ti_uid")
+            or line.get("ti_uid")
+            or line.get("ti_bs_id")
+        )
+
+    groups = {}
+    order = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        key = _group_key(line)
+        if key is None:
+            order.append(id(line))
+            groups[id(line)] = dict(line)
+            continue
+        if key not in groups:
+            merged = dict(line)
+            merged.pop("return_kind", None)
+            groups[key] = merged
+            order.append(key)
+            continue
+        merged = groups[key]
+        for qty_field in ("return_shipped_qty", "cancel_unshipped_qty", "return_quantity"):
+            try:
+                merged[qty_field] = int(merged.get(qty_field) or 0) + int(
+                    line.get(qty_field) or 0
+                )
+            except (TypeError, ValueError):
+                pass
+        for money_field in (
+            "line_merchandise_refund",
+            "line_tax_refund",
+            "line_shipping_refund",
+            "line_bounty_reclaim",
+        ):
+            if money_field in line or money_field in merged:
+                merged[money_field] = round_money(
+                    _to_float(merged.get(money_field))
+                    + _to_float(line.get(money_field))
+                )
+        m0 = merged.get("money") if isinstance(merged.get("money"), dict) else {}
+        m1 = line.get("money") if isinstance(line.get("money"), dict) else {}
+        if m0 or m1:
+            merged["money"] = {
+                k: round_money(_to_float(m0.get(k)) + _to_float(m1.get(k)))
+                for k in ("merchandise", "tax", "shipping", "bounty")
+                if k in m0 or k in m1
+            }
+        merged.pop("return_kind", None)
+    return [groups[k] for k in order]
+
+
+def expand_return_lines_list(db, order_uid, lines, *, cancel_only=False):
+    """Expand and attach per-split money for each return line."""
+    expanded = []
+    ti_cache = {}
+    for line in lines or []:
+        ti_uid = (line or {}).get("transaction_item_uid") or (line or {}).get("ti_uid")
+        ti_row = ti_cache.get(ti_uid) if ti_uid else None
+        if ti_row is None and ti_uid:
+            from transactions import _fetch_ti_row_for_bounty
+
+            ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid)
+            ti_cache[ti_uid] = ti_row
+        expanded.extend(
+            expand_return_line_splits(
+                db,
+                order_uid,
+                line,
+                ti_row=ti_row,
+                cancel_only=cancel_only,
+            )
+        )
+    return expanded
+
+
+def pending_return_item_commerce_fields(db, order_uid, item, *, ti_row=None):
+    """Legacy single-row commerce helper — use expand_return_line_splits for hybrids."""
+    if not isinstance(item, dict):
+        return {}
+
+    try:
+        shipped = int(item.get("return_shipped_qty") or 0)
+        cancel = int(item.get("cancel_unshipped_qty") or 0)
+    except (TypeError, ValueError):
+        shipped = cancel = 0
+    if shipped > 0 and cancel > 0:
+        return {}
+
+    splits = expand_return_line_splits(db, order_uid, item, ti_row=ti_row)
+    if len(splits) != 1:
+        return {}
+    split = splits[0]
+    return {
+        k: split[k]
+        for k in (
+            "line_merchandise_refund",
+            "line_tax_refund",
+            "line_shipping_refund",
+            "line_bounty_reclaim",
+            "money",
+            "return_kind",
+        )
+        if k in split
+    }
 
 
 _LINE_TAX_AMOUNT_COLUMN_READY = False
