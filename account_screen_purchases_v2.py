@@ -6,6 +6,13 @@ so the frontend never infers shipped / verified / return splits.
 """
 
 from line_commerce_fields import collapse_return_lines_for_list_row
+from units_ledger import (
+    fulfillment_method,
+    requires_shipping,
+    sale_display,
+    sale_units_ledger,
+    sync_legacy_unit_fields,
+)
 from order_display import build_return_ledger_display
 from account_screen_v2_contract import _units_for_return_row
 from account_screen_line_rows import _scoped_return_line_fields
