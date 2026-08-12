@@ -12,7 +12,15 @@ from flask_restful import Resource
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from wallet_ids import resolve_wallet_profile_id
-from wallet_service import _round_money, _to_float, build_wallet_summary, get_wallet_row, line_is_fully_verified, bounty_reversal_ledger_availability
+from wallet_service import (
+    _round_money,
+    _to_float,
+    build_wallet_summary,
+    compute_wallet_from_bounty_ledger,
+    get_wallet_row,
+    line_is_fully_verified,
+    bounty_reversal_ledger_availability,
+)
 from wallet_ledger_proceeds import _attach_status_note
 from order_quantity_context import (
     line_quantity_context,
@@ -743,7 +751,17 @@ def get_wallet_ledger(db, profile_id, *, limit=100, offset=0):
 
     page = entries[offset : offset + limit]
 
-    wallet_summary = build_wallet_summary(db, profile_id)
+    computed = compute_wallet_from_bounty_ledger(db, profile_id)
+    wallet_summary = {
+        "wallet_profile_id": resolve_wallet_profile_id(profile_id),
+        "wallet_useable_balance": computed.get("wallet_useable_balance"),
+        "wallet_pending": computed.get("wallet_pending"),
+        "wallet_reserve": 0.0,
+        "wallet_useable_after_reserve": computed.get("wallet_useable_balance"),
+        "wallet_actual_balance": computed.get("wallet_actual_balance"),
+        "wallet_lifetime_earning": computed.get("wallet_lifetime_earning"),
+        "wallet_lifetime_spent": computed.get("wallet_lifetime_spent"),
+    }
 
     return {
         "code": 200,

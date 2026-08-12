@@ -24,7 +24,11 @@ from line_commerce_fields import (
 )
 from transactions import _to_float
 from wallet_ledger import apply_ledger_entry_display, get_wallet_ledger
-from wallet_service import build_wallet_summary, compute_wallet_from_bounty_ledger
+from wallet_service import (
+    build_wallet_summary,
+    compute_wallet_from_bounty_ledger,
+    get_wallet_row,
+)
 
 from account_screen_v3_contract import (
     attention_level_for_row,
@@ -59,13 +63,25 @@ def _parse_ledger_pagination(args):
 
 
 def build_wallet_v3(db, profile_id):
-    summary = build_wallet_summary(db, profile_id)
-    if not summary:
-        return None
-    useable = round_money(summary.get("wallet_useable_balance"))
-    actual = round_money(summary.get("wallet_actual_balance"))
-    # All non-useable funds (pending bounty + held sale proceeds).
+    """
+    Account-screen wallet block.
+
+    Prefer recomputed balances (bounty + proceeds − reservations) so the card
+    matches wallet_ledger running totals even if the wallet row is stale.
+    """
+    computed = compute_wallet_from_bounty_ledger(db, profile_id)
+    useable = round_money(computed.get("wallet_useable_balance"))
+    actual = round_money(computed.get("wallet_actual_balance"))
     pending = round_money(actual - useable)
+    if (
+        actual == 0
+        and useable == 0
+        and pending == 0
+        and not get_wallet_row(db, profile_id)
+        and round_money(computed.get("bounty_total")) == 0
+        and round_money(computed.get("seller_proceeds")) == 0
+    ):
+        return None
     return {
         "useable_balance": useable,
         "pending_balance": pending,
@@ -124,6 +140,7 @@ def build_earnings_v3(db, profile_id, tz_name=None):
         "bounty_total_earned": round_money(computed.get("bounty_total")),
         "bounty_useable": round_money(computed.get("bounty_useable")),
         "bounty_pending": round_money(computed.get("bounty_pending")),
+        "bounty_reserved": round_money(computed.get("bounty_reserved")),
         "chart": _bounty_chart_series(db, profile_id, tz_name),
     }
 
@@ -790,7 +807,16 @@ def build_sales_products_v3(db, business_uid, seller_rows, *, tz_name=None, prod
     }
 
 
-def _bounty_proceeds_status(row, db):
+def _bounty_proceeds_status(row, db, *, reserved_amount=0.0, earned_net=None):
+    reserved_amount = round_money(reserved_amount)
+    if earned_net is None:
+        earned_net = round_money(
+            (row.get("bounty_earned") or row.get("tb_amount") or 0)
+        ) - reserved_amount
+    earned_net = round_money(earned_net)
+    if reserved_amount > 0.0001 and earned_net <= 0.0001:
+        return "reserved"
+
     in_escrow = row.get("in_escrow")
     released = row.get("ti_bounty_released_at") or row.get("bounty_released_at")
     if released:
@@ -812,6 +838,14 @@ def _bounty_proceeds_status(row, db):
         if rows and rows[0].get("ti_bounty_released_at"):
             return "useable"
     return "pending"
+
+
+def _bounty_status_label(proceeds_status):
+    if proceeds_status == "useable":
+        return "Useable"
+    if proceeds_status == "reserved":
+        return "Reserved"
+    return "Pending"
 
 
 def _batch_bounty_line_catalog_fields(db, ti_uids):
@@ -961,6 +995,8 @@ def _bounty_row_product_fields(row, *, sale_line=None):
 
 
 def build_bounty_results_v3(db, rows, *, tz_name=None):
+    from wallet_return_reservations import sum_active_bounty_reservation
+
     enriched = enrich_bounty_result_rows(db, rows or [])
     enriched = attach_line_snapshots_to_rows(db, enriched)
     enriched = _attach_bounty_row_catalog_fields(db, enriched)
@@ -971,8 +1007,25 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
     for row in enriched:
         if not isinstance(row, dict):
             continue
-        proceeds_status = _bounty_proceeds_status(row, db)
-        earned = round_money(row.get("bounty_earned") or row.get("tb_amount"))
+        earned_gross = round_money(row.get("bounty_earned") or row.get("tb_amount"))
+        profile_id = row.get("tb_profile_id") or row.get("profile_id")
+        ti_uid = row.get("ti_uid")
+        reserved = 0.0
+        if ti_uid and profile_id:
+            reserved = sum_active_bounty_reservation(
+                db, ti_uid=ti_uid, profile_id=profile_id
+            )
+        elif ti_uid:
+            reserved = sum_active_bounty_reservation(db, ti_uid=ti_uid)
+        reserved = round_money(reserved)
+        earned = round_money(max(0.0, earned_gross - reserved))
+        proceeds_status = _bounty_proceeds_status(
+            row, db, reserved_amount=reserved, earned_net=earned
+        )
+        # Partial reserve on a still-open line: keep Pending/Useable but reduced earned.
+        if reserved > 0.0001 and earned > 0.0001 and proceeds_status != "reserved":
+            # Prefer an explicit reserved signal when any reclaim is open.
+            proceeds_status = "reserved"
         pool = round_money(row.get("bs_bounty") or row.get("tb_amount"))
         pct = normalize_tb_percentage_display(row.get("tb_percentage"))
         pct_label = format_tb_percent_label(row.get("tb_percentage"))
@@ -983,7 +1036,6 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
             or row.get("ti_transaction_id")
             or row.get("order_uid")
         )
-        ti_uid = row.get("ti_uid")
         sale_line = snap_map.get(ti_uid) if row.get("is_return") in (True, 1, "1") else None
         entry = {
             "bounty_line_uid": f"br-{ti_uid or order_uid}",
@@ -1002,12 +1054,14 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
             "business_name": row.get("display_name") or row.get("business_name"),
             "bs_bounty": pool,
             "bounty_earned": earned,
+            "bounty_earned_gross": earned_gross,
+            "bounty_reserved": reserved,
             "tb_percentage": pct,
             "proceeds_status": proceeds_status,
             "bounty_released_at": row.get("ti_bounty_released_at"),
             "display": {
                 "date_label": format_date_label(entry_dt, tz_name) or "—",
-                "status_label": "Useable" if proceeds_status == "useable" else "Pending",
+                "status_label": _bounty_status_label(proceeds_status),
                 "pool_label": format_money_label(pool),
                 "earned_label": format_money_label(earned),
                 "percent_label": pct_label,

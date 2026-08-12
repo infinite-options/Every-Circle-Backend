@@ -1331,7 +1331,8 @@ def _sum_wallet_transactions_by_status(db, profile_id, statuses):
     """
     Sum wallet_transactions.wt_amount for a profile filtered by wt_status.
 
-    Includes all wt_types so clawbacks (negative amounts) net correctly.
+    Includes seller proceed types so clawbacks (negative amounts) net correctly.
+    Excludes return/bounty reservation rows (those adjust bounty pools separately).
     """
     if not profile_id or not statuses:
         return 0.0
@@ -1344,6 +1345,10 @@ def _sum_wallet_transactions_by_status(db, profile_id, statuses):
         FROM every_circle.wallet_transactions
         WHERE wt_status IN ({placeholders})
           AND wt_profile_id IN (%s, %s)
+          AND wt_type NOT IN (
+              'return_refund_reservation',
+              'bounty_reclaim_reservation'
+          )
         """,
         tuple(statuses) + (profile_id, wallet_id),
     )
@@ -1389,13 +1394,33 @@ def _sum_buyer_wallet_purchase_spent(db, profile_id):
     return _round_money(rows[0].get("net_spent"))
 
 
+def _apply_bounty_reservation_to_pools(bounty_pending, bounty_useable, reserved):
+    """
+    Mirror wallet_ledger bounty_reclaim_reserved: prefer pending, then useable.
+
+    Reserved amounts are removed from earned pools (not parked in wallet_reserve).
+    """
+    reserved = _round_money(max(0.0, _to_float(reserved)))
+    pending = _round_money(bounty_pending)
+    useable = _round_money(bounty_useable)
+    from_pending = min(reserved, pending)
+    remaining = _round_money(reserved - from_pending)
+    from_useable = min(remaining, useable)
+    return (
+        _round_money(pending - from_pending),
+        _round_money(useable - from_useable),
+        reserved,
+    )
+
+
 def compute_wallet_from_bounty_ledger(db, profile_id):
     """
     Recompute wallet balances from transactions_bounty + line release state, plus
     wallet_transactions seller proceeds (posted + held), minus buyer
     wallet purchase spends (transaction_wallet_amount).
 
-    Bounty useable/pending follows ti_bounty_released_at (not transaction_in_escrow).
+    Bounty useable/pending follows ti_bounty_released_at (not transaction_in_escrow),
+    then subtracts active bounty_reclaim_reservation amounts (ledger SoT).
 
     useable = bounty_useable + SUM(posted wt_amount) - net_purchase_spent
     pending = bounty_pending + SUM(held wt_amount)
@@ -1439,6 +1464,14 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
         bounty_pending = 0.0
         bounty_useable = 0.0
 
+    from wallet_return_reservations import sum_active_bounty_reservation
+
+    bounty_reserved = sum_active_bounty_reservation(db, profile_id=profile_id)
+    bounty_pending, bounty_useable, bounty_reserved = _apply_bounty_reservation_to_pools(
+        bounty_pending, bounty_useable, bounty_reserved
+    )
+    bounty_total = _round_money(max(0.0, bounty_total - bounty_reserved))
+
     seller_posted = _sum_posted_wallet_transactions(db, profile_id)
     seller_held = _sum_held_wallet_transactions(db, profile_id)
     seller_proceeds = _round_money(seller_posted + seller_held)
@@ -1457,6 +1490,7 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
         "bounty_total": bounty_total,
         "bounty_useable": bounty_useable,
         "bounty_pending": bounty_pending,
+        "bounty_reserved": bounty_reserved,
         "seller_proceeds": seller_proceeds,
         "seller_posted": seller_posted,
         "seller_held": seller_held,

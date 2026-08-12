@@ -3,8 +3,10 @@ Wallet reservations for open return requests.
 
 When a buyer opens a return in-window, reserve seller sale proceeds and bounty
 pool so those amounts cannot become spendable until the return is confirmed or
-declined. Reservations are stored as wallet_transactions rows (status=reserved)
-and mirrored on wallet.wallet_reserve for balance consistency.
+declined. Reservations are stored as wallet_transactions rows (status=reserved).
+
+Bounty reclaim reservations mirror wallet_ledger (reduce actual + pending/useable
+pools). Seller proceeds use held return_clawback rows + pending holds.
 """
 
 import json
@@ -16,6 +18,8 @@ from wallet_service import (
     _to_float,
     adjust_wallet_reserve,
     apply_pending_clawback_hold,
+    credit_bounty_to_wallet,
+    debit_bounty_from_wallet,
     get_wallet_row,
     release_pending_clawback_hold,
 )
@@ -160,6 +164,50 @@ def _insert_proceeds_clawback_hold(
     }
 
 
+def _apply_bounty_reservation_wallet(db, profile_id, amount):
+    """
+    Debit bounty pools for an open return reservation.
+
+    Matches wallet_ledger bounty_reclaim_reserved: reduce actual/lifetime and
+    prefer pending over useable (useable_delta stays 0 when pending covers it).
+    """
+    return debit_bounty_from_wallet(
+        db, profile_id, amount, prefer_pending=True
+    )
+
+
+def _clear_bounty_reservation_wallet(db, profile_id, amount, *, finalize):
+    """
+    Undo or keep the bounty debit when a reservation is cleared.
+
+    Legacy rows parked funds in wallet_reserve (useable→reserve). New rows debit
+    actual immediately. Detect legacy via remaining wallet_reserve.
+    """
+    amount = _round_money(amount)
+    if not profile_id or amount <= 0:
+        return {"code": 200, "skipped": True}
+
+    wallet = get_wallet_row(db, profile_id) or {}
+    reserve = _to_float(wallet.get("wallet_reserve"))
+
+    if reserve + 0.0001 >= amount:
+        # Legacy: undo useable→reserve park first.
+        undo = adjust_wallet_reserve(db, profile_id, -amount)
+        if undo.get("code") != 200:
+            return undo
+        if finalize:
+            # Permanent reclaim after undoing the park.
+            return debit_bounty_from_wallet(
+                db, profile_id, amount, prefer_pending=True
+            )
+        return {"code": 200, "legacy_reserve_cleared": True, "finalized": False}
+
+    # New path: insert already debited actual. Finalize keeps debit; decline restores.
+    if finalize:
+        return {"code": 200, "kept_debit": True, "finalized": True}
+    return credit_bounty_to_wallet(db, profile_id, amount)
+
+
 def _insert_reservation_row(
     db,
     *,
@@ -229,16 +277,20 @@ def _insert_reservation_row(
             "message": ins.get("message", "Failed to insert reservation row"),
         }
 
-    reserve_result = adjust_wallet_reserve(db, profile_id, amount)
-    if reserve_result.get("code") != 200:
-        return reserve_result
+    if wt_type == WT_TYPE_BOUNTY_RECLAIM_RESERVATION:
+        wallet_result = _apply_bounty_reservation_wallet(db, profile_id, amount)
+    else:
+        # Legacy return_refund_reservation path (if any remain).
+        wallet_result = adjust_wallet_reserve(db, profile_id, amount)
+    if wallet_result.get("code") != 200:
+        return wallet_result
 
     return {
         "code": 200,
         "idempotent_replay": False,
         "wt_uid": wt_uid,
         "amount": amount,
-        "wallet_reserve": reserve_result,
+        "wallet": wallet_result,
     }
 
 
@@ -750,15 +802,27 @@ def sum_active_proceeds_reservation(db, *, transaction_uid=None, ti_uid=None):
 
 
 def sum_active_bounty_reservation(db, *, ti_uid=None, profile_id=None):
-    rows = _active_reservation_rows(db, ti_uid=ti_uid)
-    total = 0.0
-    for row in rows:
-        if (row.get("wt_type") or "") != WT_TYPE_BOUNTY_RECLAIM_RESERVATION:
-            continue
-        if profile_id and row.get("wt_profile_id") != profile_id:
-            continue
-        total += _to_float(row.get("wt_amount"))
-    return _round_money(total)
+    clauses = ["wt_status = %s", "wt_type = %s"]
+    params = [WT_STATUS_RESERVED, WT_TYPE_BOUNTY_RECLAIM_RESERVATION]
+    if ti_uid:
+        clauses.append("wt_ti_id = %s")
+        params.append(ti_uid)
+    if profile_id:
+        wallet_id = resolve_wallet_profile_id(profile_id)
+        clauses.append("wt_profile_id IN (%s, %s)")
+        params.extend([profile_id, wallet_id])
+    q = db.execute(
+        f"""
+        SELECT COALESCE(SUM(wt_amount), 0) AS reserved
+        FROM every_circle.wallet_transactions
+        WHERE {" AND ".join(clauses)}
+        """,
+        tuple(params),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return _round_money(rows[0].get("reserved"))
 
 
 def sum_active_bounty_reservation_for_line(db, ti_uid):
@@ -816,6 +880,7 @@ def clear_return_reservations(
         wt_uid = row.get("wt_uid")
         profile_id = row.get("wt_profile_id")
         amount = _round_money(row.get("wt_amount"))
+        wt_type = row.get("wt_type") or ""
         upd = db.update(
             "every_circle.wallet_transactions",
             {"wt_uid": wt_uid},
@@ -827,9 +892,14 @@ def clear_return_reservations(
                 "message": upd.get("message", "Failed to clear reservation"),
                 "wt_uid": wt_uid,
             }
-        reserve_result = adjust_wallet_reserve(db, profile_id, -amount)
-        if reserve_result.get("code") != 200:
-            return reserve_result
+        if wt_type == WT_TYPE_BOUNTY_RECLAIM_RESERVATION:
+            wallet_result = _clear_bounty_reservation_wallet(
+                db, profile_id, amount, finalize=finalize
+            )
+        else:
+            wallet_result = adjust_wallet_reserve(db, profile_id, -amount)
+        if wallet_result.get("code") != 200:
+            return wallet_result
         cleared += 1
 
     return {"code": 200, "cleared": cleared, "finalized": finalize}
