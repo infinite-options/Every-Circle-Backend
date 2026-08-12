@@ -484,7 +484,10 @@ def build_buyer_purchase_row_v3(db, profile_id, order_uid, *, tz_name=None):
     """
     from account_screen_purchases_v2 import build_purchases_v2_rows
     from datetime_utils import enrich_datetime_fields
+    from order_quantity_context import clear_ledger_quantity_caches
     from transactions import fetch_buyer_purchase_list_row
+
+    clear_ledger_quantity_caches()
 
     raw = fetch_buyer_purchase_list_row(db, profile_id, order_uid)
     if not raw:

@@ -74,11 +74,21 @@ def sale_received_label(row, units, *, audience="buyer"):
     active = int(units.get("active_qty") or 0)
     shipped = int(units.get("shipped_qty") or 0)
     verified = int(units.get("verified_qty") or 0)
-    verifiable = int(units.get("verifiable_remaining_qty") or 0)
     returned = int(units.get("returned_shipped_completed_qty") or 0) + int(
         units.get("returned_unshipped_completed_qty") or 0
     )
-    requires_ship = _requires_shipping(row)
+    returned_shipped = int(units.get("returned_shipped_completed_qty") or 0)
+    return_in_progress_shipped = int(units.get("return_in_progress_shipped_qty") or 0)
+    verifiable = int(units.get("verifiable_remaining_qty") or 0)
+    if verifiable <= 0 and audience == "buyer":
+        from units_ledger import compute_verifiable_remaining
+
+        verifiable = compute_verifiable_remaining(
+            shipped=shipped,
+            verified=verified,
+            returned_shipped=returned_shipped,
+            return_in_progress_shipped=return_in_progress_shipped,
+        )
 
     # Verified + completed returns cover all active units (e.g. 2 verified + 1 returned, active 3).
     resolved = verified + returned

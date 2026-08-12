@@ -798,6 +798,135 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["delivered_label"], "Not Shipped")
         self.assertEqual(display["received_label"], "No")
 
+    def test_buyer_sale_row_open_return_does_not_override_ship_progress(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 1,
+            "transaction_in_escrow": 1,
+            "fulfillment_method": "ship",
+            "requires_shipping": True,
+            "open_returns": [
+                {
+                    "trr_uid": "trr-1",
+                    "return_status": "returning",
+                    "refund_status": "pending",
+                    "display_status": "Returning - Pending",
+                }
+            ],
+            "units": {
+                "purchased_qty": 10,
+                "active_qty": 10,
+                "shipped_qty": 5,
+                "verified_qty": 4,
+                "verifiable_remaining_qty": 1,
+                "remaining_to_ship_qty": 5,
+            },
+        }
+        money = enrich_purchase_row_money(row, {"known": False})
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "5/10")
+        self.assertEqual(display["received_label"], "Verify")
+        self.assertEqual(display["received_action"], "verify")
+
+    def test_buyer_sale_row_open_return_without_verifiable_units(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 1,
+            "transaction_in_escrow": 1,
+            "fulfillment_method": "ship",
+            "requires_shipping": True,
+            "open_returns": [{"trr_uid": "trr-1", "return_status": "returning"}],
+            "units": {
+                "purchased_qty": 10,
+                "active_qty": 10,
+                "shipped_qty": 4,
+                "verified_qty": 4,
+                "verifiable_remaining_qty": 0,
+                "remaining_to_ship_qty": 6,
+            },
+        }
+        money = enrich_purchase_row_money(row, {"known": False})
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "4/10")
+        self.assertEqual(display["received_label"], "4/10")
+        self.assertEqual(display["received_action"], "status")
+
+    def test_build_v3_units_passes_sale_ledger_fields(self):
+        from account_screen_v3_contract import build_v3_units
+
+        units = build_v3_units(
+            {
+                "row_kind": "sale",
+                "units": {
+                    "purchased_qty": 10,
+                    "active_qty": 10,
+                    "shipped_qty": 5,
+                    "verified_qty": 4,
+                    "verifiable_remaining_qty": 1,
+                    "remaining_to_ship_qty": 5,
+                },
+            }
+        )
+        self.assertEqual(units["purchased_qty"], 10)
+        self.assertEqual(units["shipped_qty"], 5)
+        self.assertEqual(units["verified_qty"], 4)
+        self.assertEqual(units["verifiable_remaining_qty"], 1)
+        self.assertEqual(units["remaining_to_ship_qty"], 5)
+
+    def test_buyer_received_verify_after_partial_ship_with_open_verified_return(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 1,
+            "transaction_in_escrow": 1,
+            "fulfillment_method": "ship",
+            "requires_shipping": True,
+            "ti_shipped_qty": 6,
+            "ti_received_qty": 5,
+            "open_returns": [{"trr_uid": "trr-1", "return_status": "returning"}],
+            "units": {
+                "purchased_qty": 7,
+                "active_qty": 7,
+                "shipped_qty": 6,
+                "verified_qty": 5,
+                "verifiable_remaining_qty": 0,
+                "return_in_progress_shipped_qty": 1,
+                "remaining_to_ship_qty": 1,
+            },
+        }
+        money = enrich_purchase_row_money(row, {"known": False})
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "6/7")
+        self.assertEqual(display["received_label"], "Verify")
+        self.assertEqual(display["received_action"], "verify")
+
+    def test_compute_verifiable_remaining_new_ship_after_verified_return(self):
+        from units_ledger import compute_verifiable_remaining
+
+        self.assertEqual(
+            compute_verifiable_remaining(
+                shipped=6,
+                verified=5,
+                returned_shipped=0,
+                return_in_progress_shipped=1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            compute_verifiable_remaining(
+                shipped=6,
+                verified=5,
+                returned_shipped=0,
+                return_in_progress_shipped=0,
+            ),
+            1,
+        )
+
     def test_buyer_delivered_label_non_shipping(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
 

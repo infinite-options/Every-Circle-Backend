@@ -31,6 +31,31 @@ def _line_fulfillment_method(row):
     return str(row.get("ti_fulfillment_method") or row.get("fulfillment_method") or "ship").strip().lower()
 
 
+def compute_verifiable_remaining(
+    *,
+    shipped,
+    verified,
+    returned_shipped=0,
+    return_in_progress_shipped=0,
+):
+    """
+    Units the buyer may still confirm receipt of.
+
+    Open returns on already-verified units must not block verifying newly
+    shipped units on the same order line / aggregate.
+    """
+    unverified_shipped = max(0, int(shipped or 0) - int(verified or 0) - int(returned_shipped or 0))
+    rip = max(0, int(return_in_progress_shipped or 0))
+    if rip <= 0 or unverified_shipped <= 0:
+        return unverified_shipped
+
+    verified_not_returned = max(0, int(verified or 0) - int(returned_shipped or 0))
+    # Assume in-progress returns consume verified units first (buyer returns what they received).
+    return_on_unverified = max(0, rip - verified_not_returned)
+    return_on_unverified = min(return_on_unverified, unverified_shipped)
+    return max(0, unverified_shipped - return_on_unverified)
+
+
 def _units_from_counts(
     *,
     purchased,
@@ -51,7 +76,12 @@ def _units_from_counts(
         shipped = verified
 
     unverified_shipped = max(0, shipped - verified - returned_shipped)
-    verifiable_remaining = max(0, unverified_shipped - return_in_progress_shipped)
+    verifiable_remaining = compute_verifiable_remaining(
+        shipped=shipped,
+        verified=verified,
+        returned_shipped=returned_shipped,
+        return_in_progress_shipped=return_in_progress_shipped,
+    )
     if is_pickup_or_virtual:
         receivable = max(
             purchased - cancelled_pre_ship - cancelled_pre_ship_in_progress,

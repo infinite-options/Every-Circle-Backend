@@ -5493,6 +5493,7 @@ class Transactions(Resource):
                 tx_row_q = db.execute(
                     """
                     SELECT transaction_uid, transaction_business_id,
+                           transaction_profile_id,
                            COALESCE(transaction_type, 'sale') AS transaction_type
                     FROM every_circle.transactions
                     WHERE transaction_uid = %s
@@ -5720,6 +5721,20 @@ class Transactions(Resource):
                 response["code"] = 200
                 response["transaction_uid"] = transaction_uid
                 response["fulfillment_updates"] = updated_lines
+
+                buyer_profile_id = tx_row.get("transaction_profile_id")
+                if buyer_profile_id:
+                    from account_screen_v3 import build_buyer_purchase_row_v3
+
+                    tz_name = request.args.get("timezone") or request.args.get("tz")
+                    purchase_row = build_buyer_purchase_row_v3(
+                        db,
+                        buyer_profile_id,
+                        transaction_uid,
+                        tz_name=tz_name,
+                    )
+                    if purchase_row:
+                        response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:

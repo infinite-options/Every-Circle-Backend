@@ -188,8 +188,26 @@ def format_date_label(dt_value, tz_name=None):
     return dt.strftime("%b ") + str(dt.day)
 
 
+_SALE_UNITS_LEDGER_KEYS = (
+    "cancelled_pre_ship_qty",
+    "cancelled_pre_ship_in_progress_qty",
+    "shipped_qty",
+    "remaining_to_ship_qty",
+    "verified_qty",
+    "verifiable_remaining_qty",
+    "returned_shipped_completed_qty",
+    "returned_unshipped_completed_qty",
+    "return_in_progress_shipped_qty",
+    "return_in_progress_unshipped_qty",
+    "active_qty",
+    "remaining_returnable_qty",
+    "max_return_shipped_qty",
+    "max_cancel_unshipped_qty",
+)
+
+
 def build_v3_units(row):
-    """Map v2 units ledger to v3 {purchased_qty, return_shipped_qty, cancel_unshipped_qty}."""
+    """Map v2 units ledger to v3 purchases.rows[].units (sale + return shapes)."""
     kind = row.get("row_kind")
     units = row.get("units") or {}
 
@@ -213,11 +231,15 @@ def build_v3_units(row):
         or row.get("ti_bs_qty")
         or 0
     )
-    return {
+    out = {
         "purchased_qty": purchased,
         "return_shipped_qty": 0,
         "cancel_unshipped_qty": 0,
     }
+    for key in _SALE_UNITS_LEDGER_KEYS:
+        if units.get(key) is not None:
+            out[key] = int(units.get(key) or 0)
+    return out
 
 
 def build_order_money(row, *, sale_line=None):
@@ -315,17 +337,25 @@ def _display_units(row):
         )
     if units.get("active_qty") is None:
         units["active_qty"] = int(units.get("purchased_qty") or 0)
-    if units.get("shipped_qty") is None and row.get("ti_shipped_qty") is not None:
+    if row.get("ti_shipped_qty") is not None:
         units["shipped_qty"] = int(row.get("ti_shipped_qty") or 0)
-    if units.get("verified_qty") is None and row.get("ti_received_qty") is not None:
+    elif units.get("shipped_qty") is None:
+        units["shipped_qty"] = 0
+    if row.get("ti_received_qty") is not None:
         units["verified_qty"] = int(row.get("ti_received_qty") or 0)
+    elif units.get("verified_qty") is None:
+        units["verified_qty"] = 0
     if units.get("remaining_to_ship_qty") is None and row.get("unshipped_item_count") is not None:
         units["remaining_to_ship_qty"] = int(row.get("unshipped_item_count") or 0)
-    if units.get("verifiable_remaining_qty") is None:
-        units["verifiable_remaining_qty"] = max(
-            int(units.get("shipped_qty") or 0) - int(units.get("verified_qty") or 0),
-            0,
-        )
+
+    from units_ledger import compute_verifiable_remaining
+
+    units["verifiable_remaining_qty"] = compute_verifiable_remaining(
+        shipped=units.get("shipped_qty"),
+        verified=units.get("verified_qty"),
+        returned_shipped=units.get("returned_shipped_completed_qty"),
+        return_in_progress_shipped=units.get("return_in_progress_shipped_qty"),
+    )
     return units
 
 
@@ -363,10 +393,6 @@ def _buyer_purchase_delivered_label(row, units):
         if row.get("cancel_unshipped") or row.get("pre_ship_cancel"):
             return "Cancelled"
         return "Returned"
-
-    open_returns = row.get("open_returns") or []
-    if open_returns:
-        return "Returning"
 
     purchased = int(units.get("purchased_qty") or 0)
     active = int(units.get("active_qty") or purchased)
