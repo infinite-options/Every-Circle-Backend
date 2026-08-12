@@ -1,11 +1,11 @@
 """
-Aggregated payloads for the mobile Account screen.
+Aggregated payloads for the mobile Account screen (schema v3).
 
-Two routes reduce parallel fan-out:
-  - Personal: purchases + bounty results + seller-side line items (same IDs as legacy).
-  - Business: seller transactions + business bounty results + business info.
+One GET renders wallet, earnings, ledger (first page), purchases, sales,
+bounty results, and profile — no separate wallet_ledger fetch on initial load.
 
-Mutations (PUT transactions, decline returns) stay on existing endpoints.
+Mutations stay on existing endpoints; after success the client refreshes
+account-screen only.
 """
 
 from flask_restful import Resource
@@ -16,117 +16,228 @@ from transactions import Transactions, SellerTransactions
 from bounty_results import BountyResults, BusinessBountyResults
 from business_info import BusinessInfo
 from datetime_utils import enrich_datetime_fields
-from order_list_hydration import attach_order_list_hydration
-from wallet_service import build_wallet_summary
+from account_screen_purchases_v2 import build_purchases_v2_rows
+from account_screen_seller_v2 import build_seller_transactions_v2_rows
+from account_screen_v2_contract import finalize_account_screen_rows
 from wallet_transactions_service import resolve_seller_wallet_profile_id
+
+from account_screen_v3 import (
+    _parse_ledger_pagination,
+    build_bounty_results_v3,
+    build_earnings_v3,
+    build_profile_v3_business,
+    build_profile_v3_personal,
+    build_purchases_v3,
+    build_sales_products_v3,
+    build_sales_v3,
+    build_wallet_ledger_v3,
+    build_wallet_v3,
+)
+
+
+def _load_personal_offerings(db, profile_id):
+    rows = db.execute(
+        """
+        SELECT profile_expertise_uid, profile_expertise_title,
+               profile_expertise_quantity, profile_expertise_cost,
+               profile_expertise_bounty, profile_expertise_sku
+        FROM every_circle.profile_expertise
+        WHERE profile_expertise_profile_personal_id = %s
+        ORDER BY profile_expertise_title
+        """,
+        (profile_id,),
+    )
+    return (rows or {}).get("result") or []
+
+
+def _load_business_products(db, business_uid):
+    rows = db.execute(
+        """
+        SELECT bs_uid, bs_service_name, bs_quantity, bs_cost, bs_bounty, bs_sku
+        FROM every_circle.business_services
+        WHERE bs_business_id = %s
+        ORDER BY bs_service_name
+        """,
+        (business_uid,),
+    )
+    return (rows or {}).get("result") or []
 
 
 def _request_timezone():
     return request.args.get("timezone") or request.args.get("tz")
 
 
-def _merge_body_status(body, status):
-    """Ensure each subsection is a dict with a numeric code for the client."""
-    if not isinstance(body, dict):
-        return {"code": status, "data": body}
-    out = dict(body)
-    out.setdefault("code", status if status is not None else out.get("code"))
-    return out
-
-
-def _enrich_section_datetimes(body, field="transaction_datetime"):
-    """Ensure nested account-screen lists expose UTC (+ optional local) datetimes."""
-    if not isinstance(body, dict):
-        return body
-
+def _enrich_rows_datetimes(rows, field="transaction_datetime"):
+    if not rows:
+        return rows
     tz_name = _request_timezone()
-    data = body.get("data")
-    if not isinstance(data, list):
-        return body
-
     enriched = []
-    for row in data:
+    for row in rows:
         if isinstance(row, dict):
             enriched.append(enrich_datetime_fields(dict(row), field, tz_name))
         else:
             enriched.append(row)
-
-    body = dict(body)
-    body["data"] = enriched
-    if tz_name:
-        body["timezone"] = tz_name
-    body["datetime_storage"] = "UTC"
-    return body
+    return enriched
 
 
 class AccountScreenPersonal(Resource):
     """
     GET /api/v1/account-screen/personal/<profile_id>
 
-    Combines:
-      - GET /api/v1/transactions/<profile_id>  (purchases)
-      - GET /api/bountyresults/<profile_id>
-      - GET /api/v1/transactions/seller/<profile_id>  (seller / expertise lines)
+    Schema v3: single authoritative payload for Purchases, Sales, Earnings,
+    Bounty table, Wallet summary, and embedded wallet_ledger (paginated).
+
+    Query params:
+      timezone / tz — profile timezone for display labels and earnings chart
+      ledger_offset, ledger_limit — ledger pagination (default 0, 50)
     """
 
     def get(self, profile_id):
         if not profile_id:
             return {"code": 400, "message": "profile_id is required"}, 400
 
+        tz_name = _request_timezone()
+        ledger_limit, ledger_offset = _parse_ledger_pagination(request.args)
+
         purchases_body, purchases_status = Transactions().get(profile_id)
         bounty_body, bounty_status = BountyResults().get(profile_id)
         seller_body, seller_status = SellerTransactions().get(profile_id)
 
-        purchases_body = _enrich_section_datetimes(purchases_body)
-        bounty_body = _enrich_section_datetimes(bounty_body)
-        seller_body = _enrich_section_datetimes(seller_body)
+        if purchases_status not in (200, None):
+            return purchases_body, purchases_status
 
         response = {
             "code": 200,
-            "purchases": _merge_body_status(purchases_body, purchases_status),
-            "bounty_results": _merge_body_status(bounty_body, bounty_status),
-            "seller_transactions": _merge_body_status(seller_body, seller_status),
+            "schema_version": 3,
+            "account_screen_type": "personal",
+            "account_screen_id": profile_id,
+            "wallet": None,
+            "earnings": None,
+            "wallet_ledger": None,
+            "purchases": {"rows": []},
+            "sales": {"offerings": [], "transactions": []},
+            "bounty_results": {"rows": []},
+            "profile": None,
         }
-        with connect() as db:
-            attach_order_list_hydration(response, db, mode="personal")
-            response["wallet"] = build_wallet_summary(db, profile_id)
+        if tz_name:
+            response["timezone"] = tz_name
+        response["datetime_storage"] = "UTC"
 
-        return (response, 200)
+        with connect() as db:
+            source_rows = (purchases_body or {}).get("data") or []
+            if (purchases_body or {}).get("schema_version") == 2:
+                purchase_rows = _enrich_rows_datetimes(source_rows)
+            else:
+                purchase_rows = build_purchases_v2_rows(db, source_rows)
+                purchase_rows = _enrich_rows_datetimes(purchase_rows)
+            response["purchases"] = build_purchases_v3(db, purchase_rows, tz_name=tz_name)
+
+            seller_legacy = (seller_body or {}).get("data") or []
+            seller_v2_rows = finalize_account_screen_rows(
+                build_seller_transactions_v2_rows(db, seller_legacy)
+            )
+            seller_v2_rows = _enrich_rows_datetimes(seller_v2_rows)
+            offerings = _load_personal_offerings(db, profile_id)
+            response["sales"] = build_sales_v3(
+                db,
+                profile_id,
+                seller_v2_rows,
+                tz_name=tz_name,
+                offerings_source=offerings,
+            )
+
+            bounty_legacy = (bounty_body or {}).get("data") or []
+            bounty_enriched = _enrich_rows_datetimes(bounty_legacy)
+            response["bounty_results"] = build_bounty_results_v3(
+                db, bounty_enriched, tz_name=tz_name
+            )
+
+            response["wallet"] = build_wallet_v3(db, profile_id)
+            response["earnings"] = build_earnings_v3(db, profile_id, tz_name)
+            response["wallet_ledger"] = build_wallet_ledger_v3(
+                db,
+                profile_id,
+                offset=ledger_offset,
+                limit=ledger_limit,
+                tz_name=tz_name,
+            )
+            response["profile"] = build_profile_v3_personal(db, profile_id)
+
+        return response, 200
 
 
 class AccountScreenBusiness(Resource):
     """
     GET /api/v1/account-screen/business/<business_uid>
 
-    Combines:
-      - GET /api/v1/transactions/seller/<business_uid>
-      - GET /api/business-bountyresults/<business_uid>
-      - GET /api/v1/businessinfo/<business_uid>
+    Same v3 envelope as personal; sales.products[] for business inventory catalog.
+    Wallet/ledger omitted when no seller wallet profile exists.
     """
 
     def get(self, business_uid):
         if not business_uid:
             return {"code": 400, "message": "business_uid is required"}, 400
 
+        tz_name = _request_timezone()
+        ledger_limit, ledger_offset = _parse_ledger_pagination(request.args)
+
         seller_body, seller_status = SellerTransactions().get(business_uid)
         bounty_body, bounty_status = BusinessBountyResults().get(business_uid)
         info_body, info_status = BusinessInfo().get(business_uid)
 
-        seller_body = _enrich_section_datetimes(seller_body)
-        bounty_body = _enrich_section_datetimes(bounty_body)
-
         response = {
             "code": 200,
-            "seller_transactions": _merge_body_status(seller_body, seller_status),
-            "business_bounty_results": _merge_body_status(
-                bounty_body, bounty_status
-            ),
-            "business_info": _merge_body_status(info_body, info_status),
+            "schema_version": 3,
+            "account_screen_type": "business",
+            "account_screen_id": business_uid,
+            "wallet": None,
+            "earnings": None,
+            "wallet_ledger": None,
+            "purchases": {"rows": []},
+            "sales": {"products": [], "transactions": []},
+            "bounty_results": {"rows": []},
+            "profile": None,
         }
+        if tz_name:
+            response["timezone"] = tz_name
+        response["datetime_storage"] = "UTC"
+
         with connect() as db:
-            attach_order_list_hydration(response, db, mode="business")
+            seller_legacy = (seller_body or {}).get("data") or []
+            seller_v2_rows = finalize_account_screen_rows(
+                build_seller_transactions_v2_rows(db, seller_legacy)
+            )
+            seller_v2_rows = _enrich_rows_datetimes(seller_v2_rows)
+
+            products = _load_business_products(db, business_uid)
+            response["sales"] = build_sales_products_v3(
+                db,
+                business_uid,
+                seller_v2_rows,
+                tz_name=tz_name,
+                products_source=products,
+            )
+
+            bounty_legacy = (bounty_body or {}).get("data") or []
+            bounty_enriched = _enrich_rows_datetimes(bounty_legacy)
+            response["bounty_results"] = build_bounty_results_v3(
+                db, bounty_enriched, tz_name=tz_name
+            )
+
             wallet_profile_id = resolve_seller_wallet_profile_id(db, business_uid)
             if wallet_profile_id:
-                response["wallet"] = build_wallet_summary(db, wallet_profile_id)
+                response["wallet"] = build_wallet_v3(db, wallet_profile_id)
+                response["earnings"] = build_earnings_v3(
+                    db, wallet_profile_id, tz_name
+                )
+                response["wallet_ledger"] = build_wallet_ledger_v3(
+                    db,
+                    wallet_profile_id,
+                    offset=ledger_offset,
+                    limit=ledger_limit,
+                    tz_name=tz_name,
+                )
 
-        return (response, 200)
+            response["profile"] = build_profile_v3_business(info_body)
+
+        return response, 200

@@ -8,26 +8,38 @@ from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
-from transaction_receipt import _parse_selected_options_field
+from transaction_receipt import _parse_selected_options_field, _enrich_receipt_line
 from transaction_shipping import (
     load_shipping_for_transaction,
     shipping_payload_from_row,
     fulfillment_fields_from_row,
-    apply_order_fulfillment_summary,
-    line_is_shippable_row,
 )
+from units_ledger import (
+    sale_units_ledger,
+    attach_line_units_ledgers,
+    sale_display,
+    seller_sale_display,
+    sync_legacy_unit_fields,
+    enrich_sale_row_v2,
+    fulfillment_method,
+    order_fulfillment_method,
+)
+from line_commerce_fields import attach_sale_lines_commerce, round_money
 from transactions import (
     _load_return_request,
     _load_open_return_requests,
     _pair_for_sale,
     _status_payload,
     _remaining_to_ship_qty,
+    _confirmed_return_split,
+    _return_ledger_line_split,
     _is_cancel_unshipped_request,
     _batch_return_requests,
     _omit_empty,
     _is_return_list_row,
     _resolve_parent_sale_uid,
     line_return_eligibility,
+    _order_bounty_paid,
     RETURN_STATUS_RETURNED,
     REFUND_STATUS_REFUNDED,
 )
@@ -46,6 +58,27 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _attach_sale_commerce_fields(db, sale_payload, order_uid, *, buyer_profile_id=None):
+    """Order + line bounty/shipping fields for order detail."""
+    if not isinstance(sale_payload, dict) or not order_uid:
+        return sale_payload
+
+    lines = sale_payload.get("lines") or []
+    attach_sale_lines_commerce(db, lines, buyer_profile_id=buyer_profile_id)
+
+    line_bounty_sum = sum(round_money(line.get("line_bounty_paid")) for line in lines if isinstance(line, dict))
+    order_bounty = round_money(_order_bounty_paid(db, order_uid))
+    if not order_bounty and line_bounty_sum:
+        order_bounty = line_bounty_sum
+
+    sale_payload["order_bounty_paid"] = order_bounty
+    if order_bounty:
+        sale_payload["bounty_amount"] = round_money(-order_bounty)
+
+    sale_payload.setdefault("transaction_fees", sale_payload.get("transaction_fees"))
+    return sale_payload
 
 
 def _enrich_order_datetimes(payload, tz_name):
@@ -114,9 +147,11 @@ def _can_view_order(sale_row, profile_id, business_uid):
         return False
     if profile_id and str(sale_row.get("transaction_profile_id")) == str(profile_id):
         return True
-    if business_uid and str(sale_row.get("transaction_business_id")) == str(
-        business_uid
-    ):
+    seller_business_id = str(sale_row.get("transaction_business_id") or "")
+    if business_uid and seller_business_id == str(business_uid):
+        return True
+    # Personal sellers often use profile_personal_uid as transaction_business_id.
+    if profile_id and seller_business_id == str(profile_id):
         return True
     return False
 
@@ -184,6 +219,10 @@ def _load_sale_lines(db, order_uid):
             ti.ti_selected_options,
             ti.ti_bs_is_returnable,
             ti.ti_bs_return_window_days,
+            ti.ti_bs_is_taxable,
+            ti.ti_bs_tax_rate,
+            ti.ti_line_tax_amount,
+            ti.ti_tax_amount,
             COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
             COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
             ti.ti_shipped_at,
@@ -197,21 +236,12 @@ def _load_sale_lines(db, order_uid):
             {name_case} AS item_name,
             bs.bs_service_name,
             bs.bs_service_desc,
-            COALESCE((
-                SELECT SUM(ABS(rti.ti_bs_qty))
-                FROM every_circle.transactions_items rti
-                INNER JOIN every_circle.transactions rt
-                    ON rti.ti_transaction_id = rt.transaction_uid
-                WHERE rt.transaction_original_uid = %s
-                  AND COALESCE(rt.transaction_type, 'return') = 'return'
-                  AND (
-                      rti.ti_original_ti_uid = ti.ti_uid
-                      OR (
-                          rti.ti_original_ti_uid IS NULL
-                          AND rti.ti_bs_id = ti.ti_bs_id
-                      )
-                  )
-            ), 0) AS returned_qty
+            bs.bs_bounty,
+            bs.bs_bounty_type,
+            pe.profile_expertise_cost,
+            pe.profile_expertise_cost_currency,
+            pe.profile_expertise_bounty,
+            pe.profile_expertise_bounty_type
         FROM every_circle.transactions_items ti
         LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
         LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
@@ -219,12 +249,14 @@ def _load_sale_lines(db, order_uid):
         WHERE ti.ti_transaction_id = %s
         ORDER BY ti.ti_uid ASC
         """,
-        (order_uid, order_uid),
+        (order_uid,),
     )
     lines = []
     for row in lines_q.get("result") or []:
         order_qty = int(row.get("ti_bs_qty") or 0)
-        returned_qty = int(row.get("returned_qty") or 0)
+        returned_qty, cancelled_qty = _confirmed_return_split(
+            db, order_uid, row.get("ti_uid")
+        )
         shipped_qty = int(row.get("ti_shipped_qty") or 0)
         remaining_to_ship = _remaining_to_ship_qty(
             db,
@@ -232,20 +264,35 @@ def _load_sale_lines(db, order_uid):
             row.get("ti_uid"),
             order_qty,
             shipped_qty,
+            ti_row=row,
         )
+        active_units = max(order_qty - cancelled_qty - returned_qty, 0)
+        from order_quantity_context import line_quantity_context as _line_qty_ctx
+
+        qty_ctx = _line_qty_ctx(db, order_uid, row.get("ti_uid"), row=row)
         eligibility = line_return_eligibility(row)
         line = {
             "ti_uid": row.get("ti_uid"),
             "ti_bs_id": row.get("ti_bs_id"),
             "ti_bs_qty": order_qty,
             "ti_received_qty": int(row.get("ti_received_qty") or 0),
+            "cancelled_qty": cancelled_qty,
             "returned_qty": returned_qty,
-            "remaining_qty": max(order_qty - returned_qty, 0),
+            "returned_qty_total": cancelled_qty + returned_qty,
+            "remaining_qty": active_units,
             "remaining_to_ship": remaining_to_ship,
+            "unverified_shipped_qty": qty_ctx.get("unverified_shipped_qty", 0),
+            "verified_returnable_qty": qty_ctx.get("verified_returnable_qty", 0),
             "ti_bs_cost": row.get("ti_bs_cost"),
             "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
             "ti_shipping_amount": row.get("ti_shipping_amount"),
             "ti_shipping_refundable": row.get("ti_shipping_refundable"),
+            "ti_line_shipping_amount": row.get("ti_line_shipping_amount"),
+            "ti_listing_shipping": row.get("ti_listing_shipping"),
+            "ti_bs_is_taxable": row.get("ti_bs_is_taxable"),
+            "ti_bs_tax_rate": row.get("ti_bs_tax_rate"),
+            "ti_line_tax_amount": row.get("ti_line_tax_amount"),
+            "ti_tax_amount": row.get("ti_tax_amount"),
             "ti_special_instructions": row.get("ti_special_instructions"),
             "item_name": row.get("item_name"),
             "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
@@ -259,7 +306,7 @@ def _load_sale_lines(db, order_uid):
             "return_ineligible_reason": eligibility["return_ineligible_reason"],
             **fulfillment_fields_from_row(row),
         }
-        lines.append(line)
+        lines.append(_enrich_receipt_line(line))
     return lines
 
 
@@ -293,10 +340,17 @@ def _load_return_transactions(db, order_uid):
                 ti.ti_original_ti_uid,
                 ti.ti_bs_id,
                 ti.ti_bs_qty,
+                ti.ti_return_shipped_qty,
+                ti.ti_cancel_unshipped_qty,
                 ti.ti_bs_cost,
                 ti.ti_choices_extra_cost,
                 ti.ti_shipping_amount,
                 ti.ti_shipping_refundable,
+                ti.ti_line_shipping_amount,
+                ti.ti_bs_is_taxable,
+                ti.ti_bs_tax_rate,
+                ti.ti_line_tax_amount,
+                ti.ti_tax_amount,
                 ti.ti_special_instructions,
                 ti.ti_selected_options,
                 {name_case} AS item_name,
@@ -314,17 +368,29 @@ def _load_return_transactions(db, order_uid):
         return_lines = []
         for row in lines_q.get("result") or []:
             qty = int(row.get("ti_bs_qty") or 0)
+            return_shipped_qty, cancel_unshipped_qty = _return_ledger_line_split(
+                db, return_uid, row
+            )
             return_lines.append(
                 {
                     "ti_uid": row.get("ti_uid"),
                     "ti_original_ti_uid": row.get("ti_original_ti_uid"),
+                    "transaction_item_uid": row.get("ti_original_ti_uid")
+                    or row.get("ti_uid"),
                     "ti_bs_id": row.get("ti_bs_id"),
                     "ti_bs_qty": qty,
                     "return_quantity": abs(qty),
+                    "return_shipped_qty": return_shipped_qty,
+                    "cancel_unshipped_qty": cancel_unshipped_qty,
                     "ti_bs_cost": row.get("ti_bs_cost"),
                     "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
                     "ti_shipping_amount": row.get("ti_shipping_amount"),
                     "ti_shipping_refundable": row.get("ti_shipping_refundable"),
+                    "ti_line_shipping_amount": row.get("ti_line_shipping_amount"),
+                    "ti_bs_is_taxable": row.get("ti_bs_is_taxable"),
+                    "ti_bs_tax_rate": row.get("ti_bs_tax_rate"),
+                    "ti_line_tax_amount": row.get("ti_line_tax_amount"),
+                    "ti_tax_amount": row.get("ti_tax_amount"),
                     "ti_special_instructions": row.get("ti_special_instructions"),
                     "item_name": row.get("item_name"),
                     "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
@@ -334,6 +400,10 @@ def _load_return_transactions(db, order_uid):
                     ),
                 }
             )
+
+        from line_commerce_fields import expand_return_lines_list
+
+        return_lines = expand_return_lines_list(db, order_uid, return_lines)
 
         returns.append(
             {
@@ -394,61 +464,29 @@ def _enrich_return_transactions_with_status(db, order_uid, sale, returns):
     return enriched
 
 
-def _apply_sale_fulfillment_rollup(sale_payload):
-    """Order-level shipping/received counts from sale lines (matches list rollups)."""
-    lines = sale_payload.get("lines") or []
-    shippable = unshipped = delivered = received = order_qty_total = 0
-    shippable_units = shipped_units = 0
-    has_in_transit = 0
+def _apply_sale_fulfillment_rollup(db, sale_payload):
+    """Order-level shipping/received counts (shared with account-screen list rows)."""
+    from transaction_shipping import build_order_fulfillment_summary
 
-    for line in lines:
-        order_qty = int(line.get("ti_bs_qty") or 0)
-        shipped_qty = int(line.get("ti_shipped_qty") or line.get("shipped_qty") or 0)
-        received_qty = int(line.get("ti_received_qty") or 0)
-        order_qty_total += order_qty
-        received += received_qty
+    order_uid = sale_payload.get("transaction_uid")
+    if not order_uid:
+        return sale_payload
 
-        if not line_is_shippable_row(line):
-            continue
+    summary_row = build_order_fulfillment_summary(db, order_uid)
+    if not summary_row:
+        return sale_payload
 
-        status = (
-            line.get("ti_fulfillment_status")
-            or line.get("fulfillment_status")
-            or "not_required"
-        )
-
-        shippable += 1
-        shippable_units += order_qty
-        shipped_units += shipped_qty
-        unshipped += max(order_qty - shipped_qty, 0)
-        if status == "delivered" and shipped_qty >= order_qty:
-            delivered += 1
-        if status == "in_transit":
-            has_in_transit = 1
-
-    summary_row = {
-        "shippable_item_count": shippable,
-        "shipped_item_count": shipped_units,
-        "unshipped_item_count": unshipped,
-        "delivered_item_count": delivered,
-        "has_in_transit": has_in_transit,
-        "has_shippable_items": 1 if shippable > 0 else 0,
-        "ti_shipped_qty": shipped_units,
-        "shippable_unit_count": shippable_units,
-        "ti_received_qty": received,
-        "ti_bs_qty": order_qty_total,
-        "received_item_count": received,
-    }
-    apply_order_fulfillment_summary([summary_row])
-
-    sale_payload["transaction_uid"] = sale_payload.get("transaction_uid")
+    sale_payload["transaction_uid"] = order_uid
     sale_payload["shippable_item_count"] = summary_row["shippable_item_count"]
     sale_payload["shipped_item_count"] = summary_row["shipped_item_count"]
     sale_payload["unshipped_item_count"] = summary_row["unshipped_item_count"]
     sale_payload["delivered_item_count"] = summary_row["delivered_item_count"]
     sale_payload["ti_shipped_qty"] = summary_row.get("ti_shipped_qty", 0)
-    sale_payload["ti_received_qty"] = received
-    sale_payload["received_item_count"] = received
+    sale_payload["ti_received_qty"] = summary_row.get("ti_received_qty", 0)
+    sale_payload["received_item_count"] = summary_row.get("received_item_count", 0)
+    sale_payload["purchased_units"] = summary_row.get("purchased_units", 0)
+    sale_payload["received_units"] = summary_row.get("received_units", 0)
+    sale_payload["cancelled_qty"] = summary_row.get("cancelled_qty", 0)
     sale_payload["all_items_received"] = summary_row["all_items_received"]
     sale_payload["all_items_shipped"] = summary_row["all_items_shipped"]
     sale_payload["has_shippable_items"] = summary_row["has_shippable_items"]
@@ -492,6 +530,9 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     Build the full order-detail payload for a sale uid.
     Used by GET /orders/:uid and account-screen order_list_hydration.
     """
+    from transaction_shipping import ensure_fulfillment_list_rollups
+
+    ensure_fulfillment_list_rollups(db)
     sale = _load_sale_header(db, order_uid)
     if not sale:
         return None
@@ -505,8 +546,7 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     pending_return = (
         open_returns[0] if open_returns else _load_return_request(db, order_uid)
     )
-    return_status, refund_status = _pair_for_sale(sale, pending_return)
-    status_fields = _status_payload(return_status, refund_status)
+    has_open_pending = bool(open_returns)
 
     pending_returns_payload = [
         _pending_payload_for_order(db, sale, req, compact=True)
@@ -516,21 +556,72 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         pending_returns_payload[0] if pending_returns_payload else None
     )
 
+    if has_open_pending:
+        status_fields = {}
+    else:
+        return_status, refund_status = _pair_for_sale(sale, pending_return)
+        status_fields = _status_payload(return_status, refund_status)
+
+    transaction_return_items = []
+    for req in open_returns:
+        transaction_return_items.extend(req.get("items") or [])
+    if transaction_return_items:
+        ti_uids = [
+            e.get("transaction_item_uid") or e.get("ti_uid")
+            for e in transaction_return_items
+            if e.get("transaction_item_uid") or e.get("ti_uid")
+        ]
+        from transactions import _sale_item_names_by_ti
+
+        name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
+        enriched_return_items = []
+        for entry in transaction_return_items:
+            item = dict(entry)
+            ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+            looked = name_map.get(ti_uid) or {}
+            if looked.get("item_name") and not item.get("item_name"):
+                item["item_name"] = looked["item_name"]
+            if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
+                item["ti_bs_cost"] = looked["ti_bs_cost"]
+            enriched_return_items.append(item)
+        from line_commerce_fields import expand_return_lines_list
+
+        transaction_return_items = expand_return_lines_list(
+            db, order_uid, enriched_return_items
+        )
+
     sale_payload = dict(sale)
     sale_payload["lines"] = sale_lines
+    _attach_sale_commerce_fields(
+        db,
+        sale_payload,
+        order_uid,
+        buyer_profile_id=sale.get("transaction_profile_id"),
+    )
     sale_payload["pending_return"] = pending_return_payload
     sale_payload["pending_returns"] = pending_returns_payload
     if pending_return_payload:
-        sale_payload["transaction_return_note"] = pending_return_payload.get("note")
+        sale_payload["transaction_return_note"] = pending_return_payload.get(
+            "note"
+        ) or pending_return_payload.get("trr_note")
         sale_payload["transaction_return_seller_note"] = pending_return_payload.get(
             "seller_note"
         )
+    if transaction_return_items:
+        sale_payload["transaction_return_items"] = transaction_return_items
     sale_payload.update(status_fields)
     sale_payload.update(shipping)
-    _apply_sale_fulfillment_rollup(sale_payload)
+    _apply_sale_fulfillment_rollup(db, sale_payload)
 
     stripe_refund = _stripe_refund_summary(
-        status_fields, pending_returns_payload, returns
+        status_fields
+        or (
+            {"refund_status": pending_return_payload.get("refund_status")}
+            if pending_return_payload
+            else {}
+        ),
+        pending_returns_payload,
+        returns,
     )
 
     payload = {
@@ -544,9 +635,106 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         **status_fields,
         **shipping,
     }
+    if transaction_return_items:
+        payload["transaction_return_items"] = transaction_return_items
+    if sale.get("transaction_return_requested") is not None:
+        payload["transaction_return_requested"] = sale.get("transaction_return_requested")
+    note = sale_payload.get("transaction_return_note")
+    if note:
+        payload["transaction_return_note"] = note
     if stripe_refund is not None:
         payload["stripe_refund"] = stripe_refund
     return payload
+
+
+def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
+    """
+    Add schema v2 unit ledger to order-detail.
+
+    audience: "buyer" | "seller" — controls display label rules.
+    sale.units must match account-screen row for the same order at the same time.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    sale = payload.get("sale")
+    if not isinstance(sale, dict):
+        return payload
+
+    sale = dict(sale)
+    header = dict(sale)
+    header.update(
+        {
+            k: payload.get(k)
+            for k in ("requires_shipping", "fulfillment_method", "transaction_in_escrow")
+            if payload.get(k) is not None
+        }
+    )
+    if not header.get("fulfillment_method"):
+        method = fulfillment_method(sale)
+        if method == "ship" and not sale.get("ti_fulfillment_method"):
+            method = order_fulfillment_method(db, order_uid)
+        header["fulfillment_method"] = method
+
+    enriched = enrich_sale_row_v2(db, header, audience=audience)
+    units = enriched["units"]
+    sale["units"] = units
+    sale["display"] = enriched["display"]
+    sale["requires_shipping"] = enriched.get("requires_shipping")
+    sale["fulfillment_method"] = enriched.get("fulfillment_method")
+    if audience == "seller":
+        sync_legacy_unit_fields(sale, units)
+
+    lines = attach_line_units_ledgers(db, order_uid, sale.get("lines") or [])
+    from line_commerce_fields import (
+        attach_line_tax_amount_fields,
+        line_merchandise_total_from_row,
+        line_snapshot_api_fields,
+        order_money_from_line_snapshots,
+    )
+
+    for line in lines:
+        if isinstance(line, dict) and line.get("ti_bs_return_window_days") is not None:
+            line["return_window_days"] = line.get("ti_bs_return_window_days")
+        if isinstance(line, dict):
+            line["money"] = order_money_from_line_snapshots(line)
+            line.update(line_snapshot_api_fields(line))
+            attach_line_tax_amount_fields(line)
+            merch_total = line_merchandise_total_from_row(line)
+            if merch_total is not None:
+                line["line_merchandise_total"] = merch_total
+    sale["lines"] = lines
+    if len(lines) == 1 and isinstance(lines[0], dict):
+        sale["ti_uid"] = lines[0].get("ti_uid")
+
+    payload = dict(payload)
+    payload["sale"] = sale
+    payload["schema_version"] = 3
+
+    returns = []
+    for ret in payload.get("returns") or []:
+        if not isinstance(ret, dict):
+            returns.append(ret)
+            continue
+        entry = dict(ret)
+        ret_lines = entry.get("lines") or []
+        for ret_line in ret_lines:
+            if isinstance(ret_line, dict) and ret_line.get("line_tax_refund") is not None:
+                # Canonical FE key already present from expand_return_lines_list.
+                money = ret_line.get("money")
+                if isinstance(money, dict):
+                    money.setdefault("known", True)
+                    money.setdefault("tax", ret_line.get("line_tax_refund"))
+        entry["return_lines"] = ret_lines
+        returns.append(entry)
+    payload["returns"] = returns
+
+    return payload
+
+
+def enrich_buyer_order_v2(db, order_uid, payload):
+    """Backward-compat alias."""
+    return enrich_order_v2(db, order_uid, payload, audience="buyer")
 
 
 class OrderDetail(Resource):
@@ -573,6 +761,9 @@ class OrderDetail(Resource):
                 return response, 403
 
             with connect() as db:
+                from order_quantity_context import clear_ledger_quantity_caches
+
+                clear_ledger_quantity_caches()
                 order_uid, resolved_from_return_uid = resolve_order_uid(
                     db, transaction_uid
                 )
@@ -598,6 +789,23 @@ class OrderDetail(Resource):
                     requested_transaction_uid=transaction_uid,
                 )
                 payload["resolved_from_return_uid"] = resolved_from_return_uid
+
+                is_buyer = (
+                    profile_id
+                    and str(sale.get("transaction_profile_id")) == str(profile_id)
+                )
+                is_seller = bool(
+                    (business_uid and str(sale.get("transaction_business_id")) == str(business_uid))
+                    or (
+                        profile_id
+                        and str(sale.get("transaction_business_id")) == str(profile_id)
+                        and not is_buyer
+                    )
+                )
+                if is_buyer:
+                    payload = enrich_order_v2(db, order_uid, payload, audience="buyer")
+                elif is_seller:
+                    payload = enrich_order_v2(db, order_uid, payload, audience="seller")
 
                 tz_name = _request_timezone()
                 payload = _enrich_order_datetimes(payload, tz_name)

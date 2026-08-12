@@ -1,11 +1,18 @@
 """
 Seller wallet_transactions ledger: table ensure, seller-eligible totals,
-and partial-delivery credit (idempotent insert + wallet credit).
+checkout pending credit, and verify-time release scheduling.
 
-Statuses: posted (spendable) | held (return-window lock until wt_available_at).
+Statuses: posted (spendable) | held (pending until wt_available_at).
 Types: partial_delivery_credit | return_clawback.
+
+Flow:
+  1) Checkout → credit seller pending (held WT, available_at NULL)
+  2) Buyer verify → schedule return-window release (set available_at) or
+     move pending→useable immediately when no window
+  3) Cron → release held rows with available_at <= now to useable
 """
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +22,8 @@ from wallet_service import (
     _to_float,
     credit_seller_proceeds_to_wallet,
     debit_seller_proceeds_from_wallet,
+    debit_seller_proceeds_pending_only,
+    get_wallet_row,
     release_bounty_for_line,
     release_bounty_for_line_net,
     release_seller_hold_to_useable,
@@ -23,12 +32,16 @@ from wallet_service import (
 
 WT_TYPE_PARTIAL_DELIVERY_CREDIT = "partial_delivery_credit"
 WT_TYPE_RETURN_CLAWBACK = "return_clawback"
+WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT = "cancel_unshipped_adjustment"
 WT_TYPE_RETURN_REFUND_RESERVATION = "return_refund_reservation"
 WT_TYPE_BOUNTY_RECLAIM_RESERVATION = "bounty_reclaim_reservation"
 WT_STATUS_POSTED = "posted"
 WT_STATUS_HELD = "held"
 WT_STATUS_RESERVED = "reserved"
 WT_STATUS_CLEARED = "cleared"
+
+# Idempotency key suffix for full-line pending credit at order placement.
+CHECKOUT_IDEMPOTENCY_SUFFIX = "checkout"
 
 _DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -156,13 +169,16 @@ def _order_bounty_paid(db, transaction_uid):
 def compute_seller_eligible_total(db, transaction_uid):
     """
     Order-level seller pool:
-      transaction_amount + COALESCE(transaction_shipping, 0) - SUM(bounty on sale)
+      merchandise + sales_tax + shipping − bounty
+
+    Uses checkout snapshots on the sale header (transaction_amount,
+    transaction_taxes, transaction_shipping) minus bounty ledger rows.
     """
     if not transaction_uid:
         return 0.0
     tx_q = db.execute(
         """
-        SELECT transaction_amount, transaction_shipping
+        SELECT transaction_amount, transaction_taxes, transaction_shipping
         FROM every_circle.transactions
         WHERE transaction_uid = %s
         """,
@@ -173,9 +189,10 @@ def compute_seller_eligible_total(db, transaction_uid):
         return 0.0
     tx = tx_rows[0]
     amount = _to_float(tx.get("transaction_amount"))
+    taxes = _to_float(tx.get("transaction_taxes"))
     shipping = _to_float(tx.get("transaction_shipping"))
     bounty = _order_bounty_paid(db, transaction_uid)
-    return _round_money(amount + shipping - bounty)
+    return _round_money(amount + taxes + shipping - bounty)
 
 
 def _business_owner_profile_uid(db, business_uid):
@@ -200,16 +217,39 @@ def _business_owner_profile_uid(db, business_uid):
     return None
 
 
+def _is_business_uid(db, seller_id):
+    """True when seller_id is a row in every_circle.business."""
+    seller_id = str(seller_id or "").strip()
+    if not seller_id:
+        return False
+    q = db.execute(
+        """
+        SELECT business_uid
+        FROM every_circle.business
+        WHERE business_uid = %s
+        LIMIT 1
+        """,
+        (seller_id,),
+    )
+    rows = q.get("result") or []
+    return bool(rows and rows[0].get("business_uid"))
+
+
 def resolve_seller_wallet_profile_id(db, transaction_business_id):
     """
-    Map transaction_business_id to the profile that owns the seller wallet.
+    Map transaction_business_id to wallet.wallet_profile_id for seller proceeds.
 
-    Personal sellers: business id is profile_personal_uid (or user id).
-    Business sellers: first owner profile via business_user.
+    Business product sales: credit the business wallet (wallet_profile_id =
+    business_uid). Offering / personal sales: credit the seller's personal
+    profile wallet.
     """
     seller_id = str(transaction_business_id or "").strip()
     if not seller_id:
         return None
+
+    # Business catalog sales → business wallet (not the owner's personal wallet).
+    if _is_business_uid(db, seller_id):
+        return seller_id
 
     by_uid = db.execute(
         """
@@ -237,6 +277,7 @@ def resolve_seller_wallet_profile_id(db, transaction_business_id):
     if rows and rows[0].get("profile_personal_uid"):
         return rows[0]["profile_personal_uid"]
 
+    # Legacy fallback if business row is missing but business_user links exist.
     return _business_owner_profile_uid(db, seller_id)
 
 
@@ -344,41 +385,6 @@ def _total_order_qty(db, transaction_uid):
         return 0
 
 
-def compute_partial_delivery_credit_amount(
-    seller_eligible_total,
-    transaction_amount,
-    qty,
-    unit_cost,
-    total_order_qty,
-    already_credited,
-):
-    """
-    Proportional share of seller_eligible_total for a receive delta.
-
-    Normal: seller_eligible_total * (qty * unit_cost / transaction_amount)
-    If transaction_amount is 0: equal split by qty / total_order_qty.
-    Capped so cumulative held+posted credits never exceed seller_eligible_total.
-    """
-    eligible = _round_money(seller_eligible_total)
-    if eligible <= 0 or qty <= 0:
-        return 0.0
-
-    tx_amount = _to_float(transaction_amount)
-    if tx_amount > 0:
-        delta_value = _to_float(qty) * _to_float(unit_cost)
-        raw = eligible * (delta_value / tx_amount)
-    else:
-        order_qty = int(total_order_qty or 0)
-        if order_qty <= 0:
-            return 0.0
-        raw = eligible * (_to_float(qty) / order_qty)
-
-    remaining = _round_money(eligible - _to_float(already_credited))
-    if remaining <= 0:
-        return 0.0
-    return _round_money(min(raw, remaining))
-
-
 def _fetch_wt_by_idempotency_key(db, idempotency_key):
     q = db.execute(
         """
@@ -437,16 +443,458 @@ def _attach_bounty_release_to_credit_result(
     return result
 
 
+def _checkout_idempotency_key(ti_uid):
+    return f"{ti_uid}:{CHECKOUT_IDEMPOTENCY_SUFFIX}"
+
+
+def _find_checkout_held_credit(db, ti_uid):
+    """Held full-line pending credit created at order placement, if any remain."""
+    if not ti_uid:
+        return None
+    row = _fetch_wt_by_idempotency_key(db, _checkout_idempotency_key(ti_uid))
+    if not row:
+        return None
+    if str(row.get("wt_status") or "").strip().lower() != WT_STATUS_HELD:
+        return None
+    if _to_float(row.get("wt_amount")) <= 0.0001:
+        return None
+    return row
+
+
+def credit_seller_proceeds_at_checkout(db, transaction_uid):
+    """
+    Credit seller wallet_pending for every sale line at order placement.
+
+    Amount per line = merchandise + tax + shipping − bounty (full purchased qty).
+    Creates one held ``partial_delivery_credit`` row per line with
+    ``wt_available_at = NULL`` (not releasable until buyer verifies).
+
+    Idempotent per line via ``{ti_uid}:checkout``.
+    """
+    if not transaction_uid:
+        return {"code": 400, "message": "transaction_uid is required"}
+
+    _ensure_wallet_transactions_table(db)
+
+    tx_q = db.execute(
+        """
+        SELECT transaction_uid, transaction_profile_id, transaction_business_id
+        FROM every_circle.transactions
+        WHERE transaction_uid = %s
+        """,
+        (transaction_uid,),
+    )
+    tx_rows = tx_q.get("result") or []
+    if not tx_rows:
+        return {"code": 404, "message": f"Transaction not found: {transaction_uid}"}
+    tx = tx_rows[0]
+
+    seller_id = tx.get("transaction_business_id")
+    seller_profile_id = resolve_seller_wallet_profile_id(db, seller_id)
+    if not seller_profile_id:
+        return {
+            "code": 500,
+            "message": (
+                "Unable to resolve seller wallet profile for "
+                f"transaction_business_id={seller_id!r}"
+            ),
+            "transaction_uid": transaction_uid,
+        }
+
+    from line_commerce_fields import (
+        compute_line_event_proceeds_breakdown,
+        load_commerce_sale_line,
+    )
+
+    lines_q = db.execute(
+        """
+        SELECT ti_uid, ti_bs_qty, ti_bs_cost, ti_bs_cost_currency,
+               ti_bs_is_returnable, ti_bs_return_window_days
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        ORDER BY ti_uid ASC
+        """,
+        (transaction_uid,),
+    )
+    line_rows = lines_q.get("result") or []
+    credited = []
+    skipped = []
+    total_credited = 0.0
+
+    for ti in line_rows:
+        ti_uid = ti.get("ti_uid")
+        if not ti_uid:
+            continue
+        order_qty = int(ti.get("ti_bs_qty") or 0)
+        if order_qty < 1:
+            skipped.append({"ti_uid": ti_uid, "reason": "qty < 1"})
+            continue
+
+        idempotency_key = _checkout_idempotency_key(ti_uid)
+        existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+        if existing and _to_float(existing.get("wt_amount")) > 0:
+            skipped.append(
+                {
+                    "ti_uid": ti_uid,
+                    "reason": "already_credited",
+                    "wt_uid": existing.get("wt_uid"),
+                    "wt_amount": existing.get("wt_amount"),
+                }
+            )
+            continue
+
+        line_row = load_commerce_sale_line(db, transaction_uid, ti_uid)
+        if not line_row:
+            return {
+                "code": 500,
+                "message": f"Sale line not found for checkout credit: {ti_uid}",
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+            }
+
+        breakdown = compute_line_event_proceeds_breakdown(
+            db,
+            transaction_uid,
+            line_row,
+            verified_qty=order_qty,
+        )
+        if not breakdown:
+            return {
+                "code": 500,
+                "message": (
+                    "Cannot compute line-exact seller proceeds at checkout"
+                ),
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+            }
+        credit_amount = _round_money(breakdown.get("amount"))
+        if credit_amount <= 0:
+            skipped.append({"ti_uid": ti_uid, "reason": "zero_or_negative_amount"})
+            continue
+
+        unit_cost = _parse_unit_cost(ti.get("ti_bs_cost"))
+        currency = (ti.get("ti_bs_cost_currency") or "USD").strip() or "USD"
+        now = utc_now_str()
+        wt_uid = _new_wallet_transaction_uid(db)
+        if not wt_uid:
+            return {
+                "code": 500,
+                "message": "Failed to generate wt_uid via new_wallet_transaction_uid",
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+            }
+
+        insert_row = {
+            "wt_uid": wt_uid,
+            "wt_profile_id": seller_profile_id,
+            "wt_buyer_id": tx.get("transaction_profile_id"),
+            "wt_seller_id": seller_id,
+            "wt_transaction_id": transaction_uid,
+            "wt_ti_id": ti_uid,
+            "wt_type": WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+            "wt_status": WT_STATUS_HELD,
+            "wt_qty": order_qty,
+            "wt_received_qty_after": 0,
+            "wt_unit_cost": _round_money(unit_cost),
+            "wt_amount": credit_amount,
+            "wt_currency": currency[:8],
+            "wt_idempotency_key": idempotency_key,
+            "wt_note": "sale proceeds at checkout (pending)",
+            "wt_available_at": None,
+            "wt_created_at": now,
+            "wt_updated_at": now,
+        }
+        insert_result = db.insert("every_circle.wallet_transactions", insert_row)
+        if insert_result.get("code") != 200:
+            insert_msg = (insert_result.get("message") or "").lower()
+            if "duplicate entry" in insert_msg:
+                existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+                if existing:
+                    skipped.append(
+                        {
+                            "ti_uid": ti_uid,
+                            "reason": "already_credited",
+                            "wt_uid": existing.get("wt_uid"),
+                        }
+                    )
+                    continue
+            return {
+                "code": insert_result.get("code", 500),
+                "message": insert_result.get(
+                    "message", "Failed to insert checkout wallet_transactions row"
+                ),
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+            }
+
+        wallet_result = credit_seller_proceeds_to_wallet(
+            db, seller_profile_id, credit_amount, hold=True
+        )
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to credit seller wallet at checkout"
+                ),
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+                "wt_uid": wt_uid,
+                "wt_amount": credit_amount,
+                "wallet": wallet_result,
+            }
+
+        total_credited = _round_money(total_credited + credit_amount)
+        credited.append(
+            {
+                "ti_uid": ti_uid,
+                "wt_uid": wt_uid,
+                "wt_amount": credit_amount,
+                "wt_qty": order_qty,
+                "wallet": wallet_result,
+            }
+        )
+
+    return {
+        "code": 200,
+        "transaction_uid": transaction_uid,
+        "seller_profile_id": seller_profile_id,
+        "credited_total": total_credited,
+        "lines": credited,
+        "skipped": skipped,
+    }
+
+
+def _allocate_verified_from_checkout_credit(
+    db, transaction_uid, ti_uid, qty, received_qty_after, *, ti, tx, seller_profile_id
+):
+    """
+    Move verified units out of the checkout pending credit.
+
+    With a return window: create a held slice with wt_available_at (wallet unchanged).
+    Without a return window: post immediately and move pending → useable.
+    Does not increase wallet_actual / lifetime (already credited at checkout).
+    """
+    checkout_wt = _find_checkout_held_credit(db, ti_uid)
+    if not checkout_wt:
+        return None
+
+    idempotency_key = f"{ti_uid}:{received_qty_after}"
+    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+    if existing and _to_float(existing.get("wt_amount")) > 0:
+        hold, _, _ = _seller_proceeds_hold_decision(ti)
+        return _attach_bounty_release_to_credit_result(
+            db,
+            _wt_success_payload(existing, idempotent_replay=True),
+            ti_uid=ti_uid,
+            ti=ti,
+            received_qty_after=received_qty_after,
+            hold=hold,
+        )
+
+    from line_commerce_fields import (
+        compute_line_event_proceeds_breakdown,
+        load_commerce_sale_line,
+    )
+
+    line_row = load_commerce_sale_line(db, transaction_uid, ti_uid)
+    if not line_row:
+        return {
+            "code": 500,
+            "message": f"Sale line not found for verify allocation: {ti_uid}",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+    breakdown = compute_line_event_proceeds_breakdown(
+        db,
+        transaction_uid,
+        line_row,
+        verified_qty=qty,
+    )
+    if not breakdown:
+        return {
+            "code": 500,
+            "message": "Cannot compute line-exact seller proceeds for verification",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
+    credit_amount = _round_money(breakdown.get("amount"))
+    if credit_amount <= 0:
+        return {
+            "code": 500,
+            "message": "Line-exact seller proceeds for verification is zero or negative",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
+
+    checkout_amount = _round_money(checkout_wt.get("wt_amount"))
+    checkout_qty = int(checkout_wt.get("wt_qty") or 0)
+    if credit_amount > checkout_amount + 0.01:
+        return {
+            "code": 409,
+            "message": (
+                f"Verify allocation ${credit_amount} exceeds remaining checkout "
+                f"pending ${checkout_amount} for {ti_uid}"
+            ),
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+    if qty > checkout_qty > 0:
+        return {
+            "code": 409,
+            "message": (
+                f"Verify qty {qty} exceeds remaining checkout qty {checkout_qty} "
+                f"for {ti_uid}"
+            ),
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+
+    hold, available_at, _window = _seller_proceeds_hold_decision(ti)
+    unit_cost = _parse_unit_cost(ti.get("ti_bs_cost"))
+    currency = (ti.get("ti_bs_cost_currency") or checkout_wt.get("wt_currency") or "USD")
+    currency = str(currency).strip() or "USD"
+    now = utc_now_str()
+    seller_id = tx.get("transaction_business_id")
+
+    remaining_amount = _round_money(checkout_amount - credit_amount)
+    remaining_qty = max(0, checkout_qty - qty)
+    if remaining_amount <= 0.0001 or remaining_qty <= 0:
+        # Fully allocated — clear checkout placeholder (amount already moved to slice).
+        upd_checkout = db.update(
+            "every_circle.wallet_transactions",
+            {"wt_uid": checkout_wt.get("wt_uid")},
+            {
+                "wt_qty": 0,
+                "wt_amount": 0,
+                "wt_status": WT_STATUS_POSTED,
+                "wt_note": "sale proceeds at checkout (fully allocated)",
+                "wt_updated_at": now,
+            },
+        )
+    else:
+        upd_checkout = db.update(
+            "every_circle.wallet_transactions",
+            {"wt_uid": checkout_wt.get("wt_uid")},
+            {
+                "wt_qty": remaining_qty,
+                "wt_amount": remaining_amount,
+                "wt_updated_at": now,
+            },
+        )
+    if upd_checkout.get("code") != 200:
+        return {
+            "code": upd_checkout.get("code", 500),
+            "message": upd_checkout.get(
+                "message", "Failed to reduce checkout pending credit"
+            ),
+            "wt_uid": checkout_wt.get("wt_uid"),
+        }
+
+    wt_uid = _new_wallet_transaction_uid(db)
+    if not wt_uid:
+        return {
+            "code": 500,
+            "message": "Failed to generate wt_uid via new_wallet_transaction_uid",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+
+    if hold:
+        wt_status = WT_STATUS_HELD
+        note = "verified — pending return window"
+        wallet_result = {
+            "code": 200,
+            "skipped": True,
+            "hold": True,
+            "message": "Already in pending from checkout; scheduled return-window release",
+        }
+    else:
+        wt_status = WT_STATUS_POSTED
+        available_at = None
+        note = "verified — moved to useable"
+        wallet_result = release_seller_hold_to_useable(
+            db, seller_profile_id, credit_amount
+        )
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to move seller proceeds to useable"
+                ),
+                "transaction_uid": transaction_uid,
+                "ti_uid": ti_uid,
+                "wallet": wallet_result,
+            }
+
+    insert_row = {
+        "wt_uid": wt_uid,
+        "wt_profile_id": seller_profile_id,
+        "wt_buyer_id": tx.get("transaction_profile_id"),
+        "wt_seller_id": seller_id,
+        "wt_transaction_id": transaction_uid,
+        "wt_ti_id": ti_uid,
+        "wt_type": WT_TYPE_PARTIAL_DELIVERY_CREDIT,
+        "wt_status": wt_status,
+        "wt_qty": qty,
+        "wt_received_qty_after": received_qty_after,
+        "wt_unit_cost": _round_money(unit_cost),
+        "wt_amount": credit_amount,
+        "wt_currency": currency[:8],
+        "wt_idempotency_key": idempotency_key,
+        "wt_note": note,
+        "wt_available_at": available_at,
+        "wt_created_at": now,
+        "wt_updated_at": now,
+    }
+    insert_result = db.insert("every_circle.wallet_transactions", insert_row)
+    if insert_result.get("code") != 200:
+        insert_msg = (insert_result.get("message") or "").lower()
+        if "duplicate entry" in insert_msg:
+            existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+            if existing:
+                return _attach_bounty_release_to_credit_result(
+                    db,
+                    _wt_success_payload(existing, idempotent_replay=True),
+                    ti_uid=ti_uid,
+                    ti=ti,
+                    received_qty_after=received_qty_after,
+                    hold=hold,
+                )
+        return {
+            "code": insert_result.get("code", 500),
+            "message": insert_result.get(
+                "message", "Failed to insert verified proceeds allocation row"
+            ),
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+
+    return _attach_bounty_release_to_credit_result(
+        db,
+        _wt_success_payload(
+            insert_row, idempotent_replay=False, wallet_result=wallet_result
+        ),
+        ti_uid=ti_uid,
+        ti=ti,
+        received_qty_after=received_qty_after,
+        hold=hold,
+    )
+
+
 def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after):
     """
-    Insert a partial_delivery_credit ledger row and credit the seller wallet.
+    Allocate seller proceeds for newly verified units.
 
-    Idempotency key: ``{ti_uid}:{received_qty_after}``. Duplicate key is a
-    success/no-op (existing row returned, wallet not re-credited).
+    Preferred path (orders credited at checkout):
+      Split the held checkout credit — schedule return-window release or move
+      pending → useable. Does not re-credit wallet_actual / lifetime.
 
-    Returnable lines with a positive ``ti_bs_return_window_days`` credit
-    ``wallet_pending`` with status ``held`` until ``wt_available_at``;
-    otherwise credit useable with status ``posted``.
+    Legacy path (no checkout credit):
+      Insert partial_delivery_credit and credit the seller wallet (prior behavior).
+
+    Idempotency key: ``{ti_uid}:{received_qty_after}``.
     """
     try:
         qty = int(qty)
@@ -466,9 +914,6 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
             "code": 400,
             "message": "qty and received_qty_after must be >= 1",
         }
-
-    idempotency_key = f"{ti_uid}:{received_qty_after}"
-    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
 
     tx_q = db.execute(
         """
@@ -501,9 +946,6 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
         }
     ti = ti_rows[0]
 
-    hold, available_at, _window_days = _seller_proceeds_hold_decision(ti)
-    wt_status = WT_STATUS_HELD if hold else WT_STATUS_POSTED
-
     seller_id = tx.get("transaction_business_id")
     seller_profile_id = resolve_seller_wallet_profile_id(db, seller_id)
     if not seller_profile_id:
@@ -517,25 +959,93 @@ def credit_partial_delivery(db, transaction_uid, ti_uid, qty, received_qty_after
             "ti_uid": ti_uid,
         }
 
-    seller_eligible = compute_seller_eligible_total(db, transaction_uid)
-    unit_cost = _parse_unit_cost(ti.get("ti_bs_cost"))
-    transaction_amount = _to_float(tx.get("transaction_amount"))
-    total_order_qty = _total_order_qty(db, transaction_uid)
-    already_credited = _posted_credits_total(db, transaction_uid)
+    allocated = _allocate_verified_from_checkout_credit(
+        db,
+        transaction_uid,
+        ti_uid,
+        qty,
+        received_qty_after,
+        ti=ti,
+        tx=tx,
+        seller_profile_id=seller_profile_id,
+    )
+    if allocated is not None:
+        return allocated
 
-    credit_amount = compute_partial_delivery_credit_amount(
-        seller_eligible_total=seller_eligible,
-        transaction_amount=transaction_amount,
-        qty=qty,
-        unit_cost=unit_cost,
-        total_order_qty=total_order_qty,
-        already_credited=already_credited,
+    # ---- Legacy path: no checkout pending credit (pre-change orders) ----
+    return _credit_partial_delivery_legacy(
+        db,
+        transaction_uid,
+        ti_uid,
+        qty,
+        received_qty_after,
+        ti=ti,
+        tx=tx,
+        seller_profile_id=seller_profile_id,
+        seller_id=seller_id,
     )
 
-    if (
-        existing
-        and _to_float(existing.get("wt_amount")) > 0
-    ):
+
+def _credit_partial_delivery_legacy(
+    db,
+    transaction_uid,
+    ti_uid,
+    qty,
+    received_qty_after,
+    *,
+    ti,
+    tx,
+    seller_profile_id,
+    seller_id,
+):
+    """Prior verify-time credit when checkout did not create pending proceeds."""
+    idempotency_key = f"{ti_uid}:{received_qty_after}"
+    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+
+    hold, available_at, _window_days = _seller_proceeds_hold_decision(ti)
+    wt_status = WT_STATUS_HELD if hold else WT_STATUS_POSTED
+
+    from line_commerce_fields import (
+        compute_line_event_proceeds_breakdown,
+        load_commerce_sale_line,
+    )
+
+    unit_cost = _parse_unit_cost(ti.get("ti_bs_cost"))
+    line_row = load_commerce_sale_line(db, transaction_uid, ti_uid)
+    if not line_row:
+        return {
+            "code": 500,
+            "message": f"Sale line not found for partial delivery credit: {ti_uid}",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+        }
+    breakdown = compute_line_event_proceeds_breakdown(
+        db,
+        transaction_uid,
+        line_row,
+        verified_qty=qty,
+    )
+    if not breakdown:
+        return {
+            "code": 500,
+            "message": (
+                "Cannot compute line-exact seller proceeds for delivery verification"
+            ),
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
+    credit_amount = _round_money(breakdown.get("amount"))
+    if credit_amount <= 0:
+        return {
+            "code": 500,
+            "message": "Line-exact seller proceeds credit is zero or negative",
+            "transaction_uid": transaction_uid,
+            "ti_uid": ti_uid,
+            "qty": qty,
+        }
+
+    if existing and _to_float(existing.get("wt_amount")) > 0:
         return _attach_bounty_release_to_credit_result(
             db,
             _wt_success_payload(existing, idempotent_replay=True),
@@ -720,6 +1230,7 @@ def _line_seller_proceeds_net(db, ti_uid):
                 CASE
                     WHEN wt_type = %s THEN wt_qty
                     WHEN wt_type = %s THEN -ABS(wt_qty)
+                    WHEN wt_type = %s THEN -ABS(wt_qty)
                     ELSE 0
                 END
             ), 0) AS net_qty,
@@ -731,17 +1242,19 @@ def _line_seller_proceeds_net(db, ti_uid):
             ), 0) AS posted_amount
         FROM every_circle.wallet_transactions
         WHERE wt_ti_id = %s
-          AND wt_type IN (%s, %s)
+          AND wt_type IN (%s, %s, %s)
           AND wt_status IN (%s, %s)
         """,
         (
             WT_TYPE_PARTIAL_DELIVERY_CREDIT,
             WT_TYPE_RETURN_CLAWBACK,
+            WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
             WT_STATUS_HELD,
             WT_STATUS_POSTED,
             ti_uid,
             WT_TYPE_PARTIAL_DELIVERY_CREDIT,
             WT_TYPE_RETURN_CLAWBACK,
+            WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
             WT_STATUS_HELD,
             WT_STATUS_POSTED,
         ),
@@ -785,22 +1298,265 @@ def _line_seller_proceeds_net(db, ti_uid):
     }
 
 
-def compute_return_clawback_amount(net_amount, net_qty, return_qty):
-    """
-    Proportional clawback of net credited proceeds for a returned qty.
+def _sale_line_reversal_context(db, ti_uid, transaction_uid=None):
+    """Load sale line + ledger bounty pool for seller reversal math."""
+    from transactions import _fetch_ti_row_for_bounty, _line_bounty_totals
 
-    clawback = net_amount * (min(return_qty, net_qty) / net_qty)
+    ti_row = _fetch_ti_row_for_bounty(db, ti_uid, transaction_uid) if ti_uid else None
+    bounty_ledger = (
+        _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0) if ti_uid else 0.0
+    )
+    return ti_row, bounty_ledger
+
+
+def compute_seller_proceeds_reversal_for_line(
+    ti_row,
+    *,
+    return_shipped_qty=0,
+    cancel_unshipped_qty=0,
+    line_bounty_ledger=None,
+):
     """
-    net_amount = _round_money(net_amount)
+    Seller pending/useable reversal for one sale line from stored split fields.
+
+    Returned unit: merchandise + tax + shipping (if refundable) − bounty.
+    Cancelled unit: merchandise + tax + shipping − bounty.
+    Excludes credit-card / platform fees.
+    """
+    from transactions import (
+        _normalize_shipping_refundable,
+        _seller_bounty_to_reclaim_for_line,
+        _tax_amount_for_line,
+    )
+
     try:
-        net_qty = int(net_qty or 0)
-        return_qty = int(return_qty or 0)
+        return_shipped_qty = int(return_shipped_qty or 0)
+        cancel_unshipped_qty = int(cancel_unshipped_qty or 0)
     except (TypeError, ValueError):
         return 0.0
-    if net_amount <= 0 or net_qty <= 0 or return_qty <= 0:
+
+    if not ti_row or (return_shipped_qty <= 0 and cancel_unshipped_qty <= 0):
         return 0.0
-    qty = min(return_qty, net_qty)
-    return _round_money(net_amount * (qty / float(net_qty)))
+
+    merch = _parse_unit_cost(ti_row.get("ti_bs_cost"))
+    tax = _tax_amount_for_line(
+        merch,
+        ti_row.get("ti_bs_is_taxable"),
+        ti_row.get("ti_bs_tax_rate"),
+    )
+    ship = _to_float(ti_row.get("ti_shipping_amount"))
+    shipping_refundable = (
+        _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0)
+        == 1
+    )
+    bounty_per_unit = _seller_bounty_to_reclaim_for_line(
+        ti_row, 1, line_bounty_ledger=line_bounty_ledger
+    )
+
+    reversal = 0.0
+    for _ in range(return_shipped_qty):
+        ship_part = ship if shipping_refundable else 0.0
+        reversal += merch + tax + ship_part - bounty_per_unit
+    for _ in range(cancel_unshipped_qty):
+        reversal += merch + tax + ship - bounty_per_unit
+
+    return _round_money(reversal)
+
+
+def _trr_clawback_qty_split(db, trr_uid, ti_uid=None):
+    """Return (return_shipped_qty, cancel_unshipped_qty) from a TRR row."""
+    if not trr_uid:
+        return 0, 0
+    q = db.execute(
+        """
+        SELECT trr_items_json, trr_cancel_unshipped, trr_ti_uid, trr_return_quantity
+        FROM every_circle.transaction_return_requests
+        WHERE trr_uid = %s
+        LIMIT 1
+        """,
+        (trr_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0, 0
+    trr = rows[0]
+    try:
+        items = json.loads(trr.get("trr_items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        items = []
+    if not isinstance(items, list):
+        items = []
+    target_ti = ti_uid or trr.get("trr_ti_uid")
+    for entry in items:
+        if target_ti and entry.get("transaction_item_uid") != target_ti:
+            continue
+        shipped = 0
+        cancel = 0
+        if entry.get("return_shipped_qty") is not None:
+            try:
+                shipped = int(entry.get("return_shipped_qty") or 0)
+            except (TypeError, ValueError):
+                shipped = 0
+        if entry.get("cancel_unshipped_qty") is not None:
+            try:
+                cancel = int(entry.get("cancel_unshipped_qty") or 0)
+            except (TypeError, ValueError):
+                cancel = 0
+        if shipped or cancel:
+            return shipped, cancel
+        try:
+            total = int(entry.get("return_quantity") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total > 0:
+            if int(trr.get("trr_cancel_unshipped") or 0) == 1:
+                return 0, total
+            return total, 0
+    try:
+        total = int(trr.get("trr_return_quantity") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0 and int(trr.get("trr_cancel_unshipped") or 0) == 1:
+        return 0, total
+    return total, 0
+
+
+def _return_ti_clawback_split(db, return_ti_uid):
+    """Split qty for a confirmed return ledger line."""
+    if not return_ti_uid:
+        return 0, 0
+    q = db.execute(
+        """
+        SELECT ti_return_shipped_qty, ti_cancel_unshipped_qty, ti_bs_qty
+        FROM every_circle.transactions_items
+        WHERE ti_uid = %s
+        LIMIT 1
+        """,
+        (return_ti_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0, 0
+    row = rows[0]
+    if row.get("ti_return_shipped_qty") is not None or row.get("ti_cancel_unshipped_qty") is not None:
+        return int(row.get("ti_return_shipped_qty") or 0), int(
+            row.get("ti_cancel_unshipped_qty") or 0
+        )
+    qty = abs(int(row.get("ti_bs_qty") or 0))
+    return qty, 0
+
+
+def _seller_proceeds_return_window_open_at(db, ti_uid, event_dt):
+    """
+    Sum partial_delivery credits on a line whose return window had not closed
+    at event_dt (wt_available_at still in the future).
+    """
+    if not ti_uid or not event_dt:
+        return 0.0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_amount), 0) AS pending_pool
+        FROM every_circle.wallet_transactions
+        WHERE wt_ti_id = %s
+          AND wt_type = %s
+          AND wt_available_at IS NOT NULL
+          AND wt_available_at > %s
+        """,
+        (ti_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, event_dt),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return max(_to_float(rows[0].get("pending_pool")), 0.0)
+
+
+def return_clawback_ledger_availability(db, event):
+    """
+    Map return_clawback wt row to ledger availability (pending vs useable).
+
+    Posted clawbacks only count as useable when reversing proceeds that were
+    already in the spendable pool. Clawbacks while the return window is still
+    open display as pending even if wt_status was incorrectly set to posted.
+    """
+    wt_status = (event.get("wt_status") or "").strip()
+    idem = (event.get("wt_idempotency_key") or "").strip()
+    claw_amt = _round_money(_to_float(event.get("wt_amount")))
+
+    if idem.endswith(":held"):
+        return "pending", 0.0
+    if idem.endswith(":posted"):
+        return "useable", claw_amt
+
+    if wt_status != WT_STATUS_POSTED:
+        return "pending", 0.0
+
+    ti_uid = event.get("wt_ti_id")
+    event_dt = event.get("wt_created_at")
+    amount_abs = abs(_to_float(event.get("wt_amount")))
+    if ti_uid and event_dt and amount_abs > 0.0001:
+        pending_pool = _seller_proceeds_return_window_open_at(db, ti_uid, event_dt)
+        if pending_pool >= amount_abs - 0.0001:
+            return "pending", 0.0
+
+    return "useable", claw_amt
+
+
+def return_clawback_ledger_description(db, event, *, delta_qty=None):
+    """Human-readable description for a return_clawback ledger row."""
+    idem = (event.get("wt_idempotency_key") or "").strip()
+    ti_uid = event.get("wt_ti_id")
+
+    if idem.startswith("return_clawback_hold:"):
+        trr_uid = idem.split(":", 1)[-1] or (event.get("wt_note") or "").strip()
+        shipped, cancel = _trr_clawback_qty_split(db, trr_uid, ti_uid)
+        if shipped or cancel:
+            return seller_proceeds_reversal_description(shipped, cancel)
+
+    note = (event.get("wt_note") or "").strip()
+    if note.startswith("return_clawback for "):
+        return_ti_uid = note.split("return_clawback for ", 1)[-1].strip()
+        shipped, cancel = _return_ti_clawback_split(db, return_ti_uid)
+        if shipped or cancel:
+            return seller_proceeds_reversal_description(shipped, cancel)
+
+    qty = delta_qty
+    if qty is None:
+        try:
+            qty = int(event.get("wt_qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+    return seller_proceeds_reversal_description(qty, 0)
+
+
+def seller_proceeds_reversal_description(
+    return_shipped_qty=0, cancel_unshipped_qty=0, *, amount=None
+):
+    """Human-readable seller proceeds reversal line for wallet ledger."""
+    try:
+        return_shipped_qty = int(return_shipped_qty or 0)
+        cancel_unshipped_qty = int(cancel_unshipped_qty or 0)
+    except (TypeError, ValueError):
+        return_shipped_qty = 0
+        cancel_unshipped_qty = 0
+
+    total_qty = return_shipped_qty + cancel_unshipped_qty
+    if return_shipped_qty > 0 and cancel_unshipped_qty > 0:
+        base = (
+            f"Sale proceeds — {return_shipped_qty} returned, "
+            f"{cancel_unshipped_qty} cancelled"
+        )
+    elif cancel_unshipped_qty > 0:
+        base = f"Sale proceeds — {cancel_unshipped_qty} unit(s) cancelled before shipment"
+    elif return_shipped_qty > 0:
+        base = f"Sale proceeds — {return_shipped_qty} unit(s) returned"
+    elif total_qty > 0:
+        base = f"Sale proceeds — {total_qty} unit(s) returned"
+    else:
+        base = "Sale proceeds — return reversal"
+
+    if amount is not None:
+        return f"{base} (−${_round_money(abs(amount)):.2f})"
+    return base
 
 
 def _insert_return_clawback_row(
@@ -889,6 +1645,281 @@ def _insert_return_clawback_row(
     }
 
 
+def order_has_posted_useable_proceeds(db, transaction_uid):
+    """True when any partial_delivery_credit on this order was posted to useable."""
+    if not transaction_uid:
+        return False
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(wt_amount), 0) AS posted
+        FROM every_circle.wallet_transactions
+        WHERE wt_transaction_id = %s
+          AND wt_type = %s
+          AND wt_status = %s
+        """,
+        (transaction_uid, WT_TYPE_PARTIAL_DELIVERY_CREDIT, WT_STATUS_POSTED),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return False
+    return _to_float(rows[0].get("posted")) > 0.0001
+
+
+def batch_order_has_posted_useable_proceeds(db, order_uids):
+    """Batch version for wallet ledger narrative build."""
+    order_uids = [uid for uid in (order_uids or []) if uid]
+    if not order_uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(order_uids))
+    q = db.execute(
+        f"""
+        SELECT wt_transaction_id, COALESCE(SUM(wt_amount), 0) AS posted
+        FROM every_circle.wallet_transactions
+        WHERE wt_transaction_id IN ({placeholders})
+          AND wt_type = %s
+          AND wt_status = %s
+        GROUP BY wt_transaction_id
+        """,
+        tuple(order_uids) + (WT_TYPE_PARTIAL_DELIVERY_CREDIT, WT_STATUS_POSTED),
+    )
+    posted = {
+        row.get("wt_transaction_id"): _to_float(row.get("posted")) > 0.0001
+        for row in (q.get("result") or [])
+    }
+    return {uid: posted.get(uid, False) for uid in order_uids}
+
+
+def _insert_cancel_unshipped_adjustment_row(
+    db,
+    *,
+    idempotency_key,
+    profile_id,
+    buyer_id,
+    seller_id,
+    transaction_id,
+    ti_id,
+    qty,
+    unit_cost,
+    amount,
+    currency,
+    note=None,
+):
+    """Insert cancel_unshipped_adjustment row. amount should be negative."""
+    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+    if existing:
+        return {
+            "code": 200,
+            "idempotent_replay": True,
+            "wt_uid": existing.get("wt_uid"),
+            "wt_amount": _round_money(existing.get("wt_amount")),
+            "wt_status": existing.get("wt_status"),
+            "row": existing,
+        }
+
+    wt_uid = _new_wallet_transaction_uid(db)
+    if not wt_uid:
+        return {
+            "code": 500,
+            "message": "Failed to generate wt_uid via new_wallet_transaction_uid",
+        }
+
+    now = utc_now_str()
+    insert_row = {
+        "wt_uid": wt_uid,
+        "wt_profile_id": profile_id,
+        "wt_buyer_id": buyer_id or "",
+        "wt_seller_id": seller_id or "",
+        "wt_transaction_id": transaction_id,
+        "wt_ti_id": ti_id,
+        "wt_type": WT_TYPE_CANCEL_UNSHIPPED_ADJUSTMENT,
+        "wt_status": WT_STATUS_HELD,
+        "wt_qty": int(qty or 0),
+        "wt_received_qty_after": 0,
+        "wt_unit_cost": _round_money(unit_cost),
+        "wt_amount": _round_money(amount),
+        "wt_currency": (currency or "USD")[:8],
+        "wt_idempotency_key": idempotency_key,
+        "wt_note": note,
+        "wt_available_at": None,
+        "wt_created_at": now,
+        "wt_updated_at": now,
+    }
+    insert_result = db.insert("every_circle.wallet_transactions", insert_row)
+    if insert_result.get("code") != 200:
+        insert_msg = (insert_result.get("message") or "").lower()
+        if "duplicate entry" in insert_msg:
+            existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+            if existing:
+                return {
+                    "code": 200,
+                    "idempotent_replay": True,
+                    "wt_uid": existing.get("wt_uid"),
+                    "wt_amount": _round_money(existing.get("wt_amount")),
+                    "wt_status": existing.get("wt_status"),
+                    "row": existing,
+                }
+        return {
+            "code": insert_result.get("code", 500),
+            "message": insert_result.get(
+                "message", "Failed to insert cancel_unshipped_adjustment row"
+            ),
+        }
+    return {
+        "code": 200,
+        "idempotent_replay": False,
+        "wt_uid": wt_uid,
+        "wt_amount": _round_money(amount),
+        "wt_status": WT_STATUS_HELD,
+        "row": insert_row,
+    }
+
+
+def adjust_seller_proceeds_on_cancel_unshipped(
+    db,
+    *,
+    original_ti_uid,
+    return_ti_uid,
+    cancel_qty,
+    transaction_uid=None,
+):
+    """
+    Reduce pending-verification seller proceeds for pre-ship cancellations.
+
+    Inserts a negative cancel_unshipped_adjustment row. Does not debit wallet
+    unless those units were already delivery-credited (normally they were not).
+    """
+    _ensure_wallet_transactions_table(db)
+
+    if not original_ti_uid or not return_ti_uid:
+        return {
+            "code": 400,
+            "message": "original_ti_uid and return_ti_uid are required",
+        }
+
+    try:
+        cancel_qty = int(cancel_qty or 0)
+    except (TypeError, ValueError):
+        return {"code": 400, "message": "cancel_qty must be an integer"}
+
+    if cancel_qty <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "No unshipped cancel qty to adjust",
+            "adjusted": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    idempotency_key = f"cancel_unshipped:{return_ti_uid}"
+    existing = _fetch_wt_by_idempotency_key(db, idempotency_key)
+    if existing:
+        return {
+            "code": 200,
+            "idempotent_replay": True,
+            "adjusted": abs(_to_float(existing.get("wt_amount"))),
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+            "wt_uid": existing.get("wt_uid"),
+        }
+
+    line_net = _line_seller_proceeds_net(db, original_ti_uid)
+    transaction_id = transaction_uid or line_net.get("wt_transaction_id")
+    if not transaction_id:
+        ti_q = db.execute(
+            """
+            SELECT ti_transaction_id
+            FROM every_circle.transactions_items
+            WHERE ti_uid = %s
+            LIMIT 1
+            """,
+            (original_ti_uid,),
+        )
+        ti_rows = ti_q.get("result") or []
+        if ti_rows:
+            transaction_id = ti_rows[0].get("ti_transaction_id")
+
+    ti_row, line_bounty = _sale_line_reversal_context(db, original_ti_uid, transaction_id)
+    adjust_amount = compute_seller_proceeds_reversal_for_line(
+        ti_row,
+        return_shipped_qty=0,
+        cancel_unshipped_qty=cancel_qty,
+        line_bounty_ledger=line_bounty,
+    )
+    per_unit = _round_money(adjust_amount / cancel_qty) if cancel_qty > 0 else 0.0
+    if adjust_amount <= 0:
+        return {
+            "code": 200,
+            "skipped": True,
+            "message": "No seller proceeds to adjust for cancel",
+            "adjusted": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    profile_id = line_net.get("wt_profile_id")
+    if not profile_id and transaction_id:
+        tx_q = db.execute(
+            """
+            SELECT transaction_business_id, transaction_profile_id
+            FROM every_circle.transactions
+            WHERE transaction_uid = %s
+            LIMIT 1
+            """,
+            (transaction_id,),
+        )
+        tx_rows = tx_q.get("result") or []
+        if tx_rows:
+            profile_id = resolve_seller_wallet_profile_id(
+                db, tx_rows[0].get("transaction_business_id")
+            )
+            if not line_net.get("wt_buyer_id"):
+                line_net["wt_buyer_id"] = tx_rows[0].get("transaction_profile_id")
+            if not line_net.get("wt_seller_id"):
+                line_net["wt_seller_id"] = tx_rows[0].get("transaction_business_id")
+
+    if not profile_id:
+        return {
+            "code": 500,
+            "message": (
+                "Unable to resolve seller wallet profile for cancel adjustment "
+                f"on ti_uid={original_ti_uid!r}"
+            ),
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    ins = _insert_cancel_unshipped_adjustment_row(
+        db,
+        idempotency_key=idempotency_key,
+        profile_id=profile_id,
+        buyer_id=line_net.get("wt_buyer_id"),
+        seller_id=line_net.get("wt_seller_id"),
+        transaction_id=transaction_id,
+        ti_id=original_ti_uid,
+        qty=cancel_qty,
+        unit_cost=per_unit,
+        amount=-adjust_amount,
+        currency=line_net.get("wt_currency") or "USD",
+        note=f"cancel_unshipped for {return_ti_uid}",
+    )
+    if ins.get("code") != 200:
+        return {
+            **ins,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+
+    return {
+        "code": 200,
+        "adjusted": adjust_amount,
+        "original_ti_uid": original_ti_uid,
+        "return_ti_uid": return_ti_uid,
+        "wt_uid": ins.get("wt_uid"),
+        "idempotent_replay": ins.get("idempotent_replay", False),
+    }
+
+
 def _find_pending_clawback_holds(db, original_ti_uid):
     """Held return_clawback rows created when buyer opened the return request."""
     if not original_ti_uid:
@@ -939,14 +1970,32 @@ def _finalize_pending_clawback_holds(
         }
 
     profile_id = holds[0].get("wt_profile_id")
+    line_net = _line_seller_proceeds_net(db, original_ti_uid)
+    posted_budget = max(_to_float(line_net.get("posted_amount")), 0.0)
+    wallet = get_wallet_row(db, profile_id) or {}
+    useable = _to_float(wallet.get("wallet_useable_balance"))
     now = utc_now_str()
     wt_uids = []
+    debit_posted = 0.0
+    debit_held = 0.0
     for row in holds:
         wt_uid = row.get("wt_uid")
         status = row.get("wt_status")
         if status == WT_STATUS_POSTED:
             wt_uids.append(wt_uid)
             continue
+        amount_abs = abs(_to_float(row.get("wt_amount")))
+        if posted_budget <= 0.0001:
+            new_status = WT_STATUS_HELD
+            debit_held = _round_money(debit_held + amount_abs)
+        elif amount_abs <= posted_budget and amount_abs <= useable + 0.0001:
+            new_status = WT_STATUS_POSTED
+            posted_budget = _round_money(posted_budget - amount_abs)
+            useable = _round_money(useable - amount_abs)
+            debit_posted = _round_money(debit_posted + amount_abs)
+        else:
+            new_status = WT_STATUS_HELD
+            debit_held = _round_money(debit_held + amount_abs)
         note = row.get("wt_note") or ""
         if return_ti_uid and note and not note.startswith("return_clawback for"):
             note = f"return_clawback for {return_ti_uid}"
@@ -954,7 +2003,7 @@ def _finalize_pending_clawback_holds(
             "every_circle.wallet_transactions",
             {"wt_uid": wt_uid},
             {
-                "wt_status": WT_STATUS_POSTED,
+                "wt_status": new_status,
                 "wt_note": note or row.get("wt_note"),
                 "wt_updated_at": now,
             },
@@ -967,7 +2016,36 @@ def _finalize_pending_clawback_holds(
             }
         wt_uids.append(wt_uid)
 
-    wallet_result = debit_seller_proceeds_from_wallet(db, profile_id, total)
+    wallet_result = {"code": 200}
+    if debit_posted > 0.0001:
+        wallet_result = debit_seller_proceeds_from_wallet(db, profile_id, debit_posted)
+        if wallet_result.get("code") != 200:
+            return {
+                "code": wallet_result.get("code", 500),
+                "message": wallet_result.get(
+                    "message", "Failed to debit seller proceeds on return finalize"
+                ),
+                "clawed": total,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+                "wt_uids": wt_uids,
+                "wallet": wallet_result,
+            }
+    if debit_held > 0.0001:
+        held_result = debit_seller_proceeds_pending_only(db, profile_id, debit_held)
+        if held_result.get("code") != 200:
+            return {
+                "code": held_result.get("code", 500),
+                "message": held_result.get(
+                    "message", "Failed to debit seller pending on return finalize"
+                ),
+                "clawed": total,
+                "original_ti_uid": original_ti_uid,
+                "return_ti_uid": return_ti_uid,
+                "wt_uids": wt_uids,
+                "wallet": held_result,
+            }
+        wallet_result = held_result
     if wallet_result.get("code") != 200:
         return {
             "code": wallet_result.get("code", 500),
@@ -984,8 +2062,8 @@ def _finalize_pending_clawback_holds(
     return {
         "code": 200,
         "clawed": total,
-        "held_part": total,
-        "posted_part": 0.0,
+        "held_part": debit_held,
+        "posted_part": debit_posted,
         "original_ti_uid": original_ti_uid,
         "return_ti_uid": return_ti_uid,
         "wt_profile_id": profile_id,
@@ -1008,8 +2086,8 @@ def clawback_seller_proceeds_on_return(
     """
     Reverse seller proceeds for returned (previously credited) quantity.
 
-    Computes clawback proportional to return_qty vs net credited qty/amount on
-    the original sale line. Inserts negative ``return_clawback`` row(s) and
+    Computes clawback from line-exact stored snapshots on the original sale line.
+    Inserts negative ``return_clawback`` row(s) and
     debits the seller wallet (pending first, then useable).
 
     Idempotency key: ``clawback:{return_ti_uid}`` (and ``:held`` / ``:posted``
@@ -1075,9 +2153,33 @@ def clawback_seller_proceeds_on_return(
         }
 
     line_net = _line_seller_proceeds_net(db, original_ti_uid)
-    clawback_amount = compute_return_clawback_amount(
-        line_net["net_amount"], line_net["net_qty"], return_qty
+    transaction_id = transaction_uid or line_net.get("wt_transaction_id")
+
+    ti_row, line_bounty = _sale_line_reversal_context(
+        db, original_ti_uid, transaction_id
     )
+    clawback_amount = compute_seller_proceeds_reversal_for_line(
+        ti_row,
+        return_shipped_qty=return_qty,
+        cancel_unshipped_qty=0,
+        line_bounty_ledger=line_bounty,
+    )
+    if clawback_amount <= 0:
+        return {
+            "code": 500,
+            "message": (
+                "Cannot compute line-exact seller proceeds clawback for return"
+            ),
+            "clawed": 0,
+            "original_ti_uid": original_ti_uid,
+            "return_ti_uid": return_ti_uid,
+        }
+    per_unit = _round_money(clawback_amount / return_qty) if return_qty > 0 else 0.0
+
+    net_credited = max(_to_float(line_net.get("net_amount")), 0.0)
+    if net_credited > 0:
+        clawback_amount = min(clawback_amount, _round_money(net_credited))
+
     if clawback_amount <= 0:
         return {
             "code": 200,
@@ -1089,7 +2191,6 @@ def clawback_seller_proceeds_on_return(
         }
 
     profile_id = line_net.get("wt_profile_id")
-    transaction_id = transaction_uid or line_net.get("wt_transaction_id")
     if not profile_id:
         # Resolve seller from the sale if credit rows lack profile (edge case).
         if transaction_id:
@@ -1132,11 +2233,24 @@ def clawback_seller_proceeds_on_return(
             "return_ti_uid": return_ti_uid,
         }
 
+    posted_net = max(_to_float(line_net.get("posted_amount")), 0.0)
     held_net = max(_to_float(line_net.get("held_amount")), 0.0)
-    held_part = _round_money(min(clawback_amount, held_net))
-    posted_part = _round_money(clawback_amount - held_part)
 
-    claw_qty = min(return_qty, max(int(line_net.get("net_qty") or 0), 0))
+    if posted_net <= 0.0001:
+        held_part = clawback_amount
+        posted_part = 0.0
+    else:
+        held_part = _round_money(min(clawback_amount, held_net))
+        posted_part = _round_money(clawback_amount - held_part)
+        wallet = get_wallet_row(db, profile_id) or {}
+        useable = _to_float(wallet.get("wallet_useable_balance"))
+        if posted_part > useable:
+            shift = _round_money(posted_part - useable)
+            held_part = _round_money(held_part + shift)
+            posted_part = _round_money(useable)
+
+    unit_cost = per_unit or line_net.get("wt_unit_cost")
+    claw_qty = min(return_qty, max(int(line_net.get("net_qty") or 0), return_qty))
     if clawback_amount > 0 and held_part > 0 and posted_part > 0:
         held_qty = int(round(claw_qty * (held_part / clawback_amount)))
         held_qty = min(max(held_qty, 0), claw_qty)
@@ -1156,7 +2270,7 @@ def clawback_seller_proceeds_on_return(
         "seller_id": line_net.get("wt_seller_id"),
         "transaction_id": transaction_id,
         "ti_id": original_ti_uid,
-        "unit_cost": line_net.get("wt_unit_cost"),
+        "unit_cost": unit_cost,
         "currency": line_net.get("wt_currency"),
         "note": note,
     }
@@ -1216,9 +2330,14 @@ def clawback_seller_proceeds_on_return(
     any_new = any(not r.get("idempotent_replay") for r in inserted)
     wallet_result = None
     if any_new and clawback_amount > 0:
-        wallet_result = debit_seller_proceeds_from_wallet(
-            db, profile_id, clawback_amount
-        )
+        if posted_part <= 0.0001:
+            wallet_result = debit_seller_proceeds_pending_only(
+                db, profile_id, clawback_amount
+            )
+        else:
+            wallet_result = debit_seller_proceeds_from_wallet(
+                db, profile_id, clawback_amount
+            )
         if wallet_result.get("code") != 200:
             return {
                 "code": wallet_result.get("code", 500),

@@ -6,6 +6,8 @@ from transactions import _is_return_list_row, _resolve_parent_sale_uid, _omit_em
 _SALE_HEADER_KEYS = frozenset(
     {
         "transaction_uid",
+        "transaction_return_requested",
+        "transaction_return_note",
         "fulfillment_status",
         "shipping_status",
         "unshipped_item_count",
@@ -16,6 +18,9 @@ _SALE_HEADER_KEYS = frozenset(
         "ti_shipped_qty",
         "ti_received_qty",
         "received_item_count",
+        "purchased_units",
+        "received_units",
+        "cancelled_qty",
         "delivered_item_count",
         "return_status",
         "refund_status",
@@ -41,8 +46,16 @@ _SALE_LINE_KEYS = frozenset(
         "shipped_qty",
         "ti_shipped_qty",
         "remaining_to_ship",
+        "cancelled_qty",
+        "cancel_unshipped_qty",
         "returned_qty",
+        "remaining_qty",
+        "returned_qty_total",
         "ti_received_qty",
+        "tracking_carrier",
+        "tracking_number",
+        "ti_tracking_carrier",
+        "ti_tracking_number",
     }
 )
 
@@ -61,6 +74,8 @@ _RETURN_LINE_KEYS = frozenset(
     {
         "ti_uid",
         "return_quantity",
+        "return_shipped_qty",
+        "cancel_unshipped_qty",
         "ti_bs_qty",
         "item_name",
         "bs_service_name",
@@ -71,6 +86,8 @@ _PENDING_RETURN_KEYS = frozenset(
     {
         "trr_uid",
         "trr_uids",
+        "trr_note",
+        "note",
         "return_status",
         "refund_status",
         "display_status",
@@ -86,8 +103,11 @@ _PENDING_ITEM_KEYS = frozenset(
         "ti_uid",
         "transaction_item_uid",
         "return_quantity",
+        "return_shipped_qty",
+        "cancel_unshipped_qty",
         "item_name",
         "ti_bs_id",
+        "ti_bs_cost",
     }
 )
 
@@ -95,6 +115,8 @@ _TOP_KEYS = frozenset(
     {
         "order_uid",
         "display_status",
+        "return_status",
+        "refund_status",
         "stripe_refund",
         "sale",
         "returns",
@@ -102,6 +124,8 @@ _TOP_KEYS = frozenset(
         "pending_return",
         "pending_return_items",
         "transaction_return_items",
+        "transaction_return_requested",
+        "transaction_return_note",
     }
 )
 

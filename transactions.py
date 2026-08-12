@@ -11,10 +11,16 @@ import requests as http_requests
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 from data_ec import connect, processImage
-from moderation import MODERATED_ACTIVE, is_owner_available_for_public_interaction
+from moderation import (
+    MODERATED_ACTIVE,
+    get_business,
+    is_business_publicly_visible,
+    is_owner_available_for_public_interaction,
+)
 from user_path_connection import ConnectionsPath
 from wallet_ids import EC_WALLET_ID
 from wallet_service import (
+    bounty_was_released_to_useable_at,
     credit_bounty_to_wallet,
     credit_useable_from_refund,
     debit_bounty_from_wallet,
@@ -24,6 +30,7 @@ from wallet_service import (
 from wallet_transactions_service import (
     clawback_seller_proceeds_on_return,
     credit_partial_delivery,
+    credit_seller_proceeds_at_checkout,
     resolve_seller_wallet_profile_id,
     _parse_unit_cost,
 )
@@ -33,6 +40,7 @@ from transaction_shipping import (
     insert_transaction_shipping,
     attach_shipping_to_transaction_rows,
     apply_order_fulfillment_summary,
+    sync_list_rows_fulfillment_from_context,
     fulfillment_list_summary_sql,
     ensure_fulfillment_list_rollups,
     append_fulfillment_field,
@@ -129,10 +137,12 @@ def _decrement_tracked_quantity(db, table, uid_column, qty_column, uid, purchase
     decrement_result = db.execute(
         f"""
         UPDATE every_circle.{table}
-        SET {qty_column} = {qty_column} - %s
+        SET {qty_column} = CAST(CAST({qty_column} AS SIGNED) - %s AS CHAR)
         WHERE {uid_column} = %s
           AND {qty_column} IS NOT NULL
-          AND {qty_column} >= %s
+          AND TRIM(CAST({qty_column} AS CHAR)) <> ''
+          AND LOWER(TRIM(CAST({qty_column} AS CHAR))) NOT IN ('unlimited', 'null', 'none')
+          AND CAST({qty_column} AS SIGNED) >= %s
         """,
         (purchased_qty, uid, purchased_qty),
         cmd="post",
@@ -165,6 +175,100 @@ def _decrement_tracked_quantity(db, table, uid_column, qty_column, uid, purchase
         "remaining": available,
     }
     return False, available, (err, 409)
+
+
+def _increment_tracked_quantity(db, table, uid_column, qty_column, uid, qty):
+    """Restore limited stock after a failed checkout line insert."""
+    qty = int(qty or 0)
+    if qty <= 0:
+        return
+    db.execute(
+        f"""
+        UPDATE every_circle.{table}
+        SET {qty_column} = CAST(CAST({qty_column} AS SIGNED) + %s AS CHAR)
+        WHERE {uid_column} = %s
+          AND {qty_column} IS NOT NULL
+          AND TRIM(CAST({qty_column} AS CHAR)) <> ''
+          AND LOWER(TRIM(CAST({qty_column} AS CHAR))) NOT IN ('unlimited', 'null', 'none')
+        """,
+        (qty, uid),
+        cmd="post",
+    )
+
+
+def _validate_business_service_available(db, bs_data):
+    """Gate checkout on business service + parent business visibility."""
+    if not bs_data:
+        return {"message": "Business service not found", "code": 404}
+
+    if int(bs_data.get("bs_is_visible") or 0) != 1:
+        return {"message": "Product is not available", "code": 403}
+
+    status = str(bs_data.get("bs_status") or "active").strip().lower()
+    if status in ("out_of_stock", "inactive", "deleted", "removed"):
+        return {"message": "Product is not available", "code": 403}
+
+    business_uid = bs_data.get("bs_business_id")
+    if business_uid:
+        business = get_business(db, business_uid)
+        if not business or not is_business_publicly_visible(business):
+            return {"message": "Business is not available", "code": 403}
+
+    return None
+
+
+def _apply_business_sold_out_if_needed(db, stock_decrement, remaining_after):
+    """Hide business products when tracked inventory reaches zero."""
+    if not stock_decrement or stock_decrement.get("table") != "business_services":
+        return
+    if not stock_decrement.get("limited"):
+        return
+    remaining = _parse_limited_quantity(remaining_after)
+    if remaining is None or remaining > 0:
+        return
+    db.update(
+        "every_circle.business_services",
+        {"bs_uid": stock_decrement["uid"]},
+        {"bs_is_visible": 0, "bs_status": "out_of_stock", "bs_updated_at": utc_now_str()},
+    )
+
+
+def _inventory_update_payload(stock_decrement, remaining):
+    if not stock_decrement:
+        return None
+    uid = stock_decrement.get("uid")
+    if not uid:
+        return None
+    entry = {
+        "product_uid": uid,
+        "remaining": remaining,
+        "quantity": stock_decrement.get("purchased_qty"),
+    }
+    if stock_decrement.get("table") == "profile_expertise":
+        entry["profile_expertise_uid"] = uid
+    elif stock_decrement.get("table") == "business_services":
+        entry["bs_uid"] = uid
+    elif stock_decrement.get("table") == "profile_wish":
+        entry["profile_wish_uid"] = uid
+    return entry
+
+
+def _find_existing_sale_by_stripe_pi(db, stripe_pi):
+    """Return an existing sale row for this PaymentIntent (checkout idempotency)."""
+    if not stripe_pi:
+        return None
+    rows = db.execute(
+        """
+        SELECT transaction_uid, transaction_profile_id, transaction_business_id
+        FROM every_circle.transactions
+        WHERE transaction_stripe_pi = %s
+          AND COALESCE(transaction_type, 'sale') = 'sale'
+        LIMIT 1
+        """,
+        (stripe_pi,),
+    )
+    result = (rows or {}).get("result") or []
+    return result[0] if result else None
 
 
 def _parse_line_shipping_amount(value):
@@ -227,7 +331,9 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
 
     ti_shipping_amount is stored as the per-unit shipping charge for the line.
     """
-    raw_amt = item.get("shipping_amount")
+    raw_amt = item.get("ti_shipping_amount_per_unit")
+    if raw_amt is None:
+        raw_amt = item.get("shipping_amount")
     if raw_amt is None:
         raw_amt = item.get("ti_shipping_amount")
 
@@ -255,6 +361,48 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
 
 def _money_close(a, b, tol=0.02):
     return abs(round(_to_float(a), 2) - round(_to_float(b), 2)) <= tol
+
+
+def _listing_unit_cost(bs_data):
+    if not bs_data:
+        return 0.0
+    for key in ("bs_cost", "profile_expertise_cost", "profile_wish_cost"):
+        if bs_data.get(key) is not None:
+            return round(_to_float(bs_data.get(key)), 2)
+    return 0.0
+
+
+def _listing_tax_config(bs_data):
+    if not bs_data:
+        return 0, 0.0
+    if bs_data.get("bs_is_taxable") is not None:
+        return bs_data.get("bs_is_taxable"), bs_data.get("bs_tax_rate")
+    if bs_data.get("profile_expertise_is_taxable") is not None:
+        return bs_data.get("profile_expertise_is_taxable"), bs_data.get(
+            "profile_expertise_tax_rate"
+        )
+    return bs_data.get("profile_wish_is_taxable"), bs_data.get("profile_wish_tax_rate")
+
+
+def _apply_line_tax_snapshot(tx_item, item, bs_data=None):
+    """Persist per-line tax snapshot from checkout payload."""
+    raw_tax = item.get("line_tax_amount")
+    if raw_tax is None or raw_tax == "":
+        raw_tax = item.get("ti_line_tax_amount")
+    if raw_tax is not None and raw_tax != "":
+        amount = round(_to_float(raw_tax), 2)
+        tx_item["ti_line_tax_amount"] = amount
+        tx_item["ti_tax_amount"] = amount
+
+    raw_rate = item.get("ti_tax_rate")
+    if raw_rate is not None and raw_rate != "":
+        tx_item["ti_bs_tax_rate"] = raw_rate
+    elif bs_data is not None and tx_item.get("ti_bs_tax_rate") is None:
+        _taxable, rate = _listing_tax_config(bs_data)
+        if rate is not None:
+            tx_item["ti_bs_tax_rate"] = rate
+        if _taxable is not None:
+            tx_item["ti_bs_is_taxable"] = _taxable
 
 
 VALID_FULFILLMENT_METHODS = ("ship", "pickup", "virtual")
@@ -293,15 +441,106 @@ def _line_uses_ship_fulfillment(ti_row):
     )
 
 
+_RETURN_SPLIT_COLUMNS_READY = False
+
+
+def ensure_return_split_columns(db):
+    """Add split return qty columns on return ledger lines (idempotent)."""
+    global _RETURN_SPLIT_COLUMNS_READY
+    if _RETURN_SPLIT_COLUMNS_READY:
+        return
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_return_shipped_qty INT NULL",
+        cmd="post",
+    )
+    db.execute(
+        "ALTER TABLE every_circle.transactions_items "
+        "ADD COLUMN ti_cancel_unshipped_qty INT NULL",
+        cmd="post",
+    )
+    _RETURN_SPLIT_COLUMNS_READY = True
+
+
+def _confirmed_return_split(db, order_uid, ti_uid):
+    """
+    Confirmed return ledger split for a sale line.
+    Returns (return_shipped_qty, cancel_unshipped_qty).
+    """
+    ensure_return_split_columns(db)
+    q = db.execute(
+        """
+        SELECT
+            rti.ti_bs_qty,
+            rti.ti_return_shipped_qty,
+            rti.ti_cancel_unshipped_qty,
+            rti.ti_original_ti_uid,
+            rt.transaction_uid AS return_tx_uid
+        FROM every_circle.transactions_items rti
+        INNER JOIN every_circle.transactions rt
+            ON rti.ti_transaction_id = rt.transaction_uid
+        WHERE rt.transaction_original_uid = %s
+          AND COALESCE(rt.transaction_type, 'return') = 'return'
+          AND rti.ti_original_ti_uid = %s
+        """,
+        (order_uid, ti_uid),
+    )
+    return_shipped = 0
+    cancel_unshipped = 0
+    for row in q.get("result") or []:
+        shipped, cancel = _return_ledger_line_split(db, row.get("return_tx_uid"), row)
+        return_shipped += shipped
+        cancel_unshipped += cancel
+    return return_shipped, cancel_unshipped
+
+
+def _returnable_verified_qty(
+    db, order_uid, ti_uid, verified_qty, exclude_trr_uid=None
+):
+    """
+    Verified units still eligible for post-ship physical return.
+    Physical returns may only come from the verified pool.
+    """
+    returned = _already_returned_qty(db, order_uid, ti_uid)
+    reserved_return, _cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    return max(int(verified_qty or 0) - returned - reserved_return, 0)
+
+
+def _max_return_shipped_qty(
+    db, order_uid, ti_uid, shipped_qty, verified_qty, exclude_trr_uid=None
+):
+    """Physical returns: min(shipped, verified) minus ledger returns and open reservations."""
+    returned = _already_returned_qty(db, order_uid, ti_uid)
+    reserved_return, _cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    cap = min(int(shipped_qty or 0), int(verified_qty or 0))
+    return max(cap - returned - reserved_return, 0)
+
+
+def _max_cancel_unshipped_qty(
+    db, order_uid, ti_uid, purchased_qty, shipped_qty, exclude_trr_uid=None
+):
+    """Pre-ship cancel: unshipped pool minus confirmed cancels and open reservations."""
+    cancelled = _cancelled_qty(db, order_uid, ti_uid)
+    _reserved_return, reserved_cancel = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    pool = max(int(purchased_qty or 0) - int(shipped_qty or 0) - cancelled, 0)
+    return max(pool - reserved_cancel, 0)
+
+
 def _returnable_qty_remaining(
     db, order_uid, ti_uid, order_qty, exclude_trr_uid=None
 ):
-    """Units still returnable on a line after ledger returns and open reservations."""
-    returned = _already_returned_qty(db, order_uid, ti_uid)
+    """Units still returnable on a line after ledger returns/cancels and open reservations."""
+    returned, cancelled = _confirmed_return_split(db, order_uid, ti_uid)
     reserved = _reserved_return_qty(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
-    return max(int(order_qty or 0) - returned - reserved, 0)
+    return max(int(order_qty or 0) - returned - cancelled - reserved, 0)
 
 
 def _parse_listing_mode_flags(raw):
@@ -540,6 +779,9 @@ def _fetch_listing_for_checkout_item(db, item):
                 "code": 404,
             }
         bs_data = bs_response["result"][0]
+        avail_err = _validate_business_service_available(db, bs_data)
+        if avail_err:
+            return None, ti_bs_id, None, False, avail_err
         listing_mode = _business_listing_mode(bs_data)
         if listing_mode is None:
             return None, ti_bs_id, None, False, {
@@ -609,6 +851,8 @@ def _plan_checkout(db, items, payload, shipping_fields):
 
     lines = []
     order_shipping = 0.0
+    order_merchandise = 0.0
+    order_tax = 0.0
     shipping_actual_pending = 0
     any_ship = False
 
@@ -633,6 +877,38 @@ def _plan_checkout(db, items, payload, shipping_fields):
         if method is None:
             return False, {"message": err_msg, "code": 400}, None
 
+        declared_unit = item.get("unit_price")
+        if declared_unit is not None and declared_unit != "":
+            unit_cost = round(_to_float(declared_unit), 2)
+        else:
+            unit_cost = _listing_unit_cost(bs_data)
+        choices_extra = 0.0
+        if str(ti_bs_id).startswith("250"):
+            choices_extra = _to_float(item.get("choices_extra_cost") or 0)
+        line_merchandise = round(unit_cost * qty + choices_extra, 2)
+        order_merchandise += line_merchandise
+
+        line_tax_raw = item.get("line_tax_amount")
+        if line_tax_raw is None or line_tax_raw == "":
+            return False, {
+                "message": f"line_tax_amount is required for item {ti_bs_id}",
+                "code": 400,
+            }, None
+        line_tax = round(_to_float(line_tax_raw), 2)
+        is_taxable, catalog_rate = _listing_tax_config(bs_data)
+        rate_raw = item.get("ti_tax_rate")
+        tax_rate = _to_float(rate_raw) if rate_raw is not None and rate_raw != "" else _to_float(catalog_rate)
+        expected_tax = round(_tax_amount_for_line(line_merchandise, is_taxable, tax_rate), 2)
+        if not _money_close(line_tax, expected_tax):
+            return False, {
+                "message": (
+                    f"line_tax_amount mismatch for item {ti_bs_id} "
+                    f"(expected {expected_tax:.2f}, got {line_tax:.2f})"
+                ),
+                "code": 400,
+            }, None
+        order_tax += line_tax
+
         if method == "ship" and not _listing_supports_ship(listing_mode, bs_data):
             return False, {
                 "message": f"Ship fulfillment is not allowed for item {ti_bs_id}",
@@ -650,6 +926,10 @@ def _plan_checkout(db, items, payload, shipping_fields):
             }, None
 
         expected_line_ship = _compute_expected_line_shipping(method, bs_data, qty)
+        per_unit_ship = item.get("ti_shipping_amount_per_unit")
+        if per_unit_ship is None:
+            per_unit_ship = item.get("ti_shipping_amount")
+
         declared_raw = item.get("line_shipping_amount")
         if declared_raw is not None and declared_raw != "":
             declared_line_ship = _parse_line_shipping_amount(declared_raw)
@@ -658,7 +938,18 @@ def _plan_checkout(db, items, payload, shipping_fields):
                     "message": f"Invalid line_shipping_amount for item {ti_bs_id}",
                     "code": 400,
                 }, None
-            if not _money_close(declared_line_ship, expected_line_ship):
+            if per_unit_ship is not None and per_unit_ship != "":
+                expected_from_unit = round(_to_float(per_unit_ship) * qty, 2)
+                if not _money_close(declared_line_ship, expected_from_unit):
+                    return False, {
+                        "message": (
+                            f"line_shipping_amount must equal ti_shipping_amount_per_unit × "
+                            f"quantity for item {ti_bs_id} "
+                            f"(expected {expected_from_unit:.2f}, got {declared_line_ship:.2f})"
+                        ),
+                        "code": 400,
+                    }, None
+            elif method == "ship" and not _money_close(declared_line_ship, expected_line_ship):
                 return False, {
                     "message": (
                         f"line_shipping_amount mismatch for item {ti_bs_id} "
@@ -669,7 +960,7 @@ def _plan_checkout(db, items, payload, shipping_fields):
         else:
             legacy_unit = item.get("shipping_amount")
             if legacy_unit is None:
-                legacy_unit = item.get("ti_shipping_amount")
+                legacy_unit = per_unit_ship
             if legacy_unit is not None and legacy_unit != "":
                 unit_amt = _parse_line_shipping_amount(legacy_unit)
                 declared_line_ship = round((unit_amt or 0.0) * qty, 2)
@@ -716,6 +1007,11 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "ti_bs_id": ti_bs_id,
                 "fulfillment_method": method,
                 "line_shipping_amount": declared_line_ship,
+                "line_tax_amount": line_tax,
+                "line_merchandise": line_merchandise,
+                "unit_price": unit_cost,
+                "ti_tax_rate": tax_rate,
+                "ti_shipping_amount_per_unit": per_unit_ship,
                 "qty": qty,
             }
         )
@@ -730,6 +1026,29 @@ def _plan_checkout(db, items, payload, shipping_fields):
         }, None
 
     order_shipping = round(order_shipping, 2)
+    order_merchandise = round(order_merchandise, 2)
+    order_tax = round(order_tax, 2)
+
+    if not _money_close(_to_float(payload.get("total_costs")), order_merchandise):
+        return False, {
+            "message": (
+                f"total_costs mismatch (expected {order_merchandise:.2f}, "
+                f"got {_to_float(payload.get('total_costs')):.2f})"
+            ),
+            "code": 400,
+        }, None
+
+    payload_taxes = payload.get("total_taxes")
+    if payload_taxes is not None and payload_taxes != "":
+        if not _money_close(_to_float(payload_taxes), order_tax):
+            return False, {
+                "message": (
+                    f"total_taxes mismatch (expected {order_tax:.2f}, "
+                    f"got {_to_float(payload_taxes):.2f})"
+                ),
+                "code": 400,
+            }, None
+
     payload_shipping = payload.get("total_shipping")
     if payload_shipping is not None:
         if not _money_close(_to_float(payload_shipping), order_shipping):
@@ -765,6 +1084,8 @@ def _plan_checkout(db, items, payload, shipping_fields):
     return True, None, {
         "lines": lines,
         "order_shipping": order_shipping,
+        "order_merchandise": order_merchandise,
+        "order_tax": order_tax,
         "any_ship": any_ship,
         "shipping_actual_pending": shipping_actual_pending,
     }
@@ -826,24 +1147,45 @@ def _refund_shipping_for_line(
     """
     Shipping credit for a product line.
 
-    ti_shipping_amount is the per-unit shipping charge snapshotted at checkout.
-
-    Refundable: per_unit × return_qty (all returned units, shipped or cancelled).
-    Non-refundable: per_unit × cancel_unshipped_qty only (shipped returns = $0).
+    Per-unit model (Buyer Fixed): per_unit × eligible return qty.
+    Flat line model: full line shipping only when the entire line is returned.
     """
-    per_unit = _to_float(ti_row.get("ti_shipping_amount"))
-    if per_unit <= 0:
+    from line_commerce_fields import is_per_unit_shipping_model, line_shipping_charge
+
+    if not ti_row:
         return 0.0
 
-    if _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0) == 1:
-        qty = int(return_qty or 0)
+    try:
+        rq = int(return_qty or 0)
+    except (TypeError, ValueError):
+        rq = 0
+    if rq <= 0:
+        return 0.0
+
+    refundable = (
+        _normalize_shipping_refundable(ti_row.get("ti_shipping_refundable"), default=0) == 1
+    )
+    if refundable:
+        eligible_qty = rq
     else:
-        qty = int(cancel_unshipped_qty or 0)
+        eligible_qty = int(cancel_unshipped_qty or 0)
 
-    if qty <= 0:
+    if eligible_qty <= 0:
         return 0.0
 
-    return round(per_unit * qty, 2)
+    if is_per_unit_shipping_model(ti_row):
+        per_unit = _to_float(ti_row.get("ti_shipping_amount"))
+        if per_unit <= 0:
+            return 0.0
+        return round(per_unit * eligible_qty, 2)
+
+    line_ship = line_shipping_charge(ti_row)
+    if line_ship <= 0:
+        return 0.0
+    original_qty = int(ti_row.get("ti_bs_qty") or 0)
+    if original_qty <= 0 or rq < original_qty:
+        return 0.0
+    return round(line_ship, 2)
 
 
 def _items_all_cancel_only(items_payload, *, order_cancel=False):
@@ -975,16 +1317,9 @@ def _normalize_status_pair(return_status=None, refund_status=None):
 
 def _is_cancel_unshipped_request(req):
     """True when this TRR is a pre-ship cancel (not a physical return)."""
-    if not req:
-        return False
-    if req.get("cancel_unshipped") or req.get("pre_ship_cancel") or req.get(
-        "is_cancel_before_ship"
-    ):
-        return True
-    if req.get("trr_cancel_unshipped") in (1, "1", True, "true"):
-        return True
-    rs = (req.get("return_status") or req.get("trr_return_status") or "").strip().lower()
-    return rs == RETURN_STATUS_CANCELLED
+    from order_display import is_cancel_request
+
+    return is_cancel_request(req)
 
 
 def _status_payload(return_status, refund_status):
@@ -1006,6 +1341,109 @@ def _list_status_payload(return_status, refund_status):
         "refund_status": fs,
         "display_status": _display_return_status(rs, fs),
     }
+
+
+def _awaiting_seller_confirm(req):
+    """True when return request is open and not yet ledgered."""
+    from order_display import is_awaiting_seller
+
+    return is_awaiting_seller(req)
+
+
+def _display_status_label(return_status, refund_status, *, cancel_unshipped=False):
+    """Human label; e.g. 'Cancelling - Pending'. Prefer order_display.return_request_display_status."""
+    from order_display import return_request_display_status
+
+    if isinstance(return_status, dict):
+        return return_request_display_status(return_status)
+    f = (refund_status or "").strip().capitalize()
+    if cancel_unshipped:
+        r = "Cancelled"
+    else:
+        r = (return_status or "").strip().capitalize()
+    if r and f:
+        return f"{r} - {f}"
+    return r or f or None
+
+
+def _pending_return_chip_labels(req, refund_status):
+    """Purchases / seller table chips — delegates to order_display."""
+    from order_display import return_request_delivered_chip, return_request_received_chip
+
+    return return_request_delivered_chip(req), return_request_received_chip(req)
+
+
+def _api_status_for_return_request(req):
+    """Shared API status for buyer/seller pending-return payloads."""
+    from order_display import build_return_request_display
+
+    result = build_return_request_display(req)
+    return result or {}
+
+
+def _return_request_status_payload(req):
+    """Compact return/refund/display_status fields from a TRR row."""
+    api = _api_status_for_return_request(req)
+    return {
+        "return_status": api.get("return_status"),
+        "refund_status": api.get("refund_status"),
+        "display_status": api.get("display_status"),
+    }
+
+
+_PARENT_SALE_RETURN_STATUS_KEYS = (
+    "return_status",
+    "refund_status",
+    "display_status",
+    "transaction_return_status",
+    "transaction_refund_status",
+)
+
+
+def _has_open_pending_return(pending_req):
+    """True when TRR is open and not yet ledgered (awaiting seller / refund)."""
+    if not pending_req or pending_req.get("trr_return_transaction_uid"):
+        return False
+    rs, fs = _normalize_status_pair(
+        pending_req.get("return_status") or pending_req.get("trr_return_status"),
+        pending_req.get("refund_status") or pending_req.get("trr_refund_status"),
+    )
+    if not rs:
+        rs, fs = _normalize_status_pair(pending_req.get("trr_status"), None)
+    return _is_open_return(rs, fs)
+
+
+def _clear_parent_sale_return_status(row):
+    """Remove return/refund status from parent sale rows while TRR is open."""
+    if isinstance(row, dict):
+        for key in _PARENT_SALE_RETURN_STATUS_KEYS:
+            row.pop(key, None)
+    return row
+
+
+def _return_request_public_payload(req, *, qty=None):
+    """
+    Status + display.* for one TRR — pending_return rows, open_returns[], list rows.
+
+    Single source of truth so orders/:uid, purchases.rows[], and seller_transactions[]
+    agree for the same trr_uid.
+    """
+    from order_display import build_return_request_display
+
+    api = build_return_request_display(req, qty=qty)
+    if not api:
+        return {}
+    out = {
+        "return_status": api.get("return_status"),
+        "refund_status": api.get("refund_status"),
+        "display_status": api.get("display_status"),
+    }
+    if api.get("display"):
+        out["display"] = dict(api["display"])
+    for flag in ("cancel_unshipped", "pre_ship_cancel", "is_cancel_before_ship"):
+        if api.get(flag):
+            out[flag] = True
+    return out
 
 
 def _is_return_list_row(row):
@@ -1215,7 +1653,7 @@ def _apply_item_options_to_tx_item(tx_item, item, ti_bs_id):
         tx_item["ti_choices_extra_cost"] = _to_float(item.get("choices_extra_cost"))
 
     unit_price = item.get("unit_price")
-    if unit_price is not None and ti_bs_id and str(ti_bs_id).startswith("250"):
+    if unit_price is not None:
         tx_item["ti_bs_cost"] = _normalize_stored_cost(unit_price)
 
 
@@ -1409,6 +1847,7 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
                COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
                COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
                COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+               ti_fulfillment_method,
                ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
                ti_fulfillment_note
         FROM every_circle.transactions_items
@@ -1427,6 +1866,7 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
                COALESCE(ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
                COALESCE(ti_shipped_qty, 0) AS ti_shipped_qty,
                COALESCE(ti_shipping_not_required, 0) AS ti_shipping_not_required,
+               ti_fulfillment_method,
                ti_shipped_at, ti_tracking_carrier, ti_tracking_number,
                ti_fulfillment_note
         FROM every_circle.transactions_items
@@ -1439,18 +1879,27 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
 
 
 def _all_lines_fully_received(db, transaction_uid):
-    incomplete_q = db.execute(
+    """True when every receivable unit (purchased − pre-ship cancel) is verified."""
+    from order_quantity_context import verification_complete
+
+    line_q = db.execute(
         """
-        SELECT COUNT(*) AS incomplete_count
+        SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
         FROM every_circle.transactions_items
         WHERE ti_transaction_id = %s
           AND ti_bs_qty > 0
-          AND COALESCE(ti_received_qty, 0) < ti_bs_qty
         """,
         (transaction_uid,),
     )
-    rows = incomplete_q.get("result") or []
-    return int(rows[0].get("incomplete_count") or 0) == 0 if rows else False
+    for row in line_q.get("result") or []:
+        ti_uid = row.get("ti_uid")
+        purchased = int(row.get("ti_bs_qty") or 0)
+        verified = int(row.get("ti_received_qty") or 0)
+        cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
+        returned = _already_returned_qty(db, transaction_uid, ti_uid)
+        if not verification_complete(verified, purchased, cancelled, returned):
+            return False
+    return True
 
 
 def _new_trr_uid(db):
@@ -1461,11 +1910,48 @@ def _new_trr_uid(db):
     return uid_resp["result"][0].get("new_id")
 
 
+def _apply_return_item_split(item, *, cancel_only=False):
+    """Normalize return_quantity = return_shipped_qty + cancel_unshipped_qty on one item."""
+    if not isinstance(item, dict):
+        return item
+    ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+    if ti_uid:
+        item.setdefault("transaction_item_uid", ti_uid)
+        item.setdefault("ti_uid", ti_uid)
+    try:
+        rq = int(item.get("return_quantity") or 0)
+    except (TypeError, ValueError):
+        rq = 0
+    has_shipped = item.get("return_shipped_qty") is not None
+    has_cancel = item.get("cancel_unshipped_qty") is not None
+    if has_shipped or has_cancel:
+        try:
+            shipped = int(item.get("return_shipped_qty") or 0)
+        except (TypeError, ValueError):
+            shipped = 0
+        try:
+            unshipped = int(item.get("cancel_unshipped_qty") or 0)
+        except (TypeError, ValueError):
+            unshipped = 0
+    elif cancel_only:
+        shipped, unshipped = 0, rq
+    else:
+        shipped, unshipped = rq, 0
+    item["return_shipped_qty"] = shipped
+    item["cancel_unshipped_qty"] = unshipped
+    return item
+
+
 def _items_from_return_request_row(row):
     """
     Build the single-item (or legacy multi-item) list for a return-request row.
     Prefer columnar trr_ti_uid / trr_return_quantity; fall back to trr_items_json.
     """
+    cancel_only = bool(
+        int(row.get("trr_cancel_unshipped") or 0) == 1
+        or row.get("cancel_unshipped")
+        or row.get("pre_ship_cancel")
+    )
     ti_uid = row.get("trr_ti_uid")
     json_items = []
     try:
@@ -1493,12 +1979,18 @@ def _items_from_return_request_row(row):
                     item["cancel_unshipped_qty"] = int(first.get("cancel_unshipped_qty") or 0)
                 except (TypeError, ValueError):
                     item["cancel_unshipped_qty"] = 0
-        return [item]
+        return [_apply_return_item_split(item, cancel_only=cancel_only)]
     try:
         items = json.loads(row.get("trr_items_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
-    return items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+    return [
+        _apply_return_item_split(entry, cancel_only=cancel_only)
+        for entry in items
+        if isinstance(entry, dict)
+    ]
 
 
 def _hydrate_return_request_row(row):
@@ -1556,20 +2048,64 @@ _TRR_SELECT_COLS = """
 
 
 def _already_returned_qty(db, order_uid, ti_uid):
-    q = db.execute(
+    """Post-ship physical returns only (excludes pre-ship cancels)."""
+    returned, _cancelled = _confirmed_return_split(db, order_uid, ti_uid)
+    return returned
+
+
+def _cancelled_qty(db, order_uid, ti_uid):
+    """Pre-ship cancels only (excludes post-ship physical returns)."""
+    _returned, cancelled = _confirmed_return_split(db, order_uid, ti_uid)
+    return cancelled
+
+
+def _return_ledger_line_split(db, return_tx_uid, row):
+    """Split qty for a confirmed return ledger line."""
+    return_shipped = row.get("ti_return_shipped_qty")
+    cancel_unshipped = row.get("ti_cancel_unshipped_qty")
+    if return_shipped is not None or cancel_unshipped is not None:
+        return int(return_shipped or 0), int(cancel_unshipped or 0)
+
+    qty = abs(int(row.get("ti_bs_qty") or 0))
+    ti_uid = row.get("ti_original_ti_uid")
+    trr_q = db.execute(
         """
-        SELECT COALESCE(SUM(ABS(rti.ti_bs_qty)), 0) AS returned_qty
-        FROM every_circle.transactions_items rti
-        INNER JOIN every_circle.transactions rt
-            ON rti.ti_transaction_id = rt.transaction_uid
-        WHERE rt.transaction_original_uid = %s
-          AND COALESCE(rt.transaction_type, 'return') = 'return'
-          AND rti.ti_original_ti_uid = %s
+        SELECT trr_cancel_unshipped, trr_items_json, trr_ti_uid
+        FROM every_circle.transaction_return_requests
+        WHERE trr_return_transaction_uid = %s
+        LIMIT 1
         """,
-        (order_uid, ti_uid),
+        (return_tx_uid,),
     )
-    rows = q.get("result") or []
-    return int(_to_float(rows[0].get("returned_qty"))) if rows else 0
+    trr_rows = trr_q.get("result") or []
+    if trr_rows:
+        trr = trr_rows[0]
+        try:
+            items = json.loads(trr.get("trr_items_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        for entry in items if isinstance(items, list) else []:
+            if ti_uid and entry.get("transaction_item_uid") != ti_uid:
+                continue
+            if entry.get("return_shipped_qty") is not None:
+                try:
+                    shipped = int(entry.get("return_shipped_qty") or 0)
+                except (TypeError, ValueError):
+                    shipped = 0
+            else:
+                shipped = 0
+            if entry.get("cancel_unshipped_qty") is not None:
+                try:
+                    cancel = int(entry.get("cancel_unshipped_qty") or 0)
+                except (TypeError, ValueError):
+                    cancel = 0
+            else:
+                cancel = 0
+            if shipped or cancel:
+                return shipped, cancel
+        if int(trr.get("trr_cancel_unshipped") or 0) == 1:
+            return 0, qty
+    return qty, 0
 
 
 def _as_trr_uid_set(exclude_trr_uid=None):
@@ -1581,31 +2117,54 @@ def _as_trr_uid_set(exclude_trr_uid=None):
     return {exclude_trr_uid}
 
 
-def _reserved_return_qty(db, order_uid, ti_uid, exclude_trr_uid=None):
-    """Qty already claimed by other open return requests on this sale."""
+def _reserved_return_split(db, order_uid, ti_uid, exclude_trr_uid=None):
+    """
+    Qty reserved by open return requests, split by post-ship return vs pre-ship cancel.
+    Returns (return_shipped_qty, cancel_unshipped_qty).
+    """
     exclude = _as_trr_uid_set(exclude_trr_uid)
     open_reqs = _load_open_return_requests(db, order_uid)
-    reserved = 0
+    return_shipped = 0
+    cancel_unshipped = 0
     for req in open_reqs:
         if req.get("trr_uid") in exclude:
             continue
-        # One row == one item (new); legacy rows may still list multiple in items.
-        if req.get("trr_ti_uid"):
-            if req.get("trr_ti_uid") != ti_uid:
-                continue
-            try:
-                reserved += int(req.get("trr_return_quantity") or 0)
-            except (TypeError, ValueError):
-                continue
-            continue
-        for entry in req.get("items") or []:
+        items = req.get("items") or _items_from_return_request_row(req)
+        cancel_only = bool(
+            req.get("trr_cancel_unshipped")
+            or req.get("cancel_unshipped")
+            or req.get("pre_ship_cancel")
+        )
+        for entry in items:
             if entry.get("transaction_item_uid") != ti_uid:
                 continue
             try:
-                reserved += int(entry.get("return_quantity") or 0)
+                total = int(entry.get("return_quantity") or 0)
             except (TypeError, ValueError):
                 continue
-    return reserved
+            if entry.get("return_shipped_qty") is not None:
+                try:
+                    return_shipped += int(entry.get("return_shipped_qty") or 0)
+                except (TypeError, ValueError):
+                    pass
+            elif not cancel_only:
+                return_shipped += total
+            if entry.get("cancel_unshipped_qty") is not None:
+                try:
+                    cancel_unshipped += int(entry.get("cancel_unshipped_qty") or 0)
+                except (TypeError, ValueError):
+                    pass
+            elif cancel_only:
+                cancel_unshipped += total
+    return return_shipped, cancel_unshipped
+
+
+def _reserved_return_qty(db, order_uid, ti_uid, exclude_trr_uid=None):
+    """Total qty already claimed by other open return requests on this sale."""
+    return_shipped, cancel_unshipped = _reserved_return_split(
+        db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
+    )
+    return return_shipped + cancel_unshipped
 
 
 def _load_sale_for_return(db, transaction_uid):
@@ -1757,8 +2316,15 @@ def _validate_and_price_return_items(
         )
 
         if uses_ship:
-            left_seller_qty = shipped_qty
-            remaining_not_left = _remaining_to_ship_qty(
+            max_return_shipped = _max_return_shipped_qty(
+                db,
+                original_tx_uid,
+                ti_uid,
+                shipped_qty,
+                received_qty,
+                exclude_trr_uid=exclude_trr_uid,
+            )
+            max_cancel = _max_cancel_unshipped_qty(
                 db,
                 original_tx_uid,
                 ti_uid,
@@ -1766,7 +2332,9 @@ def _validate_and_price_return_items(
                 shipped_qty,
                 exclude_trr_uid=exclude_trr_uid,
             )
-            left_label = "shipped"
+            left_seller_qty = max_return_shipped
+            remaining_not_left = max_cancel
+            left_label = "verified returnable"
             not_left_label = "unshipped"
         else:
             left_seller_qty = min(received_qty, returnable_remaining)
@@ -1784,28 +2352,30 @@ def _validate_and_price_return_items(
         if return_shipped_qty > left_seller_qty:
             return False, {
                 "message": (
-                    f"return_shipped_qty exceeds {left_label} qty for {ti_uid} "
-                    f"(requested {return_shipped_qty}, {left_label} {left_seller_qty})"
+                    f"return_shipped_qty exceeds max returnable verified qty for {ti_uid} "
+                    f"(requested {return_shipped_qty}, max {left_seller_qty}; "
+                    f"min(shipped, verified)=({shipped_qty}, {received_qty}))"
                 ),
                 "code": 400,
             }, None
         if cancel_unshipped_qty > remaining_not_left:
             return False, {
                 "message": (
-                    f"cancel_unshipped_qty exceeds remaining {not_left_label} qty for {ti_uid} "
-                    f"(requested {cancel_unshipped_qty}, remaining {remaining_not_left})"
+                    f"cancel_unshipped_qty exceeds max cancel-unshipped qty for {ti_uid} "
+                    f"(requested {cancel_unshipped_qty}, max {remaining_not_left})"
                 ),
                 "code": 400,
             }, None
 
         already_returned = _already_returned_qty(db, original_tx_uid, ti_uid)
+        already_cancelled = _cancelled_qty(db, original_tx_uid, ti_uid)
         reserved = _reserved_return_qty(
             db,
             original_tx_uid,
             ti_uid,
             exclude_trr_uid=exclude_trr_uid,
         )
-        remaining = original_qty - already_returned - reserved
+        remaining = original_qty - already_returned - already_cancelled - reserved
         if rq > remaining:
             return False, {
                 "message": (
@@ -1826,11 +2396,20 @@ def _validate_and_price_return_items(
             }, None
 
         line_subtotal = round(unit_cost * rq, 4)
-        line_tax = _tax_amount_for_line(
-            line_subtotal,
-            ti_row.get("ti_bs_is_taxable"),
-            ti_row.get("ti_bs_tax_rate"),
-        )
+        from line_commerce_fields import _line_tax_snapshot
+
+        prorated_row = dict(ti_row)
+        prorated_row["ti_bs_qty"] = rq
+        stored_line_tax = _line_tax_snapshot(ti_row)
+        orig_qty = int(ti_row.get("ti_bs_qty") or 0)
+        if stored_line_tax is not None and orig_qty > 0:
+            line_tax = round(_to_float(stored_line_tax) * rq / orig_qty, 4)
+        else:
+            line_tax = _tax_amount_for_line(
+                line_subtotal,
+                ti_row.get("ti_bs_is_taxable"),
+                ti_row.get("ti_bs_tax_rate"),
+            )
         line_shipping = _refund_shipping_for_line(
             ti_row,
             rq,
@@ -2057,6 +2636,7 @@ def _issue_stripe_refund(payment_intent_id, amount_dollars, metadata=None):
 
 def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=None):
     """Insert negative sale + reverse bounties. Returns (ok, error_or_None, result_dict)."""
+    ensure_return_split_columns(db)
     original_tx_uid = orig_tx.get("transaction_uid")
     lines_processed = ctx["lines_processed"]
     refund_grand = refund_meta["refund_grand"]
@@ -2157,6 +2737,11 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
         if ti_row.get("ti_shipping_refundable") is not None:
             tx_item["ti_shipping_refundable"] = ti_row.get("ti_shipping_refundable")
 
+        return_shipped_qty = int(line.get("return_shipped_qty") or 0)
+        cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
+        tx_item["ti_return_shipped_qty"] = return_shipped_qty
+        tx_item["ti_cancel_unshipped_qty"] = cancel_unshipped_qty
+
         ti_insert = db.insert("every_circle.transactions_items", tx_item)
         if ti_insert.get("code") != 200:
             return False, {
@@ -2202,10 +2787,16 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
                 bounty_insert_count += 1
                 reversal_abs = abs(reversal)
                 if reversal_abs > 0:
+                    prefer_pending = not bounty_was_released_to_useable_at(
+                        db,
+                        line["original_ti_uid"],
+                        utc_now_str(),
+                    )
                     wallet_result = debit_bounty_from_wallet(
                         db,
                         br.get("tb_profile_id"),
                         reversal_abs,
+                        prefer_pending=prefer_pending,
                     )
                     if wallet_result.get("code") != 200:
                         print(
@@ -2219,11 +2810,6 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
         return_shipped_qty = int(line.get("return_shipped_qty") or 0)
         cancel_unshipped_qty = int(line.get("cancel_unshipped_qty") or 0)
         claw_qty = return_shipped_qty
-        if claw_qty <= 0 and cancel_unshipped_qty > 0:
-            snap = line.get("snapshot") or {}
-            received_qty = int(snap.get("ti_received_qty") or 0)
-            if received_qty > 0 or snap.get("ti_received_at"):
-                claw_qty = min(int(rq), received_qty if received_qty > 0 else int(rq))
         clawback_result = None
         if claw_qty > 0:
             line_trr_uid = (trr_by_ti or {}).get(line["original_ti_uid"])
@@ -2245,6 +2831,56 @@ def _create_return_ledger(db, orig_tx, ctx, refund_meta, return_note, trr_by_ti=
                     total_seller_clawed
                     + _to_float(clawback_result.get("clawed")),
                     4,
+                )
+
+        cancel_adjust_result = None
+        cancel_hold_result = None
+        if cancel_unshipped_qty > 0 and not (
+            clawback_result and clawback_result.get("finalized_request_hold")
+        ):
+            from wallet_transactions_service import (
+                _finalize_pending_clawback_holds,
+                adjust_seller_proceeds_on_cancel_unshipped,
+            )
+
+            line_trr_uid = (trr_by_ti or {}).get(line["original_ti_uid"])
+            if return_shipped_qty <= 0:
+                cancel_hold_result = _finalize_pending_clawback_holds(
+                    db,
+                    original_ti_uid=line["original_ti_uid"],
+                    return_ti_uid=new_ti_uid,
+                    trr_uid=line_trr_uid,
+                )
+            if not (
+                cancel_hold_result
+                and _to_float(cancel_hold_result.get("clawed")) > 0
+            ):
+                cancel_adjust_result = adjust_seller_proceeds_on_cancel_unshipped(
+                    db,
+                    original_ti_uid=line["original_ti_uid"],
+                    return_ti_uid=new_ti_uid,
+                    cancel_qty=cancel_unshipped_qty,
+                    transaction_uid=original_tx_uid,
+                )
+            cancel_clawed = 0.0
+            if cancel_hold_result and cancel_hold_result.get("code") == 200:
+                cancel_clawed = _to_float(cancel_hold_result.get("clawed"))
+            elif cancel_adjust_result and cancel_adjust_result.get("code") == 200:
+                cancel_clawed = _to_float(cancel_adjust_result.get("adjusted"))
+            if cancel_clawed > 0:
+                total_seller_clawed = round(total_seller_clawed + cancel_clawed, 4)
+            if cancel_adjust_result and cancel_adjust_result.get("code") != 200:
+                print(
+                    "Warning: Failed to adjust seller proceeds for cancel on "
+                    f"{line['original_ti_uid']}: {cancel_adjust_result}"
+                )
+            elif cancel_hold_result and cancel_hold_result.get("code") not in (
+                None,
+                200,
+            ):
+                print(
+                    "Warning: Failed to finalize cancel clawback hold on "
+                    f"{line['original_ti_uid']}: {cancel_hold_result}"
                 )
 
         response_lines.append(
@@ -2381,18 +3017,36 @@ def _items_all_unshipped(db, order_uid, items_payload):
 
 
 def _remaining_to_ship_qty(
-    db, order_uid, ti_uid, order_qty, shipped_qty, exclude_trr_uid=None
+    db, order_uid, ti_uid, order_qty, shipped_qty, exclude_trr_uid=None, *, ti_row=None
 ):
     """
-    Units still shippable after accounting for already-shipped, ledger-returned,
-    and open return/cancel reservations.
-    remaining_to_ship = max(purchased - shipped - returned - reserved, 0)
+    Units still shippable after shipped qty and pre-ship cancels/reservations.
+    Post-ship physical returns do not reduce remaining_to_ship.
+
+    Uses effective shipped (max ti_shipped_qty, ti_received_qty) on shipping-required
+    lines so buyer verification implies delivery even when seller never clicked ship.
+    remaining_to_ship = max(purchased - effective_shipped - cancelled - reserved_cancel, 0)
     """
-    returned = _already_returned_qty(db, order_uid, ti_uid)
-    reserved = _reserved_return_qty(
+    if ti_row is None and ti_uid and order_uid:
+        ti_row = _resolve_transaction_item(db, order_uid, ti_uid) or {}
+    else:
+        ti_row = dict(ti_row or {})
+    ti_row.setdefault("ti_bs_qty", order_qty)
+    ti_row.setdefault("ti_shipped_qty", shipped_qty)
+
+    from transaction_shipping import effective_shipped_qty_for_line
+
+    effective_shipped = effective_shipped_qty_for_line(ti_row)
+    cancelled = _cancelled_qty(db, order_uid, ti_uid)
+    _reserved_return, reserved_cancel = _reserved_return_split(
         db, order_uid, ti_uid, exclude_trr_uid=exclude_trr_uid
     )
-    return max(int(order_qty or 0) - int(shipped_qty or 0) - returned - reserved, 0)
+    max_cancel = max(int(order_qty or 0) - effective_shipped - cancelled, 0)
+    reserved_cancel = min(int(reserved_cancel or 0), max_cancel)
+    return max(
+        int(order_qty or 0) - effective_shipped - cancelled - reserved_cancel,
+        0,
+    )
 
 
 def _remaining_unreceived_qty(
@@ -3090,7 +3744,7 @@ class ReturnTransaction(Resource):
     """
     POST: buyer requests a return → creates one trr_uid row per item.
     Physical returns start as Returning - Pending.
-    Unshipped / cancel_unshipped requests start as Cancelled - Pending.
+    Unshipped / cancel_unshipped requests start as Cancelling - Pending (API chips).
 
     Does NOT write the return ledger or refund via Stripe. Seller confirms via
     ConfirmReturnTransaction (trr_uid or trr_uids) → Returned/Cancelled - *.
@@ -3582,24 +4236,11 @@ class ConfirmReturnTransaction(Resource):
             return response, 500
 
 
-class Transactions(Resource):
-
-    def get(self, profile_id=None):
-        print(f"In Transactions GET with profile_id: {profile_id}")
-        response = {}
-
-        try:
-            if not profile_id:
-                response["message"] = "profile_id is required"
-                response["code"] = 400
-                return response, 400
-
-            with connect() as db:
-                ensure_fulfillment_list_rollups(db)
-                fulfillment_summary = fulfillment_list_summary_sql("ti")
-                # Execute query with parameterized profile_id for security
-                query = (
-                    """
+def _buyer_purchase_list_query(*, order_uid_filter=False):
+    fulfillment_summary = fulfillment_list_summary_sql("ti")
+    order_filter = " AND t.transaction_uid = %s" if order_uid_filter else ""
+    return (
+        f"""
                     SELECT
                     t.transaction_uid,
                     t.transaction_original_uid,
@@ -3616,7 +4257,6 @@ class Transactions(Resource):
                     t.transaction_return_requested,
                     t.transaction_return_note,
                     t.transaction_business_id AS seller_id,
-                    -- ti.*,
                     CASE
                         WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
                         WHEN ti.ti_bs_id LIKE '150-%%' THEN
@@ -3643,8 +4283,11 @@ class Transactions(Resource):
                     ) AS purchased_item,
                     SUM(ti.ti_bs_qty) AS ti_bs_qty,
                     MIN(ti.ti_uid) AS ti_uid,
+                    MIN(ti.ti_bs_cost) AS ti_bs_cost,
+                    MIN(pe.profile_expertise_cost) AS profile_expertise_cost,
+                    MIN(pe.profile_expertise_cost_currency) AS profile_expertise_cost_currency,
                     MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
-                    __FULFILLMENT_SUMMARY__
+                    {fulfillment_summary}
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                     ON t.transaction_uid = ti.ti_transaction_id
@@ -3652,7 +4295,6 @@ class Transactions(Resource):
                     ON ti.ti_bs_id = bs.bs_uid
                     LEFT JOIN every_circle.business biz
                     ON bs.bs_business_id = biz.business_uid
-                    
                     LEFT JOIN every_circle.profile_personal seller_pp
                     ON t.transaction_business_id = seller_pp.profile_personal_user_id
                     LEFT JOIN every_circle.profile_expertise pe
@@ -3665,8 +4307,7 @@ class Transactions(Resource):
                     ON wr.wr_profile_wish_id = pw.profile_wish_uid
                     LEFT JOIN every_circle.profile_personal wish_pp
                     ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
-                    WHERE t.transaction_profile_id = %s
-                    -- WHERE t.transaction_profile_id = '110-000014'
+                    WHERE t.transaction_profile_id = %s{order_filter}
                     GROUP BY
                     t.transaction_uid,
                     t.transaction_datetime,
@@ -3677,32 +4318,80 @@ class Transactions(Resource):
                     purchase_type
                     ORDER BY t.transaction_datetime DESC, ti_uid ASC
                """
-                ).replace("__FULFILLMENT_SUMMARY__", fulfillment_summary)
+    )
 
-                print(f"Executing query for profile_id: {profile_id}")
-                result = db.execute(query, (profile_id,))
-                # print(f"Query result: {result}")
 
-                if result.get("code") == 200:
-                    rows = _enrich_transaction_rows(result.get("result", []))
-                    rows = attach_shipping_to_transaction_rows(db, rows)
-                    rows = apply_order_fulfillment_summary(rows)
-                    rows = _enrich_list_transaction_rows(db, rows)
-                    response["message"] = "Purchase Transactions retrieved successfully"
-                    response["code"] = 200
-                    response["data"] = rows
-                    response["count"] = len(rows)
-                    if _request_timezone():
-                        response["timezone"] = _request_timezone()
-                    response["datetime_storage"] = "UTC"
-                else:
-                    response["message"] = result.get(
-                        "message", "Query execution failed"
-                    )
-                    response["code"] = result.get("code", 500)
-                    response["error"] = result.get("error", "Unknown error")
-                    return response, response["code"]
+def _query_buyer_purchase_list_rows(db, profile_id, *, order_uid=None):
+    ensure_fulfillment_list_rollups(db)
+    query = _buyer_purchase_list_query(order_uid_filter=bool(order_uid))
+    params = [profile_id]
+    if order_uid:
+        params.append(order_uid)
+    result = db.execute(query, tuple(params))
+    if result.get("code") != 200:
+        return []
+    return result.get("result") or []
 
+
+def _finalize_buyer_purchase_list_rows(db, rows):
+    """Enrich buyer purchase list rows with shipping, fulfillment, and return linkage."""
+    from order_quantity_context import apply_list_verification_status, clear_ledger_quantity_caches
+    from line_commerce_fields import format_offering_rate_display
+
+    clear_ledger_quantity_caches()
+    if not rows:
+        return []
+    rows = _enrich_transaction_rows(rows)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cost = row.get("profile_expertise_cost") or row.get("ti_bs_cost")
+        if cost is not None and str(cost).strip():
+            row["offering_rate_display"] = format_offering_rate_display(cost)
+    rows = attach_shipping_to_transaction_rows(db, rows)
+    rows = apply_order_fulfillment_summary(rows)
+    rows = sync_list_rows_fulfillment_from_context(db, rows)
+    rows = apply_list_verification_status(db, rows)
+    return _enrich_list_transaction_rows(db, rows)
+
+
+def fetch_buyer_purchase_list_row(db, profile_id, order_uid):
+    """One buyer purchase list row after post-write enrichment (account-screen v2 shape)."""
+    if not profile_id or not order_uid:
+        return None
+    rows = _query_buyer_purchase_list_rows(db, profile_id, order_uid=order_uid)
+    rows = _finalize_buyer_purchase_list_rows(db, rows)
+    return rows[0] if rows else None
+
+
+class Transactions(Resource):
+
+    def get(self, profile_id=None):
+        print(f"In Transactions GET with profile_id: {profile_id}")
+        response = {}
+
+        try:
+            if not profile_id:
+                response["message"] = "profile_id is required"
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                rows = _finalize_buyer_purchase_list_rows(
+                    db, _query_buyer_purchase_list_rows(db, profile_id)
+                )
+                from account_screen_purchases_v2 import build_purchases_v2_rows
+
+                v2_rows = build_purchases_v2_rows(db, rows)
+                response["message"] = "Purchase Transactions retrieved successfully"
+                response["code"] = 200
+                response["schema_version"] = 2
+                response["data"] = v2_rows
+                response["rows"] = v2_rows
+                response["count"] = len(v2_rows)
+                if _request_timezone():
+                    response["timezone"] = _request_timezone()
+                response["datetime_storage"] = "UTC"
                 return response, 200
 
         except Exception as e:
@@ -3802,6 +4491,17 @@ class Transactions(Resource):
             }
 
             with connect() as db:
+                if stripe_pi:
+                    existing_sale = _find_existing_sale_by_stripe_pi(db, stripe_pi)
+                    if existing_sale:
+                        response["message"] = "Transaction already recorded"
+                        response["code"] = 200
+                        response["transaction_uid"] = existing_sale.get(
+                            "transaction_uid"
+                        )
+                        response["idempotent"] = True
+                        return response, 200
+
                 plan_ok, plan_err, checkout_plan = _plan_checkout(
                     db,
                     payload.get("items", []),
@@ -3911,6 +4611,7 @@ class Transactions(Resource):
                 items_count = 0
                 bounty_count = 0
                 order_shipping_total = 0.0
+                inventory_updates = []
                 for item_idx, item in enumerate(payload.get("items", [])):
                     print(item)
                     # {'bs_uid': '250-000021', 'quantity': 9, 'recommender_profile_id': '110-000231'}
@@ -3986,6 +4687,13 @@ class Transactions(Resource):
                             return response, 404
 
                         bs_data = bs_response["result"][0]
+                        avail_err = _validate_business_service_available(db, bs_data)
+                        if avail_err:
+                            _rollback_wallet_debit()
+                            response["message"] = avail_err["message"]
+                            response["code"] = avail_err["code"]
+                            return response, avail_err["code"]
+
                         tx_item["ti_bs_cost"] = _normalize_stored_cost(bs_data.get("bs_cost"))
                         tx_item["ti_bs_cost_currency"] = bs_data.get("bs_cost_currency")
                         tx_item["ti_bs_sku"] = bs_data.get("bs_sku")
@@ -3999,10 +4707,29 @@ class Transactions(Resource):
                             bs_data.get("bs_is_returnable")
                         )
                         _apply_line_shipping_snapshot(tx_item, item, bs_data)
+                        _apply_line_tax_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("bs_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
+
+                        purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(bs_data.get("bs_quantity"))
+                        stock_err = _validate_purchase_quantity(
+                            available_qty, purchased_qty
+                        )
+                        if stock_err:
+                            _rollback_wallet_debit()
+                            response.update(stock_err[0])
+                            return response, stock_err[1]
+                        stock_decrement = {
+                            "table": "business_services",
+                            "uid_column": "bs_uid",
+                            "qty_column": "bs_quantity",
+                            "uid": ti_bs_id,
+                            "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
+                        }
 
                     elif ti_bs_id and str(ti_bs_id).startswith("150"):
                         print("ti_bs_id is an expertise")
@@ -4065,17 +4792,21 @@ class Transactions(Resource):
                             bs_data.get("profile_expertise_is_returnable")
                         )
                         _apply_line_shipping_snapshot(tx_item, item, bs_data)
+                        _apply_line_tax_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("profile_expertise_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
 
                         purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(
+                            bs_data.get("profile_expertise_quantity")
+                        )
                         stock_err = _validate_purchase_quantity(
-                            _parse_limited_quantity(bs_data.get("profile_expertise_quantity")),
-                            purchased_qty,
+                            available_qty, purchased_qty
                         )
                         if stock_err:
+                            _rollback_wallet_debit()
                             response.update(stock_err[0])
                             return response, stock_err[1]
                         stock_decrement = {
@@ -4084,6 +4815,7 @@ class Transactions(Resource):
                             "qty_column": "profile_expertise_quantity",
                             "uid": ti_bs_id,
                             "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
                         }
 
                     elif ti_bs_id and str(ti_bs_id).startswith("165"):
@@ -4149,17 +4881,21 @@ class Transactions(Resource):
                             bs_data.get("profile_wish_is_returnable")
                         )
                         _apply_line_shipping_snapshot(tx_item, item)
+                        _apply_line_tax_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
                         )
                         print("tx_item: ", tx_item)
 
                         purchased_qty = _purchase_qty(item)
+                        available_qty = _parse_limited_quantity(
+                            bs_data.get("profile_wish_quantity")
+                        )
                         stock_err = _validate_purchase_quantity(
-                            _parse_limited_quantity(bs_data.get("profile_wish_quantity")),
-                            purchased_qty,
+                            available_qty, purchased_qty
                         )
                         if stock_err:
+                            _rollback_wallet_debit()
                             response.update(stock_err[0])
                             return response, stock_err[1]
                         stock_decrement = {
@@ -4168,6 +4904,7 @@ class Transactions(Resource):
                             "qty_column": "profile_wish_quantity",
                             "uid": bs_data.get("profile_wish_uid"),
                             "purchased_qty": purchased_qty,
+                            "limited": available_qty is not None,
                         }
 
                     else:
@@ -4215,6 +4952,49 @@ class Transactions(Resource):
                     # tx_item['ti_bs_return_window_days'] = bs_data.get('bs_return_window_days')
                     # print("tx_item: ", tx_item)
 
+                    remaining_after = None
+                    if stock_decrement:
+                        _, remaining_after, dec_err = _decrement_tracked_quantity(
+                            db,
+                            stock_decrement["table"],
+                            stock_decrement["uid_column"],
+                            stock_decrement["qty_column"],
+                            stock_decrement["uid"],
+                            stock_decrement["purchased_qty"],
+                        )
+                        if dec_err:
+                            _rollback_wallet_debit()
+                            for prior in inventory_updates:
+                                if not prior.get("limited"):
+                                    continue
+                                _increment_tracked_quantity(
+                                    db,
+                                    prior["table"],
+                                    prior["uid_column"],
+                                    prior["qty_column"],
+                                    prior["uid"],
+                                    prior["purchased_qty"],
+                                )
+                            response.update(dec_err[0])
+                            return response, dec_err[1]
+                        inv_entry = _inventory_update_payload(
+                            stock_decrement, remaining_after
+                        )
+                        if inv_entry:
+                            inventory_updates.append(
+                                {
+                                    **stock_decrement,
+                                    **inv_entry,
+                                }
+                            )
+                            print(
+                                f"Decremented {stock_decrement['table']} "
+                                f"{stock_decrement['uid']} to {remaining_after}"
+                            )
+                            _apply_business_sold_out_if_needed(
+                                db, stock_decrement, remaining_after
+                            )
+
                     # Insert transaction item
                     transaction_item_response = db.insert(
                         "every_circle.transactions_items", tx_item
@@ -4224,30 +5004,20 @@ class Transactions(Resource):
                     if transaction_item_response.get("code") == 200:
                         items_count += 1
                     else:
+                        if stock_decrement and stock_decrement.get("limited"):
+                            _increment_tracked_quantity(
+                                db,
+                                stock_decrement["table"],
+                                stock_decrement["uid_column"],
+                                stock_decrement["qty_column"],
+                                stock_decrement["uid"],
+                                stock_decrement["purchased_qty"],
+                            )
+                            inventory_updates.pop()
                         print(
                             f"Warning: Failed to insert transaction item: {transaction_item_response}"
                         )
                         continue
-
-                    if stock_decrement:
-                        _, remaining, dec_err = _decrement_tracked_quantity(
-                            db,
-                            stock_decrement["table"],
-                            stock_decrement["uid_column"],
-                            stock_decrement["qty_column"],
-                            stock_decrement["uid"],
-                            stock_decrement["purchased_qty"],
-                        )
-                        if dec_err:
-                            print(
-                                f"Warning: stock decrement failed after insert for "
-                                f"{stock_decrement['uid']}: {dec_err[0]}"
-                            )
-                        elif remaining is not None:
-                            print(
-                                f"Decremented {stock_decrement['table']} "
-                                f"{stock_decrement['uid']} to {remaining}"
-                            )
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
@@ -4567,8 +5337,63 @@ class Transactions(Resource):
 
                 response["transaction_items"] = items_count
                 response["transaction_bounty_count"] = bounty_count
+
+                try:
+                    seller_credit = credit_seller_proceeds_at_checkout(
+                        db, new_transaction_uid
+                    )
+                    response["seller_proceeds_credit"] = seller_credit
+                    if seller_credit.get("code") != 200:
+                        print(
+                            "Warning: Failed to credit seller pending proceeds at "
+                            f"checkout: {seller_credit}"
+                        )
+                except Exception as seller_credit_err:
+                    print(
+                        "Warning: Exception crediting seller pending proceeds at "
+                        f"checkout: {seller_credit_err}"
+                    )
+                    response["seller_proceeds_credit"] = {
+                        "code": 500,
+                        "message": str(seller_credit_err),
+                    }
+
+                if inventory_updates:
+                    response["inventory_updates"] = [
+                        {
+                            k: v
+                            for k, v in entry.items()
+                            if k
+                            not in (
+                                "table",
+                                "uid_column",
+                                "qty_column",
+                                "limited",
+                                "purchased_qty",
+                            )
+                        }
+                        for entry in inventory_updates
+                    ]
                 response["message"] = "Transaction completed successfully"
                 response["code"] = 200
+                response["schema_version"] = 3
+                purchase_row = None
+                try:
+                    from account_screen_v3 import build_buyer_purchase_row_v3
+
+                    purchase_row = build_buyer_purchase_row_v3(
+                        db,
+                        payload.get("profile_id"),
+                        new_transaction_uid,
+                        tz_name=_request_timezone(),
+                    )
+                except Exception as purchase_row_err:
+                    print(
+                        "Warning: Failed to build v3 purchase_row after checkout: "
+                        f"{purchase_row_err}"
+                    )
+                if purchase_row:
+                    response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:
@@ -4577,6 +5402,7 @@ class Transactions(Resource):
             response["message"] = f"An error occurred: {str(e)}"
             response["code"] = 500
             return response, 500
+
 
     def put(self):
         print("In Transactions PUT")
@@ -4689,6 +5515,7 @@ class Transactions(Resource):
                 tx_row_q = db.execute(
                     """
                     SELECT transaction_uid, transaction_business_id,
+                           transaction_profile_id,
                            COALESCE(transaction_type, 'sale') AS transaction_type
                     FROM every_circle.transactions
                     WHERE transaction_uid = %s
@@ -4916,6 +5743,20 @@ class Transactions(Resource):
                 response["code"] = 200
                 response["transaction_uid"] = transaction_uid
                 response["fulfillment_updates"] = updated_lines
+
+                buyer_profile_id = tx_row.get("transaction_profile_id")
+                if buyer_profile_id:
+                    from account_screen_v3 import build_buyer_purchase_row_v3
+
+                    tz_name = request.args.get("timezone") or request.args.get("tz")
+                    purchase_row = build_buyer_purchase_row_v3(
+                        db,
+                        buyer_profile_id,
+                        transaction_uid,
+                        tz_name=tz_name,
+                    )
+                    if purchase_row:
+                        response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:
@@ -5016,9 +5857,16 @@ class Transactions(Resource):
                     ti_uid = ti_row.get("ti_uid")
                     order_qty = int(ti_row.get("ti_bs_qty") or 0)
                     current_received = int(ti_row.get("ti_received_qty") or 0)
-                    remaining = order_qty - current_received
+                    cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
+                    returned = _already_returned_qty(db, transaction_uid, ti_uid)
+                    from order_quantity_context import receivable_units_from_totals
 
-                    if order_qty <= 0:
+                    receivable = receivable_units_from_totals(
+                        order_qty, cancelled, returned
+                    )
+                    remaining = receivable - current_received
+
+                    if order_qty <= 0 or receivable <= 0:
                         response["message"] = (
                             f"Item {item_uid} is not eligible for delivery verification"
                         )
@@ -5026,22 +5874,52 @@ class Transactions(Resource):
                         return response, 400
                     if received_qty > remaining:
                         response["message"] = (
-                            f"received_quantity exceeds remaining qty for {item_uid} "
-                            f"(remaining: {remaining})"
+                            f"received_quantity exceeds remaining receivable qty for "
+                            f"{item_uid} (remaining: {remaining})"
                         )
                         response["code"] = 400
                         return response, 400
 
                     new_received = current_received + received_qty
 
+                    from transaction_shipping import (
+                        FULFILLMENT_STATUS_IN_TRANSIT,
+                        line_is_shippable_row,
+                    )
+
+                    ship_sets = []
+                    ship_params = []
+                    if line_is_shippable_row(ti_row):
+                        current_shipped = int(ti_row.get("ti_shipped_qty") or 0)
+                        new_shipped = max(current_shipped, new_received)
+                        if new_shipped > current_shipped:
+                            ship_sets.extend(
+                                [
+                                    "ti_shipped_qty = %s",
+                                    "ti_shipped_at = COALESCE(ti_shipped_at, %s)",
+                                ]
+                            )
+                            ship_params.extend([new_shipped, received_at])
+                            current_status = (
+                                ti_row.get("ti_fulfillment_status") or "not_shipped"
+                            )
+                            if current_status == "not_shipped":
+                                ship_sets.append("ti_fulfillment_status = %s")
+                                ship_params.append(FULFILLMENT_STATUS_IN_TRANSIT)
+
+                    set_clause = "ti_received_qty = %s, ti_received_at = %s"
+                    set_params = [new_received, received_at]
+                    if ship_sets:
+                        set_clause = f"{set_clause}, " + ", ".join(ship_sets)
+                        set_params.extend(ship_params)
+
                     ti_update = db.execute(
-                        """
+                        f"""
                         UPDATE every_circle.transactions_items
-                        SET ti_received_qty = %s,
-                            ti_received_at = %s
+                        SET {set_clause}
                         WHERE ti_uid = %s AND ti_transaction_id = %s
                         """,
-                        (new_received, received_at, ti_uid, transaction_uid),
+                        tuple(set_params + [ti_uid, transaction_uid]),
                         "post",
                     )
                     if ti_update.get("code") != 200:
@@ -5109,6 +5987,18 @@ class Transactions(Resource):
                 response.update(update_fields)
                 response["delivery_verification_items"] = updated_lines
                 response["all_items_received"] = all_received
+
+                from account_screen_v3 import build_buyer_purchase_row_v3
+
+                tz_name = request.args.get("timezone") or request.args.get("tz")
+                purchase_row = build_buyer_purchase_row_v3(
+                    db,
+                    buyer_profile_id,
+                    transaction_uid,
+                    tz_name=tz_name,
+                )
+                if purchase_row:
+                    response["purchase_row"] = purchase_row
                 return response, 200
 
         except Exception as e:
@@ -5429,8 +6319,46 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             f"uid (trr_uid={pending.get('trr_uid')!r})"
         )
         return None
-    rs, fs = _pair_for_sale(sale_row, pending)
     items = pending.get("items") or []
+    ti_uids = [
+        e.get("transaction_item_uid") or e.get("ti_uid")
+        for e in items
+        if e.get("transaction_item_uid") or e.get("ti_uid")
+    ]
+    name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
+    enriched_items = []
+    for entry in items:
+        item = dict(entry)
+        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+        looked = name_map.get(ti_uid) or {}
+        if looked.get("item_name") and not item.get("item_name"):
+            item["item_name"] = looked["item_name"]
+        if looked.get("ti_bs_id") and not item.get("ti_bs_id"):
+            item["ti_bs_id"] = looked["ti_bs_id"]
+        if looked.get("ti_bs_cost") is not None and item.get("ti_bs_cost") is None:
+            item["ti_bs_cost"] = looked["ti_bs_cost"]
+        enriched_items.append(item)
+    cancel_only = bool(
+        pending.get("cancel_unshipped")
+        or pending.get("pre_ship_cancel")
+        or pending.get("is_cancel_before_ship")
+    )
+    from line_commerce_fields import expand_return_line_splits
+
+    expanded_items = []
+    for item in enriched_items:
+        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+        ti_row = _fetch_ti_row_for_bounty(db, ti_uid, order_uid) if ti_uid else None
+        expanded_items.extend(
+            expand_return_line_splits(
+                db,
+                order_uid,
+                item,
+                ti_row=ti_row,
+                cancel_only=cancel_only,
+            )
+        )
+    items = expanded_items
 
     estimated_refund = None
     stored_json = pending.get("trr_estimated_refund_json")
@@ -5440,7 +6368,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
         except (TypeError, ValueError, json.JSONDecodeError):
             estimated_refund = None
 
-    if estimated_refund is None and items:
+    if estimated_refund is None and enriched_items:
         ok, _err, ctx = _validate_and_price_return_items(
             db,
             order_uid,
@@ -5452,7 +6380,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
                         or pending.get("pre_ship_cancel")
                     ),
                 }
-                for entry in items
+                for entry in enriched_items
             ],
             exclude_trr_uid=pending.get("trr_uid"),
             enforce_return_eligibility=False,
@@ -5467,11 +6395,15 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
             if stored:
                 estimated_refund = {"total": round(stored, 4)}
 
-    bounty_to_reclaim = _resolve_bounty_to_reclaim(db, order_uid, pending, items)
+    bounty_to_reclaim = _resolve_bounty_to_reclaim(
+        db, order_uid, pending, enriched_items
+    )
 
+    note = pending.get("trr_note") or pending.get("note")
     payload = {
         "trr_uid": pending.get("trr_uid"),
-        "note": pending.get("trr_note") or pending.get("note"),
+        "note": note,
+        "trr_note": note,
         "items": items,
         "estimated_refund": estimated_refund,
         "bounty_to_reclaim": bounty_to_reclaim,
@@ -5489,7 +6421,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
         payload["estimated_total"] = estimated_refund["total"]
 
     if compact:
-        payload.update(_list_status_payload(rs, fs))
+        payload.update(_return_request_public_payload(pending))
         return _omit_empty(payload)
 
     payload["seller_note"] = seller_note
@@ -5504,7 +6436,7 @@ def _pending_return_payload_for_sale(db, sale_row, pending, *, compact=True):
     payload["return_transaction_uid"] = pending.get("trr_return_transaction_uid")
     payload["stripe_refund_id"] = pending.get("trr_stripe_refund_id")
     payload["updated_at"] = pending.get("trr_updated_at")
-    payload.update(_status_payload(rs, fs))
+    payload.update(_return_request_public_payload(pending))
     return payload
 
 
@@ -5590,8 +6522,7 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         if payload:
             bounty_total += _to_float(payload.get("bounty_to_reclaim"))
 
-    rs, fs = _pair_for_sale(sale_row, primary)
-    status_fields = _list_status_payload(rs, fs)
+    status_fields = _return_request_status_payload(primary)
     cancel_flag = any(_is_cancel_unshipped_request(p) for p in pending_reqs)
 
     items = []
@@ -5601,26 +6532,28 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
     name_map = _sale_item_names_by_ti(db, order_uid, ti_uids)
 
     item_names = []
-    return_lines = []
+    raw_lines = []
     qty_total = 0
-    for entry in items:
-        ti_uid = entry.get("transaction_item_uid")
-        try:
-            rq = int(entry.get("return_quantity") or 0)
-        except (TypeError, ValueError):
-            rq = 0
-        qty_total += abs(rq)
-        looked_up = name_map.get(ti_uid) or {}
-        name = (
-            entry.get("item_name")
-            or entry.get("bs_service_name")
-            or looked_up.get("item_name")
-        )
-        if name:
-            item_names.append(str(name))
-        return_lines.append(
-            {
+    for req in pending_reqs:
+        req_cancel = _is_cancel_unshipped_request(req)
+        for entry in req.get("items") or []:
+            ti_uid = entry.get("transaction_item_uid") or entry.get("ti_uid")
+            try:
+                rq = int(entry.get("return_quantity") or 0)
+            except (TypeError, ValueError):
+                rq = 0
+            qty_total += abs(rq)
+            looked_up = name_map.get(ti_uid) or {}
+            name = (
+                entry.get("item_name")
+                or entry.get("bs_service_name")
+                or looked_up.get("item_name")
+            )
+            if name:
+                item_names.append(str(name))
+            line_entry = {
                 "ti_uid": ti_uid,
+                "transaction_item_uid": ti_uid,
                 "ti_bs_id": looked_up.get("ti_bs_id") or entry.get("ti_bs_id"),
                 "item_name": name,
                 "return_quantity": abs(rq),
@@ -5628,7 +6561,22 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
                 "ti_bs_cost_currency": looked_up.get("ti_bs_cost_currency")
                 or entry.get("ti_bs_cost_currency"),
             }
-        )
+            if entry.get("return_shipped_qty") is not None:
+                line_entry["return_shipped_qty"] = int(entry.get("return_shipped_qty") or 0)
+            if entry.get("cancel_unshipped_qty") is not None:
+                line_entry["cancel_unshipped_qty"] = int(
+                    entry.get("cancel_unshipped_qty") or 0
+                )
+            if req.get("trr_uid"):
+                line_entry["trr_uid"] = req.get("trr_uid")
+            _apply_return_item_split(line_entry, cancel_only=req_cancel)
+            raw_lines.append(line_entry)
+
+    from line_commerce_fields import collapse_return_lines_for_list_row
+
+    return_lines = collapse_return_lines_for_list_row(raw_lines)
+
+    api_status = _return_request_public_payload(primary, qty=qty_total)
 
     subtotal = round(
         sum(
@@ -5706,26 +6654,10 @@ def _synthetic_pending_return_row(db, sale_row, pending_reqs):
         "is_cancel_before_ship": cancel_flag,
         "estimated_total": credit,
         "estimated_refund": batch_estimated_refund,
-        # Keep a slim pending_return for FE helpers that still read pending_return.*.
-        "pending_return": _omit_empty(
-            {
-                "trr_uid": trr_uids[0] if len(trr_uids) == 1 else None,
-                "trr_uids": trr_uids,
-                "trr_transaction_uid": order_uid,
-                "note": primary.get("trr_note"),
-                "items": items,
-                "estimated_total": credit,
-                "estimated_refund": batch_estimated_refund,
-                "bounty_to_reclaim": round(bounty_total, 4),
-                "created_at": primary.get("trr_created_at"),
-                "cancel_unshipped": cancel_flag,
-                "pre_ship_cancel": cancel_flag,
-                "is_cancel_before_ship": cancel_flag,
-                **status_fields,
-            }
-        ),
         **status_fields,
     }
+    if api_status.get("display"):
+        row["display"] = api_status["display"]
     if len(trr_uids) == 1:
         row["trr_uid"] = trr_uids[0]
         row["transaction_uid"] = trr_uids[0]
@@ -5797,21 +6729,30 @@ def _batch_return_lines(db, return_tx_uids):
     for row in q.get("result") or []:
         tx_uid = row.get("return_transaction_uid")
         qty = int(_to_float(row.get("ti_bs_qty")))
+        return_shipped_qty, cancel_unshipped_qty = _return_ledger_line_split(
+            db, tx_uid, row
+        )
         out.setdefault(tx_uid, []).append(
             {
                 "ti_uid": row.get("ti_uid"),
                 "ti_original_ti_uid": row.get("ti_original_ti_uid"),
+                "transaction_item_uid": row.get("ti_original_ti_uid")
+                or row.get("ti_uid"),
                 "ti_bs_id": row.get("ti_bs_id"),
                 "item_name": row.get("item_name"),
                 "quantity": qty,
                 "return_quantity": abs(qty),
+                "return_shipped_qty": return_shipped_qty,
+                "cancel_unshipped_qty": cancel_unshipped_qty,
                 "unit_cost": _to_float(row.get("ti_bs_cost")),
             }
         )
     return out
 
 
-def _normalize_completed_return_row(out, linked_req=None, return_lines=None):
+def _normalize_completed_return_row(
+    out, linked_req=None, return_lines=None, *, db=None
+):
     """Ensure completed reverse-txn rows have FE-stable return fields."""
     out["transaction_type"] = "return"
     out["is_return"] = True
@@ -5851,6 +6792,10 @@ def _normalize_completed_return_row(out, linked_req=None, return_lines=None):
             )
 
     lines = return_lines or []
+    if db and parent_sale and lines:
+        from line_commerce_fields import collapse_return_lines_for_list_row
+
+        lines = collapse_return_lines_for_list_row(lines)
     out["return_lines"] = lines
     out["lines"] = lines
     if lines and not out.get("purchased_item"):
@@ -5944,6 +6889,7 @@ def _enrich_list_transaction_rows(db, rows):
                 out,
                 linked_req=linked,
                 return_lines=return_lines_map.get(out.get("transaction_uid")) or [],
+                db=db,
             )
             if linked_reqs:
                 out["trr_uids"] = [
@@ -5954,22 +6900,63 @@ def _enrich_list_transaction_rows(db, rows):
             out["is_pending_return"] = False
             if sale_uid:
                 sales_by_uid[sale_uid] = out
-            # Return detail lives on synthetic return list rows only.
-            # Sale keeps status flags so the purchase can show Returning/Pending.
-            out.pop("pending_returns", None)
-            out.pop("pending_return", None)
             if open_reqs:
-                rs, fs = _pair_for_sale(out, open_reqs[0])
-                out.update(_list_status_payload(rs, fs))
+                _clear_parent_sale_return_status(out)
+                pending_returns_payload = [
+                    _pending_return_payload_for_sale(db, out, req, compact=True)
+                    for req in open_reqs
+                ]
+                pending_returns_payload = [
+                    p for p in pending_returns_payload if p
+                ]
+                if pending_returns_payload:
+                    out["pending_returns"] = pending_returns_payload
+                    out["pending_return"] = pending_returns_payload[0]
+                    note = pending_returns_payload[0].get("note") or pending_returns_payload[
+                        0
+                    ].get("trr_note")
+                    if note:
+                        out["transaction_return_note"] = note
+                return_items = []
+                for req in open_reqs:
+                    return_items.extend(req.get("items") or [])
+                if return_items:
+                    ti_uids = [
+                        e.get("transaction_item_uid") or e.get("ti_uid")
+                        for e in return_items
+                        if e.get("transaction_item_uid") or e.get("ti_uid")
+                    ]
+                    name_map = _sale_item_names_by_ti(db, sale_uid, ti_uids)
+                    enriched_return_items = []
+                    for entry in return_items:
+                        item = dict(entry)
+                        ti_uid = item.get("transaction_item_uid") or item.get("ti_uid")
+                        looked = name_map.get(ti_uid) or {}
+                        if looked.get("item_name") and not item.get("item_name"):
+                            item["item_name"] = looked["item_name"]
+                        if looked.get("ti_bs_cost") is not None and item.get(
+                            "ti_bs_cost"
+                        ) is None:
+                            item["ti_bs_cost"] = looked["ti_bs_cost"]
+                        enriched_return_items.append(item)
+                    from line_commerce_fields import expand_return_lines_list
+
+                    out["transaction_return_items"] = expand_return_lines_list(
+                        db, sale_uid, enriched_return_items
+                    )
+            else:
+                out.pop("pending_returns", None)
+                out.pop("pending_return", None)
 
         enriched.append(out)
 
     synthetic = []
     for sale_uid, sale_row in sales_by_uid.items():
         for batch in _group_open_return_batches(return_req_map.get(sale_uid) or []):
-            row = _synthetic_pending_return_row(db, sale_row, batch)
-            if row:
-                synthetic.append(row)
+            for req in batch:
+                row = _synthetic_pending_return_row(db, sale_row, [req])
+                if row:
+                    synthetic.append(row)
 
     if synthetic:
         enriched.extend(synthetic)
@@ -6114,6 +7101,10 @@ class SellerTransactions(Resource):
                     rows = _enrich_transaction_rows(result.get("result", []))
                     rows = attach_shipping_to_transaction_rows(db, rows)
                     rows = apply_order_fulfillment_summary(rows)
+                    rows = sync_list_rows_fulfillment_from_context(db, rows)
+                    from order_quantity_context import apply_list_verification_status
+
+                    rows = apply_list_verification_status(db, rows)
                     rows = _enrich_list_transaction_rows(db, rows)
                     response["message"] = "Seller transactions retrieved successfully"
                     response["code"] = 200

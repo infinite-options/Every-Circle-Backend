@@ -761,7 +761,13 @@ class BusinessTagSearch(Resource):
 
 class BusinessServicePurchase(Resource):
     def post(self):
-        """Decrement bs_quantity when a purchase is made. Atomic SQL to prevent race conditions."""
+        """
+        Decrement bs_quantity when a purchase is made.
+
+        Legacy fallback — primary inventory decrement is in POST /api/v1/transactions.
+        When transaction_uid is supplied, this endpoint is idempotent: if the sale
+        line already exists with sufficient qty, no second decrement is performed.
+        """
         print("In BusinessServicePurchase POST")
         response = {}
 
@@ -770,6 +776,7 @@ class BusinessServicePurchase(Resource):
             payload = getattr(request, '_decrypted_json', None) or request.get_json(force=True) or {}
             bs_uid = payload.get("bs_uid", "").strip()
             qty_purchased = payload.get("quantity", 1)
+            transaction_uid = (payload.get("transaction_uid") or "").strip()
 
             if not bs_uid:
                 response["message"] = "bs_uid is required"
@@ -786,6 +793,34 @@ class BusinessServicePurchase(Resource):
                 return response, 400
 
             with connect() as db:
+                if transaction_uid:
+                    ti_q = db.execute(
+                        """
+                        SELECT COALESCE(SUM(ti_bs_qty), 0) AS purchased_qty
+                        FROM every_circle.transactions_items
+                        WHERE ti_transaction_id = %s AND ti_bs_id = %s
+                        """,
+                        (transaction_uid, bs_uid),
+                    )
+                    rows = (ti_q or {}).get("result") or []
+                    recorded_qty = int(rows[0].get("purchased_qty") or 0) if rows else 0
+                    if recorded_qty >= qty_purchased:
+                        svc_query = db.select(
+                            "every_circle.business_services", where={"bs_uid": bs_uid}
+                        )
+                        remaining = None
+                        if svc_query.get("result"):
+                            remaining = svc_query["result"][0].get("bs_quantity")
+                        response["message"] = (
+                            "Purchase already recorded via checkout"
+                        )
+                        response["remaining"] = remaining
+                        response["bs_uid"] = bs_uid
+                        response["transaction_uid"] = transaction_uid
+                        response["idempotent"] = True
+                        response["code"] = 200
+                        return response, 200
+
                 # Fetch current service
                 svc_query = db.select(
                     "every_circle.business_services", where={"bs_uid": bs_uid}
@@ -859,26 +894,25 @@ def _new_bsr_uid(db):
 
 
 def _load_restock_by_trr_uid(db, trr_uid, bs_uid):
-    if not trr_uid:
-        return None
-    result = db.execute(
-        """
-        SELECT bsr_quantity, bsr_remaining
-        FROM every_circle.business_service_restocks
-        WHERE bsr_trr_uid = %s AND bsr_bs_uid = %s
-        LIMIT 1
-        """,
-        (trr_uid, bs_uid),
+    """Total units already restocked for this return + product."""
+    from inventory_restock import sum_restocked_for_trr
+
+    return sum_restocked_for_trr(
+        db,
+        table="every_circle.business_service_restocks",
+        qty_column="bsr_quantity",
+        trr_column="bsr_trr_uid",
+        listing_column="bsr_bs_uid",
+        trr_uid=trr_uid,
+        listing_uid=bs_uid,
     )
-    rows = result.get("result") or []
-    return rows[0] if rows else None
 
 
 def _record_restock_audit(
     db, bs_uid, quantity, remaining, seller_id=None, trr_uid=None, order_uid=None
 ):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db.insert(
+    return db.insert(
         "every_circle.business_service_restocks",
         {
             "bsr_uid": _new_bsr_uid(db),
@@ -936,18 +970,35 @@ class BusinessServiceRestock(Resource):
                 return response, 400
 
             with connect() as db:
+                restocked_total = 0
+                trr_return_qty = None
                 if trr_uid:
-                    prior = _load_restock_by_trr_uid(db, trr_uid, bs_uid)
-                    if prior:
-                        response["message"] = "Restock already applied for this trr_uid"
-                        response["code"] = 409
-                        response["bs_uid"] = bs_uid
-                        response["quantity"] = int(prior.get("bsr_quantity") or quantity)
-                        remaining = prior.get("bsr_remaining")
-                        if remaining is not None:
-                            remaining = int(remaining)
-                        response["remaining"] = remaining
-                        return response, 409
+                    from inventory_restock import validate_trr_restock_capacity
+
+                    restocked_total = _load_restock_by_trr_uid(db, trr_uid, bs_uid)
+                    allowed, cap_err, trr_return_qty = validate_trr_restock_capacity(
+                        db,
+                        trr_uid,
+                        quantity,
+                        already_restocked=restocked_total,
+                    )
+                    if not allowed:
+                        cap_err = dict(cap_err)
+                        cap_err["bs_uid"] = bs_uid
+                        cap_err["quantity"] = quantity
+                        if cap_err.get("code") == 409:
+                            svc_q = db.select(
+                                "every_circle.business_services",
+                                where={"bs_uid": bs_uid},
+                            )
+                            if svc_q.get("result"):
+                                remaining_raw = svc_q["result"][0].get("bs_quantity")
+                                if (
+                                    remaining_raw is not None
+                                    and str(remaining_raw).strip().lower() != "unlimited"
+                                ):
+                                    cap_err["remaining"] = int(remaining_raw)
+                        return cap_err, cap_err.get("code", 400)
 
                 svc_query = db.select(
                     "every_circle.business_services", where={"bs_uid": bs_uid}
@@ -973,7 +1024,7 @@ class BusinessServiceRestock(Resource):
                         None,
                         message="Unlimited stock — no increment needed",
                     )
-                    _record_restock_audit(
+                    audit_result = _record_restock_audit(
                         db,
                         bs_uid,
                         quantity,
@@ -982,6 +1033,20 @@ class BusinessServiceRestock(Resource):
                         trr_uid=trr_uid,
                         order_uid=order_uid,
                     )
+                    from inventory_restock import restock_audit_insert_error
+
+                    audit_err = restock_audit_insert_error(audit_result)
+                    if audit_err:
+                        audit_err["bs_uid"] = bs_uid
+                        return audit_err, 500
+                    if trr_uid:
+                        response["trr_uid"] = trr_uid
+                        response["restocked_total"] = restocked_total + quantity
+                        if trr_return_qty is not None:
+                            response["trr_return_quantity"] = trr_return_qty
+                            response["remaining_restockable"] = max(
+                                trr_return_qty - (restocked_total + quantity), 0
+                            )
                     return response, 200
 
                 current_qty_int = int(current_qty)
@@ -1006,7 +1071,7 @@ class BusinessServiceRestock(Resource):
                 actual_qty = verify["result"][0].get("bs_quantity") if verify["result"] else None
                 remaining = int(actual_qty) if actual_qty is not None else new_qty
 
-                _record_restock_audit(
+                audit_result = _record_restock_audit(
                     db,
                     bs_uid,
                     quantity,
@@ -1015,6 +1080,12 @@ class BusinessServiceRestock(Resource):
                     trr_uid=trr_uid,
                     order_uid=order_uid,
                 )
+                from inventory_restock import restock_audit_insert_error
+
+                audit_err = restock_audit_insert_error(audit_result)
+                if audit_err:
+                    audit_err["bs_uid"] = bs_uid
+                    return audit_err, 500
 
                 response = _build_restock_response(
                     bs_uid,
@@ -1022,6 +1093,14 @@ class BusinessServiceRestock(Resource):
                     remaining,
                     message="Restock recorded successfully",
                 )
+                if trr_uid:
+                    response["trr_uid"] = trr_uid
+                    response["restocked_total"] = restocked_total + quantity
+                    if trr_return_qty is not None:
+                        response["trr_return_quantity"] = trr_return_qty
+                        response["remaining_restockable"] = max(
+                            trr_return_qty - (restocked_total + quantity), 0
+                        )
                 return response, 200
 
         except Exception as e:

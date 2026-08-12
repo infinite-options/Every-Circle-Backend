@@ -1,10 +1,12 @@
 """
 Auto-release seller return-window holds after wt_available_at.
 
-Held partial_delivery_credit rows move from wallet_pending to useable and
-flip to status posted. When an open return has active wallet reservations,
-only the net amount (held − reserved refund) is released; bounty release
-uses the same net logic (pending − reserved reclaim).
+Held partial_delivery_credit rows (verified slices with a return window)
+move from wallet_pending to useable and flip to status posted. Checkout
+pending credits keep wt_available_at NULL until buyer verifies.
+
+When an open return has active wallet reservations, only the net amount
+(held − reserved refund) is released; bounty release uses the same net logic.
 
 Used by SellerHoldReleaseCron_CLASS (Postman) and SellerHoldRelease_CRON (Zappa).
 """

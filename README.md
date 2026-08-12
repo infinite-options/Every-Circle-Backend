@@ -21,7 +21,7 @@ SHOW PROCESSLIST;
 
 KILL 276116;
 
-To RESET Database
+-- TO RESET ENTIRE DATABASE
 SET FOREIGN_KEY_CHECKS = 0;
 
 TRUNCATE TABLE every_circle.business;
@@ -64,4 +64,22 @@ TRUNCATE TABLE every_circle.types;
 TRUNCATE TABLE every_circle.users;
 TRUNCATE TABLE every_circle.wish_response;
 
+SET FOREIGN_KEY_CHECKS = 1;
+
+-- TO DELETE ALL TRANSACTION AND WALLET ACCOUNTS ONLY
+SET FOREIGN_KEY_CHECKS = 0;
+-- Ledger / wallet (depends on transactions)
+TRUNCATE TABLE every_circle.wallet_transactions;
+TRUNCATE TABLE every_circle.wallet;
+-- Return restock audit (depends on transaction_return_requests)
+TRUNCATE TABLE every_circle.profile_expertise_restocks;
+TRUNCATE TABLE every_circle.business_service_restocks;
+-- Returns (depends on transactions / items)
+TRUNCATE TABLE every_circle.transaction_return_requests;
+-- Transaction children
+TRUNCATE TABLE every_circle.transactions_bounty;
+TRUNCATE TABLE every_circle.transactions_shipping;
+TRUNCATE TABLE every_circle.transactions_items;
+-- Parent orders (includes sale + return transaction rows)
+TRUNCATE TABLE every_circle.transactions;
 SET FOREIGN_KEY_CHECKS = 1;
