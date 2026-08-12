@@ -237,6 +237,211 @@ def build_row_money(row, *, sale_line=None):
     return build_order_money(row)
 
 
+def enrich_purchase_row_money(row, money):
+    """
+    Fill money.customer_total / customer_credit when line snapshots are missing.
+
+    Legacy transaction_* fields backfill historical rows so amount_label is never NA.
+    """
+    if not isinstance(money, dict):
+        money = {}
+    kind = row.get("row_kind")
+    if kind in _RETURN_ROW_KINDS:
+        if money.get("customer_credit") is not None:
+            return money
+        pending = row.get("pending_return") or {}
+        estimated = pending.get("estimated_refund") or row.get("estimated_refund") or {}
+        credit = estimated.get("total_customer_credit") or estimated.get("total")
+        if credit is not None:
+            credit_val = -abs(round_money(credit))
+            return {
+                **money,
+                "customer_credit": credit_val,
+                "known": True,
+            }
+        total = abs(
+            round_money(
+                row.get("transaction_total")
+                or row.get("refund_amount")
+                or row.get("refund_total")
+                or row.get("return_total")
+                or 0
+            )
+        )
+        if total > 0:
+            return {
+                **money,
+                "customer_credit": -total,
+                "known": True,
+            }
+        return money
+
+    if money.get("known") and money.get("customer_total") is not None:
+        return money
+
+    total = round_money(row.get("transaction_total"))
+    if total <= 0:
+        return money
+
+    enriched = dict(money)
+    enriched["customer_total"] = total
+    enriched["known"] = True
+    if enriched.get("merchandise") is None:
+        amount = round_money(row.get("transaction_amount"))
+        if amount > 0:
+            enriched["merchandise"] = amount
+    if enriched.get("tax") is None:
+        taxes = round_money(row.get("transaction_taxes"))
+        if taxes > 0:
+            enriched["tax"] = taxes
+    if enriched.get("shipping") is None:
+        ship = round_money(row.get("transaction_shipping"))
+        enriched["shipping"] = ship
+    fees = round_money(row.get("transaction_fees"))
+    if fees > 0:
+        enriched["fees"] = fees
+        enriched["customer_total_with_fees"] = round_money(total + fees)
+    return enriched
+
+
+def _display_units(row):
+    """Merge v2 units ledger with legacy ti_* fields for display chip math."""
+    units = dict(row.get("units") or {})
+    v3_units = build_v3_units(row)
+
+    if units.get("purchased_qty") is None:
+        units["purchased_qty"] = int(
+            v3_units.get("purchased_qty") or row.get("ti_bs_qty") or 0
+        )
+    if units.get("active_qty") is None:
+        units["active_qty"] = int(units.get("purchased_qty") or 0)
+    if units.get("shipped_qty") is None and row.get("ti_shipped_qty") is not None:
+        units["shipped_qty"] = int(row.get("ti_shipped_qty") or 0)
+    if units.get("verified_qty") is None and row.get("ti_received_qty") is not None:
+        units["verified_qty"] = int(row.get("ti_received_qty") or 0)
+    if units.get("remaining_to_ship_qty") is None and row.get("unshipped_item_count") is not None:
+        units["remaining_to_ship_qty"] = int(row.get("unshipped_item_count") or 0)
+    if units.get("verifiable_remaining_qty") is None:
+        units["verifiable_remaining_qty"] = max(
+            int(units.get("shipped_qty") or 0) - int(units.get("verified_qty") or 0),
+            0,
+        )
+    return units
+
+
+def _requires_shipping_row(row):
+    if row.get("has_shippable_items") in (0, "0", False):
+        return False
+    if row.get("requires_shipping") is not None:
+        return bool(row.get("requires_shipping"))
+    fs = str(row.get("fulfillment_status") or row.get("ti_fulfillment_status") or "").lower()
+    if fs == "not_required":
+        return False
+    try:
+        from units_ledger import fulfillment_method, requires_shipping
+
+        probe = dict(row)
+        if probe.get("fulfillment_method") is None and probe.get("ti_fulfillment_method"):
+            probe["fulfillment_method"] = probe.get("ti_fulfillment_method")
+        return requires_shipping(probe)
+    except Exception:
+        method = str(row.get("fulfillment_method") or row.get("ti_fulfillment_method") or "ship").lower()
+        return method not in ("pickup", "virtual", "not_required")
+
+
+def _buyer_purchase_delivered_label(row, units):
+    """Backend-owned Delivered column for personal purchases.rows[]."""
+    from order_display import (
+        DELIVERY_NOT_APPLICABLE,
+        return_request_delivered_chip,
+    )
+
+    kind = row.get("row_kind")
+    if kind in _RETURN_ROW_KINDS:
+        if kind == "pending_return":
+            return return_request_delivered_chip(row)
+        if row.get("cancel_unshipped") or row.get("pre_ship_cancel"):
+            return "Cancelled"
+        return "Returned"
+
+    open_returns = row.get("open_returns") or []
+    if open_returns:
+        return "Returning"
+
+    purchased = int(units.get("purchased_qty") or 0)
+    active = int(units.get("active_qty") or purchased)
+    cancelled = int(units.get("cancelled_pre_ship_qty") or 0)
+    if active <= 0 and cancelled > 0 and purchased > 0:
+        return "Cancelled"
+
+    if not _requires_shipping_row(row):
+        verified = int(units.get("verified_qty") or 0)
+        if verified >= active and active > 0:
+            return "Paid"
+        return DELIVERY_NOT_APPLICABLE
+
+    shipped = int(units.get("shipped_qty") or 0)
+    total = active if active > 0 else purchased
+
+    if shipped <= 0:
+        return "Not Shipped"
+    if total > 0 and shipped < total:
+        return f"{shipped}/{total}"
+
+    in_escrow = row.get("transaction_in_escrow") in (1, "1", True)
+    verified = int(units.get("verified_qty") or 0)
+    if not in_escrow and verified >= total and total > 0:
+        return "Delivered"
+    return "Shipped"
+
+
+def _buyer_purchase_received_label(row, units):
+    """Backend-owned Received column for personal purchases.rows[]."""
+    from order_display import sale_received_label
+
+    kind = row.get("row_kind")
+    if kind in _RETURN_ROW_KINDS:
+        from order_display import return_request_received_chip
+
+        if kind == "pending_return":
+            return return_request_received_chip(row), None
+        fs = str(row.get("refund_status") or row.get("transaction_refund_status") or "").lower()
+        if fs == "refunded":
+            return "Refunded", None
+        if fs in ("rejected", "stripe_fail", "stripe_failed"):
+            return "Rejected", None
+        return "Pending", None
+
+    received, received_action = sale_received_label(row, units, audience="buyer")
+    return received, received_action
+
+
+def _amount_label_for_row(row, money, *, kind):
+    if kind in _RETURN_ROW_KINDS:
+        credit = money.get("customer_credit")
+        if credit is not None:
+            return format_money_label(credit)
+        total = abs(
+            round_money(
+                row.get("transaction_total")
+                or row.get("refund_amount")
+                or row.get("refund_total")
+                or 0
+            )
+        )
+        if total > 0:
+            return format_money_label(-total)
+        return "—"
+
+    total = money.get("customer_total")
+    if total is not None:
+        return format_money_label(total)
+    legacy = round_money(row.get("transaction_total"))
+    if legacy > 0:
+        return format_money_label(legacy)
+    return "—"
+
+
 def _return_line_display_qty(line):
     """Units in one return line (physical return + pre-ship cancel)."""
     if not isinstance(line, dict):
@@ -304,6 +509,7 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
     kind = row.get("row_kind")
     v2_display = row.get("display") or {}
     units = build_v3_units(row)
+    display_units = _display_units(row)
     dt = row.get("transaction_datetime") or row.get("entry_datetime")
 
     if kind in _RETURN_ROW_KINDS:
@@ -313,26 +519,39 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
             type_label = "Cancel" if row.get("is_cancel_before_ship") else "Return"
         else:
             type_label = "Return"
-        amount = money.get("customer_credit")
     else:
         qty = int(units.get("purchased_qty") or 0)
         cancelled = 0
-        type_label = "Order"
-        amount = money.get("customer_total")
+        type_label = "Purchase" if audience == "buyer" else "Order"
 
     qty = max(int(qty or 0), 0)
+
+    if audience == "buyer":
+        delivered_label = _buyer_purchase_delivered_label(row, display_units)
+        received_label, received_action = _buyer_purchase_received_label(row, display_units)
+        amount_label = _amount_label_for_row(row, money, kind=kind)
+    else:
+        delivered_label = v2_display.get("delivered_label") or "—"
+        received_label = v2_display.get("received_label") or "—"
+        received_action = v2_display.get("received_action")
+        if kind in _RETURN_ROW_KINDS:
+            amount_label = _amount_label_for_row(row, money, kind=kind)
+        else:
+            amount = money.get("customer_total")
+            amount_label = format_money_label(amount) if amount is not None else "—"
+
     display = {
         "date_label": format_date_label(dt, tz_name) or v2_display.get("date_label") or "—",
         "qty": qty,
         "qty_label": str(qty) if qty else "—",
         "cancelled_label": str(cancelled) if cancelled else "—",
-        "delivered_label": v2_display.get("delivered_label") or "—",
-        "received_label": v2_display.get("received_label") or "—",
-        "amount_label": format_money_label(amount) if amount is not None else "NA",
-        "type_label": type_label,
+        "delivered_label": delivered_label,
+        "received_label": received_label,
+        "amount_label": amount_label,
+        "type_label": v2_display.get("type_label") or type_label,
     }
-    if v2_display.get("received_action"):
-        display["received_action"] = v2_display["received_action"]
+    if received_action:
+        display["received_action"] = received_action
     elif audience == "buyer" and kind not in _RETURN_ROW_KINDS:
         display["received_action"] = "status"
 

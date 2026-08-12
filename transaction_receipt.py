@@ -137,7 +137,10 @@ def _enrich_receipt_line(row):
             row["offering_rate_display"] = rate
         row["purchase_type"] = "expertise"
     elif str(ti_bs_id).startswith("250-"):
-        rate = _format_offering_rate_display(row.get("ti_bs_cost"))
+        rate = _format_offering_rate_display(
+            row.get("ti_bs_cost"),
+            row.get("ti_bs_cost_currency"),
+        )
         if rate:
             row["offering_rate_display"] = rate
         row["purchase_type"] = "service"

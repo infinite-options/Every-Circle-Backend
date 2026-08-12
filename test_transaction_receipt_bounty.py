@@ -28,6 +28,23 @@ class TransactionReceiptBountyTests(unittest.TestCase):
         self.assertEqual(payload["total_bounty_paid"], 20.0)
         self.assertEqual(payload["total_amount_paid"], 341.96)
 
+    def test_enrich_business_service_line_rate_display(self):
+        from transaction_receipt import _enrich_receipt_line
+
+        row = _enrich_receipt_line(
+            {
+                "ti_bs_id": "250-000001",
+                "ti_bs_cost": 15.0,
+                "ti_bs_qty": 2,
+                "ti_line_tax_amount": 2.40,
+                "ti_line_shipping_amount": 5.0,
+                "ti_shipping_amount": 2.5,
+            }
+        )
+        self.assertEqual(row["offering_rate_display"], "$15/each")
+        self.assertEqual(row["purchase_type"], "service")
+        self.assertTrue(row["money"]["known"])
+
     @patch("line_commerce_fields.attach_sale_lines_commerce")
     @patch("transactions._seller_bounty_pool_for_line_row")
     def test_attach_receipt_bounty_fields_per_item(self, mock_pool, mock_attach):

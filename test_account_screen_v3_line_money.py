@@ -52,6 +52,60 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(money["shipping"], 12.0)
         self.assertEqual(money["customer_total"], 111.0)
 
+    def test_non_taxable_line_tax_is_zero(self):
+        from line_commerce_fields import (
+            attach_line_tax_amount_fields,
+            line_snapshot_api_fields,
+        )
+
+        row = {
+            "ti_bs_cost": 100.0,
+            "ti_bs_qty": 2,
+            "ti_bs_is_taxable": 0,
+            "ti_line_shipping_amount": 0.0,
+        }
+        money = order_money_from_line_snapshots(row)
+        self.assertTrue(money["known"])
+        self.assertEqual(money["tax"], 0.0)
+        self.assertEqual(money["merchandise"], 200.0)
+
+        attach_line_tax_amount_fields(row)
+        self.assertEqual(row["line_tax_amount"], 0.0)
+        self.assertEqual(row["ti_line_tax_amount"], 0.0)
+        snap = line_snapshot_api_fields(row)
+        self.assertEqual(snap["line_tax_amount"], 0.0)
+
+    def test_tax_present_when_shipping_snapshot_missing(self):
+        """Missing shipping must not wipe tax; default shipping to 0.00."""
+        row = {
+            "ti_bs_cost": 150.0,
+            "ti_bs_qty": 4,
+            "ti_line_tax_amount": 60.0,
+        }
+        money = order_money_from_line_snapshots(row)
+        self.assertTrue(money["known"])
+        self.assertEqual(money["tax"], 60.0)
+        self.assertEqual(money["shipping"], 0.0)
+        self.assertEqual(money["merchandise"], 600.0)
+        self.assertEqual(money["customer_total"], 660.0)
+
+    def test_line_tax_amount_alias_on_purchase_line_entry(self):
+        line = build_purchase_line_v3_entry(
+            {
+                "ti_uid": "510-1",
+                "ti_bs_id": "250-1",
+                "item_name": "Saw",
+                "ti_bs_cost": "170",
+                "ti_bs_qty": 2,
+                "ti_line_tax_amount": 34.0,
+                "ti_line_shipping_amount": 24.0,
+            }
+        )
+        self.assertEqual(line["line_tax_amount"], 34.0)
+        self.assertEqual(line["ti_line_tax_amount"], 34.0)
+        self.assertEqual(line["money"]["tax"], 34.0)
+        self.assertTrue(line["money"]["known"])
+
     def test_legacy_rate_fallback_for_pre_fix_orders(self):
         row = {
             "ti_bs_cost": 30.0,
@@ -272,6 +326,156 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertTrue(money["known"])
         self.assertEqual(money["merchandise"], 36.0)
         self.assertEqual(money["customer_total"], 43.64)
+
+    def test_bounty_results_v3_business_product_sales_fields(self):
+        from account_screen_v3 import build_bounty_results_v3
+
+        class _Db:
+            def execute(self, query, params=None, **kwargs):
+                if "ti_uid IN" in query and "bs_service_name" in query:
+                    return {
+                        "result": [
+                            {
+                                "ti_uid": "510-000915",
+                                "ti_bs_id": "250-000129",
+                                "ti_bs_qty": 3,
+                                "bs_uid": "250-000129",
+                                "bs_service_name": "Chain Saw",
+                            }
+                        ]
+                    }
+                if "ti_uid IN" in query and "ti_bs_cost" in query:
+                    return {
+                        "result": [
+                            {
+                                "ti_uid": "510-000915",
+                                "ti_bs_id": "250-000129",
+                                "ti_bs_cost": 150.0,
+                                "ti_bs_qty": 3,
+                                "ti_line_tax_amount": 36.0,
+                                "ti_line_shipping_amount": 0.0,
+                                "ti_shipping_amount": 0.0,
+                            }
+                        ]
+                    }
+                if "ti_bounty_released_at" in query:
+                    return {"result": []}
+                if "ti_uid IN" in query:
+                    return {"result": []}
+                return {"result": []}
+
+        legacy = [
+            {
+                "ti_uid": "510-000915",
+                "transaction_uid": "500-000736",
+                "transaction_datetime": "2026-08-10 12:00:00",
+                "bounty_earned": 30,
+                "bs_bounty": 10,
+                "tb_percentage": 1.0,
+            }
+        ]
+        result = build_bounty_results_v3(_Db(), legacy)
+        row = result["rows"][0]
+        self.assertEqual(row["ti_bs_id"], "250-000129")
+        self.assertEqual(row["bs_uid"], "250-000129")
+        self.assertEqual(row["ti_bs_qty"], 3)
+        self.assertEqual(row["bs_service_name"], "Chain Saw")
+        self.assertEqual(row["line_merchandise_total"], 450.0)
+        self.assertEqual(row["money"]["merchandise"], 450.0)
+        self.assertEqual(row["bounty_earned"], 30.0)
+
+    def test_sales_products_v3_net_revenue_and_qty(self):
+        from account_screen_v3 import build_sales_products_v3
+
+        seller_rows = [
+            {
+                "row_kind": "sale_line",
+                "ti_uid": "510-000915",
+                "ti_bs_id": "250-000129",
+                "ti_bs_qty": 3,
+                "ti_bs_cost": 150.0,
+                "ti_line_tax_amount": 36.0,
+                "ti_line_shipping_amount": 0.0,
+                "ti_shipping_amount": 0.0,
+                "purchased_item": "Chain Saw",
+                "line_bounty_paid": 30.0,
+            },
+            {
+                "row_kind": "return",
+                "ti_uid": "510-000915",
+                "ti_bs_id": "250-000129",
+                "return_lines": [
+                    {
+                        "return_shipped_qty": 1,
+                        "cancel_unshipped_qty": 0,
+                        "return_quantity": 1,
+                    }
+                ],
+                "units": {"return_shipped_qty": 1, "cancel_unshipped_qty": 0},
+                "bounty_to_reclaim": 10.0,
+            },
+        ]
+        products_source = [
+            {
+                "bs_uid": "250-000129",
+                "bs_service_name": "Chain Saw",
+                "bs_quantity": "8",
+                "bs_cost": 150.0,
+                "bs_bounty": 10.0,
+            },
+            {
+                "bs_uid": "250-000131",
+                "bs_service_name": "Nail Gun",
+                "bs_quantity": "30",
+                "bs_cost": 170.0,
+                "bs_bounty": 20.0,
+            },
+        ]
+
+        class _Db:
+            def execute(self, query, params=None, **kwargs):
+                if "ti_uid IN" in query:
+                    return {
+                        "result": [
+                            {
+                                "ti_uid": "510-000915",
+                                "ti_bs_id": "250-000129",
+                                "ti_bs_cost": 150.0,
+                                "ti_bs_qty": 3,
+                                "ti_line_tax_amount": 36.0,
+                                "ti_line_shipping_amount": 0.0,
+                                "ti_shipping_amount": 0.0,
+                            }
+                        ]
+                    }
+                return {"result": []}
+
+        result = build_sales_products_v3(
+            _Db(), "200-000001", seller_rows, products_source=products_source
+        )
+        product = next(
+            p for p in result["products"] if p["product_uid"] == "250-000129"
+        )
+        self.assertEqual(product["title"], "Chain Saw")
+        self.assertEqual(product["quantity_sold"], 2)
+        self.assertEqual(product["revenue"], 300.0)
+        self.assertEqual(product["bounty_paid"], 20.0)
+        self.assertEqual(product["money"]["merchandise"], 300.0)
+        self.assertEqual(product["quantity_available"], 8)
+        self.assertEqual(product["quantity_available_label"], "8")
+
+        unsold = next(
+            p for p in result["products"] if p["product_uid"] == "250-000131"
+        )
+        self.assertEqual(len(result["products"]), 2)
+        self.assertEqual(unsold["title"], "Nail Gun")
+        self.assertEqual(unsold["quantity_sold"], 0)
+        self.assertEqual(unsold["revenue"], 0.0)
+        self.assertEqual(unsold["bounty_paid"], 0.0)
+        self.assertNotIn("money", unsold)
+        self.assertEqual(unsold["quantity_available"], 30)
+        self.assertEqual(unsold["unit_price"], 170.0)
+        self.assertEqual(unsold["bounty"], 20.0)
 
     def test_round_ledger_entry_to_cents(self):
         from account_screen_v3 import _round_ledger_entry
@@ -573,6 +777,60 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["qty"], 2)
         self.assertEqual(display["qty_label"], "2")
         self.assertEqual(display["cancelled_label"], "1")
+
+    def test_buyer_delivered_label_not_shipped(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 1,
+            "transaction_in_escrow": 1,
+            "fulfillment_method": "ship",
+            "units": {
+                "purchased_qty": 2,
+                "active_qty": 2,
+                "shipped_qty": 0,
+                "verified_qty": 0,
+            },
+        }
+        money = enrich_purchase_row_money(row, {"known": False})
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "Not Shipped")
+        self.assertEqual(display["received_label"], "No")
+
+    def test_buyer_delivered_label_non_shipping(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 0,
+            "fulfillment_method": "virtual",
+            "units": {"purchased_qty": 1, "active_qty": 1, "verified_qty": 0},
+        }
+        money = enrich_purchase_row_money(
+            row, {"customer_total": 75.0, "known": True}
+        )
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "—")
+        self.assertEqual(display["amount_label"], "$75.00")
+
+    def test_buyer_amount_label_legacy_transaction_total(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "sale",
+            "has_shippable_items": 0,
+            "fulfillment_method": "virtual",
+            "transaction_total": 299.99,
+            "transaction_amount": 250.0,
+            "transaction_taxes": 24.99,
+            "transaction_shipping": 25.0,
+            "units": {"purchased_qty": 1, "active_qty": 1},
+        }
+        money = enrich_purchase_row_money(row, {"known": False})
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["amount_label"], "$299.99")
+        self.assertEqual(money["customer_total"], 299.99)
 
 
 if __name__ == "__main__":

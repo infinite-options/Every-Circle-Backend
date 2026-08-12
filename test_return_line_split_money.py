@@ -71,6 +71,52 @@ class ReturnLineSplitMoneyTests(unittest.TestCase):
         self.assertEqual(cancel_row["line_shipping_refund"], 2.0)
         self.assertEqual(cancel_row["line_bounty_reclaim"], 2.0)
 
+    def test_taxable_partial_return_tax_prorates_from_line_snapshot(self):
+        ti_row = {
+            "ti_uid": "ti-tax",
+            "ti_bs_id": "250-1",
+            "ti_bs_qty": 4,
+            "ti_bs_cost": 150.0,
+            "ti_bs_is_taxable": 1,
+            "ti_bs_tax_rate": 10.0,
+            "ti_line_tax_amount": 60.0,
+            "ti_shipping_amount": 20.0,
+            "ti_listing_shipping": "buyer fixed",
+            "ti_shipping_refundable": 1,
+            "bs_bounty": 10.0,
+            "bs_bounty_type": "per_item",
+        }
+        db = _FakeDb()
+        # Return 2 of 4 → half of stored line tax
+        money = _split_row_refund_money(
+            db,
+            "order-tax",
+            ti_row,
+            return_qty=2,
+            return_shipped_qty=2,
+            cancel_unshipped_qty=0,
+        )
+        self.assertEqual(money["line_tax_refund"], 30.0)
+        self.assertEqual(money["line_merchandise_refund"], 300.0)
+
+        rows = expand_return_line_splits(
+            db,
+            "order-tax",
+            {
+                "transaction_item_uid": "ti-tax",
+                "return_quantity": 2,
+                "return_shipped_qty": 1,
+                "cancel_unshipped_qty": 1,
+            },
+            ti_row=ti_row,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["line_tax_refund"], 15.0)
+        self.assertEqual(rows[1]["line_tax_refund"], 15.0)
+        self.assertEqual(rows[0]["money"]["tax"], 15.0)
+        self.assertTrue(rows[0]["money"]["known"])
+        self.assertEqual(sum(r["line_tax_refund"] for r in rows), 30.0)
+
     def test_expand_hybrid_item_into_two_rows(self):
         db = _FakeDb()
         item = {

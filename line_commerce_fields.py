@@ -617,6 +617,7 @@ def _attach_split_row_money(row, money):
         "tax": money["line_tax_refund"],
         "shipping": money["line_shipping_refund"],
         "bounty": money["line_bounty_reclaim"],
+        "known": True,
     }
     return row
 
@@ -899,12 +900,25 @@ def _snapshot_present(value):
     return value is not None and value != ""
 
 
+def _line_is_explicitly_non_taxable(row):
+    """True when checkout snapshotted the line as non-taxable."""
+    raw = row.get("ti_bs_is_taxable")
+    if raw is None or raw == "":
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("0", "false", "no", "n")
+    try:
+        return int(raw) == 0
+    except (TypeError, ValueError):
+        return not bool(raw)
+
+
 def _line_tax_snapshot(row):
     """
     Resolve line tax from stored snapshots only.
 
-    Priority: ti_line_tax_amount → ti_tax_amount → rate × line merchandise.
-    Never allocates from order-level transaction_taxes.
+    Priority: ti_line_tax_amount → ti_tax_amount → explicit non-taxable (0) →
+    rate × line merchandise. Never allocates from order-level transaction_taxes.
     """
     if not isinstance(row, dict):
         return None
@@ -912,7 +926,9 @@ def _line_tax_snapshot(row):
         if _snapshot_present(row.get(key)):
             return round_money(row.get(key))
 
-    qty = _line_snapshot_qty(row)
+    if _line_is_explicitly_non_taxable(row):
+        return 0.0
+
     merchandise = line_merchandise_total_from_row(row)
     if merchandise is None:
         return None
@@ -923,6 +939,26 @@ def _line_tax_snapshot(row):
         _tax_amount_for_line(merchandise, row.get("ti_bs_is_taxable"), rate)
     )
     return tax if tax >= 0 else None
+
+
+def attach_line_tax_amount_fields(row):
+    """
+    Emit canonical FE tax keys on a sale line when tax is resolvable.
+
+    Canonical: line_tax_amount (preferred) and ti_line_tax_amount (alias).
+    Non-taxable lines get 0.00 — never null when known.
+    """
+    if not isinstance(row, dict):
+        return row
+    tax = _line_tax_snapshot(row)
+    if tax is None:
+        return row
+    row["line_tax_amount"] = tax
+    row["ti_line_tax_amount"] = tax
+    money = row.get("money")
+    if isinstance(money, dict) and money.get("tax") is None and money.get("known"):
+        money["tax"] = tax
+    return row
 
 
 def _line_shipping_snapshot(row):
@@ -963,8 +999,11 @@ def line_snapshot_api_fields(row):
     rate = row.get("ti_bs_tax_rate") or row.get("ti_tax_rate")
     if _snapshot_present(rate):
         out["ti_bs_tax_rate"] = rate
+    if row.get("ti_bs_is_taxable") is not None and row.get("ti_bs_is_taxable") != "":
+        out["ti_bs_is_taxable"] = row.get("ti_bs_is_taxable")
     tax = _line_tax_snapshot(row)
     if tax is not None:
+        out["line_tax_amount"] = tax
         out["ti_line_tax_amount"] = tax
     per_unit = row.get("ti_shipping_amount_per_unit")
     if not _snapshot_present(per_unit):
@@ -1037,6 +1076,7 @@ def build_purchase_line_v3_entry(line_row):
         entry["offering_rate_display"] = format_offering_rate_display(unit)
     tax = _line_tax_snapshot(line_row)
     if tax is not None:
+        entry["line_tax_amount"] = tax
         entry["ti_line_tax_amount"] = tax
     ship = _line_shipping_snapshot(line_row)
     if ship is not None:
@@ -1067,16 +1107,22 @@ def order_money_from_line_snapshots(row):
     Build v3 order money from stored checkout snapshots only.
 
     No order-level allocation or rate recomputation on read.
+    Tax is always the line snapshot (or 0.00 when explicitly non-taxable).
+    Missing shipping with known merchandise+tax defaults to 0.00 (free /
+    not charged) so FE line tax is not forced to NA.
     """
     merchandise = line_merchandise_total_from_row(row)
     tax_amt = _line_tax_snapshot(row)
     ship_amt = _line_shipping_snapshot(row)
 
+    if merchandise is not None and tax_amt is not None and ship_amt is None:
+        ship_amt = 0.0
+
     if merchandise is None or tax_amt is None or ship_amt is None:
         return {
-            "merchandise": None,
-            "tax": None,
-            "shipping": None,
+            "merchandise": merchandise,
+            "tax": tax_amt,
+            "shipping": ship_amt,
             "customer_total": None,
             "customer_credit": None,
             "known": False,
@@ -1280,7 +1326,8 @@ def batch_line_checkout_snapshots(db, ti_uids):
             ti_shipping_amount,
             ti_line_shipping_amount,
             ti_shipping_refundable,
-            ti_listing_shipping
+            ti_listing_shipping,
+            ti_choices_extra_cost
         FROM every_circle.transactions_items
         WHERE ti_uid IN ({placeholders})
         """,
@@ -1318,6 +1365,7 @@ def attach_line_snapshots_to_rows(db, rows):
                 "ti_line_shipping_amount",
                 "ti_shipping_refundable",
                 "ti_listing_shipping",
+                "ti_choices_extra_cost",
             ):
                 if skip_qty and key == "ti_bs_qty":
                     continue

@@ -16,7 +16,10 @@ from line_commerce_fields import (
     enrich_bounty_result_rows,
     format_offering_rate_display,
     is_consolidated_purchase_order_row,
+    line_merchandise_total_from_row,
     line_snapshot_api_fields,
+    order_money_from_line_snapshots,
+    return_money_from_line_snapshots,
     round_money,
 )
 from transactions import _to_float
@@ -28,6 +31,7 @@ from account_screen_v3_contract import (
     attention_priority,
     build_return_logistics,
     build_row_money,
+    enrich_purchase_row_money,
     build_v3_actions,
     build_v3_display,
     build_v3_units,
@@ -261,6 +265,7 @@ def transform_purchase_row_v3(row, *, db=None, tz_name=None, sale_line=None):
         money = aggregate_order_customer_money(db, order_uid, order_row=row)
     else:
         money = build_row_money(row, sale_line=sale_line)
+    money = enrich_purchase_row_money(row, money)
     v3 = strip_v2_row_fields(row)
     v3["row_kind"] = map_row_kind_v3(row.get("row_kind"))
     v3["units"] = build_v3_units(row)
@@ -541,6 +546,146 @@ def _net_quantity_sold_by_offering(enriched, transactions):
     return sold
 
 
+def _net_product_sales_aggregates(enriched, transactions, snap_map):
+    """
+    Net quantity, merchandise revenue, and bounty paid per business product (250-*).
+
+    Revenue is sum of line_merchandise_total on sale lines minus return merchandise
+    credits. Omits products with no tracked sale/return activity.
+    """
+    agg = defaultdict(
+        lambda: {
+            "qty": 0,
+            "revenue": 0.0,
+            "bounty_paid": 0.0,
+            "has_activity": False,
+            "title": None,
+        }
+    )
+    for raw, tx in zip(enriched or [], transactions or []):
+        product_uid = raw.get("ti_bs_id") or raw.get("offering_uid")
+        if not product_uid or not str(product_uid).startswith("250-"):
+            continue
+        raw_kind = raw.get("row_kind")
+        if raw.get("is_pending_return") or raw_kind == "pending_return":
+            continue
+
+        bucket = agg[product_uid]
+        name = raw.get("purchased_item") or raw.get("item_name") or raw.get("bs_service_name")
+        if name and str(name).strip() and not bucket["title"]:
+            bucket["title"] = str(name).strip()
+
+        row_kind = tx.get("row_kind")
+        if row_kind == "order":
+            bucket["has_activity"] = True
+            units = tx.get("units") or build_v3_units(raw)
+            bucket["qty"] += _gross_order_qty_for_sold(raw, units)
+            merch = line_merchandise_total_from_row(raw)
+            if merch is not None:
+                bucket["revenue"] = round_money(bucket["revenue"] + merch)
+            bounty = round_money(
+                raw.get("line_bounty_paid") or raw.get("order_bounty_paid") or 0
+            )
+            if bounty:
+                bucket["bounty_paid"] = round_money(bucket["bounty_paid"] + bounty)
+        elif row_kind == "return" and raw_kind == "return":
+            bucket["has_activity"] = True
+            units = tx.get("units") or build_v3_units(raw)
+            ret_qty = int(units.get("return_shipped_qty") or 0) + int(
+                units.get("cancel_unshipped_qty") or 0
+            )
+            bucket["qty"] -= ret_qty
+            sale_line = snap_map.get(raw.get("ti_uid"))
+            ret_money = return_money_from_line_snapshots(raw, sale_line=sale_line)
+            if ret_money.get("known") and ret_money.get("merchandise") is not None:
+                bucket["revenue"] = round_money(
+                    bucket["revenue"] + ret_money["merchandise"]
+                )
+            reclaim = round_money(
+                raw.get("bounty_to_reclaim")
+                or (tx.get("bounty") or {}).get("bounty_to_reclaim")
+                or 0
+            )
+            if reclaim:
+                bucket["bounty_paid"] = round_money(bucket["bounty_paid"] - reclaim)
+    return agg
+
+
+def _build_products_v3(enriched, transactions, products_source, snap_map):
+    """Authoritative Product Sales summary — one row per catalog product with explicit zeros."""
+    aggregates = _net_product_sales_aggregates(enriched, transactions, snap_map)
+    attention_by_product = {}
+    for raw, tx in zip(enriched or [], transactions or []):
+        product_uid = raw.get("ti_bs_id") or raw.get("offering_uid")
+        if not product_uid:
+            continue
+        level = attention_level_for_row(raw)
+        if level:
+            prev = attention_by_product.get(product_uid)
+            if not prev or attention_priority(level) > attention_priority(prev):
+                attention_by_product[product_uid] = level
+
+    catalog_items = [
+        item for item in (products_source or []) if isinstance(item, dict)
+    ]
+    from transactions import _parse_limited_quantity
+
+    products = []
+    for item in catalog_items:
+        uid = item.get("bs_uid") or item.get("product_uid")
+        if not uid:
+            continue
+
+        stats = aggregates.get(uid) or {}
+        title = (
+            item.get("bs_service_name")
+            or item.get("title")
+            or stats.get("title")
+            or uid
+        )
+
+        quantity_sold = max(0, int(stats.get("qty") or 0))
+        revenue = max(0.0, round_money(stats.get("revenue") or 0))
+        bounty_paid = max(0.0, round_money(stats.get("bounty_paid") or 0))
+
+        entry = {
+            "product_uid": uid,
+            "title": str(title).strip(),
+            "quantity_sold": quantity_sold,
+            "revenue": revenue,
+            "bounty_paid": bounty_paid,
+        }
+
+        if quantity_sold > 0 or revenue > 0 or bounty_paid > 0:
+            entry["money"] = {
+                "merchandise": revenue,
+                "bounty_paid": bounty_paid,
+            }
+
+        raw_qty = item.get("bs_quantity")
+        if raw_qty is None or raw_qty == "":
+            raw_qty = item.get("quantity_available")
+        parsed_qty = _parse_limited_quantity(raw_qty)
+        if parsed_qty is None:
+            entry["quantity_available_label"] = "Unlimited"
+        else:
+            entry["quantity_available"] = parsed_qty
+            entry["quantity_available_label"] = str(parsed_qty)
+
+        unit_price = round_money(item.get("bs_cost") or item.get("unit_price"))
+        if unit_price:
+            entry["unit_price"] = unit_price
+        catalog_bounty = round_money(item.get("bs_bounty") or item.get("bounty"))
+        if catalog_bounty:
+            entry["bounty"] = catalog_bounty
+
+        level = attention_by_product.get(uid)
+        if level:
+            entry["attention_level"] = level
+        products.append(entry)
+    return products
+
+
 def _build_offerings_v3(enriched, transactions, offerings_source=None):
     sold_by_offering = _net_quantity_sold_by_offering(enriched, transactions)
     attention_by_offering = {}
@@ -621,7 +766,7 @@ def build_sales_v3(db, profile_id, seller_rows, *, tz_name=None, offerings_sourc
 
 
 def build_sales_products_v3(db, business_uid, seller_rows, *, tz_name=None, products_source=None):
-    """Business account: sales.products[] instead of offerings[]."""
+    """Business account: authoritative sales.products[] Product Sales summary."""
     enriched = attach_line_snapshots_to_rows(db, seller_rows)
     snap_map = batch_line_checkout_snapshots(
         db, [r.get("ti_uid") for r in enriched if isinstance(r, dict)]
@@ -635,43 +780,7 @@ def build_sales_products_v3(db, business_uid, seller_rows, *, tz_name=None, prod
         )
         for r in enriched
     ]
-    sold_by_product = _net_quantity_sold_by_offering(enriched, transactions)
-    attention_by_product = {}
-    for raw, tx in zip(enriched or [], transactions or []):
-        product_uid = raw.get("ti_bs_id") or raw.get("offering_uid")
-        if not product_uid:
-            continue
-        level = attention_level_for_row(raw)
-        if level:
-            prev = attention_by_product.get(product_uid)
-            if not prev or attention_priority(level) > attention_priority(prev):
-                attention_by_product[product_uid] = level
-
-    products = []
-    for item in products_source or []:
-        uid = item.get("bs_uid") or item.get("product_uid")
-        if not uid:
-            continue
-        raw_qty = item.get("bs_quantity")
-        if raw_qty is None or raw_qty == "":
-            raw_qty = item.get("quantity_available")
-        from transactions import _parse_limited_quantity
-
-        parsed_qty = _parse_limited_quantity(raw_qty)
-        unlimited = parsed_qty is None
-        qty_avail = parsed_qty if parsed_qty is not None else 0
-        products.append(
-            {
-                "product_uid": uid,
-                "title": item.get("bs_service_name") or item.get("title"),
-                "unit_price": round_money(item.get("bs_cost") or item.get("unit_price")),
-                "bounty": round_money(item.get("bs_bounty") or item.get("bounty")),
-                "quantity_available": None if unlimited else qty_avail,
-                "quantity_available_label": "∞" if unlimited else str(qty_avail),
-                "quantity_sold": max(0, int(sold_by_product.get(uid) or 0)),
-                "attention_level": attention_by_product.get(uid),
-            }
-        )
+    products = _build_products_v3(enriched, transactions, products_source, snap_map)
     return {
         "products": products,
         "transactions": transactions,
@@ -702,8 +811,159 @@ def _bounty_proceeds_status(row, db):
     return "pending"
 
 
+def _batch_bounty_line_catalog_fields(db, ti_uids):
+    """Product name and ids for bounty_results rows (business + offering lines)."""
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT
+            ti.ti_uid,
+            ti.ti_bs_id,
+            ti.ti_bs_qty,
+            bs.bs_uid,
+            bs.bs_service_name,
+            bs.bs_service_desc,
+            pe.profile_expertise_title,
+            CASE
+                WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                ELSE NULL
+            END AS item_name
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
+        LEFT JOIN every_circle.profile_expertise pe
+            ON ti.ti_bs_id = pe.profile_expertise_uid
+        WHERE ti.ti_uid IN ({placeholders})
+        """,
+        tuple(uids),
+    )
+    return {
+        row.get("ti_uid"): row
+        for row in (q.get("result") or [])
+        if row.get("ti_uid")
+    }
+
+
+def _attach_bounty_row_catalog_fields(db, rows):
+    """Merge product display fields onto bounty result rows."""
+    ti_uids = [r.get("ti_uid") for r in (rows or []) if isinstance(r, dict) and r.get("ti_uid")]
+    catalog_map = _batch_bounty_line_catalog_fields(db, ti_uids)
+    enriched = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+        out = dict(row)
+        catalog = catalog_map.get(out.get("ti_uid")) or {}
+        for key in (
+            "ti_bs_id",
+            "ti_bs_qty",
+            "bs_uid",
+            "bs_service_name",
+            "bs_service_desc",
+            "profile_expertise_title",
+            "item_name",
+        ):
+            if out.get(key) is None and catalog.get(key) is not None:
+                out[key] = catalog.get(key)
+        enriched.append(out)
+    return enriched
+
+
+def _bounty_product_display_name(row):
+    for key in (
+        "bs_service_name",
+        "profile_expertise_title",
+        "item_name",
+        "purchased_item",
+        "title",
+    ):
+        val = row.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return None
+
+
+def _bounty_row_product_fields(row, *, sale_line=None):
+    """Identity, qty, and revenue fields for bounty chart / receipt rows."""
+    if not isinstance(row, dict):
+        return {}
+
+    is_return = row.get("is_return") in (True, 1, "1", "true", "True")
+    ti_bs_id = row.get("ti_bs_id") or row.get("bs_uid")
+    product_name = _bounty_product_display_name(row)
+    fields = {}
+
+    if ti_bs_id:
+        fields["ti_bs_id"] = ti_bs_id
+        if str(ti_bs_id).startswith("250-"):
+            fields["bs_uid"] = ti_bs_id
+
+    if product_name:
+        fields["bs_service_name"] = product_name
+        fields["item_name"] = product_name
+        fields["purchased_item"] = product_name
+
+    desc = row.get("bs_service_desc")
+    if desc is not None and str(desc).strip():
+        fields["bs_service_desc"] = str(desc).strip()
+
+    money = {}
+
+    if is_return:
+        units = build_v3_units(row)
+        ret_qty = int(units.get("return_shipped_qty") or 0) + int(
+            units.get("cancel_unshipped_qty") or 0
+        )
+        if ret_qty > 0:
+            fields["ti_bs_qty"] = -ret_qty
+        ret_money = return_money_from_line_snapshots(row, sale_line=sale_line)
+        if ret_money.get("known") and ret_money.get("merchandise") is not None:
+            fields["line_merchandise_total"] = ret_money["merchandise"]
+            money["merchandise"] = ret_money["merchandise"]
+    else:
+        qty = row.get("ti_bs_qty")
+        if qty is not None and str(qty).strip() != "":
+            try:
+                parsed_qty = int(qty)
+                if parsed_qty != 0:
+                    fields["ti_bs_qty"] = parsed_qty
+            except (TypeError, ValueError):
+                pass
+        merch_total = line_merchandise_total_from_row(row)
+        if merch_total is not None:
+            fields["line_merchandise_total"] = merch_total
+            money["merchandise"] = merch_total
+        elif not money:
+            order_money = order_money_from_line_snapshots(row)
+            if order_money.get("known") and order_money.get("merchandise") is not None:
+                fields["line_merchandise_total"] = order_money["merchandise"]
+                money["merchandise"] = order_money["merchandise"]
+
+    bounty_paid = round_money(row.get("bounty_paid") or row.get("bounty_earned") or 0)
+    if bounty_paid:
+        fields["bounty_paid"] = bounty_paid
+        money["bounty_paid"] = bounty_paid
+
+    if money:
+        fields["money"] = money
+
+    for key, val in line_snapshot_api_fields(row).items():
+        if val is not None and fields.get(key) is None:
+            fields[key] = val
+    return fields
+
+
 def build_bounty_results_v3(db, rows, *, tz_name=None):
     enriched = enrich_bounty_result_rows(db, rows or [])
+    enriched = attach_line_snapshots_to_rows(db, enriched)
+    enriched = _attach_bounty_row_catalog_fields(db, enriched)
+    snap_map = batch_line_checkout_snapshots(
+        db, [r.get("ti_uid") for r in enriched if isinstance(r, dict) and r.get("ti_uid")]
+    )
     v3_rows = []
     for row in enriched:
         if not isinstance(row, dict):
@@ -720,36 +980,40 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
             or row.get("ti_transaction_id")
             or row.get("order_uid")
         )
-        v3_rows.append(
-            {
-                "bounty_line_uid": f"br-{row.get('ti_uid') or order_uid}",
-                "transaction_uid": order_uid,
-                "order_uid": order_uid,
-                "ti_uid": row.get("ti_uid"),
-                "entry_datetime": entry_dt,
-                "entry_datetime_local": enrich_datetime_fields(
-                    {"entry_datetime": entry_dt}, "entry_datetime", tz_name
-                ).get("entry_datetime_local")
-                if entry_dt
-                else None,
-                "purchaser_profile_id": row.get("transaction_profile_id"),
-                "purchaser_name": row.get("purchaser_name"),
-                "transaction_business_id": row.get("transaction_business_id"),
-                "business_name": row.get("display_name") or row.get("business_name"),
-                "bs_bounty": pool,
-                "bounty_earned": earned,
-                "tb_percentage": pct,
-                "proceeds_status": proceeds_status,
-                "bounty_released_at": row.get("ti_bounty_released_at"),
-                "display": {
-                    "date_label": format_date_label(entry_dt, tz_name) or "—",
-                    "status_label": "Useable" if proceeds_status == "useable" else "Pending",
-                    "pool_label": format_money_label(pool),
-                    "earned_label": format_money_label(earned),
-                    "percent_label": pct_label,
-                },
-            }
-        )
+        ti_uid = row.get("ti_uid")
+        sale_line = snap_map.get(ti_uid) if row.get("is_return") in (True, 1, "1") else None
+        entry = {
+            "bounty_line_uid": f"br-{ti_uid or order_uid}",
+            "transaction_uid": order_uid,
+            "order_uid": order_uid,
+            "ti_uid": ti_uid,
+            "entry_datetime": entry_dt,
+            "entry_datetime_local": enrich_datetime_fields(
+                {"entry_datetime": entry_dt}, "entry_datetime", tz_name
+            ).get("entry_datetime_local")
+            if entry_dt
+            else None,
+            "purchaser_profile_id": row.get("transaction_profile_id"),
+            "purchaser_name": row.get("purchaser_name"),
+            "transaction_business_id": row.get("transaction_business_id"),
+            "business_name": row.get("display_name") or row.get("business_name"),
+            "bs_bounty": pool,
+            "bounty_earned": earned,
+            "tb_percentage": pct,
+            "proceeds_status": proceeds_status,
+            "bounty_released_at": row.get("ti_bounty_released_at"),
+            "display": {
+                "date_label": format_date_label(entry_dt, tz_name) or "—",
+                "status_label": "Useable" if proceeds_status == "useable" else "Pending",
+                "pool_label": format_money_label(pool),
+                "earned_label": format_money_label(earned),
+                "percent_label": pct_label,
+            },
+        }
+        if row.get("is_return") in (True, 1, "1"):
+            entry["is_return"] = True
+        entry.update(_bounty_row_product_fields(row, sale_line=sale_line))
+        v3_rows.append(entry)
     return {"rows": v3_rows}
 
 

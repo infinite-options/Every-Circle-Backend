@@ -219,6 +219,10 @@ def _load_sale_lines(db, order_uid):
             ti.ti_selected_options,
             ti.ti_bs_is_returnable,
             ti.ti_bs_return_window_days,
+            ti.ti_bs_is_taxable,
+            ti.ti_bs_tax_rate,
+            ti.ti_line_tax_amount,
+            ti.ti_tax_amount,
             COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
             COALESCE(ti.ti_shipped_qty, 0) AS ti_shipped_qty,
             ti.ti_shipped_at,
@@ -283,6 +287,12 @@ def _load_sale_lines(db, order_uid):
             "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
             "ti_shipping_amount": row.get("ti_shipping_amount"),
             "ti_shipping_refundable": row.get("ti_shipping_refundable"),
+            "ti_line_shipping_amount": row.get("ti_line_shipping_amount"),
+            "ti_listing_shipping": row.get("ti_listing_shipping"),
+            "ti_bs_is_taxable": row.get("ti_bs_is_taxable"),
+            "ti_bs_tax_rate": row.get("ti_bs_tax_rate"),
+            "ti_line_tax_amount": row.get("ti_line_tax_amount"),
+            "ti_tax_amount": row.get("ti_tax_amount"),
             "ti_special_instructions": row.get("ti_special_instructions"),
             "item_name": row.get("item_name"),
             "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
@@ -336,6 +346,11 @@ def _load_return_transactions(db, order_uid):
                 ti.ti_choices_extra_cost,
                 ti.ti_shipping_amount,
                 ti.ti_shipping_refundable,
+                ti.ti_line_shipping_amount,
+                ti.ti_bs_is_taxable,
+                ti.ti_bs_tax_rate,
+                ti.ti_line_tax_amount,
+                ti.ti_tax_amount,
                 ti.ti_special_instructions,
                 ti.ti_selected_options,
                 {name_case} AS item_name,
@@ -371,6 +386,11 @@ def _load_return_transactions(db, order_uid):
                     "ti_choices_extra_cost": row.get("ti_choices_extra_cost"),
                     "ti_shipping_amount": row.get("ti_shipping_amount"),
                     "ti_shipping_refundable": row.get("ti_shipping_refundable"),
+                    "ti_line_shipping_amount": row.get("ti_line_shipping_amount"),
+                    "ti_bs_is_taxable": row.get("ti_bs_is_taxable"),
+                    "ti_bs_tax_rate": row.get("ti_bs_tax_rate"),
+                    "ti_line_tax_amount": row.get("ti_line_tax_amount"),
+                    "ti_tax_amount": row.get("ti_tax_amount"),
                     "ti_special_instructions": row.get("ti_special_instructions"),
                     "item_name": row.get("item_name"),
                     "bs_service_name": row.get("bs_service_name") or row.get("item_name"),
@@ -667,6 +687,7 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
 
     lines = attach_line_units_ledgers(db, order_uid, sale.get("lines") or [])
     from line_commerce_fields import (
+        attach_line_tax_amount_fields,
         line_merchandise_total_from_row,
         line_snapshot_api_fields,
         order_money_from_line_snapshots,
@@ -678,6 +699,7 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
         if isinstance(line, dict):
             line["money"] = order_money_from_line_snapshots(line)
             line.update(line_snapshot_api_fields(line))
+            attach_line_tax_amount_fields(line)
             merch_total = line_merchandise_total_from_row(line)
             if merch_total is not None:
                 line["line_merchandise_total"] = merch_total
@@ -696,6 +718,13 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
             continue
         entry = dict(ret)
         ret_lines = entry.get("lines") or []
+        for ret_line in ret_lines:
+            if isinstance(ret_line, dict) and ret_line.get("line_tax_refund") is not None:
+                # Canonical FE key already present from expand_return_lines_list.
+                money = ret_line.get("money")
+                if isinstance(money, dict):
+                    money.setdefault("known", True)
+                    money.setdefault("tax", ret_line.get("line_tax_refund"))
         entry["return_lines"] = ret_lines
         returns.append(entry)
     payload["returns"] = returns
