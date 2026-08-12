@@ -203,12 +203,11 @@ def line_quantity_context(db, order_uid, ti_uid, *, row=None, order_splits=None,
         ti_row=row,
     )
     net_verified_not_returned = max(verified - returned, 0)
-    # Align with v2 units_ledger: returned unverified units do not count as pending verify.
-    unverified_shipped = max(shipped - verified - returned, 0)
-    unverified_pool = max(0, shipped - verified)
-    unverified_returned = min(returned, unverified_pool)
-    returned_verified = returned - unverified_returned
-    verified_for_return_window = max(0, verified - returned_verified)
+    # ti_shipped/ti_received are never reduced by returns. Physical returns come
+    # from the verified pool, so unverified = shipped − verified only.
+    unverified_shipped = max(shipped - verified, 0)
+    # Returns ⊆ verified → all completed returns are from the verified pool.
+    verified_for_return_window = max(0, verified - returned)
     pending_verification_units = remaining_to_ship + max(0, shipped - verified)
     verified_returnable = _returnable_verified_qty_cached(
         db,

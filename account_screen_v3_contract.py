@@ -194,6 +194,7 @@ _SALE_UNITS_LEDGER_KEYS = (
     "shipped_qty",
     "remaining_to_ship_qty",
     "verified_qty",
+    "unverified_shipped_qty",
     "verifiable_remaining_qty",
     "returned_shipped_completed_qty",
     "returned_unshipped_completed_qty",
@@ -668,9 +669,15 @@ def attention_level_for_row(row):
     """Seller attention chip priority: red > orange > purple."""
     if not isinstance(row, dict):
         return None
-    if row.get("needs_shipping") or row.get("needs_shipment"):
-        return "red"
     units = row.get("units") or {}
+    # Prefer units ledger — sale_line rows strip needs_shipping before v3 transform.
+    remaining_to_ship = int(units.get("remaining_to_ship_qty") or 0)
+    if (
+        row.get("needs_shipping")
+        or row.get("needs_shipment")
+        or remaining_to_ship > 0
+    ):
+        return "red"
     if int(units.get("verifiable_remaining_qty") or 0) > 0:
         return "orange"
     if row.get("is_pending_return") or row.get("open_returns"):

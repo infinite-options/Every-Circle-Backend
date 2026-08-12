@@ -439,6 +439,9 @@ class TransactionReceipt(Resource):
 
         try:
             with connect() as db:
+                from order_quantity_context import clear_ledger_quantity_caches
+
+                clear_ledger_quantity_caches()
                 rows, err = _load_receipt_lines(
                     db, profile_id, transaction_uid, seller_id
                 )

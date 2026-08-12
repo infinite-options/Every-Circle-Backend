@@ -548,47 +548,11 @@ def _fetch_bounty_ledger_rows(db, profile_id):
     return q.get("result") or []
 
 
-def _seller_business_ids(db, profile_id):
-    """Business uids whose wallet resolves to this profile (personal + owned businesses)."""
-    ids = {str(profile_id or "").strip()}
-    ids.discard("")
-    q = db.execute(
-        """
-        SELECT bu.bu_business_id
-        FROM every_circle.business_user bu
-        INNER JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
-        INNER JOIN every_circle.profile_personal pp
-            ON pp.profile_personal_user_id = u.user_uid
-        WHERE pp.profile_personal_uid = %s
-        """,
-        (profile_id,),
-    )
-    for row in q.get("result") or []:
-        business_id = row.get("bu_business_id")
-        if business_id:
-            ids.add(str(business_id))
-    return list(ids)
-
-
 def _fetch_seller_sale_uids(db, profile_id):
-    seller_ids = _seller_business_ids(db, profile_id)
-    if not seller_ids:
-        return []
-    placeholders = ", ".join(["%s"] * len(seller_ids))
-    q = db.execute(
-        f"""
-        SELECT DISTINCT t.transaction_uid
-        FROM every_circle.transactions t
-        WHERE COALESCE(t.transaction_type, 'sale') = 'sale'
-          AND t.transaction_business_id IN ({placeholders})
-        """,
-        tuple(seller_ids),
-    )
-    return [
-        row.get("transaction_uid")
-        for row in (q.get("result") or [])
-        if row.get("transaction_uid")
-    ]
+    """Sale orders for this wallet id only (personal offering or business, not both)."""
+    from wallet_ledger_proceeds import fetch_seller_sale_uids
+
+    return fetch_seller_sale_uids(db, profile_id)
 
 
 def _fetch_wallet_transaction_ledger_rows(db, profile_id):

@@ -31,6 +31,17 @@ def _line_fulfillment_method(row):
     return str(row.get("ti_fulfillment_method") or row.get("fulfillment_method") or "ship").strip().lower()
 
 
+def compute_unverified_shipped(*, shipped, verified):
+    """
+    Shipped units not yet buyer-verified.
+
+    ti_shipped_qty / ti_received_qty are never reduced by returns/cancels.
+    Completed physical returns come from the *verified* pool, so they must NOT
+    be subtracted here — doing so double-counts and falsely zeroes Verify.
+    """
+    return max(0, int(shipped or 0) - int(verified or 0))
+
+
 def compute_verifiable_remaining(
     *,
     shipped,
@@ -41,16 +52,16 @@ def compute_verifiable_remaining(
     """
     Units the buyer may still confirm receipt of.
 
-    Open returns on already-verified units must not block verifying newly
-    shipped units on the same order line / aggregate.
+    Physical returns (completed or open) consume verified units first. Only the
+    portion of an open return that exceeds net verified units can block verify.
     """
-    unverified_shipped = max(0, int(shipped or 0) - int(verified or 0) - int(returned_shipped or 0))
+    unverified_shipped = compute_unverified_shipped(shipped=shipped, verified=verified)
     rip = max(0, int(return_in_progress_shipped or 0))
     if rip <= 0 or unverified_shipped <= 0:
         return unverified_shipped
 
+    # Gross verified still includes units later returned; net = still with buyer.
     verified_not_returned = max(0, int(verified or 0) - int(returned_shipped or 0))
-    # Assume in-progress returns consume verified units first (buyer returns what they received).
     return_on_unverified = max(0, rip - verified_not_returned)
     return_on_unverified = min(return_on_unverified, unverified_shipped)
     return max(0, unverified_shipped - return_on_unverified)
@@ -75,7 +86,8 @@ def _units_from_counts(
         remaining_to_ship = 0
         shipped = verified
 
-    unverified_shipped = max(0, shipped - verified - returned_shipped)
+    # Do NOT subtract returned_shipped — returns come from verified, not unverified.
+    unverified_shipped = compute_unverified_shipped(shipped=shipped, verified=verified)
     verifiable_remaining = compute_verifiable_remaining(
         shipped=shipped,
         verified=verified,
@@ -138,6 +150,7 @@ def _units_from_counts(
         "shipped_qty": shipped,
         "remaining_to_ship_qty": remaining_to_ship,
         "verified_qty": verified,
+        "unverified_shipped_qty": unverified_shipped,
         "verifiable_remaining_qty": verifiable_remaining,
         "returned_shipped_completed_qty": returned_shipped,
         "returned_unshipped_completed_qty": returned_unshipped,
@@ -269,7 +282,7 @@ def proceeds_buckets_from_sale_units(db, order_uid, *, qty_ctx=None):
     cancelled = int(units.get("cancelled_pre_ship_qty") or 0)
     returned = returned_shipped + int(units.get("returned_unshipped_completed_qty") or 0)
     active_qty = int(units.get("active_qty") or 0)
-    unverified_shipped = max(0, shipped - verified - returned)
+    unverified_shipped = max(0, shipped - verified)
 
     return {
         "purchased_qty": purchased,
@@ -329,6 +342,34 @@ def sale_units_ledger(db, order_uid):
     )
 
 
+def sync_line_units_api_fields(line):
+    """
+    Promote canonical units.* to line top-level for verify/return UIs.
+
+    unverified_shipped_qty — shipped − verified (returns are not subtracted).
+    verifiable_remaining_qty — units the buyer may confirm receipt of now.
+    """
+    if not isinstance(line, dict):
+        return line
+    units = line.get("units") or {}
+    shipped = int(units.get("shipped_qty") or 0)
+    verified = int(units.get("verified_qty") or 0)
+    raw_unverified = max(0, shipped - verified)
+    line["unverified_shipped_qty"] = int(
+        units.get("unverified_shipped_qty") if units.get("unverified_shipped_qty") is not None else raw_unverified
+    )
+    line["verifiable_remaining_qty"] = int(units.get("verifiable_remaining_qty") or 0)
+    for key in (
+        "return_in_progress_shipped_qty",
+        "return_in_progress_unshipped_qty",
+        "max_return_shipped_qty",
+        "max_cancel_unshipped_qty",
+    ):
+        if units.get(key) is not None:
+            line[key] = int(units.get(key) or 0)
+    return line
+
+
 def attach_line_units_ledgers(db, order_uid, lines):
     """Add units to each sale line; shares one DB pass for splits/open requests."""
     if not lines:
@@ -351,6 +392,7 @@ def attach_line_units_ledgers(db, order_uid, lines):
                 order_splits=order_splits,
                 open_reqs=open_reqs,
             )
+            sync_line_units_api_fields(row)
         out.append(row)
     return out
 

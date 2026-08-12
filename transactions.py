@@ -30,6 +30,7 @@ from wallet_service import (
 from wallet_transactions_service import (
     clawback_seller_proceeds_on_return,
     credit_partial_delivery,
+    credit_seller_proceeds_at_checkout,
     resolve_seller_wallet_profile_id,
     _parse_unit_cost,
 )
@@ -5336,6 +5337,27 @@ class Transactions(Resource):
 
                 response["transaction_items"] = items_count
                 response["transaction_bounty_count"] = bounty_count
+
+                try:
+                    seller_credit = credit_seller_proceeds_at_checkout(
+                        db, new_transaction_uid
+                    )
+                    response["seller_proceeds_credit"] = seller_credit
+                    if seller_credit.get("code") != 200:
+                        print(
+                            "Warning: Failed to credit seller pending proceeds at "
+                            f"checkout: {seller_credit}"
+                        )
+                except Exception as seller_credit_err:
+                    print(
+                        "Warning: Exception crediting seller pending proceeds at "
+                        f"checkout: {seller_credit_err}"
+                    )
+                    response["seller_proceeds_credit"] = {
+                        "code": 500,
+                        "message": str(seller_credit_err),
+                    }
+
                 if inventory_updates:
                     response["inventory_updates"] = [
                         {

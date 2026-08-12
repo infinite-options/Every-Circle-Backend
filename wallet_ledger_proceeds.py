@@ -126,11 +126,9 @@ def _bucket_snapshot_from_totals(
     returned,
     pending_return_window=None,
 ):
-    unverified_shipped = max(shipped - verified - returned, 0)
+    unverified_shipped = max(shipped - verified, 0)
     if pending_return_window is None:
-        unverified_pool = max(0, shipped - verified)
-        returned_verified = returned - min(returned, unverified_pool)
-        pending_return_window = max(0, verified - returned_verified)
+        pending_return_window = max(0, verified - returned)
     pending_verification = unverified_shipped
     pending_shipment = max(0, purchased - cancelled - unverified_shipped - verified)
     active_qty = max(0, purchased - cancelled - returned)
@@ -519,36 +517,25 @@ def build_order_proceeds_ledger_entries(
 
 
 def fetch_seller_sale_uids(db, profile_id):
-    """Distinct sale order uids for businesses owned by this profile."""
-    ids = {str(profile_id or "").strip()}
-    ids.discard("")
+    """
+    Distinct sale order uids where this id is the seller.
+
+    Personal wallets: only offerings sold as that profile_personal_uid.
+    Business wallets: only sales for that business_uid.
+    Owned businesses are NOT folded into the personal ledger — those belong
+    on the business account-screen / wallet.
+    """
+    seller_id = str(profile_id or "").strip()
+    if not seller_id:
+        return []
     q = db.execute(
         """
-        SELECT bu.bu_business_id
-        FROM every_circle.business_user bu
-        INNER JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
-        INNER JOIN every_circle.profile_personal pp
-            ON pp.profile_personal_user_id = u.user_uid
-        WHERE pp.profile_personal_uid = %s
-        """,
-        (profile_id,),
-    )
-    for row in q.get("result") or []:
-        business_id = row.get("bu_business_id")
-        if business_id:
-            ids.add(str(business_id))
-    seller_ids = list(ids)
-    if not seller_ids:
-        return []
-    placeholders = ", ".join(["%s"] * len(seller_ids))
-    q = db.execute(
-        f"""
         SELECT DISTINCT t.transaction_uid
         FROM every_circle.transactions t
         WHERE COALESCE(t.transaction_type, 'sale') = 'sale'
-          AND t.transaction_business_id IN ({placeholders})
+          AND t.transaction_business_id = %s
         """,
-        tuple(seller_ids),
+        (seller_id,),
     )
     return [
         row.get("transaction_uid")

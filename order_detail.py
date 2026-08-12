@@ -761,6 +761,9 @@ class OrderDetail(Resource):
                 return response, 403
 
             with connect() as db:
+                from order_quantity_context import clear_ledger_quantity_caches
+
+                clear_ledger_quantity_caches()
                 order_uid, resolved_from_return_uid = resolve_order_uid(
                     db, transaction_uid
                 )

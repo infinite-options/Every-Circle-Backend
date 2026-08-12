@@ -90,12 +90,14 @@ def sale_received_label(row, units, *, audience="buyer"):
             return_in_progress_shipped=return_in_progress_shipped,
         )
 
-    # Verified + completed returns cover all active units (e.g. 2 verified + 1 returned, active 3).
-    resolved = verified + returned
-    if resolved >= active and active > 0:
+    # ti_received_qty is gross (never decremented on return). Net kept + returned
+    # covers active when every active unit is either still verified or returned.
+    net_verified = max(0, verified - returned_shipped)
+    resolved = net_verified + returned
+    if resolved >= active and active > 0 and verifiable <= 0:
         return "Yes", None
 
-    if verified >= active and active > 0:
+    if verified >= active and active > 0 and verifiable <= 0:
         return "Yes", None
 
     if audience == "buyer" and verifiable > 0:
