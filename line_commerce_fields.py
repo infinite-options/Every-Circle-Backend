@@ -116,6 +116,72 @@ def batch_buyer_bounty_by_line(db, ti_uids, buyer_profile_id):
     return out
 
 
+def batch_primary_bounty_by_line(db, ti_uids):
+    """Largest positive tb row per line (percentage + amount) when buyer row is missing."""
+    uids = [u for u in (ti_uids or []) if u]
+    if not uids:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(uids))
+    q = db.execute(
+        f"""
+        SELECT tb_ti_id, tb_percentage, tb_amount
+        FROM every_circle.transactions_bounty
+        WHERE tb_ti_id IN ({placeholders})
+          AND tb_amount > 0.0001
+        ORDER BY tb_amount DESC
+        """,
+        tuple(uids),
+    )
+    out = {}
+    for row in q.get("result") or []:
+        ti_uid = row.get("tb_ti_id")
+        if not ti_uid or ti_uid in out:
+            continue
+        amt = round_money(row.get("tb_amount"))
+        pct_raw = row.get("tb_percentage")
+        try:
+            pct = float(pct_raw)
+        except (TypeError, ValueError):
+            pct = pct_raw
+        out[ti_uid] = {
+            "tb_amount": amt,
+            "tb_percentage": pct,
+            "bounty_earned": amt,
+        }
+    return out
+
+
+def _order_buyer_profile_id(db, order_uid):
+    if not db or not order_uid:
+        return None
+    q = db.execute(
+        """
+        SELECT transaction_profile_id
+        FROM every_circle.transactions
+        WHERE transaction_uid = %s
+        LIMIT 1
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return None
+    return rows[0].get("transaction_profile_id")
+
+
+def _buyer_bounty_for_line(buyer_map, primary_map, ti_uid):
+    buyer = (buyer_map or {}).get(ti_uid) if ti_uid else None
+    primary = (primary_map or {}).get(ti_uid) if ti_uid else None
+    if not buyer:
+        return primary
+    if buyer.get("tb_percentage") is None and primary and primary.get("tb_percentage") is not None:
+        merged = dict(buyer)
+        merged["tb_percentage"] = primary.get("tb_percentage")
+        return merged
+    return buyer
+
+
 def attach_line_commerce_fields(
     line,
     *,
@@ -156,7 +222,9 @@ def attach_line_commerce_fields(
                 "bounty_earned", buyer_bounty["tb_amount"]
             )
         if buyer_bounty.get("tb_percentage") is not None:
-            line["tb_percentage"] = buyer_bounty["tb_percentage"]
+            from account_screen_v3_contract import apply_tb_percentage_display
+
+            apply_tb_percentage_display(line, buyer_bounty.get("tb_percentage"))
 
     _strip_legacy_line_shipping_fields(line)
     return line
@@ -252,6 +320,7 @@ def attach_sale_lines_commerce(db, lines, *, buyer_profile_id=None):
     ti_uids = [line.get("ti_uid") for line in lines if isinstance(line, dict) and line.get("ti_uid")]
     bounty_map = _line_bounty_totals(db, ti_uids)
     buyer_map = batch_buyer_bounty_by_line(db, ti_uids, buyer_profile_id)
+    primary_map = batch_primary_bounty_by_line(db, ti_uids)
 
     for line in lines:
         if not isinstance(line, dict):
@@ -260,7 +329,7 @@ def attach_sale_lines_commerce(db, lines, *, buyer_profile_id=None):
         attach_line_commerce_fields(
             line,
             line_bounty_paid=bounty_map.get(ti_uid, 0.0),
-            buyer_bounty=buyer_map.get(ti_uid),
+            buyer_bounty=_buyer_bounty_for_line(buyer_map, primary_map, ti_uid),
         )
     return lines
 
@@ -687,6 +756,24 @@ def expand_return_line_splits(db, order_uid, line, *, ti_row=None, cancel_only=F
             line_bounty_ledger=line_bounty_ledger,
         )
         results.append(_attach_split_row_money(row, money))
+
+    sale_ti_uid = (
+        out.get("ti_original_ti_uid")
+        or out.get("transaction_item_uid")
+        or out.get("ti_uid")
+        or (ti_row.get("ti_uid") if isinstance(ti_row, dict) else None)
+    )
+    if sale_ti_uid and results:
+        buyer_id = _order_buyer_profile_id(db, order_uid) if order_uid else None
+        buyer_map = batch_buyer_bounty_by_line(db, [sale_ti_uid], buyer_id)
+        primary_map = batch_primary_bounty_by_line(db, [sale_ti_uid])
+        bounty = _buyer_bounty_for_line(buyer_map, primary_map, sale_ti_uid)
+        pct = (bounty or {}).get("tb_percentage")
+        if pct is not None:
+            from account_screen_v3_contract import apply_tb_percentage_display
+
+            for row in results:
+                apply_tb_percentage_display(row, pct)
     return results
 
 

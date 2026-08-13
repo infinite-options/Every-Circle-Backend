@@ -173,6 +173,24 @@ def format_tb_percent_label(pct):
     return f"{whole}%" if whole is not None else "—"
 
 
+def apply_tb_percentage_display(line, pct=None):
+    """
+    Set FE bounty-% fields on a sale or return line.
+
+    tb_percentage → whole percent 0–100; percent_label → '40%'.
+    """
+    if not isinstance(line, dict):
+        return line
+    if pct is None:
+        pct = line.get("tb_percentage")
+    whole = normalize_tb_percentage_display(pct)
+    if whole is None:
+        return line
+    line["tb_percentage"] = whole
+    line["percent_label"] = f"{whole}%"
+    return line
+
+
 def format_date_label(dt_value, tz_name=None):
     """MMM D in profile timezone."""
     dt = parse_stored_datetime(dt_value)

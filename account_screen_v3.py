@@ -98,7 +98,6 @@ def _bounty_chart_series(db, profile_id, tz_name):
         INNER JOIN every_circle.transactions_items ti ON tb.tb_ti_id = ti.ti_uid
         INNER JOIN every_circle.transactions t ON ti.ti_transaction_id = t.transaction_uid
         WHERE tb.tb_profile_id = %s
-          AND tb.tb_amount > 0.0001
         ORDER BY t.transaction_datetime ASC
         """,
         (profile_id,),
@@ -135,11 +134,15 @@ def _bounty_chart_series(db, profile_id, tz_name):
 
 
 def build_earnings_v3(db, profile_id, tz_name=None):
+    """Bounty header pools — same split as the wallet card (useable + pending = total)."""
     computed = compute_wallet_from_bounty_ledger(db, profile_id)
+    useable = round_money(computed.get("bounty_useable"))
+    total = round_money(computed.get("bounty_total"))
+    pending = round_money(max(0.0, total - useable))
     return {
-        "bounty_total_earned": round_money(computed.get("bounty_total")),
-        "bounty_useable": round_money(computed.get("bounty_useable")),
-        "bounty_pending": round_money(computed.get("bounty_pending")),
+        "bounty_total_earned": total,
+        "bounty_useable": useable,
+        "bounty_pending": pending,
         "bounty_reserved": round_money(computed.get("bounty_reserved")),
         "chart": _bounty_chart_series(db, profile_id, tz_name),
     }

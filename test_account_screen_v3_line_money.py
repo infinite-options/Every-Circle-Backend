@@ -282,6 +282,7 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
 
     def test_tb_percentage_fraction_to_whole_percent(self):
         from account_screen_v3_contract import (
+            apply_tb_percentage_display,
             format_tb_percent_label,
             normalize_tb_percentage_display,
         )
@@ -290,6 +291,10 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(normalize_tb_percentage_display(0.4), 40)
         self.assertEqual(normalize_tb_percentage_display(40), 40)
         self.assertEqual(format_tb_percent_label("0.4"), "40%")
+
+        line = apply_tb_percentage_display({}, 0.4)
+        self.assertEqual(line["tb_percentage"], 40)
+        self.assertEqual(line["percent_label"], "40%")
 
     def test_return_bounty_line_scoped_not_order_total(self):
         from account_screen_v3 import _seller_bounty_block

@@ -181,6 +181,10 @@ _RECEIPT_LINE_SELECT = """
         ti.ti_choices_extra_cost,
         ti.ti_shipping_amount,
         ti.ti_shipping_refundable,
+        ti.ti_bs_is_taxable,
+        ti.ti_bs_tax_rate,
+        ti.ti_line_tax_amount,
+        ti.ti_tax_amount,
         ti.ti_special_instructions,
         ti.ti_selected_options,
         COALESCE(ti.ti_fulfillment_status, 'not_required') AS ti_fulfillment_status,
@@ -333,11 +337,31 @@ def _process_receipt_rows(db, rows):
     return enriched_rows
 
 
+def _refresh_receipt_line_snapshots(line):
+    """Restore money + Total/Shipping snapshot aliases after commerce strip."""
+    from line_commerce_fields import (
+        line_merchandise_total_from_row,
+        line_snapshot_api_fields,
+        order_money_from_line_snapshots,
+    )
+
+    if not isinstance(line, dict):
+        return line
+    money = order_money_from_line_snapshots(line)
+    if money.get("known"):
+        line["money"] = money
+    line.update(line_snapshot_api_fields(line))
+    merch_total = line_merchandise_total_from_row(line)
+    if merch_total is not None:
+        line["line_merchandise_total"] = merch_total
+    return line
+
+
 def _attach_receipt_bounty_fields(db, lines, profile_id):
     """Per-line seller bounty pool + optional buyer referrer share (receipt Bounty column)."""
     from line_commerce_fields import attach_sale_lines_commerce, round_money
     from transactions import _seller_bounty_pool_for_line_row
-    from account_screen_v3_contract import normalize_tb_percentage_display
+    from account_screen_v3_contract import apply_tb_percentage_display
 
     if not lines:
         return lines
@@ -365,15 +389,13 @@ def _attach_receipt_bounty_fields(db, lines, profile_id):
                 "bounty_earned",
                 "tb_amount",
                 "tb_percentage",
+                "percent_label",
             ):
                 line.pop(key, None)
-            continue
+        else:
+            apply_tb_percentage_display(line)
 
-        pct = line.get("tb_percentage")
-        if pct is not None:
-            normalized = normalize_tb_percentage_display(pct)
-            if normalized is not None:
-                line["tb_percentage"] = normalized
+        _refresh_receipt_line_snapshots(line)
 
     return lines
 

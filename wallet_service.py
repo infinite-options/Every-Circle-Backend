@@ -1420,7 +1420,9 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
     wallet purchase spends (transaction_wallet_amount).
 
     Bounty useable/pending follows ti_bounty_released_at (not transaction_in_escrow),
-    then subtracts active bounty_reclaim_reservation amounts (ledger SoT).
+    including negative reversal rows so pending nets to the same figure as
+    wallet (actual − useable). Then subtracts active bounty_reclaim_reservation
+    amounts (ledger SoT).
 
     useable = bounty_useable + SUM(posted wt_amount) - net_purchase_spent
     pending = bounty_pending + SUM(held wt_amount)
@@ -1434,15 +1436,13 @@ def compute_wallet_from_bounty_ledger(db, profile_id):
             COALESCE(SUM(tb.tb_amount), 0) AS total_earned,
             COALESCE(SUM(
                 CASE
-                    WHEN tb.tb_amount > 0
-                     AND ti.ti_bounty_released_at IS NULL
+                    WHEN ti.ti_bounty_released_at IS NULL
                     THEN tb.tb_amount ELSE 0
                 END
             ), 0) AS pending_amount,
             COALESCE(SUM(
                 CASE
-                    WHEN tb.tb_amount > 0
-                     AND ti.ti_bounty_released_at IS NOT NULL
+                    WHEN ti.ti_bounty_released_at IS NOT NULL
                     THEN tb.tb_amount ELSE 0
                 END
             ), 0) AS useable_amount
