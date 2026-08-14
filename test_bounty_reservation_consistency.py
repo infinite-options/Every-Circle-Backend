@@ -52,7 +52,13 @@ class ComputeWalletWithReservationTests(unittest.TestCase):
                 return {"code": 200, "result": []}
             return {"result": []}
 
-        db.execute.side_effect = _exec
+        executed = []
+
+        def _exec_capture(sql, params=None, *args, **kwargs):
+            executed.append(sql or "")
+            return _exec(sql, params, *args, **kwargs)
+
+        db.execute.side_effect = _exec_capture
 
         with patch(
             "wallet_return_reservations.sum_active_bounty_reservation",
@@ -63,6 +69,8 @@ class ComputeWalletWithReservationTests(unittest.TestCase):
         ):
             computed = compute_wallet_from_bounty_ledger(db, "110-000108")
 
+        ledger_sql = next(s for s in executed if "pending_amount" in s.lower())
+        self.assertNotIn("tb.tb_amount > 0", " ".join(ledger_sql.split()))
         self.assertEqual(computed["bounty_useable"], 48.0)
         self.assertEqual(computed["bounty_pending"], 9.6)
         self.assertEqual(computed["bounty_total"], 57.6)
@@ -107,6 +115,41 @@ class AccountScreenProjectionTests(unittest.TestCase):
         self.assertEqual(earnings["bounty_useable"], 48.0)
         self.assertEqual(earnings["bounty_pending"], 9.6)
         self.assertEqual(earnings["bounty_reserved"], 9.6)
+
+    def test_earnings_pending_matches_wallet_when_sql_pending_includes_ghost_reversal(self):
+        """+$19.20 still unreleased after -$19.20 reversals must not inflate Earnings Pending."""
+        db = MagicMock()
+        computed = {
+            "wallet_actual_balance": 128.0,
+            "wallet_pending": 87.2,
+            "wallet_useable_balance": 60.0,
+            "wallet_lifetime_earning": 128.0,
+            "wallet_lifetime_spent": 0.0,
+            "bounty_total": 128.0,
+            "bounty_useable": 60.0,
+            "bounty_pending": 87.2,
+            "bounty_reserved": 0.0,
+            "seller_proceeds": 0.0,
+        }
+        with patch(
+            "account_screen_v3.compute_wallet_from_bounty_ledger",
+            return_value=computed,
+        ), patch(
+            "account_screen_v3.get_wallet_row",
+            return_value={"wallet_profile_id": "110-000108"},
+        ), patch(
+            "account_screen_v3._bounty_chart_series",
+            return_value={"granularity": "day", "series": []},
+        ):
+            wallet = build_wallet_v3(db, "110-000108")
+            earnings = build_earnings_v3(db, "110-000108")
+
+        self.assertEqual(wallet["actual_balance"], 128.0)
+        self.assertEqual(wallet["useable_balance"], 60.0)
+        self.assertEqual(wallet["pending_balance"], 68.0)
+        self.assertEqual(earnings["bounty_total_earned"], 128.0)
+        self.assertEqual(earnings["bounty_useable"], 60.0)
+        self.assertEqual(earnings["bounty_pending"], 68.0)
 
     def test_bounty_results_reduces_earned_and_marks_reserved(self):
         db = MagicMock()

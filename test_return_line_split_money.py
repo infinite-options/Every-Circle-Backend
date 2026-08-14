@@ -152,6 +152,39 @@ class ReturnLineSplitMoneyTests(unittest.TestCase):
         self.assertEqual(rows[0]["money"]["bounty"], 2.0)
         self.assertEqual(rows[1]["money"]["shipping"], 2.0)
 
+    def test_expand_return_line_includes_bounty_percent(self):
+        class _BountyDb(_FakeDb):
+            def execute(self, query, params=None, **kwargs):
+                sql = query if isinstance(query, str) else ""
+                if "transaction_profile_id" in sql:
+                    return {"result": [{"transaction_profile_id": "110-1"}]}
+                if "transactions_bounty" in sql:
+                    return {
+                        "result": [
+                            {
+                                "tb_ti_id": "ti-123",
+                                "tb_percentage": 0.4,
+                                "tb_amount": 8.0,
+                            }
+                        ]
+                    }
+                return {"result": []}
+
+        rows = expand_return_line_splits(
+            _BountyDb(),
+            "order-1",
+            {
+                "transaction_item_uid": "ti-123",
+                "return_quantity": 1,
+                "return_shipped_qty": 1,
+                "cancel_unshipped_qty": 0,
+            },
+            ti_row=self._acquire_ti_row(),
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tb_percentage"], 40)
+        self.assertEqual(rows[0]["percent_label"], "40%")
+
     def test_physical_return_only_single_row(self):
         db = _FakeDb()
         ti_row = self._acquire_ti_row()

@@ -81,14 +81,29 @@ def sale_received_label(row, units, *, audience="buyer"):
     return_in_progress_shipped = int(units.get("return_in_progress_shipped_qty") or 0)
     verifiable = int(units.get("verifiable_remaining_qty") or 0)
     if verifiable <= 0 and audience == "buyer":
-        from units_ledger import compute_verifiable_remaining
-
-        verifiable = compute_verifiable_remaining(
-            shipped=shipped,
-            verified=verified,
-            returned_shipped=returned_shipped,
-            return_in_progress_shipped=return_in_progress_shipped,
+        from units_ledger import (
+            compute_pickup_verifiable_remaining,
+            compute_verifiable_remaining,
         )
+
+        if _is_pickup_or_virtual(row):
+            purchased = int(units.get("purchased_qty") or active or 0)
+            verifiable = compute_pickup_verifiable_remaining(
+                purchased=purchased,
+                verified=verified,
+                cancelled_pre_ship=units.get("cancelled_pre_ship_qty"),
+                cancelled_pre_ship_in_progress=units.get(
+                    "cancelled_pre_ship_in_progress_qty"
+                ),
+                return_in_progress_shipped=return_in_progress_shipped,
+            )
+        else:
+            verifiable = compute_verifiable_remaining(
+                shipped=shipped,
+                verified=verified,
+                returned_shipped=returned_shipped,
+                return_in_progress_shipped=return_in_progress_shipped,
+            )
 
     # ti_received_qty is gross (never decremented on return). Net kept + returned
     # covers active when every active unit is either still verified or returned.

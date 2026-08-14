@@ -282,6 +282,7 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
 
     def test_tb_percentage_fraction_to_whole_percent(self):
         from account_screen_v3_contract import (
+            apply_tb_percentage_display,
             format_tb_percent_label,
             normalize_tb_percentage_display,
         )
@@ -290,6 +291,10 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(normalize_tb_percentage_display(0.4), 40)
         self.assertEqual(normalize_tb_percentage_display(40), 40)
         self.assertEqual(format_tb_percent_label("0.4"), "40%")
+
+        line = apply_tb_percentage_display({}, 0.4)
+        self.assertEqual(line["tb_percentage"], 40)
+        self.assertEqual(line["percent_label"], "40%")
 
     def test_return_bounty_line_scoped_not_order_total(self):
         from account_screen_v3 import _seller_bounty_block
@@ -1010,7 +1015,85 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         )
         display = build_v3_display(row, money, audience="buyer")
         self.assertEqual(display["delivered_label"], "—")
+        self.assertEqual(display["received_label"], "Verify")
+        self.assertEqual(display["received_action"], "verify")
         self.assertEqual(display["amount_label"], "$75.00")
+
+    def test_buyer_received_verify_for_pickup_non_delivery(self):
+        """Pickup / non-delivery with no ship step must show Verify, not No."""
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "order",
+            "ti_fulfillment_method": "pickup",
+            "fulfillment_method": "pickup",
+            "fulfillment_status": "not_required",
+            "transaction_in_escrow": 1,
+            "ti_shipped_qty": 0,
+            "ti_received_qty": 0,
+            "units": {
+                "purchased_qty": 1,
+                "active_qty": 1,
+                "shipped_qty": 0,
+                "verified_qty": 0,
+                "verifiable_remaining_qty": 1,
+                "remaining_to_ship_qty": 0,
+            },
+        }
+        money = enrich_purchase_row_money(
+            row, {"customer_total": 165.0, "known": True}
+        )
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["delivered_label"], "—")
+        self.assertEqual(display["received_label"], "Verify")
+        self.assertEqual(display["received_action"], "verify")
+
+    def test_buyer_received_yes_after_pickup_verify(self):
+        from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
+
+        row = {
+            "row_kind": "order",
+            "ti_fulfillment_method": "pickup",
+            "fulfillment_method": "pickup",
+            "fulfillment_status": "not_required",
+            "transaction_in_escrow": 0,
+            "ti_shipped_qty": 0,
+            "ti_received_qty": 1,
+            "units": {
+                "purchased_qty": 1,
+                "active_qty": 1,
+                "shipped_qty": 0,
+                "verified_qty": 1,
+                "verifiable_remaining_qty": 0,
+            },
+        }
+        money = enrich_purchase_row_money(
+            row, {"customer_total": 165.0, "known": True}
+        )
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["received_label"], "Yes")
+        self.assertEqual(display["received_action"], "status")
+
+    def test_compute_pickup_verifiable_remaining(self):
+        from units_ledger import compute_pickup_verifiable_remaining
+
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(purchased=1, verified=0),
+            1,
+        )
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(purchased=1, verified=1),
+            0,
+        )
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(
+                purchased=3,
+                verified=1,
+                cancelled_pre_ship=1,
+                cancelled_pre_ship_in_progress=0,
+            ),
+            1,
+        )
 
     def test_buyer_amount_label_legacy_transaction_total(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
@@ -1029,6 +1112,27 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         display = build_v3_display(row, money, audience="buyer")
         self.assertEqual(display["amount_label"], "$299.99")
         self.assertEqual(money["customer_total"], 299.99)
+
+    def test_receivable_ignores_completed_returns_after_partial_verify(self):
+        """
+        Buy 4 → verify 2 → return 1 + cancel 1 → ship 1 more must still allow
+        verifying the newly shipped unit (receivable stays purchased − cancel).
+        """
+        from order_quantity_context import (
+            receivable_units_from_totals,
+            verification_complete,
+        )
+
+        purchased, cancelled, returned, verified = 4, 1, 1, 2
+        receivable = receivable_units_from_totals(purchased, cancelled, returned)
+        self.assertEqual(receivable, 3)
+        self.assertEqual(receivable - verified, 1)
+        self.assertFalse(
+            verification_complete(verified, purchased, cancelled, returned)
+        )
+        self.assertTrue(
+            verification_complete(verified + 1, purchased, cancelled, returned)
+        )
 
 
 if __name__ == "__main__":

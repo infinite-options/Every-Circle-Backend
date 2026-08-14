@@ -1085,8 +1085,6 @@ def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
     return ti_rows[0] if ti_rows else None
 
 
-
-
 def _apply_return_item_split(item, *, cancel_only=False):
     """Normalize return_quantity = return_shipped_qty + cancel_unshipped_qty on one item."""
     if not isinstance(item, dict):
@@ -5078,12 +5076,12 @@ class Transactions(Resource):
                     order_qty = int(ti_row.get("ti_bs_qty") or 0)
                     current_received = int(ti_row.get("ti_received_qty") or 0)
                     cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
-                    returned = _already_returned_qty(db, transaction_uid, ti_uid)
                     from order_quantity_context import receivable_units_from_totals
 
-                    receivable = receivable_units_from_totals(
-                        order_qty, cancelled, returned
-                    )
+                    # Cap is purchased − pre-ship cancels only. Returns do not
+                    # shrink receivable: ti_received_qty is gross and returns
+                    # come from the verified pool (see units_ledger).
+                    receivable = receivable_units_from_totals(order_qty, cancelled)
                     remaining = receivable - current_received
 
                     if order_qty <= 0 or receivable <= 0:
@@ -5174,23 +5172,28 @@ class Transactions(Resource):
                     }
                     updated_lines.append(line_out)
 
-                _db_83 = db
-                _transaction_uid_80 = transaction_uid
                 from order_quantity_context import verification_complete
-                line_q = _db_83.execute('\n        SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty\n        FROM every_circle.transactions_items\n        WHERE ti_transaction_id = %s\n          AND ti_bs_qty > 0\n        ', (_transaction_uid_80,))
-                all_received__returned = False
-                for row in line_q.get('result') or []:
-                    _ti_uid_79 = row.get('ti_uid')
-                    purchased = int(row.get('ti_bs_qty') or 0)
-                    verified = int(row.get('ti_received_qty') or 0)
-                    _cancelled_82 = _cancelled_qty(_db_83, _transaction_uid_80, _ti_uid_79)
-                    _returned_81 = _already_returned_qty(_db_83, _transaction_uid_80, _ti_uid_79)
-                    if not verification_complete(verified, purchased, _cancelled_82, _returned_81):
+
+                # True when every receivable unit (purchased − pre-ship cancel)
+                # is verified. Returns do not shrink receivable.
+                line_q = db.execute(
+                    """
+                    SELECT ti_uid, ti_bs_qty, COALESCE(ti_received_qty, 0) AS ti_received_qty
+                    FROM every_circle.transactions_items
+                    WHERE ti_transaction_id = %s
+                      AND ti_bs_qty > 0
+                    """,
+                    (transaction_uid,),
+                )
+                all_received = True
+                for row in line_q.get("result") or []:
+                    line_ti_uid = row.get("ti_uid")
+                    purchased = int(row.get("ti_bs_qty") or 0)
+                    verified = int(row.get("ti_received_qty") or 0)
+                    cancelled = _cancelled_qty(db, transaction_uid, line_ti_uid)
+                    if not verification_complete(verified, purchased, cancelled):
                         all_received = False
-                        all_received__returned = True
                         break
-                if not all_received__returned:
-                    all_received = True
                 update_fields = {}
 
                 if all_received:

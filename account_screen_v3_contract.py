@@ -173,6 +173,24 @@ def format_tb_percent_label(pct):
     return f"{whole}%" if whole is not None else "—"
 
 
+def apply_tb_percentage_display(line, pct=None):
+    """
+    Set FE bounty-% fields on a sale or return line.
+
+    tb_percentage → whole percent 0–100; percent_label → '40%'.
+    """
+    if not isinstance(line, dict):
+        return line
+    if pct is None:
+        pct = line.get("tb_percentage")
+    whole = normalize_tb_percentage_display(pct)
+    if whole is None:
+        return line
+    line["tb_percentage"] = whole
+    line["percent_label"] = f"{whole}%"
+    return line
+
+
 def format_date_label(dt_value, tz_name=None):
     """MMM D in profile timezone."""
     dt = parse_stored_datetime(dt_value)
@@ -349,14 +367,30 @@ def _display_units(row):
     if units.get("remaining_to_ship_qty") is None and row.get("unshipped_item_count") is not None:
         units["remaining_to_ship_qty"] = int(row.get("unshipped_item_count") or 0)
 
-    from units_ledger import compute_verifiable_remaining
-
-    units["verifiable_remaining_qty"] = compute_verifiable_remaining(
-        shipped=units.get("shipped_qty"),
-        verified=units.get("verified_qty"),
-        returned_shipped=units.get("returned_shipped_completed_qty"),
-        return_in_progress_shipped=units.get("return_in_progress_shipped_qty"),
+    from units_ledger import (
+        compute_pickup_verifiable_remaining,
+        compute_verifiable_remaining,
     )
+
+    if _requires_shipping_row(row):
+        units["verifiable_remaining_qty"] = compute_verifiable_remaining(
+            shipped=units.get("shipped_qty"),
+            verified=units.get("verified_qty"),
+            returned_shipped=units.get("returned_shipped_completed_qty"),
+            return_in_progress_shipped=units.get("return_in_progress_shipped_qty"),
+        )
+    else:
+        # Pickup / virtual / non-delivery: do not use ship-only math (shipped=0
+        # would falsely zero Verify).
+        units["verifiable_remaining_qty"] = compute_pickup_verifiable_remaining(
+            purchased=units.get("purchased_qty"),
+            verified=units.get("verified_qty"),
+            cancelled_pre_ship=units.get("cancelled_pre_ship_qty"),
+            cancelled_pre_ship_in_progress=units.get(
+                "cancelled_pre_ship_in_progress_qty"
+            ),
+            return_in_progress_shipped=units.get("return_in_progress_shipped_qty"),
+        )
     return units
 
 

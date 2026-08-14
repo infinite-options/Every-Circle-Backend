@@ -67,6 +67,30 @@ def compute_verifiable_remaining(
     return max(0, unverified_shipped - return_on_unverified)
 
 
+def compute_pickup_verifiable_remaining(
+    *,
+    purchased,
+    verified,
+    cancelled_pre_ship=0,
+    cancelled_pre_ship_in_progress=0,
+    return_in_progress_shipped=0,
+):
+    """
+    Pickup / virtual / non-delivery: no ship step, so the buyer may verify
+    remaining active units immediately.
+    """
+    receivable = max(
+        int(purchased or 0)
+        - int(cancelled_pre_ship or 0)
+        - int(cancelled_pre_ship_in_progress or 0),
+        0,
+    )
+    return max(
+        0,
+        receivable - int(verified or 0) - int(return_in_progress_shipped or 0),
+    )
+
+
 def _units_from_counts(
     *,
     purchased,
@@ -88,19 +112,20 @@ def _units_from_counts(
 
     # Do NOT subtract returned_shipped — returns come from verified, not unverified.
     unverified_shipped = compute_unverified_shipped(shipped=shipped, verified=verified)
-    verifiable_remaining = compute_verifiable_remaining(
-        shipped=shipped,
-        verified=verified,
-        returned_shipped=returned_shipped,
-        return_in_progress_shipped=return_in_progress_shipped,
-    )
     if is_pickup_or_virtual:
-        receivable = max(
-            purchased - cancelled_pre_ship - cancelled_pre_ship_in_progress,
-            0,
+        verifiable_remaining = compute_pickup_verifiable_remaining(
+            purchased=purchased,
+            verified=verified,
+            cancelled_pre_ship=cancelled_pre_ship,
+            cancelled_pre_ship_in_progress=cancelled_pre_ship_in_progress,
+            return_in_progress_shipped=return_in_progress_shipped,
         )
-        verifiable_remaining = max(
-            0, receivable - verified - return_in_progress_shipped
+    else:
+        verifiable_remaining = compute_verifiable_remaining(
+            shipped=shipped,
+            verified=verified,
+            returned_shipped=returned_shipped,
+            return_in_progress_shipped=return_in_progress_shipped,
         )
 
     # active_qty: fulfillment chip denominator = purchased minus completed and
