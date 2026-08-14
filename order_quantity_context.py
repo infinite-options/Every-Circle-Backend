@@ -819,17 +819,20 @@ def compute_proceeds_buckets(ctx, *, db=None, order_uid=None):
 
 
 def receivable_units_from_totals(purchased_qty, cancelled_qty, returned_qty=0):
-    """Units the buyer may still need to verify (purchased − cancels − returns)."""
-    return max(
-        int(purchased_qty or 0)
-        - int(cancelled_qty or 0)
-        - int(returned_qty or 0),
-        0,
-    )
+    """
+    Units the buyer may still need to verify (purchased − pre-ship cancels).
+
+    ti_received_qty is never reduced by returns, and physical returns come from
+    the verified pool — so completed returns must not shrink this cap (doing so
+    double-counts and blocks verify after a later ship on the same line).
+    returned_qty is accepted for call-site compatibility and ignored.
+    """
+    _ = returned_qty
+    return max(int(purchased_qty or 0) - int(cancelled_qty or 0), 0)
 
 
 def verification_complete(received_qty, purchased_qty, cancelled_qty, returned_qty=0):
-    """True when every receivable unit has been buyer-verified."""
+    """True when every receivable unit (purchased − pre-ship cancel) is verified."""
     receivable = receivable_units_from_totals(
         purchased_qty, cancelled_qty, returned_qty
     )
@@ -843,7 +846,7 @@ def apply_list_verification_status(db, rows):
     Set all_items_received (and clear stale escrow) on buyer/seller list rows.
 
     Verification completes when verified qty reaches receivable units
-    (purchased − pre-ship cancels − completed returns), not full ti_bs_qty.
+    (purchased − pre-ship cancels), not full ti_bs_qty.
     """
     if not rows:
         return rows
@@ -860,11 +863,8 @@ def apply_list_verification_status(db, rows):
         qty = order_quantity_context(db, order_uid)
         purchased = int(qty.get("purchased_qty") or 0)
         cancelled = int(qty.get("cancelled_qty") or 0)
-        returned = int(qty.get("returned_qty") or 0)
         verified = int(qty.get("verified_qty") or 0)
-        all_received = verification_complete(
-            verified, purchased, cancelled, returned
-        )
+        all_received = verification_complete(verified, purchased, cancelled)
 
         row["all_items_received"] = 1 if all_received else 0
 

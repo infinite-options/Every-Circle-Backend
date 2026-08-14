@@ -1896,8 +1896,7 @@ def _all_lines_fully_received(db, transaction_uid):
         purchased = int(row.get("ti_bs_qty") or 0)
         verified = int(row.get("ti_received_qty") or 0)
         cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
-        returned = _already_returned_qty(db, transaction_uid, ti_uid)
-        if not verification_complete(verified, purchased, cancelled, returned):
+        if not verification_complete(verified, purchased, cancelled):
             return False
     return True
 
@@ -5858,12 +5857,12 @@ class Transactions(Resource):
                     order_qty = int(ti_row.get("ti_bs_qty") or 0)
                     current_received = int(ti_row.get("ti_received_qty") or 0)
                     cancelled = _cancelled_qty(db, transaction_uid, ti_uid)
-                    returned = _already_returned_qty(db, transaction_uid, ti_uid)
                     from order_quantity_context import receivable_units_from_totals
 
-                    receivable = receivable_units_from_totals(
-                        order_qty, cancelled, returned
-                    )
+                    # Cap is purchased − pre-ship cancels only. Returns do not
+                    # shrink receivable: ti_received_qty is gross and returns
+                    # come from the verified pool (see units_ledger).
+                    receivable = receivable_units_from_totals(order_qty, cancelled)
                     remaining = receivable - current_received
 
                     if order_qty <= 0 or receivable <= 0:

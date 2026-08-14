@@ -1113,6 +1113,27 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["amount_label"], "$299.99")
         self.assertEqual(money["customer_total"], 299.99)
 
+    def test_receivable_ignores_completed_returns_after_partial_verify(self):
+        """
+        Buy 4 → verify 2 → return 1 + cancel 1 → ship 1 more must still allow
+        verifying the newly shipped unit (receivable stays purchased − cancel).
+        """
+        from order_quantity_context import (
+            receivable_units_from_totals,
+            verification_complete,
+        )
+
+        purchased, cancelled, returned, verified = 4, 1, 1, 2
+        receivable = receivable_units_from_totals(purchased, cancelled, returned)
+        self.assertEqual(receivable, 3)
+        self.assertEqual(receivable - verified, 1)
+        self.assertFalse(
+            verification_complete(verified, purchased, cancelled, returned)
+        )
+        self.assertTrue(
+            verification_complete(verified + 1, purchased, cancelled, returned)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

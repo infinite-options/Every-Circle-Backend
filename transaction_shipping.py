@@ -686,15 +686,12 @@ def apply_order_fulfillment_summary(rows):
         row.pop("ti_bs_qty_for_received", None)
         row.pop("shippable_unit_count", None)
         cancelled_units = int(row.get("cancelled_qty") or 0)
-        returned_units = int(row.get("returned_qty") or 0)
         from order_quantity_context import verification_complete
 
         if order_qty > 0:
             row["all_items_received"] = (
                 1
-                if verification_complete(
-                    received_qty, order_qty, cancelled_units, returned_units
-                )
+                if verification_complete(received_qty, order_qty, cancelled_units)
                 else 0
             )
         else:
