@@ -1252,6 +1252,11 @@ class BusinessClaim(Resource):
                         WHERE pp.profile_personal_uid = '{claim["claim_profile_id"]}'
                         LIMIT 1
                     """, cmd='post')
+                    db.execute(f"""
+                        UPDATE every_circle.business
+                        SET business_claim_approved = 1
+                        WHERE business_uid = '{claim["claim_business_id"]}'
+                    """, cmd='post')
 
             response["message"] = f"Claim {action} successfully"
             response["code"] = 200

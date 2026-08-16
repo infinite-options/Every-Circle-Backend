@@ -55,6 +55,75 @@ def _normalize_business_cc_fee_payer(value):
     return "seller"
 
 
+# Roles that mean "no owner" — reviewer-seeded / unclaimed listings must not
+# create business_user ownership rows.
+_UNCLAIMED_BUSINESS_ROLE_TOKENS = frozenset(
+    {"", "unclaimed", "null", "none", "n/a", "na"}
+)
+
+
+def _is_unclaimed_business_role(role):
+    """True when business_role means no ownership (seed / unclaimed listing)."""
+    if role is None:
+        return True
+    return str(role).strip().lower() in _UNCLAIMED_BUSINESS_ROLE_TOKENS
+
+
+def _profile_uid_for_user(db, user_or_profile_uid):
+    """Resolve a profile_personal_uid from a user_uid (or pass through 110-*)."""
+    if not user_or_profile_uid:
+        return None
+    uid = str(user_or_profile_uid).strip()
+    if uid.startswith("110-"):
+        return uid
+    profile_query = db.select(
+        "every_circle.profile_personal",
+        where={"profile_personal_user_id": uid},
+    )
+    if profile_query.get("result"):
+        return profile_query["result"][0].get("profile_personal_uid")
+    return None
+
+
+_BUSINESS_CREATED_BY_COLS_READY = None
+
+
+def _business_created_by_columns_ready(db):
+    """True once optional audit columns exist on every_circle.business."""
+    global _BUSINESS_CREATED_BY_COLS_READY
+    if _BUSINESS_CREATED_BY_COLS_READY is not None:
+        return _BUSINESS_CREATED_BY_COLS_READY
+    try:
+        resp = db.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = 'every_circle'
+              AND TABLE_NAME = 'business'
+              AND COLUMN_NAME = 'business_created_by_user_id'
+            """
+        )
+        _BUSINESS_CREATED_BY_COLS_READY = bool(
+            resp.get("result") and int(resp["result"][0].get("c") or 0) > 0
+        )
+    except Exception as e:
+        print(f"Could not check business_created_by columns: {e}")
+        _BUSINESS_CREATED_BY_COLS_READY = False
+    return _BUSINESS_CREATED_BY_COLS_READY
+
+
+def _apply_business_created_by_audit(db, payload, user_or_profile_uid):
+    """Attach seed/create audit fields when the optional columns are present."""
+    if not _business_created_by_columns_ready(db):
+        return
+    if not user_or_profile_uid:
+        return
+    payload["business_created_by_user_id"] = user_or_profile_uid
+    created_by_profile = _profile_uid_for_user(db, user_or_profile_uid)
+    if created_by_profile:
+        payload["business_created_by_profile_id"] = created_by_profile
+
+
 # Only columns that exist on every_circle.business_services. Keys not in this set
 # are dropped on PUT (they do not cause SQL errors).
 #
@@ -450,14 +519,15 @@ class BusinessInfo(Resource):
                     if business_query["result"]:
                         business_uid = uid
                 elif uid.startswith("100"):
-                    # Look up business_uid from business_user table
+                    # Look up business_uid from business_user (real ownership only)
                     business_user_query = db.select(
                         "every_circle.business_user", where={"bu_user_id": uid}
                     )
                     if business_user_query["result"]:
-                        business_uid = business_user_query["result"][0][
-                            "bu_business_id"
-                        ]
+                        for bu_row in business_user_query["result"]:
+                            if not _is_unclaimed_business_role(bu_row.get("bu_role")):
+                                business_uid = bu_row["bu_business_id"]
+                                break
                 else:
                     # Google ID lookup
                     business_query = db.select(
@@ -506,10 +576,12 @@ class BusinessInfo(Resource):
                 """
                 business_users_response = db.execute(business_users_query)
 
-                # Format business_users data
+                # Format business_users data (omit unclaimed / no-owner seed links)
                 business_users = []
                 if business_users_response.get("result"):
                     for bu_record in business_users_response["result"]:
+                        if _is_unclaimed_business_role(bu_record.get("bu_role")):
+                            continue
                         business_users.append(
                             {
                                 "business_user_id": bu_record.get("bu_user_id"),
@@ -874,6 +946,19 @@ class BusinessInfo(Resource):
                     else:
                         payload["business_cc_fee_payer"] = "seller"
 
+                    # Unclaimed / reviewer-seeded listings are not owned yet.
+                    # Default DB column is 1, so unclaimed must explicitly set 0.
+                    unclaimed_create = _is_unclaimed_business_role(business_role)
+                    if unclaimed_create:
+                        payload["business_claim_approved"] = 0
+                    elif "business_claim_approved" not in payload:
+                        payload["business_claim_approved"] = 1
+
+                    # Audit who created/seeded the listing (not via business_user).
+                    _apply_business_created_by_audit(
+                        db, payload, business_user_id or user_uid
+                    )
+
                     # print("Insert Payload: ", payload)
                     insert_response = db.insert("every_circle.business", payload)
                     # print("insert_response: ", insert_response)
@@ -887,57 +972,67 @@ class BusinessInfo(Resource):
                             update_short_name=bl_short_name_provided,
                         )
 
-                    # Insert into business_user table (skip if already linked)
-                    existing_bu = db.select(
-                        "every_circle.business_user",
-                        where={
-                            "bu_business_id": new_business_uid,
-                            "bu_user_id": business_user_id,
-                        },
-                    )
-                    if existing_bu.get("result"):
+                    # Ownership starts only via a real role (Business Setup) or
+                    # claim approval — never for unclaimed / empty / null roles.
+                    if unclaimed_create:
                         print(
-                            f"business_user already exists for business {new_business_uid}, "
-                            f"user {business_user_id}; skipping insert"
+                            f"Skipping business_user insert for unclaimed seed "
+                            f"business {new_business_uid} (caller {business_user_id})"
                         )
                     else:
-                        try:
-                            bu_uid_response = db.call(procedure="new_bu_uid")
-                            print(f"bu_uid_response: {bu_uid_response}")
+                        # Insert into business_user table (skip if already linked)
+                        existing_bu = db.select(
+                            "every_circle.business_user",
+                            where={
+                                "bu_business_id": new_business_uid,
+                                "bu_user_id": business_user_id,
+                            },
+                        )
+                        if existing_bu.get("result"):
+                            print(
+                                f"business_user already exists for business {new_business_uid}, "
+                                f"user {business_user_id}; skipping insert"
+                            )
+                        else:
+                            try:
+                                bu_uid_response = db.call(procedure="new_bu_uid")
+                                print(f"bu_uid_response: {bu_uid_response}")
 
-                            if (
-                                "result" not in bu_uid_response
-                                or not bu_uid_response["result"]
-                            ):
-                                error_msg = bu_uid_response.get(
-                                    "message",
-                                    "Stored procedure 'new_bu_uid' may not exist or failed",
-                                )
-                                print(f"Error: {error_msg}")
-                                print(f"Full response: {bu_uid_response}")
+                                if (
+                                    "result" not in bu_uid_response
+                                    or not bu_uid_response["result"]
+                                ):
+                                    error_msg = bu_uid_response.get(
+                                        "message",
+                                        "Stored procedure 'new_bu_uid' may not exist or failed",
+                                    )
+                                    print(f"Error: {error_msg}")
+                                    print(f"Full response: {bu_uid_response}")
+                                    response["message"] = (
+                                        f"Failed to generate bu_uid: {error_msg}"
+                                    )
+                                    response["code"] = 500
+                                    return response, 500
+                            except Exception as e:
+                                print(f"Exception calling new_bu_uid: {str(e)}")
+                                traceback.print_exc()
                                 response["message"] = (
-                                    f"Failed to generate bu_uid: {error_msg}"
+                                    f"Error calling new_bu_uid stored procedure: {str(e)}"
                                 )
                                 response["code"] = 500
                                 return response, 500
-                        except Exception as e:
-                            print(f"Exception calling new_bu_uid: {str(e)}")
-                            traceback.print_exc()
-                            response["message"] = (
-                                f"Error calling new_bu_uid stored procedure: {str(e)}"
+
+                            new_bu_uid = bu_uid_response["result"][0]["new_id"]
+
+                            business_user_payload = {
+                                "bu_uid": new_bu_uid,
+                                "bu_business_id": new_business_uid,
+                                "bu_user_id": business_user_id,
+                                "bu_role": business_role,
+                            }
+                            db.insert(
+                                "every_circle.business_user", business_user_payload
                             )
-                            response["code"] = 500
-                            return response, 500
-
-                        new_bu_uid = bu_uid_response["result"][0]["new_id"]
-
-                        business_user_payload = {
-                            "bu_uid": new_bu_uid,
-                            "bu_business_id": new_business_uid,
-                            "bu_user_id": business_user_id,
-                            "bu_role": business_role,
-                        }
-                        db.insert("every_circle.business_user", business_user_payload)
 
                     if categories_uid_str:
                         self._add_categories(db, categories_uid_str, new_business_uid)
@@ -1065,8 +1160,13 @@ class BusinessInfo(Resource):
                     business_user_id = payload.get("user_uid")
                     print(f"Using user_uid '{business_user_id}' as business_user_id")
 
-                # Handle business_user table update/insert
-                if business_role is not None and business_user_id is not None:
+                # Handle business_user table update/insert for real ownership roles only.
+                # Unclaimed / empty / null must not create or update ownership rows.
+                if (
+                    business_role is not None
+                    and business_user_id is not None
+                    and not _is_unclaimed_business_role(business_role)
+                ):
                     # Check if a record exists with BOTH business_id AND user_id matching
                     business_user_query = db.select(
                         "every_circle.business_user",
@@ -1129,6 +1229,10 @@ class BusinessInfo(Resource):
                                 f"Exception creating new business_user record: {str(e)}"
                             )
                             traceback.print_exc()
+                elif _is_unclaimed_business_role(business_role) and business_role is not None:
+                    print(
+                        f"Skipping business_user upsert for unclaimed role on business {business_uid}"
+                    )
 
                 # Get current business_user_id for service updates (fallback to first record if not provided)
                 if business_user_id:
@@ -2026,6 +2130,13 @@ class BusinessInfo(Resource):
 
             # Process each email/role pair
             for email, role in zip(additional_business_user, additional_business_role):
+                if _is_unclaimed_business_role(role):
+                    print(
+                        f"Skipping additional business_user with unclaimed role "
+                        f"for email '{email}' on business {business_uid}"
+                    )
+                    continue
+
                 # Find user_id from email
                 user_query = db.select(
                     "every_circle.users", where={"user_email_id": email}
@@ -2479,7 +2590,8 @@ class BusinessInfo(Resource):
                         business_country, business_zip_code, business_latitude, 
                         business_longitude, business_joined_timestamp, 
                         business_price_level, business_google_rating, 
-                        business_website, business_is_active, business_cc_fee_payer)
+                        business_website, business_is_active, business_cc_fee_payer,
+                        business_claim_approved)
                     VALUES 
                         (%(business_uid)s, %(business_google_id)s, %(business_name)s,
                         %(business_phone_number)s, 1,
@@ -2487,7 +2599,8 @@ class BusinessInfo(Resource):
                         %(business_country)s, %(business_zip_code)s, %(business_latitude)s,
                         %(business_longitude)s, %(business_joined_timestamp)s,
                         %(business_price_level)s, %(business_google_rating)s,
-                        %(business_website)s, 1, %(business_cc_fee_payer)s)
+                        %(business_website)s, 1, %(business_cc_fee_payer)s,
+                        0)
                     ON DUPLICATE KEY UPDATE
                         business_name = %(business_name)s,
                         business_phone_number = %(business_phone_number)s,
@@ -2506,23 +2619,15 @@ class BusinessInfo(Resource):
                 result = db.execute(query, business_data)
                 print("Database insert result:", result)
 
-                # Insert into business_user table
-                bu_uid_response = db.call(procedure="new_bu_uid")
-                if "result" not in bu_uid_response or not bu_uid_response["result"]:
-                    db.execute("ROLLBACK")
-                    return {
-                        "error": f'Failed to generate bu_uid: {bu_uid_response.get("message", "Unknown error")}'
-                    }, 500
-
-                new_bu_uid = bu_uid_response["result"][0]["new_id"]
-
-                business_user_payload = {
-                    "bu_uid": new_bu_uid,
-                    "bu_business_id": business_uid,
-                    "bu_user_id": user_uid,
-                    "bu_role": None,  # Default role, can be updated later
-                }
-                db.insert("every_circle.business_user", business_user_payload)
+                # Unclaimed Google Places seed — do not attach caller as owner.
+                audit_payload = {}
+                _apply_business_created_by_audit(db, audit_payload, user_uid)
+                if audit_payload:
+                    db.update(
+                        "every_circle.business",
+                        {"business_uid": business_uid},
+                        audit_payload,
+                    )
 
                 # Verify the insert
                 verify_query = (

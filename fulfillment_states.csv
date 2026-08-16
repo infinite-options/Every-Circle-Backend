@@ -1,0 +1,35 @@
+,,,,,,,,,,,,,,,,,,,,
+,Scenario UID,Row Kind,Ordered,Mode,Shipped,Verified,Cancelled,Returned,Open Return/Cancel,active_qty,verifiable_remaining_qty,Seller Approval,Status,Rules,Buyer Delivered Display Status,Buyer Received Display Status,Seller Delivered Display Status,Seller Received Display Status,Source,Notes
+,1,Order,5,Virtual/Pickup,0,0,0,0,—,5,5,-,in-progress,"""Pickup: verifiable = (ordered - cancels) - verified; returns do not shrink cap""",—,Verify,—,No,BE actual,"""Sheet had Buyer Rec=No; BE shows Verify (pickup immediately verifiable)"""
+,2,Order,5,Virtual/Pickup,0,1,0,0,—,5,4,-,in-progress,Verified gross never decreases on return,—,Verify,—,1/5,BE actual,Matches sheet intent
+,3,Order,5,Virtual/Pickup,0,2,0,0,—,5,3,-,in-progress,Verified gross never decreases on return,—,Verify,—,2/5,BE actual,Matches sheet intent
+,4,Order,5,Virtual/Pickup,0,5,0,0,—,5,0,-,completed,verifiable=0 and verified>=active,—,Yes,—,Yes,BE actual,Matches sheet
+,5,Order,5,Virtual/Pickup,0,2,1,1,completed,4,2,-,in-progress,"""Thread #2: buy5 verify2 cancel1 return1 completed""",—,Verify,—,2/4,Thread #2,"""Expect 2 to verify in modal (not 1). active=4 because cancel completed"""
+,6,Order,5,Virtual/Pickup,0,2,0,0,"""open hybrid: cancel1 + return1""",4,2,-,in-progress,"""Thread #2 open: cancels_in_progress reduce active; open return of verified must NOT reduce verifiable""",—,Verify,—,2/4,Thread #2,"""Old bug showed verifiable=1; fixed by pickup open-return rule"""
+,7,Order,5,Delivery,0,0,0,0,—,5,0,-,in-progress,Delivery: verifiable = shipped - verified,Not Shipped,No,Not Shipped,No,BE actual,Matches sheet
+,8,Order,5,Delivery,1,0,0,0,—,5,1,-,in-progress,Delivery: verifiable = shipped - verified,1/5,Verify,1/5,No,BE actual,Matches sheet
+,9,Order,5,Delivery,1,1,0,0,—,5,0,-,in-progress,No unverified shipped,1/5,1/5,1/5,1/5,BE actual,Matches sheet
+,10,Order,5,Delivery,2,1,0,0,—,5,1,-,in-progress,One unverified shipped,2/5,Verify,2/5,1/5,BE actual,Matches sheet
+,11,Order,5,Delivery,3,2,0,0,—,5,1,-,in-progress,One unverified shipped,3/5,Verify,3/5,2/5,BE actual,Matches sheet
+,12,Order,5,Delivery,5,5,0,0,—,5,0,-,completed,All shipped and verified,Shipped,Yes,Shipped,Yes,BE actual,Matches sheet
+,13,Order,5,Delivery,3,2,0,1,completed,5,1,-,in-progress,Return of verified does not clear unverified shipped Verify,3/5,Verify,3/5,2/5,BE actual,Return row is separate; sale row still shows Verify for the 1 unverified shipped
+,14,Order,5,Delivery,3,2,2,0,completed,3,1,-,in-progress,active shrinks by completed cancels only,Shipped,Verify,Shipped,2/3,BE actual,"""Denominator becomes active=3; shipped 3/3 => Shipped"""
+,15,Order,5,Delivery,3,2,2,1,completed,3,1,-,completed (returns/cancels done),Your combo row,Shipped,Verify,Shipped,2/3,BE actual / sheet row,"""Sale not fully complete until that 1 unverified unit is verified"""
+,16,Order,4,Delivery,2,2,1,1,completed,3,0,-,in-progress,"""Thread #1 before last ship: buy4 verify2 cancel1 return1""",2/3,2/3,2/3,2/3,Thread #1,No Verify until another unit ships
+,17,Order,4,Delivery,3,2,1,1,completed,3,1,-,in-progress,"""Thread #1 after last ship (return processed first)""",Shipped,Verify,Shipped,2/3,Thread #1,"""PUT verify must allow received_quantity=1; receivable = ordered-cancels=3"""
+,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,
+,20,Row Kind,Ordered,Mode,Shipped,Verified,Cancelled,Returned,,active_qty,,Seller Approval,Status,Rules,Buyer Delivered Display Status,Buyer Received Display Status,Seller Delivered Display Status,Seller Received Display Status,Source,Notes
+,21,Return,5,Virtual/Pickup,0,5,0,1,,5,,-,in-progress,Returned <= Verified,Returning,Pending,Returning,Pending,BE actual,Physical return of verified unit(s)
+,22,Return,5,Virtual/Pickup,0,5,0,1,,5,,Yes,completed,Returned <= Verified,Returned,Refunded,Returned,Refunded,BE actual,Matches sheet
+,23,Return,5,Virtual/Pickup,0,5,0,1,,5,,No,completed/rejected,Returned <= Verified,Returning,Rejected,Returning,Rejected,BE actual,Matches sheet
+,24,Return (Cancel),5,Virtual/Pickup,0,3,1,0,,4,,-,in-progress,Cancelled <= (Ordered - Verified),Cancelling,Pending,Cancelling,Pending,BE actual / sheet,"""On approve/complete sale active becomes 4. Open cancel also reduces sale active in BE units_ledger"""
+,25,Return (Cancel),5,Virtual/Pickup,0,3,1,0,,4,,Yes,completed,Cancelled <= (Ordered - Verified),Cancelled,Refunded,Cancelled,Refunded,BE actual,Matches sheet active=4
+,26,Return (Cancel),5,Virtual/Pickup,0,3,1,0,,5,,No,rejected,Cancelled <= (Ordered - Verified),Cancelling,Rejected,Cancelling,Rejected,BE actual,Sale active restored to 5
+,27,Return,5,Delivery,3,2,0,1,,5,,-,in-progress,Returned <= Verified,Returning,Pending,Returning,Pending,BE actual,Matches sheet
+,28,Return,5,Delivery,3,2,0,1,,5,,Yes,completed,Returned <= Verified,Returned,Refunded,Returned,Refunded,BE actual,Matches sheet
+,29,Return,5,Delivery,3,2,0,1,,5,,No,completed/rejected,Returned <= Verified,Returning,Rejected,Returning,Rejected,BE actual,Matches sheet
+,30,Return (Cancel),5,Delivery,3,2,2,0,,3,,-,in-progress,Cancelled <= (Ordered - Shipped),Cancelling,Pending,Cancelling,Pending,BE actual / sheet,"Open cancel reduces sale active immediately (5-2=3); same rule as pickup #24"
+,31,Return (Cancel),5,Delivery,3,2,2,0,,3,,Yes,completed,Cancelled <= (Ordered - Shipped),Cancelled,Refunded,Cancelled,Refunded,BE actual,Sale active=3
+,32,Return (Cancel),5,Delivery,3,2,2,0,,5,,No,completed/rejected,Cancelled <= (Ordered - Shipped),Cancelling,Rejected,Cancelling,Rejected,BE actual,Sale active restored to 5
+,33,Return,5,Delivery,3,2,2,1,,3,,Yes,completed,"""Your combo: cancel2 + return1""",Returned + Cancelled rows (split),Refunded,Returned + Cancelled rows (split),Refunded,BE actual / sheet,"""Hybrid expands to two return-line rows: Return·must receive and Cancellation·not shipped"""

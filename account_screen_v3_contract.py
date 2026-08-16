@@ -390,6 +390,7 @@ def _display_units(row):
                 "cancelled_pre_ship_in_progress_qty"
             ),
             return_in_progress_shipped=units.get("return_in_progress_shipped_qty"),
+            returned_shipped=units.get("returned_shipped_completed_qty"),
         )
     return units
 

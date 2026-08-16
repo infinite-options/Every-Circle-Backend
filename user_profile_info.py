@@ -1427,6 +1427,9 @@ class UserProfileInfo(Resource):
                         INNER JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
                         INNER JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
                         WHERE p.profile_personal_uid = '{profile_id}'
+                          AND bu.bu_role IS NOT NULL
+                          AND TRIM(bu.bu_role) <> ''
+                          AND LOWER(TRIM(bu.bu_role)) NOT IN ('unclaimed', 'null', 'none', 'n/a', 'na')
                           AND bu.bu_uid = (
                               SELECT MIN(bu2.bu_uid)
                               FROM every_circle.business_user bu2

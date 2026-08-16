@@ -1095,6 +1095,47 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
             1,
         )
 
+    def test_pickup_verifiable_after_partial_verify_cancel_and_return(self):
+        """Buy 5 → verify 2 → cancel 1 + return 1 → still 2 left to verify."""
+        from units_ledger import compute_pickup_verifiable_remaining, _units_from_counts
+
+        # Completed cancel + completed return of verified unit.
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(
+                purchased=5,
+                verified=2,
+                cancelled_pre_ship=1,
+                returned_shipped=1,
+            ),
+            2,
+        )
+        # Open hybrid return+cancel must not eat verifiable (return is of verified).
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(
+                purchased=5,
+                verified=2,
+                cancelled_pre_ship=0,
+                cancelled_pre_ship_in_progress=1,
+                return_in_progress_shipped=1,
+                returned_shipped=0,
+            ),
+            2,
+        )
+        units = _units_from_counts(
+            purchased=5,
+            shipped=0,
+            verified=2,
+            cancelled_pre_ship=1,
+            returned_shipped=1,
+            returned_unshipped=0,
+            remaining_to_ship=0,
+            return_in_progress_shipped=0,
+            return_in_progress_unshipped=0,
+            is_pickup_or_virtual=True,
+        )
+        self.assertEqual(units["verifiable_remaining_qty"], 2)
+        self.assertEqual(units["active_qty"], 4)
+
     def test_buyer_amount_label_legacy_transaction_total(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
 

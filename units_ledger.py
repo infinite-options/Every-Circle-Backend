@@ -74,10 +74,16 @@ def compute_pickup_verifiable_remaining(
     cancelled_pre_ship=0,
     cancelled_pre_ship_in_progress=0,
     return_in_progress_shipped=0,
+    returned_shipped=0,
 ):
     """
     Pickup / virtual / non-delivery: no ship step, so the buyer may verify
     remaining active units immediately.
+
+    Cap = purchased − pre-ship cancels (completed + in-progress) − verified.
+    Completed returns do not shrink the cap (ti_received_qty is gross).
+    Open physical returns consume verified units first — only the excess above
+    net verified may block verifying other units (same rule as ship).
     """
     receivable = max(
         int(purchased or 0)
@@ -85,10 +91,15 @@ def compute_pickup_verifiable_remaining(
         - int(cancelled_pre_ship_in_progress or 0),
         0,
     )
-    return max(
-        0,
-        receivable - int(verified or 0) - int(return_in_progress_shipped or 0),
-    )
+    base = max(0, receivable - int(verified or 0))
+    rip = max(0, int(return_in_progress_shipped or 0))
+    if rip <= 0 or base <= 0:
+        return base
+
+    verified_not_returned = max(0, int(verified or 0) - int(returned_shipped or 0))
+    return_on_unverified = max(0, rip - verified_not_returned)
+    return_on_unverified = min(return_on_unverified, base)
+    return max(0, base - return_on_unverified)
 
 
 def _units_from_counts(
@@ -119,6 +130,7 @@ def _units_from_counts(
             cancelled_pre_ship=cancelled_pre_ship,
             cancelled_pre_ship_in_progress=cancelled_pre_ship_in_progress,
             return_in_progress_shipped=return_in_progress_shipped,
+            returned_shipped=returned_shipped,
         )
     else:
         verifiable_remaining = compute_verifiable_remaining(
