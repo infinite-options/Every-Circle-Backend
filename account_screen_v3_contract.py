@@ -583,7 +583,7 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
             type_label = "Return"
     else:
         qty = int(units.get("purchased_qty") or 0)
-        cancelled = 0
+        cancelled = int(units.get("cancelled_pre_ship_qty") or 0)
         type_label = "Purchase" if audience == "buyer" else "Order"
 
     qty = max(int(qty or 0), 0)

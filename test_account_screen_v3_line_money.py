@@ -783,6 +783,27 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["qty_label"], "2")
         self.assertEqual(display["cancelled_label"], "1")
 
+    def test_buyer_order_cancelled_label_uses_pre_ship_qty(self):
+        from account_screen_v3_contract import build_v3_display
+
+        money = {"customer_total": 83.6, "customer_credit": None}
+        row = {
+            "row_kind": "order",
+            "transaction_datetime": "2026-08-15T14:30:50Z",
+            "ti_fulfillment_method": "pickup",
+            "units": {
+                "purchased_qty": 4,
+                "cancelled_pre_ship_qty": 1,
+                "shipped_qty": 3,
+                "verified_qty": 3,
+                "active_qty": 3,
+                "remaining_to_ship_qty": 0,
+            },
+        }
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["cancelled_label"], "1")
+        self.assertEqual(display["qty_label"], "4")
+
     def test_buyer_delivered_label_not_shipped(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
 

@@ -209,7 +209,43 @@ def _normalize_bounty_entry(db, row):
     }
     if units:
         entry["units"] = units
-    if qty_ctx:
+        # Flat qty fields must match nested units (avoid qty_ctx disagreement).
+        entry["purchased_qty"] = int(units.get("purchased_qty") or 0)
+        entry["cancelled_qty"] = int(units.get("cancelled_pre_ship_qty") or 0)
+        entry["returned_qty"] = int(units.get("returned_shipped_completed_qty") or 0) + int(
+            units.get("returned_unshipped_completed_qty") or 0
+        )
+        entry["verified_qty"] = int(units.get("verified_qty") or 0)
+        entry["shipped_qty"] = int(units.get("shipped_qty") or 0)
+        entry["unverified_shipped_qty"] = int(units.get("unverified_shipped_qty") or 0)
+        entry["pending_shipment"] = int(units.get("remaining_to_ship_qty") or 0)
+        entry["pending_cancellation"] = int(
+            units.get("cancelled_pre_ship_in_progress_qty") or 0
+        )
+        entry["pending_verification"] = int(units.get("verifiable_remaining_qty") or 0)
+        entry["active_qty"] = int(units.get("active_qty") or 0)
+        if qty_ctx:
+            # Keep proceeds-only extras that units do not own.
+            extras = quantity_context_fields(qty_ctx)
+            for key in (
+                "pending_return_window",
+                "shippable_qty",
+                "verified_returnable_qty",
+                "pending_verification_units",
+                "net_verified_held",
+                "per_unit_proceeds",
+                "merchandise_amount",
+                "sales_tax_amount",
+                "shipping_amount",
+                "bounty_amount",
+                "per_unit_merchandise",
+                "per_unit_sales_tax",
+                "per_unit_shipping",
+                "per_unit_bounty",
+            ):
+                if extras.get(key) is not None and entry.get(key) is None:
+                    entry[key] = extras.get(key)
+    elif qty_ctx:
         entry.update(quantity_context_fields(qty_ctx))
     return _attach_status_note(entry)
 
@@ -512,6 +548,7 @@ def _fetch_bounty_ledger_rows(db, profile_id):
             t.transaction_original_uid,
             COALESCE(ti.ti_received_qty, 0) AS ti_received_qty,
             ti.ti_bs_qty,
+            ti.ti_fulfillment_method,
             ti.ti_bounty_released_at,
             MAX(orig_ti.ti_bounty_released_at) AS source_bounty_released_at,
             SUM(tb.tb_amount) AS amount,
@@ -542,6 +579,7 @@ def _fetch_bounty_ledger_rows(db, profile_id):
             t.transaction_original_uid,
             ti.ti_received_qty,
             ti.ti_bs_qty,
+            ti.ti_fulfillment_method,
             ti.ti_bounty_released_at,
             p.profile_personal_first_name,
             p.profile_personal_last_name,

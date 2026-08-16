@@ -151,6 +151,50 @@ class AccountScreenProjectionTests(unittest.TestCase):
         self.assertEqual(earnings["bounty_useable"], 60.0)
         self.assertEqual(earnings["bounty_pending"], 68.0)
 
+    def test_bounty_chart_subtracts_active_reservations(self):
+        from account_screen_v3 import _bounty_chart_series
+
+        db = MagicMock()
+
+        def _exec(sql, params=None, *args, **kwargs):
+            q = (sql or "").lower()
+            if "transactions_bounty" in q:
+                return {
+                    "result": [
+                        {
+                            "transaction_datetime": "2026-08-14 20:00:00",
+                            "tb_amount": 1.6,
+                        },
+                        {
+                            "transaction_datetime": "2026-08-15 14:00:00",
+                            "tb_amount": 2.4,
+                        },
+                    ]
+                }
+            if "wallet_transactions" in q:
+                return {
+                    "result": [
+                        {
+                            "wt_created_at": "2026-08-15 00:12:42",
+                            "wt_amount": 0.32,
+                        }
+                    ]
+                }
+            return {"result": []}
+
+        db.execute.side_effect = _exec
+        with patch(
+            "wallet_ids.resolve_wallet_profile_id",
+            return_value="110-000108",
+        ):
+            chart = _bounty_chart_series(db, "110-000108", "America/Los_Angeles")
+
+        by_date = {p["date"]: p for p in chart["series"]}
+        # Reservation at 00:12Z is Aug 14 local (America/Los_Angeles).
+        self.assertEqual(by_date["2026-08-14"]["daily"], 1.28)
+        self.assertEqual(by_date["2026-08-15"]["daily"], 2.4)
+        self.assertEqual(by_date["2026-08-15"]["cumulative"], 3.68)
+
     def test_bounty_results_reduces_earned_and_marks_reserved(self):
         db = MagicMock()
         rows = [
@@ -191,6 +235,101 @@ class AccountScreenProjectionTests(unittest.TestCase):
         self.assertEqual(row["proceeds_status"], "reserved")
         self.assertEqual(row["display"]["status_label"], "Reserved")
         self.assertEqual(row["display"]["earned_label"], "$9.60")
+
+    def test_bounty_results_preserves_negative_reversal_amount(self):
+        """Return clawbacks must keep signed earned (not clamped to $0)."""
+        db = MagicMock()
+        rows = [
+            {
+                "ti_uid": "510-000029",
+                "tb_profile_id": "110-000053",
+                "bounty_earned": -1.6,
+                "tb_amount": -1.6,
+                "tb_percentage": 0.4,
+                "bs_bounty": 2,
+                "bs_bounty_type": "per_item",
+                "ti_bs_qty": -2,
+                "transaction_uid": "500-000025",
+                "transaction_original_uid": "500-000024",
+                "transaction_type": "return",
+                "transaction_datetime": "2026-08-15 14:32:38",
+                "ti_bounty_released_at": None,
+                "purchaser_name": "PM Test19",
+                "display_name": "Chinese25",
+                "is_return": True,
+            }
+        ]
+        with patch(
+            "account_screen_v3.enrich_bounty_result_rows",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3.attach_line_snapshots_to_rows",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3._attach_bounty_row_catalog_fields",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3.batch_line_checkout_snapshots",
+            return_value={},
+        ), patch(
+            "wallet_return_reservations.sum_active_bounty_reservation",
+            return_value=0.0,
+        ):
+            out = build_bounty_results_v3(db, rows)
+
+        row = out["rows"][0]
+        self.assertEqual(row["bounty_earned"], -1.6)
+        self.assertEqual(row["bounty_earned_gross"], -1.6)
+        self.assertEqual(row["bounty_reserved"], 0.0)
+        self.assertEqual(row["display"]["earned_label"], "-$1.60")
+        self.assertEqual(row["proceeds_status"], "reversed")
+        self.assertEqual(row["display"]["status_label"], "Reversed")
+        self.assertEqual(row["transaction_uid"], "500-000025")
+        self.assertEqual(row["order_uid"], "500-000024")
+        self.assertEqual(row["display"]["pool_label"], "-$4.00")
+
+    def test_bounty_results_pool_label_is_line_pool(self):
+        db = MagicMock()
+        rows = [
+            {
+                "ti_uid": "510-000028",
+                "tb_profile_id": "110-000053",
+                "bounty_earned": 3.2,
+                "tb_amount": 3.2,
+                "tb_percentage": 0.4,
+                "bs_bounty": 2,
+                "bs_bounty_type": "per_item",
+                "ti_bs_qty": 4,
+                "transaction_uid": "500-000024",
+                "transaction_datetime": "2026-08-15 14:30:50",
+                "ti_bounty_released_at": None,
+                "purchaser_name": "PM Test19",
+                "display_name": "Chinese25",
+            }
+        ]
+        with patch(
+            "account_screen_v3.enrich_bounty_result_rows",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3.attach_line_snapshots_to_rows",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3._attach_bounty_row_catalog_fields",
+            side_effect=lambda _db, r: r,
+        ), patch(
+            "account_screen_v3.batch_line_checkout_snapshots",
+            return_value={},
+        ), patch(
+            "wallet_return_reservations.sum_active_bounty_reservation",
+            return_value=0.0,
+        ):
+            out = build_bounty_results_v3(db, rows)
+
+        row = out["rows"][0]
+        self.assertEqual(row["bs_bounty"], 2.0)
+        self.assertEqual(row["display"]["pool_label"], "$8.00")
+        self.assertEqual(row["display"]["earned_label"], "$3.20")
+        self.assertEqual(row["order_uid"], "500-000024")
 
 
 if __name__ == "__main__":

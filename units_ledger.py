@@ -222,7 +222,10 @@ def line_units_ledger(
         order_splits=order_splits,
         open_reqs=open_reqs,
     )
-    if row is None:
+    needs_fulfillment = row is None or not (
+        row.get("ti_fulfillment_method") or row.get("fulfillment_method")
+    )
+    if needs_fulfillment:
         q = db.execute(
             """
             SELECT ti_fulfillment_method
@@ -232,7 +235,12 @@ def line_units_ledger(
             (ti_uid, order_uid),
         )
         rows = q.get("result") or []
-        row = rows[0] if rows else {}
+        fetched = rows[0] if rows else {}
+        if row is None:
+            row = fetched
+        elif fetched.get("ti_fulfillment_method"):
+            row = dict(row)
+            row["ti_fulfillment_method"] = fetched.get("ti_fulfillment_method")
 
     if open_reqs is None:
         open_reqs = _open_return_requests_for_order(db, order_uid)

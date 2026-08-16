@@ -304,6 +304,32 @@ def _stamp_messages_off_timestamp(personal_info):
         personal_info['profile_personal_messages_off_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _coerce_messages_allow_transaction(value, *, default=1):
+    """Normalize profile_personal_messages_allow_transaction to 0 or 1 (default ON)."""
+    if value is None or value == "":
+        return 1 if default else 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return 0
+    if s in ("1", "true", "yes", "on"):
+        return 1
+    return 1 if default else 0
+
+
+def _normalize_messages_allow_transaction(personal_info):
+    """Ensure allow_transaction is present as 0/1; NULL/missing → 1."""
+    if not isinstance(personal_info, dict):
+        return personal_info
+    personal_info["profile_personal_messages_allow_transaction"] = (
+        _coerce_messages_allow_transaction(
+            personal_info.get("profile_personal_messages_allow_transaction")
+        )
+    )
+    return personal_info
+
+
 def _normalize_record_uid(value):
     """Treat missing/blank UID as absent so PUT creates rows instead of update-by-empty-id."""
     if value is None:
@@ -563,10 +589,13 @@ def _filter_and_enrich_business_info(db, business_rows, is_owner_view, viewer_is
 
 def _enrich_personal_info_for_owner(db, personal_info, profile_id, is_owner_view):
     """Attach user moderation metadata on login / owner profile views."""
-    if not personal_info or not is_owner_view:
+    if not personal_info:
         return personal_info
 
-    enriched = dict(personal_info)
+    enriched = _normalize_messages_allow_transaction(dict(personal_info))
+    if not is_owner_view:
+        return enriched
+
     enriched.pop("profile_personal_moderated", None)
     enriched["moderation"] = build_user_moderation_metadata(db, profile_id)
     return enriched
@@ -1557,6 +1586,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
+                    'profile_personal_messages_allow_transaction',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
@@ -1567,6 +1597,14 @@ class UserProfileInfo(Resource):
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
+                if "profile_personal_messages_allow_transaction" in personal_info:
+                    personal_info["profile_personal_messages_allow_transaction"] = (
+                        _coerce_messages_allow_transaction(
+                            personal_info["profile_personal_messages_allow_transaction"]
+                        )
+                    )
+                else:
+                    personal_info["profile_personal_messages_allow_transaction"] = 1
 
                 # Process profile image if provided
                 if 'profile_image' in request.files:
@@ -2117,6 +2155,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
+                    'profile_personal_messages_allow_transaction',
                     'profile_personal_experience_is_public',
                     'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public',
@@ -2130,6 +2169,12 @@ class UserProfileInfo(Resource):
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
+                if "profile_personal_messages_allow_transaction" in personal_info:
+                    personal_info["profile_personal_messages_allow_transaction"] = (
+                        _coerce_messages_allow_transaction(
+                            personal_info["profile_personal_messages_allow_transaction"]
+                        )
+                    )
 
                 print("Remaining payload fields: ", payload)
                 
