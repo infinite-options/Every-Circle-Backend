@@ -74,8 +74,15 @@ def _attach_sale_commerce_fields(db, sale_payload, order_uid, *, buyer_profile_i
         order_bounty = line_bounty_sum
 
     sale_payload["order_bounty_paid"] = order_bounty
-    if order_bounty:
-        sale_payload["bounty_amount"] = round_money(-order_bounty)
+    # Negative bounty_amount means seller-funded claw from proceeds.
+    # Seeking bounty is buyer-funded — keep order_bounty_paid for display, omit claw.
+    from transactions import _order_seller_funded_bounty_paid
+
+    seller_funded = round_money(_order_seller_funded_bounty_paid(db, order_uid))
+    if seller_funded:
+        sale_payload["bounty_amount"] = round_money(-seller_funded)
+    else:
+        sale_payload.pop("bounty_amount", None)
 
     sale_payload.setdefault("transaction_fees", sale_payload.get("transaction_fees"))
     return sale_payload
@@ -156,27 +163,104 @@ def _can_view_order(sale_row, profile_id, business_uid):
     return False
 
 
+def _clean_display_name(value):
+    """Trim concatenated names; return None when empty."""
+    if value is None:
+        return None
+    name = " ".join(str(value).split())
+    return name or None
+
+
+def _attach_party_display_names(sale):
+    """
+    Buyer/seller display names for Order Details subtitle.
+
+    Same resolution as wallet_ledger counterparty naming:
+      purchaser ← transaction_profile_id personal name
+      seller    ← 200-* business.business_name, or 110-* personal first+last
+    """
+    if not isinstance(sale, dict):
+        return sale
+
+    purchaser = _clean_display_name(sale.get("purchaser_name"))
+    seller = _clean_display_name(
+        sale.get("seller_name")
+        or sale.get("transaction_business_name")
+        or sale.get("business_name")
+    )
+
+    sale["purchaser_name"] = purchaser
+    sale["buyer_name"] = purchaser
+    sale["seller_name"] = seller
+    sale["transaction_business_name"] = seller
+    sale["business_name"] = seller
+    return sale
+
+
 def _load_sale_header(db, order_uid):
     sale_q = db.execute(
         """
         SELECT
-            transaction_uid,
-            transaction_datetime,
-            transaction_profile_id,
-            transaction_business_id,
-            transaction_stripe_pi,
-            transaction_total,
-            transaction_amount,
-            transaction_taxes,
-            transaction_fees,
-            transaction_shipping,
-            COALESCE(transaction_wallet_amount, 0) AS transaction_wallet_amount,
-            transaction_in_escrow,
-            transaction_return_requested,
-            transaction_return_note,
-            COALESCE(transaction_type, 'sale') AS transaction_type
-        FROM every_circle.transactions
-        WHERE transaction_uid = %s
+            t.transaction_uid,
+            t.transaction_datetime,
+            t.transaction_profile_id,
+            t.transaction_business_id,
+            t.transaction_stripe_pi,
+            t.transaction_total,
+            t.transaction_amount,
+            t.transaction_taxes,
+            t.transaction_fees,
+            t.transaction_shipping,
+            COALESCE(t.transaction_wallet_amount, 0) AS transaction_wallet_amount,
+            t.transaction_in_escrow,
+            t.transaction_return_requested,
+            t.transaction_return_note,
+            COALESCE(t.transaction_type, 'sale') AS transaction_type,
+            NULLIF(
+                TRIM(
+                    CONCAT_WS(
+                        ' ',
+                        buyer_pp.profile_personal_first_name,
+                        buyer_pp.profile_personal_last_name
+                    )
+                ),
+                ''
+            ) AS purchaser_name,
+            CASE
+                WHEN t.transaction_business_id LIKE '200-%%' THEN b.business_name
+                WHEN t.transaction_business_id LIKE '110-%%' THEN
+                    NULLIF(
+                        TRIM(
+                            CONCAT_WS(
+                                ' ',
+                                seller_pp.profile_personal_first_name,
+                                seller_pp.profile_personal_last_name
+                            )
+                        ),
+                        ''
+                    )
+                ELSE COALESCE(
+                    b.business_name,
+                    NULLIF(
+                        TRIM(
+                            CONCAT_WS(
+                                ' ',
+                                seller_pp.profile_personal_first_name,
+                                seller_pp.profile_personal_last_name
+                            )
+                        ),
+                        ''
+                    )
+                )
+            END AS seller_name
+        FROM every_circle.transactions t
+        LEFT JOIN every_circle.profile_personal buyer_pp
+            ON t.transaction_profile_id = buyer_pp.profile_personal_uid
+        LEFT JOIN every_circle.business b
+            ON t.transaction_business_id = b.business_uid
+        LEFT JOIN every_circle.profile_personal seller_pp
+            ON t.transaction_business_id = seller_pp.profile_personal_uid
+        WHERE t.transaction_uid = %s
         """,
         (order_uid,),
     )
@@ -187,7 +271,7 @@ def _load_sale_header(db, order_uid):
     sale = rows[0]
     if (sale.get("transaction_type") or "sale") != "sale":
         return None
-    return sale
+    return _attach_party_display_names(sale)
 
 
 def _line_name_case_sql():
@@ -245,7 +329,8 @@ def _load_sale_lines(db, order_uid):
         FROM every_circle.transactions_items ti
         LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
         LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
-        LEFT JOIN every_circle.profile_wish pw ON ti.ti_bs_id = pw.profile_wish_uid
+        LEFT JOIN every_circle.wish_response wr ON ti.ti_bs_id = wr.wish_response_uid
+        LEFT JOIN every_circle.profile_wish pw ON wr.wr_profile_wish_id = pw.profile_wish_uid
         WHERE ti.ti_transaction_id = %s
         ORDER BY ti.ti_uid ASC
         """,
@@ -359,7 +444,8 @@ def _load_return_transactions(db, order_uid):
             FROM every_circle.transactions_items ti
             LEFT JOIN every_circle.business_services bs ON ti.ti_bs_id = bs.bs_uid
             LEFT JOIN every_circle.profile_expertise pe ON ti.ti_bs_id = pe.profile_expertise_uid
-            LEFT JOIN every_circle.profile_wish pw ON ti.ti_bs_id = pw.profile_wish_uid
+            LEFT JOIN every_circle.wish_response wr ON ti.ti_bs_id = wr.wish_response_uid
+            LEFT JOIN every_circle.profile_wish pw ON wr.wr_profile_wish_id = pw.profile_wish_uid
             WHERE ti.ti_transaction_id = %s
             ORDER BY ti.ti_uid ASC
             """,
@@ -632,6 +718,12 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
         "pending_return": pending_return_payload,
         "pending_returns": pending_returns_payload,
         "summary": _build_summary(sale, returns),
+        # Party display names (also on sale) for Order Details subtitle
+        "purchaser_name": sale_payload.get("purchaser_name"),
+        "buyer_name": sale_payload.get("buyer_name"),
+        "seller_name": sale_payload.get("seller_name"),
+        "business_name": sale_payload.get("business_name"),
+        "transaction_business_name": sale_payload.get("transaction_business_name"),
         **status_fields,
         **shipping,
     }

@@ -63,8 +63,11 @@ class BountyResults(Resource):
                             ti.*,
                             t.transaction_datetime,
                             t.transaction_uid,
+                            t.transaction_type,
+                            t.transaction_original_uid,
                             t.transaction_profile_id, t.transaction_business_id, 
                             IF (t.transaction_in_escrow = 1,1,0) AS in_escrow,
+                            (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
                             CONCAT(p.profile_personal_first_name, ' ', p.profile_personal_last_name) AS purchaser_name,
                             IF(
                                 t.transaction_business_id LIKE '110%%',

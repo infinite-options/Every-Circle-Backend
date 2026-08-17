@@ -96,6 +96,7 @@ def sale_received_label(row, units, *, audience="buyer"):
                     "cancelled_pre_ship_in_progress_qty"
                 ),
                 return_in_progress_shipped=return_in_progress_shipped,
+                returned_shipped=returned_shipped,
             )
         else:
             verifiable = compute_verifiable_remaining(

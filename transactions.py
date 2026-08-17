@@ -182,6 +182,43 @@ def _normalize_shipping_refundable(value, default=0):
     return 1 if _as_returnable_flag(value, default=bool(default)) else 0
 
 
+def _shipping_amount_from_product(product_data):
+    """Derive line shipping charge from business / expertise / wish listing snapshot."""
+    if not product_data:
+        return None
+    sh = product_data.get("bs_shipping")
+    if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_expertise_shipping")
+    if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_wish_shipping")
+    if sh is None or str(sh).strip() == "":
+        return None
+    low = str(sh).strip().lower()
+    if low == "free":
+        return 0.0
+    if low in ("buyer fixed", "buyer_fixed"):
+        amt = _parse_line_shipping_amount(
+            product_data.get("bs_shipping_amount")
+            if product_data.get("bs_shipping_amount") is not None
+            else (
+                product_data.get("profile_expertise_shipping_amount")
+                if product_data.get("profile_expertise_shipping_amount") is not None
+                else product_data.get("profile_wish_shipping_amount")
+            )
+        )
+        return 0.0 if amt is None else amt
+    return None
+
+
+def _shipping_refundable_from_product(product_data, default=0):
+    if not product_data:
+        return default
+    raw = product_data.get("bs_shipping_refundable")
+    if raw is None or raw == "":
+        raw = product_data.get("profile_expertise_shipping_refundable")
+    if raw is None or raw == "":
+        raw = product_data.get("profile_wish_shipping_refundable")
+    return _normalize_shipping_refundable(raw, default=default)
 
 
 def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
@@ -204,40 +241,17 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
     if raw_amt is not None and raw_amt != "":
         tx_item["ti_shipping_amount"] = _parse_line_shipping_amount(raw_amt)
     elif bs_data is not None:
-        _product_data_67 = bs_data
-        if not _product_data_67:
-            amt = None
-        else:
-            sh = _product_data_67.get('bs_shipping')
-            if sh is None or str(sh).strip() == '':
-                sh = _product_data_67.get('profile_expertise_shipping')
-            if sh is None or str(sh).strip() == '':
-                amt = None
-            else:
-                low = str(sh).strip().lower()
-                if low == 'free':
-                    amt = 0.0
-                elif low in ('buyer fixed', 'buyer_fixed'):
-                    _amt_68 = _parse_line_shipping_amount(_product_data_67.get('bs_shipping_amount') if _product_data_67.get('bs_shipping_amount') is not None else _product_data_67.get('profile_expertise_shipping_amount'))
-                    amt = 0.0 if _amt_68 is None else _amt_68
-                else:
-                    amt = None
+        amt = _shipping_amount_from_product(bs_data)
         if amt is not None:
             tx_item["ti_shipping_amount"] = amt
 
     if raw_ref is not None and raw_ref != "":
         tx_item["ti_shipping_refundable"] = _normalize_shipping_refundable(raw_ref)
     elif bs_data is not None:
-        product_data = bs_data
-        default = 0
-        if not product_data:
-            _r__shipping_refundable_from_product_9 = default
-        else:
-            raw = product_data.get('bs_shipping_refundable')
-            if raw is None or raw == '':
-                raw = product_data.get('profile_expertise_shipping_refundable')
-            _r__shipping_refundable_from_product_9 = _normalize_shipping_refundable(raw, default=default)
-        tx_item["ti_shipping_refundable"] = _r__shipping_refundable_from_product_9
+        tx_item["ti_shipping_refundable"] = _shipping_refundable_from_product(
+            bs_data,
+            default=0,
+        )
     else:
         tx_item["ti_shipping_refundable"] = 0
 
@@ -245,6 +259,32 @@ def _apply_line_shipping_snapshot(tx_item, item, bs_data=None):
 def _money_close(a, b, tol=0.02):
     return abs(round(_to_float(a), 2) - round(_to_float(b), 2)) <= tol
 
+
+
+def _line_buyer_bounty_amount(item, bs_data, qty, is_wish):
+    """
+    Buyer-paid bounty for seeking (wish) lines only.
+
+    Offering (150) / product (250) bounty is seller-funded and must not enter
+    checkout paid-total math. Returns 0 for non-wish lines.
+    """
+    if not is_wish:
+        return 0.0
+    bounty_raw = item.get("bounty")
+    if bounty_raw is None or bounty_raw == "":
+        return 0.0
+    bounty = _to_float(bounty_raw)
+    if bounty <= 0:
+        return 0.0
+    bounty_type = (
+        item.get("bounty_type")
+        or (bs_data or {}).get("profile_wish_bounty_type")
+        or "per_item"
+    )
+    bounty_type = str(bounty_type).strip().lower()
+    if bounty_type == "total":
+        return round(bounty, 2)
+    return round(bounty * int(qty), 2)
 
 
 def _listing_tax_config(bs_data):
@@ -433,6 +473,8 @@ def _listing_shipping_type(product_data):
     if sh is None or str(sh).strip() == "":
         sh = product_data.get("profile_expertise_shipping")
     if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_wish_shipping")
+    if sh is None or str(sh).strip() == "":
         return None
     return str(sh).strip()
 
@@ -441,14 +483,520 @@ def _has_shipping_config(product_data):
     return _listing_shipping_type(product_data) is not None
 
 
+def _business_listing_mode(product_data):
+    """Business services (250-*): require valid bs_mode (no shipping inference fallback)."""
+    if not product_data:
+        return None
+    raw = product_data.get("bs_mode")
+    if raw is None or not str(raw).strip():
+        return None
+    mode_str = str(raw).strip()
+    flags = _parse_listing_mode_flags(mode_str)
+    if not any(flags.values()):
+        return None
+    return _normalize_listing_mode(mode_str)
 
 
+def _listing_unit_cost(bs_data):
+    if not bs_data:
+        return 0.0
+    for key in ("bs_cost", "profile_expertise_cost", "profile_wish_cost"):
+        if bs_data.get(key) is not None:
+            return round(_to_float(bs_data.get(key)), 2)
+    return 0.0
 
 
+def _listing_supports_ship(listing_mode, product_data):
+    flags = _mode_flags_from_product(product_data)
+    if flags["delivered"] or flags["virtual"]:
+        return True
+    if listing_mode in ("ship", "both"):
+        return True
+    if listing_mode is None:
+        return _has_shipping_config(product_data)
+    return False
 
 
+def _listing_supports_pickup(listing_mode, product_data=None):
+    flags = _mode_flags_from_product(product_data)
+    if flags["inPerson"]:
+        return True
+    if listing_mode in ("pickup", "both"):
+        return True
+    if listing_mode is None:
+        return not _has_shipping_config(product_data)
+    return False
 
 
+def _listing_supports_virtual(listing_mode, product_data=None):
+    flags = _mode_flags_from_product(product_data)
+    if flags["virtual"]:
+        return True
+    if listing_mode is None:
+        return False
+    return listing_mode in ("virtual", "both")
+
+
+def _resolve_fulfillment_method(item, listing_mode, product_data):
+    """
+    Resolve ship / pickup / virtual with backward-compatible defaults.
+    Returns (method, error_message_or_None).
+    """
+    raw = item.get("fulfillment_method")
+    if raw is not None and str(raw).strip():
+        method = str(raw).strip().lower()
+        if method not in VALID_FULFILLMENT_METHODS:
+            return (
+                None,
+                "Invalid fulfillment_method; must be 'ship', 'pickup', or 'virtual'",
+            )
+        return method, None
+
+    if listing_mode == "both":
+        return None, "fulfillment_method is required for dual-mode listings"
+    if listing_mode == "pickup":
+        return "pickup", None
+    if listing_mode == "ship":
+        return "ship", None
+    if listing_mode == "virtual":
+        return "virtual", None
+    if _has_shipping_config(product_data):
+        return "ship", None
+    return "pickup", None
+
+
+def _is_buyer_actual_shipping(product_data):
+    sh = _listing_shipping_type(product_data)
+    if not sh:
+        return False
+    return sh.strip().lower() in ("buyer actual", "buyer_actual")
+
+
+def _compute_expected_line_shipping(fulfillment_method, product_data, qty):
+    """Total shipping charge for a checkout line (0 for pickup / virtual / free / buyer actual)."""
+    if _is_no_shipping_fulfillment(fulfillment_method):
+        return 0.0
+    sh = _listing_shipping_type(product_data)
+    if not sh:
+        return 0.0
+    low = sh.strip().lower()
+    if low == "free":
+        return 0.0
+    if low in ("buyer actual", "buyer_actual"):
+        return 0.0
+    if low in ("buyer fixed", "buyer_fixed"):
+        amt = _parse_line_shipping_amount(
+            product_data.get("bs_shipping_amount")
+            if product_data.get("bs_shipping_amount") is not None
+            else (
+                product_data.get("profile_expertise_shipping_amount")
+                if product_data.get("profile_expertise_shipping_amount") is not None
+                else product_data.get("profile_wish_shipping_amount")
+            )
+        )
+        per_unit = 0.0 if amt is None else amt
+        return round(per_unit * int(qty or 1), 2)
+    return 0.0
+
+
+def _snapshot_listing_shipping_on_line(tx_item, product_data):
+    """Persist listing shipping config on the line for receipts."""
+    sh = _listing_shipping_type(product_data)
+    if sh:
+        tx_item["ti_listing_shipping"] = sh
+
+
+def _apply_checkout_fulfillment(tx_item, plan, product_data):
+    """Apply ship / pickup / virtual choice to a transaction line."""
+    method = plan["fulfillment_method"]
+    qty = int(plan.get("qty") or tx_item.get("ti_bs_qty") or 1)
+    line_shipping = round(_to_float(plan.get("line_shipping_amount")), 2)
+
+    tx_item["ti_fulfillment_method"] = method
+    _snapshot_listing_shipping_on_line(tx_item, product_data)
+
+    if _is_no_shipping_fulfillment(method):
+        tx_item["ti_fulfillment_status"] = FULFILLMENT_STATUS_NOT_REQUIRED
+        tx_item["ti_shipping_not_required"] = 1
+        tx_item["ti_line_shipping_amount"] = 0.0
+        tx_item["ti_shipping_amount"] = 0.0
+        return
+
+    tx_item["ti_fulfillment_status"] = FULFILLMENT_STATUS_NOT_SHIPPED
+    tx_item["ti_shipping_not_required"] = 0
+    tx_item["ti_line_shipping_amount"] = line_shipping
+    per_unit = round(line_shipping / qty, 2) if qty > 0 else 0.0
+    tx_item["ti_shipping_amount"] = per_unit
+
+
+def _fetch_listing_for_checkout_item(db, item):
+    """
+    Load listing row for checkout validation.
+    Returns (bs_data, ti_bs_id, listing_mode, is_wish_item) or (None, None, None, False) + error via raise pattern.
+
+    Actually returns (bs_data, ti_bs_id, listing_mode, is_wish, error_dict_or_None)
+    """
+    ti_bs_id = (
+        item.get("bs_uid")
+        or item.get("expertise_uid")
+        or item.get("wish_response_uid")
+    )
+    if not ti_bs_id:
+        return None, None, None, False, {
+            "message": "Each item requires bs_uid, expertise_uid, or wish_response_uid",
+            "code": 400,
+        }
+
+    is_wish = False
+    listing_mode = None
+
+    if str(ti_bs_id).startswith("250"):
+        bs_response = db.execute(
+            "SELECT * FROM every_circle.business_services WHERE bs_uid = %s",
+            (ti_bs_id,),
+        )
+        if not bs_response.get("result"):
+            return None, ti_bs_id, None, False, {
+                "message": f"Business service not found: {ti_bs_id}",
+                "code": 404,
+            }
+        bs_data = bs_response["result"][0]
+        avail_err = _validate_business_service_available(db, bs_data)
+        if avail_err:
+            return None, ti_bs_id, None, False, avail_err
+        listing_mode = _business_listing_mode(bs_data)
+        if listing_mode is None:
+            return None, ti_bs_id, None, False, {
+                "message": (
+                    f"Business service {ti_bs_id} has missing or invalid bs_mode "
+                    "(requires Virtual, Delivered, and/or In-Person)"
+                ),
+                "code": 400,
+            }
+    elif str(ti_bs_id).startswith("150"):
+        bs_response = db.execute(
+            "SELECT * FROM every_circle.profile_expertise WHERE profile_expertise_uid = %s",
+            (ti_bs_id,),
+        )
+        if not bs_response.get("result"):
+            return None, ti_bs_id, None, False, {
+                "message": f"Expertise not found: {ti_bs_id}",
+                "code": 404,
+            }
+        bs_data = bs_response["result"][0]
+        if int(bs_data.get("profile_expertise_moderated") or 0) != MODERATED_ACTIVE:
+            return None, ti_bs_id, None, False, {
+                "message": "Offering is not available",
+                "code": 403,
+            }
+        owner_uid = bs_data.get("profile_expertise_profile_personal_id")
+        if not is_owner_available_for_public_interaction(db, owner_uid):
+            return None, ti_bs_id, None, False, {
+                "message": "Offering is not available",
+                "code": 403,
+            }
+        listing_mode = _normalize_listing_mode(bs_data.get("profile_expertise_mode"))
+    elif str(ti_bs_id).startswith("165"):
+        is_wish = True
+        bs_response = db.execute(
+            """
+            SELECT wish_response.wish_response_uid, profile_wish.*
+            FROM every_circle.profile_wish
+            LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid
+            WHERE wish_response_uid = %s
+            """,
+            (item.get("wish_response_uid"),),
+        )
+        if not bs_response.get("result"):
+            return None, ti_bs_id, None, False, {
+                "message": f"Wish not found: {item.get('wish_response_uid')}",
+                "code": 404,
+            }
+        bs_data = bs_response["result"][0]
+        listing_mode = _normalize_listing_mode(bs_data.get("profile_wish_mode"))
+    else:
+        return None, ti_bs_id, None, False, {
+            "message": f"Invalid item id: {ti_bs_id}",
+            "code": 400,
+        }
+
+    return bs_data, ti_bs_id, listing_mode, is_wish, None
+
+
+def _plan_checkout(db, items, payload, shipping_fields):
+    """
+    Validate fulfillment_method, line shipping, address rules, and order totals
+    before inserting the sale.
+    """
+    if not isinstance(items, list) or len(items) == 0:
+        return False, {"message": "items must be a non-empty list", "code": 400}, None
+
+    lines = []
+    order_shipping = 0.0
+    order_merchandise = 0.0
+    order_tax = 0.0
+    order_buyer_bounty = 0.0
+    shipping_actual_pending = 0
+    any_ship = False
+    any_wish = False
+
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        if (
+            not item.get("bs_uid")
+            and not item.get("expertise_uid")
+            and not item.get("wish_response_uid")
+        ):
+            continue
+
+        bs_data, ti_bs_id, listing_mode, is_wish, err = _fetch_listing_for_checkout_item(
+            db, item
+        )
+        if err:
+            return False, err, None
+
+        if is_wish:
+            any_wish = True
+
+        qty = _purchase_qty(item)
+        method, err_msg = _resolve_fulfillment_method(item, listing_mode, bs_data)
+        if method is None:
+            return False, {"message": err_msg, "code": 400}, None
+
+        declared_unit = item.get("unit_price")
+        if declared_unit is not None and declared_unit != "":
+            unit_cost = round(_to_float(declared_unit), 2)
+        else:
+            unit_cost = _listing_unit_cost(bs_data)
+        choices_extra = 0.0
+        if str(ti_bs_id).startswith("250"):
+            choices_extra = _to_float(item.get("choices_extra_cost") or 0)
+        line_merchandise = round(unit_cost * qty + choices_extra, 2)
+        order_merchandise += line_merchandise
+
+        line_buyer_bounty = _line_buyer_bounty_amount(item, bs_data, qty, is_wish)
+        order_buyer_bounty += line_buyer_bounty
+
+        line_tax_raw = item.get("line_tax_amount")
+        if line_tax_raw is None or line_tax_raw == "":
+            return False, {
+                "message": f"line_tax_amount is required for item {ti_bs_id}",
+                "code": 400,
+            }, None
+        line_tax = round(_to_float(line_tax_raw), 2)
+        is_taxable, catalog_rate = _listing_tax_config(bs_data)
+        rate_raw = item.get("ti_tax_rate")
+        tax_rate = _to_float(rate_raw) if rate_raw is not None and rate_raw != "" else _to_float(catalog_rate)
+        expected_tax = round(_tax_amount_for_line(line_merchandise, is_taxable, tax_rate), 2)
+        if not _money_close(line_tax, expected_tax):
+            return False, {
+                "message": (
+                    f"line_tax_amount mismatch for item {ti_bs_id} "
+                    f"(expected {expected_tax:.2f}, got {line_tax:.2f})"
+                ),
+                "code": 400,
+            }, None
+        order_tax += line_tax
+
+        if method == "ship" and not _listing_supports_ship(listing_mode, bs_data):
+            return False, {
+                "message": f"Ship fulfillment is not allowed for item {ti_bs_id}",
+                "code": 400,
+            }, None
+        if method == "pickup" and not _listing_supports_pickup(listing_mode, bs_data):
+            return False, {
+                "message": f"Pickup fulfillment is not allowed for item {ti_bs_id}",
+                "code": 400,
+            }, None
+        if method == "virtual" and not _listing_supports_virtual(listing_mode, bs_data):
+            return False, {
+                "message": f"Virtual fulfillment is not allowed for item {ti_bs_id}",
+                "code": 400,
+            }, None
+
+        expected_line_ship = _compute_expected_line_shipping(method, bs_data, qty)
+        per_unit_ship = item.get("ti_shipping_amount_per_unit")
+        if per_unit_ship is None:
+            per_unit_ship = item.get("ti_shipping_amount")
+
+        declared_raw = item.get("line_shipping_amount")
+        if declared_raw is not None and declared_raw != "":
+            declared_line_ship = _parse_line_shipping_amount(declared_raw)
+            if declared_line_ship is None:
+                return False, {
+                    "message": f"Invalid line_shipping_amount for item {ti_bs_id}",
+                    "code": 400,
+                }, None
+            if per_unit_ship is not None and per_unit_ship != "":
+                expected_from_unit = round(_to_float(per_unit_ship) * qty, 2)
+                if not _money_close(declared_line_ship, expected_from_unit):
+                    return False, {
+                        "message": (
+                            f"line_shipping_amount must equal ti_shipping_amount_per_unit × "
+                            f"quantity for item {ti_bs_id} "
+                            f"(expected {expected_from_unit:.2f}, got {declared_line_ship:.2f})"
+                        ),
+                        "code": 400,
+                    }, None
+            elif method == "ship" and not _money_close(declared_line_ship, expected_line_ship):
+                return False, {
+                    "message": (
+                        f"line_shipping_amount mismatch for item {ti_bs_id} "
+                        f"(expected {expected_line_ship:.2f}, got {declared_line_ship:.2f})"
+                    ),
+                    "code": 400,
+                }, None
+        else:
+            legacy_unit = item.get("shipping_amount")
+            if legacy_unit is None:
+                legacy_unit = per_unit_ship
+            if legacy_unit is not None and legacy_unit != "":
+                unit_amt = _parse_line_shipping_amount(legacy_unit)
+                declared_line_ship = round((unit_amt or 0.0) * qty, 2)
+                if method == "ship" and not _money_close(
+                    declared_line_ship, expected_line_ship
+                ):
+                    return False, {
+                        "message": (
+                            f"Shipping amount mismatch for item {ti_bs_id} "
+                            f"(expected {expected_line_ship:.2f}, got {declared_line_ship:.2f})"
+                        ),
+                        "code": 400,
+                    }, None
+            else:
+                declared_line_ship = expected_line_ship
+
+        if _is_no_shipping_fulfillment(method) and declared_line_ship != 0:
+            return False, {
+                "message": (
+                    f"{method.title()} lines must have line_shipping_amount 0 ({ti_bs_id})"
+                ),
+                "code": 400,
+            }, None
+
+        snr = item.get("shipping_not_required")
+        if snr is not None and _is_no_shipping_fulfillment(method):
+            if int(snr) != 1:
+                return False, {
+                    "message": (
+                        f"shipping_not_required must be 1 for {method} lines ({ti_bs_id})"
+                    ),
+                    "code": 400,
+                }, None
+
+        if method == "ship":
+            any_ship = True
+            if _is_buyer_actual_shipping(bs_data):
+                shipping_actual_pending = 1
+
+        order_shipping += declared_line_ship
+        lines.append(
+            {
+                "item_index": idx,
+                "ti_bs_id": ti_bs_id,
+                "fulfillment_method": method,
+                "line_shipping_amount": declared_line_ship,
+                "line_tax_amount": line_tax,
+                "line_merchandise": line_merchandise,
+                "line_buyer_bounty": line_buyer_bounty,
+                "is_wish": is_wish,
+                "unit_price": unit_cost,
+                "ti_tax_rate": tax_rate,
+                "ti_shipping_amount_per_unit": per_unit_ship,
+                "qty": qty,
+            }
+        )
+
+    if not lines:
+        return False, {"message": "No valid items in checkout", "code": 400}, None
+
+    if any_ship and not shipping_fields:
+        return False, {
+            "message": "shipping_address is required when any item uses ship fulfillment",
+            "code": 400,
+        }, None
+
+    order_shipping = round(order_shipping, 2)
+    order_merchandise = round(order_merchandise, 2)
+    order_tax = round(order_tax, 2)
+    order_buyer_bounty = round(order_buyer_bounty, 2)
+
+    if not _money_close(_to_float(payload.get("total_costs")), order_merchandise):
+        return False, {
+            "message": (
+                f"total_costs mismatch (expected {order_merchandise:.2f}, "
+                f"got {_to_float(payload.get('total_costs')):.2f})"
+            ),
+            "code": 400,
+        }, None
+
+    payload_taxes = payload.get("total_taxes")
+    if payload_taxes is not None and payload_taxes != "":
+        if not _money_close(_to_float(payload_taxes), order_tax):
+            return False, {
+                "message": (
+                    f"total_taxes mismatch (expected {order_tax:.2f}, "
+                    f"got {_to_float(payload_taxes):.2f})"
+                ),
+                "code": 400,
+            }, None
+
+    payload_shipping = payload.get("total_shipping")
+    if payload_shipping is not None:
+        if not _money_close(_to_float(payload_shipping), order_shipping):
+            return False, {
+                "message": (
+                    f"total_shipping mismatch (expected {order_shipping:.2f}, "
+                    f"got {_to_float(payload_shipping):.2f})"
+                ),
+                "code": 400,
+            }, None
+
+    payload_bounty = payload.get("total_bounty")
+    if payload_bounty is not None and payload_bounty != "":
+        if not _money_close(_to_float(payload_bounty), order_buyer_bounty):
+            return False, {
+                "message": (
+                    f"total_bounty mismatch (expected {order_buyer_bounty:.2f}, "
+                    f"got {_to_float(payload_bounty):.2f})"
+                ),
+                "code": 400,
+            }, None
+
+    shipping_for_total = (
+        order_shipping
+        if payload_shipping is None
+        else round(_to_float(payload_shipping), 2)
+    )
+    buyer_bounty_for_paid = order_buyer_bounty if any_wish else 0.0
+    expected_paid = round(
+        _to_float(payload.get("total_costs"))
+        + _to_float(payload.get("total_taxes"))
+        + shipping_for_total
+        + _to_float(payload.get("total_fees"))
+        + buyer_bounty_for_paid,
+        2,
+    )
+    if not _money_close(_to_float(payload.get("total_amount_paid")), expected_paid):
+        return False, {
+            "message": (
+                f"total_amount_paid mismatch (expected {expected_paid:.2f}, "
+                f"got {_to_float(payload.get('total_amount_paid')):.2f})"
+            ),
+            "code": 400,
+        }, None
+
+    return True, None, {
+        "lines": lines,
+        "order_shipping": order_shipping,
+        "order_merchandise": order_merchandise,
+        "order_tax": order_tax,
+        "order_buyer_bounty": order_buyer_bounty,
+        "any_ship": any_ship,
+        "any_wish": any_wish,
+        "shipping_actual_pending": shipping_actual_pending,
+    }
 
 
 def _parse_return_item_quantities(entry, *, line_unshipped=False, order_cancel=False):
@@ -965,6 +1513,45 @@ def _build_selected_options(item):
     return options or None
 
 
+def _selected_bso_ids(item):
+    """Collect selected option UIDs (255-…) for ti_bso_id."""
+    options = _build_selected_options(item) or []
+    uids = []
+    seen = set()
+    for opt in options:
+        bso_uid = (opt.get("bso_uid") or "").strip()
+        if not bso_uid or bso_uid in seen:
+            continue
+        seen.add(bso_uid)
+        uids.append(bso_uid)
+    return uids
+
+
+def _apply_item_options_to_tx_item(tx_item, item, ti_bs_id):
+    """Persist selected options, special instructions, and line price from checkout."""
+    options = _build_selected_options(item)
+    if options:
+        tx_item["ti_selected_options"] = json.dumps(options)
+        bso_ids = _selected_bso_ids(item)
+        if bso_ids:
+            # One option → single uid; multiple groups → comma-separated.
+            tx_item["ti_bso_id"] = ",".join(bso_ids)
+
+    special = (item.get("special_instructions") or "").strip()
+    if special:
+        tx_item["ti_special_instructions"] = special
+
+    if item.get("choices_extra_cost") is not None:
+        tx_item["ti_choices_extra_cost"] = _to_float(item.get("choices_extra_cost"))
+
+    # Seeking: keep listing profile_wish_cost as ti_bs_cost (do not fold buyer
+    # bounty into unit cost via amortized unit_price). Offering/product may still
+    # overwrite from FE unit_price.
+    unit_price = item.get("unit_price")
+    if unit_price is not None and not (
+        ti_bs_id and str(ti_bs_id).startswith("165")
+    ):
+        tx_item["ti_bs_cost"] = _normalize_stored_cost(unit_price)
 
 
 def _parse_selected_options_field(raw):
@@ -1028,7 +1615,146 @@ def _charity_share_is_payable(charity_amount, charity_pct):
         return charity_amount > 0
 
 
+def _middle_path_nodes(combined_path, seen):
+    """Nodes strictly between path endpoints, excluding known bounty recipients."""
+    if not combined_path:
+        return []
+    try:
+        uids = combined_path.split(",")
+        middle = uids[1:-1] if len(uids) > 2 else []
+        return [uid for uid in middle if uid and uid not in seen]
+    except Exception as e:
+        print(f"Error processing network path: {str(e)}")
+        return []
 
+
+def _without_zero_charity(participants):
+    return [
+        p
+        for p in participants
+        if p.get("tb_profile_id") != CHARITY_PROFILE_ID
+        or _charity_share_is_payable(p.get("tb_amount"), p.get("tb_percentage"))
+    ]
+
+
+def _network_participants_capped(middle_uids, effective_bounty):
+    """
+    Split the 40% network pool across intermediaries; cap each at 20%.
+    Any undistributed share goes to charity.
+    """
+    pool = round(_BOUNTY_NETWORK_POOL * effective_bounty, 4)
+    max_per = round(_BOUNTY_NETWORK_MAX_PERSON * effective_bounty, 4)
+    if not middle_uids:
+        if pool <= 0:
+            return []
+        return [
+            {
+                "tb_profile_id": CHARITY_PROFILE_ID,
+                **_bounty_pct_amount(effective_bounty, _BOUNTY_NETWORK_POOL),
+            }
+        ]
+
+    per_person = min(round(pool / len(middle_uids), 4), max_per)
+    total_paid = round(per_person * len(middle_uids), 4)
+    charity_amount = round(pool - total_paid, 4)
+    person_pct = round(per_person / effective_bounty, 4) if effective_bounty else 0
+
+    participants = [
+        {
+            "tb_profile_id": uid,
+            "tb_percentage": str(person_pct),
+            "tb_amount": per_person,
+        }
+        for uid in middle_uids
+    ]
+    if charity_amount > 0:
+        charity_pct = (
+            round(charity_amount / effective_bounty, 4) if effective_bounty else 0
+        )
+        if _charity_share_is_payable(charity_amount, charity_pct):
+            participants.append(
+                {
+                    "tb_profile_id": CHARITY_PROFILE_ID,
+                    "tb_percentage": str(charity_pct),
+                    "tb_amount": charity_amount,
+                }
+            )
+    return participants
+
+
+def _plan_seeking_bounty_shares(
+    effective_bounty, buyer_id, recommender_id, combined_path, seller_id=None
+):
+    """
+    Seeking-only bounty allocation (buyer-funded).
+
+    Roles:
+      BUYER       = Seeking ad poster (pays unit cost × qty); no fixed bounty share
+      SELLER      = Wish responder (receives merchandise); fixed share only when
+                    they are also the recommender
+      RECOMMENDER = Who introduced seller and buyer
+
+    Split (both scenarios — recommender is / is not seller):
+      - Recommender: 40%  (seller receives this when recommender == seller)
+      - Network:     40%  between recommender ↔ buyer (exclude endpoints);
+                     max 20% per node; excess → charity.
+                     Seller may appear here only when not the recommender.
+      - Every Circle: 20%
+
+    Returns (known_participants, network_participants).
+    """
+    known = []
+    if recommender_id:
+        known.append(
+            {
+                "tb_profile_id": recommender_id,
+                **_bounty_pct_amount(effective_bounty, 0.40),
+            }
+        )
+    known.append(
+        {
+            "tb_profile_id": EC_WALLET_ID,
+            **_bounty_pct_amount(effective_bounty, 0.20),
+        }
+    )
+    seen = {p["tb_profile_id"] for p in known if p["tb_profile_id"]}
+    # Defensive: never treat buyer as a network intermediary.
+    if buyer_id:
+        seen.add(buyer_id)
+    middle = _middle_path_nodes(combined_path, seen)
+    network = _network_participants_capped(middle, effective_bounty)
+
+    recommender_is_seller = bool(
+        recommender_id
+        and seller_id
+        and str(recommender_id) == str(seller_id)
+    )
+    print(
+        "Seeking bounty plan: "
+        f"buyer={buyer_id}, seller={seller_id}, recommender={recommender_id}, "
+        f"recommender_is_seller={recommender_is_seller}, "
+        f"path={combined_path}, middle={middle}"
+    )
+    return known, network
+
+
+def _network_participants_business(middle_uids, effective_bounty, seen):
+    """Legacy business network split: equal shares of 40%, pad with charity if < 2."""
+    network_result = list(middle_uids)
+    if len(network_result) < 2 and CHARITY_PROFILE_ID not in seen:
+        network_result.append(CHARITY_PROFILE_ID)
+    if not network_result:
+        return []
+    network_percentage = _BOUNTY_NETWORK_POOL / len(network_result)
+    return _without_zero_charity(
+        [
+            {
+                "tb_profile_id": uid,
+                **_bounty_pct_amount(effective_bounty, network_percentage),
+            }
+            for uid in network_result
+        ]
+    )
 
 
 def _get_authenticated_profile_id():
@@ -3078,13 +3804,91 @@ class ConfirmReturnTransaction(Resource):
             return response, 500
 
 
+def _buyer_purchase_list_query(*, order_uid_filter=False):
+    fulfillment_summary = fulfillment_list_summary_sql("ti")
+    order_filter = " AND t.transaction_uid = %s" if order_uid_filter else ""
+    return (
+        f"""
+                    SELECT
+                    t.transaction_uid,
+                    t.transaction_original_uid,
+                    COALESCE(t.transaction_type, 'sale') AS transaction_type,
+                    (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_amount,
+                    t.transaction_taxes,
+                    t.transaction_fees,
+                    t.transaction_shipping,
+                    t.transaction_profile_id,
+                    t.transaction_in_escrow,
+                    t.transaction_return_requested,
+                    t.transaction_return_note,
+                    t.transaction_business_id AS seller_id,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN
+                            CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN
+                            CONCAT(seller_pp.profile_personal_first_name, ' ', seller_pp.profile_personal_last_name)
+                        ELSE NULL
+                    END AS business_name,
+                    CASE
+                        WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'
+                        WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'
+                        WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'
+                        ELSE 'Unknown'
+                    END AS purchase_type,
+                    GROUP_CONCAT(
+                        CASE
+                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name
+                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title
+                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title
+                            ELSE 'See Receipt'
+                        END
+                        ORDER BY ti.ti_uid
+                        SEPARATOR ', '
+                    ) AS purchased_item,
+                    SUM(ti.ti_bs_qty) AS ti_bs_qty,
+                    MIN(ti.ti_uid) AS ti_uid,
+                    MIN(ti.ti_bs_cost) AS ti_bs_cost,
+                    MIN(pe.profile_expertise_cost) AS profile_expertise_cost,
+                    MIN(pe.profile_expertise_cost_currency) AS profile_expertise_cost_currency,
+                    MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,
+                    {fulfillment_summary}
+                    FROM every_circle.transactions t
+                    LEFT JOIN every_circle.transactions_items ti
+                    ON t.transaction_uid = ti.ti_transaction_id
+                    LEFT JOIN every_circle.business_services bs
+                    ON ti.ti_bs_id = bs.bs_uid
+                    LEFT JOIN every_circle.business biz
+                    ON bs.bs_business_id = biz.business_uid
+                    LEFT JOIN every_circle.profile_personal seller_pp
+                    ON t.transaction_business_id = seller_pp.profile_personal_uid
+                    LEFT JOIN every_circle.profile_expertise pe
+                    ON ti.ti_bs_id = pe.profile_expertise_uid
+                    LEFT JOIN every_circle.profile_personal expertise_pp
+                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid
+                    LEFT JOIN every_circle.wish_response wr
+                    ON ti.ti_bs_id = wr.wish_response_uid
+                    LEFT JOIN every_circle.profile_wish pw
+                    ON wr.wr_profile_wish_id = pw.profile_wish_uid
+                    WHERE t.transaction_profile_id = %s{order_filter}
+                    GROUP BY
+                    t.transaction_uid,
+                    t.transaction_datetime,
+                    t.transaction_total,
+                    t.transaction_profile_id,
+                    seller_id,
+                    business_name,
+                    purchase_type
+                    ORDER BY t.transaction_datetime DESC, ti_uid ASC
+               """
+    )
 
 def _query_buyer_purchase_list_rows(db, profile_id, *, order_uid=None):
     ensure_fulfillment_list_rollups(db)
-    order_uid_filter = bool(order_uid)
-    fulfillment_summary = fulfillment_list_summary_sql('ti')
-    order_filter = ' AND t.transaction_uid = %s' if order_uid_filter else ''
-    query = f"\n                    SELECT\n                    t.transaction_uid,\n                    t.transaction_original_uid,\n                    COALESCE(t.transaction_type, 'sale') AS transaction_type,\n                    (COALESCE(t.transaction_type, 'sale') = 'return') AS is_return,\n                    t.transaction_datetime,\n                    t.transaction_total,\n                    t.transaction_amount,\n                    t.transaction_taxes,\n                    t.transaction_fees,\n                    t.transaction_shipping,\n                    t.transaction_profile_id,\n                    t.transaction_in_escrow,\n                    t.transaction_return_requested,\n                    t.transaction_return_note,\n                    t.transaction_business_id AS seller_id,\n                    CASE\n                        WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name\n                        WHEN ti.ti_bs_id LIKE '150-%%' THEN\n                            CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)\n                        WHEN ti.ti_bs_id LIKE '165-%%' THEN\n                            CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)\n                        ELSE NULL\n                    END AS business_name,\n                    CASE\n                        WHEN ti.ti_bs_id LIKE '250-%%' THEN 'Business'\n                        WHEN ti.ti_bs_id LIKE '150-%%' THEN 'Offering'\n                        WHEN ti.ti_bs_id LIKE '165-%%' THEN 'Seeking'\n                        ELSE 'Unknown'\n                    END AS purchase_type,\n                    GROUP_CONCAT(\n                        CASE\n                            WHEN ti.ti_bs_id LIKE '250-%%' THEN bs.bs_service_name\n                            WHEN ti.ti_bs_id LIKE '150-%%' THEN pe.profile_expertise_title\n                            WHEN ti.ti_bs_id LIKE '165-%%' THEN pw.profile_wish_title\n                            ELSE 'See Receipt'\n                        END\n                        ORDER BY ti.ti_uid\n                        SEPARATOR ', '\n                    ) AS purchased_item,\n                    SUM(ti.ti_bs_qty) AS ti_bs_qty,\n                    MIN(ti.ti_uid) AS ti_uid,\n                    MIN(ti.ti_bs_cost) AS ti_bs_cost,\n                    MIN(pe.profile_expertise_cost) AS profile_expertise_cost,\n                    MIN(pe.profile_expertise_cost_currency) AS profile_expertise_cost_currency,\n                    MAX(ti.ti_fulfillment_method) AS ti_fulfillment_method,\n                    {fulfillment_summary}\n                    FROM every_circle.transactions t\n                    LEFT JOIN every_circle.transactions_items ti\n                    ON t.transaction_uid = ti.ti_transaction_id\n                    LEFT JOIN every_circle.business_services bs\n                    ON ti.ti_bs_id = bs.bs_uid\n                    LEFT JOIN every_circle.business biz\n                    ON bs.bs_business_id = biz.business_uid\n                    LEFT JOIN every_circle.profile_personal seller_pp\n                    ON t.transaction_business_id = seller_pp.profile_personal_user_id\n                    LEFT JOIN every_circle.profile_expertise pe\n                    ON ti.ti_bs_id = pe.profile_expertise_uid\n                    LEFT JOIN every_circle.profile_personal expertise_pp\n                    ON pe.profile_expertise_profile_personal_id = expertise_pp.profile_personal_uid\n                    LEFT JOIN every_circle.wish_response wr\n                    ON ti.ti_bs_id = wr.wish_response_uid\n                    LEFT JOIN every_circle.profile_wish pw\n                    ON wr.wr_profile_wish_id = pw.profile_wish_uid\n                    LEFT JOIN every_circle.profile_personal wish_pp\n                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid\n                    WHERE t.transaction_profile_id = %s{order_filter}\n                    GROUP BY\n                    t.transaction_uid,\n                    t.transaction_datetime,\n                    t.transaction_total,\n                    t.transaction_profile_id,\n                    seller_id,\n                    business_name,\n                    purchase_type\n                    ORDER BY t.transaction_datetime DESC, ti_uid ASC\n               "
+    query = _buyer_purchase_list_query(order_uid_filter=bool(order_uid))
     params = [profile_id]
     if order_uid:
         params.append(order_uid)
@@ -3274,301 +4078,12 @@ class Transactions(Resource):
                         response["idempotent"] = True
                         return response, 200
 
-                _db_191 = db
-                items = payload.get('items', [])
-                _payload_176 = payload
-                _shipping_fields_175 = shipping_fields
-                if not isinstance(items, list) or len(items) == 0:
-                    _r__plan_checkout_174 = (False, {'message': 'items must be a non-empty list', 'code': 400}, None)
-                else:
-                    lines = []
-                    _order_shipping_192 = 0.0
-                    order_merchandise = 0.0
-                    order_tax = 0.0
-                    shipping_actual_pending = 0
-                    any_ship = False
-                    _r__plan_checkout_174__returned = False
-                    for idx, _item_183 in enumerate(items):
-                        if not isinstance(_item_183, dict):
-                            continue
-                        if not _item_183.get('bs_uid') and (not _item_183.get('expertise_uid')) and (not _item_183.get('wish_response_uid')):
-                            continue
-                        _db_152 = _db_191
-                        _item_151 = _item_183
-                        _ti_bs_id_148 = _item_151.get('bs_uid') or _item_151.get('expertise_uid') or _item_151.get('wish_response_uid')
-                        if not _ti_bs_id_148:
-                            _r__fetch_listing_for_checkout_item_145 = (None, None, None, False, {'message': 'Each item requires bs_uid, expertise_uid, or wish_response_uid', 'code': 400})
-                        else:
-                            is_wish = False
-                            _listing_mode_147 = None
-                            if str(_ti_bs_id_148).startswith('250'):
-                                _bs_response_180 = _db_152.execute('SELECT * FROM every_circle.business_services WHERE bs_uid = %s', (_ti_bs_id_148,))
-                                if not _bs_response_180.get('result'):
-                                    _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': f'Business service not found: {_ti_bs_id_148}', 'code': 404})
-                                else:
-                                    _bs_data_153 = _bs_response_180['result'][0]
-                                    _avail_err_184 = _validate_business_service_available(_db_152, _bs_data_153)
-                                    if _avail_err_184:
-                                        _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, _avail_err_184)
-                                    else:
-                                        _product_data_149 = _bs_data_153
-                                        if not _product_data_149:
-                                            _listing_mode_147 = None
-                                        else:
-                                            _raw_146 = _product_data_149.get('bs_mode')
-                                            if _raw_146 is None or not str(_raw_146).strip():
-                                                _listing_mode_147 = None
-                                            else:
-                                                mode_str = str(_raw_146).strip()
-                                                _flags_150 = _parse_listing_mode_flags(mode_str)
-                                                if not any(_flags_150.values()):
-                                                    _listing_mode_147 = None
-                                                else:
-                                                    _listing_mode_147 = _normalize_listing_mode(mode_str)
-                                        if _listing_mode_147 is None:
-                                            _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': f'Business service {_ti_bs_id_148} has missing or invalid bs_mode (requires Virtual, Delivered, and/or In-Person)', 'code': 400})
-                            elif str(_ti_bs_id_148).startswith('150'):
-                                _bs_response_180 = _db_152.execute('SELECT * FROM every_circle.profile_expertise WHERE profile_expertise_uid = %s', (_ti_bs_id_148,))
-                                if not _bs_response_180.get('result'):
-                                    _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': f'Expertise not found: {_ti_bs_id_148}', 'code': 404})
-                                else:
-                                    _bs_data_153 = _bs_response_180['result'][0]
-                                    if int(_bs_data_153.get('profile_expertise_moderated') or 0) != MODERATED_ACTIVE:
-                                        _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': 'Offering is not available', 'code': 403})
-                                    else:
-                                        _owner_uid_178 = _bs_data_153.get('profile_expertise_profile_personal_id')
-                                        if not is_owner_available_for_public_interaction(_db_152, _owner_uid_178):
-                                            _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': 'Offering is not available', 'code': 403})
-                                        else:
-                                            _listing_mode_147 = _normalize_listing_mode(_bs_data_153.get('profile_expertise_mode'))
-                            elif str(_ti_bs_id_148).startswith('165'):
-                                is_wish = True
-                                _bs_response_180 = _db_152.execute('\n            SELECT wish_response.wish_response_uid, profile_wish.*\n            FROM every_circle.profile_wish\n            LEFT JOIN every_circle.wish_response ON wr_profile_wish_id = profile_wish_uid\n            WHERE wish_response_uid = %s\n            ', (_item_151.get('wish_response_uid'),))
-                                if not _bs_response_180.get('result'):
-                                    _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': f'Wish not found: {_item_151.get('wish_response_uid')}', 'code': 404})
-                                else:
-                                    _bs_data_153 = _bs_response_180['result'][0]
-                                    _listing_mode_147 = _normalize_listing_mode(_bs_data_153.get('profile_wish_mode'))
-                            else:
-                                _r__fetch_listing_for_checkout_item_145 = (None, _ti_bs_id_148, None, False, {'message': f'Invalid item id: {_ti_bs_id_148}', 'code': 400})
-                            _r__fetch_listing_for_checkout_item_145 = (_bs_data_153, _ti_bs_id_148, _listing_mode_147, is_wish, None)
-                        _bs_data_179, _ti_bs_id_187, listing_mode, _is_wish, _err_189 = _r__fetch_listing_for_checkout_item_145
-                        if _err_189:
-                            _r__plan_checkout_174 = (False, _err_189, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        _qty_188 = _purchase_qty(_item_183)
-                        _item_88 = _item_183
-                        _listing_mode_86 = listing_mode
-                        _product_data_87 = _bs_data_179
-                        _raw_177 = _item_88.get('fulfillment_method')
-                        if _raw_177 is not None and str(_raw_177).strip():
-                            _method_89 = str(_raw_177).strip().lower()
-                            if _method_89 not in VALID_FULFILLMENT_METHODS:
-                                _r__resolve_fulfillment_method_85 = (None, "Invalid fulfillment_method; must be 'ship', 'pickup', or 'virtual'")
-                            else:
-                                _r__resolve_fulfillment_method_85 = (_method_89, None)
-                        elif _listing_mode_86 == 'both':
-                            _r__resolve_fulfillment_method_85 = (None, 'fulfillment_method is required for dual-mode listings')
-                        elif _listing_mode_86 == 'pickup':
-                            _r__resolve_fulfillment_method_85 = ('pickup', None)
-                        elif _listing_mode_86 == 'ship':
-                            _r__resolve_fulfillment_method_85 = ('ship', None)
-                        elif _listing_mode_86 == 'virtual':
-                            _r__resolve_fulfillment_method_85 = ('virtual', None)
-                        elif _has_shipping_config(_product_data_87):
-                            _r__resolve_fulfillment_method_85 = ('ship', None)
-                        else:
-                            _r__resolve_fulfillment_method_85 = ('pickup', None)
-                        _method_186, err_msg = _r__resolve_fulfillment_method_85
-                        if _method_186 is None:
-                            _r__plan_checkout_174 = (False, {'message': err_msg, 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        declared_unit = _item_183.get('unit_price')
-                        if declared_unit is not None and declared_unit != '':
-                            unit_cost = round(_to_float(declared_unit), 2)
-                        else:
-                            _bs_data_10 = _bs_data_179
-                            if not _bs_data_10:
-                                unit_cost = 0.0
-                            else:
-                                _unit_cost__returned_182 = False
-                                for key in ('bs_cost', 'profile_expertise_cost', 'profile_wish_cost'):
-                                    if _bs_data_10.get(key) is not None:
-                                        unit_cost = round(_to_float(_bs_data_10.get(key)), 2)
-                                        _unit_cost__returned_182 = True
-                                        break
-                                if _r__plan_checkout_174__returned:
-                                    break
-                                if not _unit_cost__returned_182:
-                                    unit_cost = 0.0
-                        choices_extra = 0.0
-                        if str(_ti_bs_id_187).startswith('250'):
-                            choices_extra = _to_float(_item_183.get('choices_extra_cost') or 0)
-                        line_merchandise = round(unit_cost * _qty_188 + choices_extra, 2)
-                        order_merchandise += line_merchandise
-                        line_tax_raw = _item_183.get('line_tax_amount')
-                        if line_tax_raw is None or line_tax_raw == '':
-                            _r__plan_checkout_174 = (False, {'message': f'line_tax_amount is required for item {_ti_bs_id_187}', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        line_tax = round(_to_float(line_tax_raw), 2)
-                        is_taxable, catalog_rate = _listing_tax_config(_bs_data_179)
-                        rate_raw = _item_183.get('ti_tax_rate')
-                        tax_rate = _to_float(rate_raw) if rate_raw is not None and rate_raw != '' else _to_float(catalog_rate)
-                        expected_tax = round(_tax_amount_for_line(line_merchandise, is_taxable, tax_rate), 2)
-                        if not _money_close(line_tax, expected_tax):
-                            _r__plan_checkout_174 = (False, {'message': f'line_tax_amount mismatch for item {_ti_bs_id_187} (expected {expected_tax:.2f}, got {line_tax:.2f})', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        order_tax += line_tax
-                        _listing_mode_18 = listing_mode
-                        _product_data_16 = _bs_data_179
-                        _flags_17 = _mode_flags_from_product(_product_data_16)
-                        if _flags_17['delivered'] or _flags_17['virtual']:
-                            _r__listing_supports_ship_15 = True
-                        elif _listing_mode_18 in ('ship', 'both'):
-                            _r__listing_supports_ship_15 = True
-                        elif _listing_mode_18 is None:
-                            _r__listing_supports_ship_15 = _has_shipping_config(_product_data_16)
-                        else:
-                            _r__listing_supports_ship_15 = False
-                        if _method_186 == 'ship' and (not _r__listing_supports_ship_15):
-                            _r__plan_checkout_174 = (False, {'message': f'Ship fulfillment is not allowed for item {_ti_bs_id_187}', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        _listing_mode_22 = listing_mode
-                        _product_data_20 = _bs_data_179
-                        _flags_21 = _mode_flags_from_product(_product_data_20)
-                        if _flags_21['inPerson']:
-                            _r__listing_supports_pickup_19 = True
-                        elif _listing_mode_22 in ('pickup', 'both'):
-                            _r__listing_supports_pickup_19 = True
-                        elif _listing_mode_22 is None:
-                            _r__listing_supports_pickup_19 = not _has_shipping_config(_product_data_20)
-                        else:
-                            _r__listing_supports_pickup_19 = False
-                        if _method_186 == 'pickup' and (not _r__listing_supports_pickup_19):
-                            _r__plan_checkout_174 = (False, {'message': f'Pickup fulfillment is not allowed for item {_ti_bs_id_187}', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        _listing_mode_13 = listing_mode
-                        _product_data_12 = _bs_data_179
-                        flags = _mode_flags_from_product(_product_data_12)
-                        if flags['virtual']:
-                            _r__listing_supports_virtual_11 = True
-                        elif _listing_mode_13 is None:
-                            _r__listing_supports_virtual_11 = False
-                        else:
-                            _r__listing_supports_virtual_11 = _listing_mode_13 in ('virtual', 'both')
-                        if _method_186 == 'virtual' and (not _r__listing_supports_virtual_11):
-                            _r__plan_checkout_174 = (False, {'message': f'Virtual fulfillment is not allowed for item {_ti_bs_id_187}', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        fulfillment_method = _method_186
-                        _product_data_74 = _bs_data_179
-                        _qty_75 = _qty_188
-                        if _is_no_shipping_fulfillment(fulfillment_method):
-                            expected_line_ship = 0.0
-                        else:
-                            _sh_73 = _listing_shipping_type(_product_data_74)
-                            if not _sh_73:
-                                expected_line_ship = 0.0
-                            else:
-                                low = _sh_73.strip().lower()
-                                if low == 'free':
-                                    expected_line_ship = 0.0
-                                elif low in ('buyer actual', 'buyer_actual'):
-                                    expected_line_ship = 0.0
-                                elif low in ('buyer fixed', 'buyer_fixed'):
-                                    amt = _parse_line_shipping_amount(_product_data_74.get('bs_shipping_amount') if _product_data_74.get('bs_shipping_amount') is not None else _product_data_74.get('profile_expertise_shipping_amount'))
-                                    _per_unit_185 = 0.0 if amt is None else amt
-                                    expected_line_ship = round(_per_unit_185 * int(_qty_75 or 1), 2)
-                                else:
-                                    expected_line_ship = 0.0
-                        per_unit_ship = _item_183.get('ti_shipping_amount_per_unit')
-                        if per_unit_ship is None:
-                            per_unit_ship = _item_183.get('ti_shipping_amount')
-                        declared_raw = _item_183.get('line_shipping_amount')
-                        if declared_raw is not None and declared_raw != '':
-                            declared_line_ship = _parse_line_shipping_amount(declared_raw)
-                            if declared_line_ship is None:
-                                _r__plan_checkout_174 = (False, {'message': f'Invalid line_shipping_amount for item {_ti_bs_id_187}', 'code': 400}, None)
-                                _r__plan_checkout_174__returned = True
-                                break
-                            if per_unit_ship is not None and per_unit_ship != '':
-                                expected_from_unit = round(_to_float(per_unit_ship) * _qty_188, 2)
-                                if not _money_close(declared_line_ship, expected_from_unit):
-                                    _r__plan_checkout_174 = (False, {'message': f'line_shipping_amount must equal ti_shipping_amount_per_unit × quantity for item {_ti_bs_id_187} (expected {expected_from_unit:.2f}, got {declared_line_ship:.2f})', 'code': 400}, None)
-                                    _r__plan_checkout_174__returned = True
-                                    break
-                            elif _method_186 == 'ship' and (not _money_close(declared_line_ship, expected_line_ship)):
-                                _r__plan_checkout_174 = (False, {'message': f'line_shipping_amount mismatch for item {_ti_bs_id_187} (expected {expected_line_ship:.2f}, got {declared_line_ship:.2f})', 'code': 400}, None)
-                                _r__plan_checkout_174__returned = True
-                                break
-                        else:
-                            legacy_unit = _item_183.get('shipping_amount')
-                            if legacy_unit is None:
-                                legacy_unit = per_unit_ship
-                            if legacy_unit is not None and legacy_unit != '':
-                                unit_amt = _parse_line_shipping_amount(legacy_unit)
-                                declared_line_ship = round((unit_amt or 0.0) * _qty_188, 2)
-                                if _method_186 == 'ship' and (not _money_close(declared_line_ship, expected_line_ship)):
-                                    _r__plan_checkout_174 = (False, {'message': f'Shipping amount mismatch for item {_ti_bs_id_187} (expected {expected_line_ship:.2f}, got {declared_line_ship:.2f})', 'code': 400}, None)
-                                    _r__plan_checkout_174__returned = True
-                                    break
-                            else:
-                                declared_line_ship = expected_line_ship
-                        if _is_no_shipping_fulfillment(_method_186) and declared_line_ship != 0:
-                            _r__plan_checkout_174 = (False, {'message': f'{_method_186.title()} lines must have line_shipping_amount 0 ({_ti_bs_id_187})', 'code': 400}, None)
-                            _r__plan_checkout_174__returned = True
-                            break
-                        snr = _item_183.get('shipping_not_required')
-                        if snr is not None and _is_no_shipping_fulfillment(_method_186):
-                            if int(snr) != 1:
-                                _r__plan_checkout_174 = (False, {'message': f'shipping_not_required must be 1 for {_method_186} lines ({_ti_bs_id_187})', 'code': 400}, None)
-                                _r__plan_checkout_174__returned = True
-                                break
-                        if _method_186 == 'ship':
-                            any_ship = True
-                            _product_data_190 = _bs_data_179
-                            _sh_181 = _listing_shipping_type(_product_data_190)
-                            if not _sh_181:
-                                _r__is_buyer_actual_shipping_1 = False
-                            else:
-                                _r__is_buyer_actual_shipping_1 = _sh_181.strip().lower() in ('buyer actual', 'buyer_actual')
-                            if _r__is_buyer_actual_shipping_1:
-                                shipping_actual_pending = 1
-                        _order_shipping_192 += declared_line_ship
-                        lines.append({'item_index': idx, 'ti_bs_id': _ti_bs_id_187, 'fulfillment_method': _method_186, 'line_shipping_amount': declared_line_ship, 'line_tax_amount': line_tax, 'line_merchandise': line_merchandise, 'unit_price': unit_cost, 'ti_tax_rate': tax_rate, 'ti_shipping_amount_per_unit': per_unit_ship, 'qty': _qty_188})
-                    if not _r__plan_checkout_174__returned:
-                        if not lines:
-                            _r__plan_checkout_174 = (False, {'message': 'No valid items in checkout', 'code': 400}, None)
-                        elif any_ship and (not _shipping_fields_175):
-                            _r__plan_checkout_174 = (False, {'message': 'shipping_address is required when any item uses ship fulfillment', 'code': 400}, None)
-                        else:
-                            _order_shipping_192 = round(_order_shipping_192, 2)
-                            order_merchandise = round(order_merchandise, 2)
-                            order_tax = round(order_tax, 2)
-                            if not _money_close(_to_float(_payload_176.get('total_costs')), order_merchandise):
-                                _r__plan_checkout_174 = (False, {'message': f'total_costs mismatch (expected {order_merchandise:.2f}, got {_to_float(_payload_176.get('total_costs')):.2f})', 'code': 400}, None)
-                            else:
-                                payload_taxes = _payload_176.get('total_taxes')
-                                if payload_taxes is not None and payload_taxes != '':
-                                    if not _money_close(_to_float(payload_taxes), order_tax):
-                                        _r__plan_checkout_174 = (False, {'message': f'total_taxes mismatch (expected {order_tax:.2f}, got {_to_float(payload_taxes):.2f})', 'code': 400}, None)
-                                payload_shipping = _payload_176.get('total_shipping')
-                                if payload_shipping is not None:
-                                    if not _money_close(_to_float(payload_shipping), _order_shipping_192):
-                                        _r__plan_checkout_174 = (False, {'message': f'total_shipping mismatch (expected {_order_shipping_192:.2f}, got {_to_float(payload_shipping):.2f})', 'code': 400}, None)
-                                shipping_for_total = _order_shipping_192 if payload_shipping is None else round(_to_float(payload_shipping), 2)
-                                expected_paid = round(_to_float(_payload_176.get('total_costs')) + _to_float(_payload_176.get('total_taxes')) + shipping_for_total + _to_float(_payload_176.get('total_fees')), 2)
-                                if not _money_close(_to_float(_payload_176.get('total_amount_paid')), expected_paid):
-                                    _r__plan_checkout_174 = (False, {'message': f'total_amount_paid mismatch (expected {expected_paid:.2f}, got {_to_float(_payload_176.get('total_amount_paid')):.2f})', 'code': 400}, None)
-                                else:
-                                    _r__plan_checkout_174 = (True, None, {'lines': lines, 'order_shipping': _order_shipping_192, 'order_merchandise': order_merchandise, 'order_tax': order_tax, 'any_ship': any_ship, 'shipping_actual_pending': shipping_actual_pending})
-                plan_ok, plan_err, checkout_plan = _r__plan_checkout_174
+                plan_ok, plan_err, checkout_plan = _plan_checkout(
+                    db,
+                    payload.get("items", []),
+                    payload,
+                    shipping_fields,
+                )
                 if not plan_ok:
                     return plan_err, plan_err.get("code", 400)
 
@@ -3941,7 +4456,7 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("profile_wish_is_returnable")
                         )
-                        _apply_line_shipping_snapshot(tx_item, item)
+                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
                         _apply_line_tax_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
@@ -3972,63 +4487,11 @@ class Transactions(Resource):
                         print("ti_bs_id is not a valid ID")
                         continue
 
-                    _r__apply_item_options_to_tx_item_92 = None
-                    _tx_item_94 = tx_item
-                    _item_95 = item
-                    _ti_bs_id_93 = ti_bs_id
-                    options = _build_selected_options(_item_95)
-                    if options:
-                        _tx_item_94['ti_selected_options'] = json.dumps(options)
-                        _item_47 = _item_95
-                        _options_48 = _build_selected_options(_item_47) or []
-                        _uids_96 = []
-                        _seen_97 = set()
-                        for opt in _options_48:
-                            bso_uid = (opt.get('bso_uid') or '').strip()
-                            if not bso_uid or bso_uid in _seen_97:
-                                continue
-                            _seen_97.add(bso_uid)
-                            _uids_96.append(bso_uid)
-                        bso_ids = _uids_96
-                        if bso_ids:
-                            _tx_item_94['ti_bso_id'] = ','.join(bso_ids)
-                    special = (_item_95.get('special_instructions') or '').strip()
-                    if special:
-                        _tx_item_94['ti_special_instructions'] = special
-                    if _item_95.get('choices_extra_cost') is not None:
-                        _tx_item_94['ti_choices_extra_cost'] = _to_float(_item_95.get('choices_extra_cost'))
-                    unit_price = _item_95.get('unit_price')
-                    if unit_price is not None:
-                        _tx_item_94['ti_bs_cost'] = _normalize_stored_cost(unit_price)
+                    _apply_item_options_to_tx_item(tx_item, item, ti_bs_id)
 
                     line_plan = plan_by_index.get(item_idx)
                     if line_plan:
-                        _r__apply_checkout_fulfillment_90 = None
-                        _tx_item_91 = tx_item
-                        plan = line_plan
-                        product_data = bs_data
-                        method = plan['fulfillment_method']
-                        qty = int(plan.get('qty') or _tx_item_91.get('ti_bs_qty') or 1)
-                        line_shipping = round(_to_float(plan.get('line_shipping_amount')), 2)
-                        _tx_item_91['ti_fulfillment_method'] = method
-                        _r__snapshot_listing_shipping_on_line_2 = None
-                        _tx_item_4 = _tx_item_91
-                        _product_data_3 = product_data
-                        sh = _listing_shipping_type(_product_data_3)
-                        if sh:
-                            _tx_item_4['ti_listing_shipping'] = sh
-                        if _is_no_shipping_fulfillment(method):
-                            _tx_item_91['ti_fulfillment_status'] = FULFILLMENT_STATUS_NOT_REQUIRED
-                            _tx_item_91['ti_shipping_not_required'] = 1
-                            _tx_item_91['ti_line_shipping_amount'] = 0.0
-                            _tx_item_91['ti_shipping_amount'] = 0.0
-                            _r__apply_checkout_fulfillment_90 = None
-                        else:
-                            _tx_item_91['ti_fulfillment_status'] = FULFILLMENT_STATUS_NOT_SHIPPED
-                            _tx_item_91['ti_shipping_not_required'] = 0
-                            _tx_item_91['ti_line_shipping_amount'] = line_shipping
-                            per_unit = round(line_shipping / qty, 2) if qty > 0 else 0.0
-                            _tx_item_91['ti_shipping_amount'] = per_unit
+                        _apply_checkout_fulfillment(tx_item, line_plan, bs_data)
 
                     line_qty = int(tx_item.get("ti_bs_qty") or 1)
                     if line_plan:
@@ -4216,6 +4679,7 @@ class Transactions(Resource):
                         is_expertise_item = (
                             ti_bs_id and str(ti_bs_id).startswith("150")
                         )
+                        seller_profile_id = payload.get("business_id")
 
                         if is_expertise_item:
                             seller_profile_id = (
@@ -4224,7 +4688,8 @@ class Transactions(Resource):
                             )
                             path_from, path_to = seller_profile_id, profile_id
                         elif is_wish_item:
-                            path_from, path_to = profile_id, recommender_profile_id
+                            # Seeking: network path is recommender ↔ buyer
+                            path_from, path_to = recommender_profile_id, profile_id
                         else:
                             path_from, path_to = profile_id, recommender_profile_id
 
@@ -4247,17 +4712,20 @@ class Transactions(Resource):
                                 print(f'Error getting connection path: {str(_e_69)}')
                                 combined_path = None
 
-                        known_participants = []
-                        if is_expertise_item:
-                            if profile_id:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
+                        if is_wish_item:
+                            # Seeking-only allocation (do not change 150/250).
+                            known_participants, network_participants = (
+                                _plan_seeking_bounty_shares(
+                                    effective_bounty,
+                                    profile_id,
+                                    recommender_profile_id,
+                                    combined_path,
+                                    seller_id=seller_profile_id,
                                 )
-                        elif is_wish_item:
-                            if buyer_is_recommender:
+                            )
+                        else:
+                            known_participants = []
+                            if is_expertise_item:
                                 if profile_id:
                                     known_participants.append(
                                         {
@@ -4266,102 +4734,53 @@ class Transactions(Resource):
                                         }
                                     )
                             else:
-                                if profile_id:
+                                if buyer_is_recommender:
                                     known_participants.append(
                                         {
                                             "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                            **_bounty_pct_amount(effective_bounty, 0.40),
                                         }
                                     )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        else:
-                            if buyer_is_recommender:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
+                                else:
+                                    if profile_id:
+                                        known_participants.append(
+                                            {
+                                                "tb_profile_id": profile_id,
+                                                **_bounty_pct_amount(
+                                                    effective_bounty, 0.20
+                                                ),
+                                            }
+                                        )
+                                    if recommender_profile_id:
+                                        known_participants.append(
+                                            {
+                                                "tb_profile_id": recommender_profile_id,
+                                                **_bounty_pct_amount(
+                                                    effective_bounty, 0.20
+                                                ),
+                                            }
+                                        )
+                            known_participants.append(
+                                {
+                                    "tb_profile_id": EC_WALLET_ID,
+                                    **_bounty_pct_amount(effective_bounty, 0.20),
+                                }
+                            )
+                            seen = {
+                                p["tb_profile_id"]
+                                for p in known_participants
+                                if p["tb_profile_id"]
+                            }
+
+                            middle_nodes = _middle_path_nodes(combined_path, seen)
+                            if is_expertise_item:
+                                network_participants = _network_participants_capped(
+                                    middle_nodes, effective_bounty
                                 )
                             else:
-                                if profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        known_participants.append(
-                            {
-                                "tb_profile_id": EC_WALLET_ID,
-                                **_bounty_pct_amount(effective_bounty, 0.20),
-                            }
-                        )
-                        seen = {
-                            p["tb_profile_id"]
-                            for p in known_participants
-                            if p["tb_profile_id"]
-                        }
-
-                        _combined_path_36 = combined_path
-                        _seen_37 = seen
-                        if not _combined_path_36:
-                            middle_nodes = []
-                        else:
-                            try:
-                                uids = _combined_path_36.split(',')
-                                middle = uids[1:-1] if len(uids) > 2 else []
-                                middle_nodes = [uid for uid in middle if uid and uid not in _seen_37]
-                            except Exception as _e_35:
-                                print(f'Error processing network path: {str(_e_35)}')
-                                middle_nodes = []
-                        if is_expertise_item or is_wish_item:
-                            _middle_uids_109 = middle_nodes
-                            _effective_bounty_107 = effective_bounty
-                            pool = round(_BOUNTY_NETWORK_POOL * _effective_bounty_107, 4)
-                            max_per = round(_BOUNTY_NETWORK_MAX_PERSON * _effective_bounty_107, 4)
-                            if not _middle_uids_109:
-                                if pool <= 0:
-                                    network_participants = []
-                                else:
-                                    network_participants = [{'tb_profile_id': CHARITY_PROFILE_ID, **_bounty_pct_amount(_effective_bounty_107, _BOUNTY_NETWORK_POOL)}]
-                            else:
-                                per_person = min(round(pool / len(_middle_uids_109), 4), max_per)
-                                total_paid = round(per_person * len(_middle_uids_109), 4)
-                                charity_amount = round(pool - total_paid, 4)
-                                person_pct = round(per_person / _effective_bounty_107, 4) if _effective_bounty_107 else 0
-                                _participants_110 = [{'tb_profile_id': _uid_108, 'tb_percentage': str(person_pct), 'tb_amount': per_person} for _uid_108 in _middle_uids_109]
-                                if charity_amount > 0:
-                                    charity_pct = round(charity_amount / _effective_bounty_107, 4) if _effective_bounty_107 else 0
-                                    if _charity_share_is_payable(charity_amount, charity_pct):
-                                        _participants_110.append({'tb_profile_id': CHARITY_PROFILE_ID, 'tb_percentage': str(charity_pct), 'tb_amount': charity_amount})
-                                network_participants = _participants_110
-                        else:
-                            middle_uids = middle_nodes
-                            _effective_bounty_39 = effective_bounty
-                            _seen_41 = seen
-                            network_result = list(middle_uids)
-                            if len(network_result) < 2 and CHARITY_PROFILE_ID not in _seen_41:
-                                network_result.append(CHARITY_PROFILE_ID)
-                            if not network_result:
-                                network_participants = []
-                            else:
-                                network_percentage = _BOUNTY_NETWORK_POOL / len(network_result)
-                                participants = [{'tb_profile_id': _uid_40, **_bounty_pct_amount(_effective_bounty_39, network_percentage)} for _uid_40 in network_result]
-                                _r__without_zero_charity_14 = [_p_38 for _p_38 in participants if _p_38.get('tb_profile_id') != CHARITY_PROFILE_ID or _charity_share_is_payable(_p_38.get('tb_amount'), _p_38.get('tb_percentage'))]
-                                network_participants = _r__without_zero_charity_14
+                                network_participants = _network_participants_business(
+                                    middle_nodes, effective_bounty, seen
+                                )
                         print("network_participants: ", network_participants)
 
                         # Process known participants (buyer, recommender, ec-wallet)
@@ -5324,6 +5743,67 @@ def _order_bounty_paid(db, order_uid):
     return _batch_order_bounty_paid(db, [order_uid]).get(order_uid, 0.0)
 
 
+def is_seeking_sale_line(ti_row_or_id):
+    """
+    True for Seeking / wish sale lines (buyer-funded bounty).
+
+    Accepts a line dict (ti_bs_id / purchase_type) or a raw bs id string.
+    """
+    if ti_row_or_id is None:
+        return False
+    if isinstance(ti_row_or_id, dict):
+        bs_id = str(ti_row_or_id.get("ti_bs_id") or "")
+        if bs_id.startswith("165"):
+            return True
+        purchase_type = str(ti_row_or_id.get("purchase_type") or "").strip().lower()
+        return purchase_type in ("wish", "seeking")
+    return str(ti_row_or_id).startswith("165")
+
+
+def _order_seller_funded_bounty_paid(db, order_uid):
+    """
+    Bounty that reduces seller sale proceeds.
+
+    Excludes Seeking (165-*) lines: that bounty is buyer-funded at checkout and
+    paid out via transactions_bounty, not clawed from seller merchandise.
+    """
+    if not order_uid:
+        return 0.0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(tb.tb_amount), 0) AS seller_funded_bounty
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        WHERE ti.ti_transaction_id = %s
+          AND ti.ti_bs_id NOT LIKE '165-%%'
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return round(_to_float(rows[0].get("seller_funded_bounty")), 4)
+
+
+def _sale_line_count(db, order_uid):
+    if not order_uid:
+        return 0
+    q = db.execute(
+        """
+        SELECT COUNT(*) AS line_count
+        FROM every_circle.transactions_items
+        WHERE ti_transaction_id = %s
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0
+    try:
+        return int(rows[0].get("line_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 
 def _fetch_ti_row_for_bounty(db, ti_uid, order_uid):
     """Load sale line with catalog bounty from business_services or profile_expertise."""
@@ -5394,6 +5874,9 @@ def _seller_bounty_to_reclaim_for_line(ti_row, return_qty, *, line_bounty_ledger
     """Seller bounty reversed for a partial/full line return."""
     if not ti_row:
         return 0.0
+    # Seeking bounty is buyer-funded — never reclaim from seller proceeds.
+    if is_seeking_sale_line(ti_row):
+        return 0.0
     try:
         rq = int(return_qty)
     except (TypeError, ValueError):
@@ -5462,21 +5945,10 @@ def _bounty_to_reclaim_for_line(
     if scale is None:
         return 0.0
 
-    _db_66 = db
-    _order_uid_65 = order_uid
-    if not _order_uid_65:
-        _r__sale_line_count_64 = 0
-    else:
-        q = _db_66.execute('\n        SELECT COUNT(*) AS line_count\n        FROM every_circle.transactions_items\n        WHERE ti_transaction_id = %s\n        ', (_order_uid_65,))
-        rows = q.get('result') or []
-        if not rows:
-            _r__sale_line_count_64 = 0
-        else:
-            try:
-                _r__sale_line_count_64 = int(rows[0].get('line_count') or 0)
-            except (TypeError, ValueError):
-                _r__sale_line_count_64 = 0
-    if _r__sale_line_count_64 == 1:
+    if _sale_line_count(db, order_uid) == 1:
+        # Seeking single-line orders: order bounty is buyer-funded, not seller reclaim.
+        if is_seeking_sale_line(ti_row):
+            return 0.0
         order_bounty = _order_bounty_paid(db, order_uid)
         if order_bounty > 0:
             return round(order_bounty * scale, 4)
@@ -6076,7 +6548,7 @@ class SellerTransactions(Resource):
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN
                                 CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
                             WHEN ti.ti_bs_id LIKE '165-%%' THEN
-                                CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                                CONCAT(seller_pp.profile_personal_first_name, ' ', seller_pp.profile_personal_last_name)
                             ELSE NULL
                         END AS business_name,
                         CASE
@@ -6122,7 +6594,7 @@ class SellerTransactions(Resource):
                     LEFT JOIN every_circle.users buyer_u
                     ON buyer_pp.profile_personal_user_id = buyer_u.user_uid
                     LEFT JOIN every_circle.profile_personal seller_pp
-                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    ON t.transaction_business_id = seller_pp.profile_personal_uid
                     LEFT JOIN every_circle.profile_expertise pe
                     ON ti.ti_bs_id = pe.profile_expertise_uid
                     LEFT JOIN every_circle.profile_personal expertise_pp
@@ -6131,8 +6603,6 @@ class SellerTransactions(Resource):
                     ON ti.ti_bs_id = wr.wish_response_uid
                     LEFT JOIN every_circle.profile_wish pw
                     ON wr.wr_profile_wish_id = pw.profile_wish_uid
-                    LEFT JOIN every_circle.profile_personal wish_pp
-                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
                     WHERE t.transaction_business_id = %s
                     -- WHERE t.transaction_business_id = '110-000014'
                     GROUP BY

@@ -4,12 +4,18 @@ from data_ec import connect
 import datetime
 import uuid
 import os
+from datetime import timedelta, timezone
 from dotenv import load_dotenv
 import ably
 import asyncio
 from nearby import RELATIONSHIP_MAP
+from datetime_utils import parse_stored_datetime
 
 load_dotenv()
+
+# Extra days after a sale line's return window closes during which buyer/seller
+# may still message under profile_personal_messages_allow_transaction.
+_TRANSACTION_MESSAGING_GRACE_DAYS = 10
 
 
 # --------------- helpers ---------------
@@ -155,6 +161,223 @@ def _is_blocked(blocker_uid, blocked_uid):
         return False
 
 
+def _flag_truthy(value, default=False):
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+def _allow_transaction_flag(value):
+    """profile_personal_messages_allow_transaction — default ON when NULL/missing."""
+    return _flag_truthy(value, default=True)
+
+
+def _sale_lines_allow_transaction_messaging(lines, now=None):
+    """
+    True if a shared sale still qualifies for transaction messaging:
+      - open (any line not yet received), or
+      - completed, within grace days after each line's return window closes
+        (non-returnable / no window → window closes at received_at).
+    """
+    if not lines:
+        return False
+    now = now or datetime.datetime.now(timezone.utc)
+    latest_deadline = None
+    for line in lines:
+        received_at = parse_stored_datetime(
+            line.get("ti_received_at") if isinstance(line, dict) else None
+        )
+        if received_at is None:
+            return True  # still open
+
+        is_returnable = _flag_truthy(
+            line.get("ti_bs_is_returnable") if isinstance(line, dict) else None,
+            default=True,
+        )
+        window_days = 0
+        if is_returnable:
+            raw = line.get("ti_bs_return_window_days") if isinstance(line, dict) else None
+            if raw is not None and str(raw).strip() != "":
+                try:
+                    window_days = max(0, int(raw))
+                except (TypeError, ValueError):
+                    window_days = 0
+
+        closes = received_at + timedelta(days=window_days)
+        deadline = closes + timedelta(days=_TRANSACTION_MESSAGING_GRACE_DAYS)
+        if latest_deadline is None or deadline > latest_deadline:
+            latest_deadline = deadline
+
+    return latest_deadline is not None and now <= latest_deadline
+
+
+def _seller_ids_for_profile(db, profile_uid):
+    """IDs that may appear as transaction_business_id for this personal profile."""
+    ids = {str(profile_uid)}
+    try:
+        rows = db.execute(
+            """
+            SELECT profile_personal_user_id
+            FROM every_circle.profile_personal
+            WHERE profile_personal_uid = %s
+            LIMIT 1
+            """,
+            args=(profile_uid,),
+        )
+        user_id = ((rows.get("result") or [{}])[0] or {}).get("profile_personal_user_id")
+        if user_id:
+            ids.add(str(user_id))
+            biz = db.execute(
+                """
+                SELECT bu_business_id
+                FROM every_circle.business_user
+                WHERE bu_user_id = %s
+                """,
+                args=(user_id,),
+            )
+            for row in biz.get("result") or []:
+                bid = row.get("bu_business_id")
+                if bid:
+                    ids.add(str(bid))
+    except Exception as e:
+        print(f"_seller_ids_for_profile error: {e}")
+    return ids
+
+
+def _shared_sale_allows_messaging(db, uid_a, uid_b, now=None):
+    """Buyer/seller (either direction) on a qualifying open/recent sale."""
+    a_seller_ids = _seller_ids_for_profile(db, uid_a)
+    b_seller_ids = _seller_ids_for_profile(db, uid_b)
+    # Placeholders for IN clauses
+    a_list = list(a_seller_ids)
+    b_list = list(b_seller_ids)
+    if not a_list or not b_list:
+        return False
+
+    a_ph = ", ".join(["%s"] * len(a_list))
+    b_ph = ", ".join(["%s"] * len(b_list))
+    query = f"""
+        SELECT
+            t.transaction_uid,
+            ti.ti_received_at,
+            ti.ti_bs_return_window_days,
+            ti.ti_bs_is_returnable
+        FROM every_circle.transactions t
+        INNER JOIN every_circle.transactions_items ti
+            ON ti.ti_transaction_id = t.transaction_uid
+        WHERE COALESCE(t.transaction_type, 'sale') = 'sale'
+          AND (
+                (t.transaction_profile_id = %s AND t.transaction_business_id IN ({b_ph}))
+             OR (t.transaction_profile_id = %s AND t.transaction_business_id IN ({a_ph}))
+          )
+    """
+    args = tuple([uid_a, *b_list, uid_b, *a_list])
+    rows = db.execute(query, args=args)
+    result = rows.get("result") or []
+    if not result:
+        return False
+
+    by_tx = {}
+    for row in result:
+        tx_uid = row.get("transaction_uid")
+        by_tx.setdefault(tx_uid, []).append(row)
+
+    for lines in by_tx.values():
+        if _sale_lines_allow_transaction_messaging(lines, now=now):
+            return True
+    return False
+
+
+def _has_offering_response_relationship(db, uid_a, uid_b):
+    rows = db.execute(
+        """
+        SELECT 1
+        FROM every_circle.expertise_response er
+        INNER JOIN every_circle.profile_expertise pe
+            ON er.er_profile_expertise_id = pe.profile_expertise_uid
+        WHERE (pe.profile_expertise_profile_personal_id = %s AND er.er_responder_id = %s)
+           OR (pe.profile_expertise_profile_personal_id = %s AND er.er_responder_id = %s)
+        LIMIT 1
+        """,
+        args=(uid_a, uid_b, uid_b, uid_a),
+    )
+    return bool(rows.get("result"))
+
+
+def _has_seeking_response_relationship(db, uid_a, uid_b):
+    rows = db.execute(
+        """
+        SELECT 1
+        FROM every_circle.wish_response wr
+        INNER JOIN every_circle.profile_wish pw
+            ON wr.wr_profile_wish_id = pw.profile_wish_uid
+        WHERE (pw.profile_wish_profile_personal_id = %s AND wr.wr_responder_id = %s)
+           OR (pw.profile_wish_profile_personal_id = %s AND wr.wr_responder_id = %s)
+        LIMIT 1
+        """,
+        args=(uid_a, uid_b, uid_b, uid_a),
+    )
+    return bool(rows.get("result"))
+
+
+def _is_transaction_related(sender_uid, recipient_uid):
+    """
+    True if sender and recipient share a purchase (open or within grace after return
+    window), offering reply, or seeking reply relationship.
+    """
+    if not sender_uid or not recipient_uid:
+        return False
+    try:
+        with connect() as db:
+            if _has_offering_response_relationship(db, sender_uid, recipient_uid):
+                return True
+            if _has_seeking_response_relationship(db, sender_uid, recipient_uid):
+                return True
+            if _shared_sale_allows_messaging(db, sender_uid, recipient_uid):
+                return True
+        return False
+    except Exception as e:
+        print(f"_is_transaction_related error: {e}")
+        return False
+
+
+def _transaction_exception_allows(sender_uid, recipient_uid):
+    """
+    Recipient allows transaction-related messaging and sender qualifies.
+    Independent of profile_personal_messages_off; does not override blocked_users.
+    """
+    if not recipient_uid or str(recipient_uid)[:3] != "110":
+        return False
+    if not sender_uid or str(sender_uid)[:3] != "110":
+        return False
+    try:
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT profile_personal_messages_allow_transaction
+                FROM every_circle.profile_personal
+                WHERE profile_personal_uid = %s
+                """,
+                args=(recipient_uid,),
+            )
+        row = (rows.get("result") or [{}])[0]
+        if not _allow_transaction_flag(row.get("profile_personal_messages_allow_transaction")):
+            return False
+    except Exception as e:
+        print(f"_transaction_exception_allows error: {e}")
+        return False
+    return _is_transaction_related(sender_uid, recipient_uid)
+
+
 def _blocked_or_muted(sender_uid, recipient_uid):
     """
     True if recipient_uid has blocked sender_uid, or has globally turned off messages.
@@ -210,6 +433,9 @@ def _recipient_has_messages_disabled(sender_uid, recipient_uid):
     messages turned off" would be misleading — the reason messaging isn't flowing here is
     sender_uid's own block, not anything recipient_uid did.
 
+    Also suppressed when recipient allows transaction messaging and sender is
+    transaction-related — those senders are not blocked by messages_off / audience.
+
     Deliberately NOT suppressed just because recipient_uid also happens to be excluded by
     sender_uid's own (often just-default) Messages Privacy setting — "All Circle Members" is
     the default for every account, so two strangers who haven't connected via circles yet will
@@ -218,6 +444,8 @@ def _recipient_has_messages_disabled(sender_uid, recipient_uid):
     """
     if _is_blocked(sender_uid, recipient_uid):
         return False
+    if _transaction_exception_allows(sender_uid, recipient_uid):
+        return False
     return _blocked_or_muted(sender_uid, recipient_uid) or _privacy_excludes(sender_uid, recipient_uid)
 
 
@@ -225,12 +453,15 @@ def _should_suppress_new_message_notification(sender_uid, recipient_uid):
     """
     True if the real-time "new message" notification should be suppressed — either party has
     blocked the other (blocking cuts off notifications both ways, unlike the one-directional
-    "Messages turned off" banner above), or recipient_uid has globally muted messages.
+    "Messages turned off" banner above), or recipient_uid has globally muted messages
+    (unless the transaction-messaging exception applies).
     """
     if not recipient_uid or recipient_uid[:3] != "110":
         return False
     if _is_blocked(recipient_uid, sender_uid) or _is_blocked(sender_uid, recipient_uid):
         return True
+    if _transaction_exception_allows(sender_uid, recipient_uid):
+        return False
     try:
         with connect() as db:
             muted = db.execute(
@@ -281,14 +512,49 @@ def _audience_allows(owner_uid, other_uid, audience, audience_types_csv):
 
 def _messages_privacy_violation(sender_uid, recipient_uid):
     """
-    Returns an error message string if the recipient's "Can Message Me" Messages Privacy
-    setting blocks sender_uid, or None if sending is permitted. There is no sender-side
-    restriction — everyone can always attempt to message anyone; only the recipient's own
-    audience setting can block it. Only enforced when both accounts are personal (110-).
+    Returns an error message string if the recipient's messaging privacy blocks sender_uid,
+    or None if sending is permitted.
+
+    Allow when ANY of:
+      A) messages_off != 1 AND sender passes receive_from / receive_types
+      B) allow_transaction == 1 AND sender is transaction-related to recipient
+
+    Explicit blocked_users rows are not overridden here (checked separately for banners).
+    Only enforced when both accounts are personal (110-).
     """
     if not sender_uid or sender_uid[:3] != "110" or not recipient_uid or recipient_uid[:3] != "110":
         return None
-    if _privacy_excludes(sender_uid, recipient_uid):
+
+    if _transaction_exception_allows(sender_uid, recipient_uid):
+        return None
+
+    try:
+        with connect() as db:
+            rows = db.execute(
+                """
+                SELECT profile_personal_messages_off,
+                       profile_personal_messages_receive_from,
+                       profile_personal_messages_receive_types
+                FROM every_circle.profile_personal
+                WHERE profile_personal_uid = %s
+                """,
+                args=(recipient_uid,),
+            )
+        row = (rows.get("result") or [{}])[0]
+    except Exception as e:
+        print(f"_messages_privacy_violation error: {e}")
+        return None
+
+    if _flag_truthy(row.get("profile_personal_messages_off"), default=False):
+        return "This person has messages turned off."
+
+    receive_from = row.get("profile_personal_messages_receive_from") or "all_circles"
+    if not _audience_allows(
+        recipient_uid,
+        sender_uid,
+        receive_from,
+        row.get("profile_personal_messages_receive_types"),
+    ):
         return "This person's message privacy settings don't allow you to message them."
     return None
 
@@ -299,6 +565,9 @@ def _hidden_after_cutoff(sender_uid, recipient_uid):
     should be hidden from recipient_uid — because recipient_uid blocked sender_uid, and/or muted
     all messages globally, at that point in time. Returns None if nothing should be hidden.
     Messages sent BEFORE this cutoff remain visible to both sides.
+
+    Global mute cutoff is skipped when the transaction-messaging exception applies so
+    transaction counterparts can keep a visible thread while messages_off is on.
     """
     if not recipient_uid or recipient_uid[:3] != "110":
         return None
@@ -321,6 +590,8 @@ def _hidden_after_cutoff(sender_uid, recipient_uid):
                 if row.get("profile_personal_messages_off") and row.get("profile_personal_messages_off_at")
                 else None
             )
+            if mute_cutoff and _transaction_exception_allows(sender_uid, recipient_uid):
+                mute_cutoff = None
 
             cutoffs = [c for c in (block_cutoff, mute_cutoff) if c]
             return min(cutoffs) if cutoffs else None

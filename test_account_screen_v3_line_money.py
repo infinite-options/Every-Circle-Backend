@@ -783,6 +783,27 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
         self.assertEqual(display["qty_label"], "2")
         self.assertEqual(display["cancelled_label"], "1")
 
+    def test_buyer_order_cancelled_label_uses_pre_ship_qty(self):
+        from account_screen_v3_contract import build_v3_display
+
+        money = {"customer_total": 83.6, "customer_credit": None}
+        row = {
+            "row_kind": "order",
+            "transaction_datetime": "2026-08-15T14:30:50Z",
+            "ti_fulfillment_method": "pickup",
+            "units": {
+                "purchased_qty": 4,
+                "cancelled_pre_ship_qty": 1,
+                "shipped_qty": 3,
+                "verified_qty": 3,
+                "active_qty": 3,
+                "remaining_to_ship_qty": 0,
+            },
+        }
+        display = build_v3_display(row, money, audience="buyer")
+        self.assertEqual(display["cancelled_label"], "1")
+        self.assertEqual(display["qty_label"], "4")
+
     def test_buyer_delivered_label_not_shipped(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money
 
@@ -1094,6 +1115,47 @@ class AccountScreenV3LineMoneyTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_pickup_verifiable_after_partial_verify_cancel_and_return(self):
+        """Buy 5 → verify 2 → cancel 1 + return 1 → still 2 left to verify."""
+        from units_ledger import compute_pickup_verifiable_remaining, _units_from_counts
+
+        # Completed cancel + completed return of verified unit.
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(
+                purchased=5,
+                verified=2,
+                cancelled_pre_ship=1,
+                returned_shipped=1,
+            ),
+            2,
+        )
+        # Open hybrid return+cancel must not eat verifiable (return is of verified).
+        self.assertEqual(
+            compute_pickup_verifiable_remaining(
+                purchased=5,
+                verified=2,
+                cancelled_pre_ship=0,
+                cancelled_pre_ship_in_progress=1,
+                return_in_progress_shipped=1,
+                returned_shipped=0,
+            ),
+            2,
+        )
+        units = _units_from_counts(
+            purchased=5,
+            shipped=0,
+            verified=2,
+            cancelled_pre_ship=1,
+            returned_shipped=1,
+            returned_unshipped=0,
+            remaining_to_ship=0,
+            return_in_progress_shipped=0,
+            return_in_progress_unshipped=0,
+            is_pickup_or_virtual=True,
+        )
+        self.assertEqual(units["verifiable_remaining_qty"], 2)
+        self.assertEqual(units["active_qty"], 4)
 
     def test_buyer_amount_label_legacy_transaction_total(self):
         from account_screen_v3_contract import build_v3_display, enrich_purchase_row_money

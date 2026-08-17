@@ -91,6 +91,13 @@ def build_wallet_v3(db, profile_id):
 
 
 def _bounty_chart_series(db, profile_id, tz_name):
+    """Daily bounty series; cumulative matches bounty_total_earned (net of reserves)."""
+    from wallet_ids import resolve_wallet_profile_id
+    from wallet_return_reservations import (
+        WT_STATUS_RESERVED,
+        WT_TYPE_BOUNTY_RECLAIM_RESERVATION,
+    )
+
     q = db.execute(
         """
         SELECT t.transaction_datetime, tb.tb_amount
@@ -117,6 +124,38 @@ def _bounty_chart_series(db, profile_id, tz_name):
                 pass
         day_key = dt.date().isoformat()
         daily[day_key] += _to_float(row.get("tb_amount"))
+
+    # Active bounty reclaim reservations reduce headline total — mirror on chart dates.
+    wallet_id = resolve_wallet_profile_id(profile_id)
+    res_q = db.execute(
+        """
+        SELECT wt_created_at, wt_amount
+        FROM every_circle.wallet_transactions
+        WHERE wt_profile_id IN (%s, %s)
+          AND wt_status = %s
+          AND wt_type = %s
+        """,
+        (
+            profile_id,
+            wallet_id,
+            WT_STATUS_RESERVED,
+            WT_TYPE_BOUNTY_RECLAIM_RESERVATION,
+        ),
+    )
+    for row in (res_q or {}).get("result") or []:
+        dt = parse_stored_datetime(row.get("wt_created_at"))
+        if dt is None:
+            continue
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+
+                dt = dt.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        day_key = dt.date().isoformat()
+        # Stored wt_amount is positive; chart impact is a reduction.
+        daily[day_key] -= abs(_to_float(row.get("wt_amount")))
 
     cumulative = 0.0
     series = []
@@ -817,6 +856,8 @@ def _bounty_proceeds_status(row, db, *, reserved_amount=0.0, earned_net=None):
             (row.get("bounty_earned") or row.get("tb_amount") or 0)
         ) - reserved_amount
     earned_net = round_money(earned_net)
+    if earned_net < -0.0001:
+        return "reversed"
     if reserved_amount > 0.0001 and earned_net <= 0.0001:
         return "reserved"
 
@@ -848,7 +889,64 @@ def _bounty_status_label(proceeds_status):
         return "Useable"
     if proceeds_status == "reserved":
         return "Reserved"
+    if proceeds_status == "reversed":
+        return "Reversed"
     return "Pending"
+
+
+def _bounty_row_is_return(row, *, earned_gross=0.0):
+    if row.get("is_return") in (True, 1, "1", "true", "True"):
+        return True
+    if (row.get("transaction_type") or "").lower() == "return":
+        return True
+    try:
+        if int(row.get("ti_bs_qty") or 0) < 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return earned_gross < -0.0001
+
+
+def _bounty_results_line_pool(row, *, is_return=False):
+    """Line bounty pool for bounty_results Total (unit × qty; signed for returns)."""
+    from transactions import _catalog_bounty_unit_and_type, _seller_bounty_pool_for_line_row
+
+    try:
+        qty = int(row.get("ti_bs_qty") or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    if qty < 0 or is_return:
+        unit, bounty_type = _catalog_bounty_unit_and_type(row)
+        unit = round_money(unit)
+        if unit <= 0:
+            return 0.0
+        abs_qty = abs(qty) if qty != 0 else 0
+        if bounty_type == "total":
+            return round_money(-unit if (qty < 0 or is_return) else unit)
+        if abs_qty <= 0:
+            return 0.0
+        return round_money(-unit * abs_qty)
+    return round_money(_seller_bounty_pool_for_line_row(row))
+
+
+def _bounty_results_order_uids(row):
+    """transaction_uid = this txn; order_uid = parent sale when this is a return."""
+    transaction_uid = (
+        row.get("transaction_uid")
+        or row.get("ti_transaction_id")
+        or row.get("order_uid")
+    )
+    original = row.get("transaction_original_uid")
+    is_return = _bounty_row_is_return(row)
+    if is_return and original:
+        return transaction_uid, original
+    if is_return:
+        return transaction_uid, (
+            row.get("order_uid")
+            or original
+            or transaction_uid
+        )
+    return transaction_uid, transaction_uid
 
 
 def _batch_bounty_line_catalog_fields(db, ti_uids):
@@ -1021,7 +1119,12 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
         elif ti_uid:
             reserved = sum_active_bounty_reservation(db, ti_uid=ti_uid)
         reserved = round_money(reserved)
-        earned = round_money(max(0.0, earned_gross - reserved))
+        # Reservations only apply to positive earn rows; do not floor reversals at 0.
+        if earned_gross < 0:
+            earned = earned_gross
+        else:
+            earned = round_money(max(0.0, earned_gross - reserved))
+        is_return = _bounty_row_is_return(row, earned_gross=earned_gross)
         proceeds_status = _bounty_proceeds_status(
             row, db, reserved_amount=reserved, earned_net=earned
         )
@@ -1029,20 +1132,29 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
         if reserved > 0.0001 and earned > 0.0001 and proceeds_status != "reserved":
             # Prefer an explicit reserved signal when any reclaim is open.
             proceeds_status = "reserved"
-        pool = round_money(row.get("bs_bounty") or row.get("tb_amount"))
+        if is_return and earned < -0.0001:
+            proceeds_status = "reversed"
+        unit_bounty = round_money(row.get("bs_bounty") or 0)
+        pool = _bounty_results_line_pool(row, is_return=is_return)
+        if abs(pool) < 0.0001 and unit_bounty:
+            # Catalog unit present but line pool helper returned 0 — scale manually.
+            try:
+                qty = int(row.get("ti_bs_qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty:
+                pool = round_money(unit_bounty * qty)
+            else:
+                pool = unit_bounty
         pct = normalize_tb_percentage_display(row.get("tb_percentage"))
         pct_label = format_tb_percent_label(row.get("tb_percentage"))
 
         entry_dt = row.get("transaction_datetime") or row.get("entry_datetime")
-        order_uid = (
-            row.get("transaction_uid")
-            or row.get("ti_transaction_id")
-            or row.get("order_uid")
-        )
-        sale_line = snap_map.get(ti_uid) if row.get("is_return") in (True, 1, "1") else None
+        transaction_uid, order_uid = _bounty_results_order_uids(row)
+        sale_line = snap_map.get(ti_uid) if is_return else None
         entry = {
-            "bounty_line_uid": f"br-{ti_uid or order_uid}",
-            "transaction_uid": order_uid,
+            "bounty_line_uid": f"br-{ti_uid or transaction_uid}",
+            "transaction_uid": transaction_uid,
             "order_uid": order_uid,
             "ti_uid": ti_uid,
             "entry_datetime": entry_dt,
@@ -1055,7 +1167,7 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
             "purchaser_name": row.get("purchaser_name"),
             "transaction_business_id": row.get("transaction_business_id"),
             "business_name": row.get("display_name") or row.get("business_name"),
-            "bs_bounty": pool,
+            "bs_bounty": unit_bounty or pool,
             "bounty_earned": earned,
             "bounty_earned_gross": earned_gross,
             "bounty_reserved": reserved,
@@ -1070,8 +1182,10 @@ def build_bounty_results_v3(db, rows, *, tz_name=None):
                 "percent_label": pct_label,
             },
         }
-        if row.get("is_return") in (True, 1, "1"):
+        if is_return:
             entry["is_return"] = True
+            if row.get("transaction_original_uid"):
+                entry["transaction_original_uid"] = row.get("transaction_original_uid")
         entry.update(_bounty_row_product_fields(row, sale_line=sale_line))
         v3_rows.append(entry)
     return {"rows": v3_rows}

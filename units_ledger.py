@@ -74,10 +74,16 @@ def compute_pickup_verifiable_remaining(
     cancelled_pre_ship=0,
     cancelled_pre_ship_in_progress=0,
     return_in_progress_shipped=0,
+    returned_shipped=0,
 ):
     """
     Pickup / virtual / non-delivery: no ship step, so the buyer may verify
     remaining active units immediately.
+
+    Cap = purchased − pre-ship cancels (completed + in-progress) − verified.
+    Completed returns do not shrink the cap (ti_received_qty is gross).
+    Open physical returns consume verified units first — only the excess above
+    net verified may block verifying other units (same rule as ship).
     """
     receivable = max(
         int(purchased or 0)
@@ -85,10 +91,15 @@ def compute_pickup_verifiable_remaining(
         - int(cancelled_pre_ship_in_progress or 0),
         0,
     )
-    return max(
-        0,
-        receivable - int(verified or 0) - int(return_in_progress_shipped or 0),
-    )
+    base = max(0, receivable - int(verified or 0))
+    rip = max(0, int(return_in_progress_shipped or 0))
+    if rip <= 0 or base <= 0:
+        return base
+
+    verified_not_returned = max(0, int(verified or 0) - int(returned_shipped or 0))
+    return_on_unverified = max(0, rip - verified_not_returned)
+    return_on_unverified = min(return_on_unverified, base)
+    return max(0, base - return_on_unverified)
 
 
 def _units_from_counts(
@@ -119,6 +130,7 @@ def _units_from_counts(
             cancelled_pre_ship=cancelled_pre_ship,
             cancelled_pre_ship_in_progress=cancelled_pre_ship_in_progress,
             return_in_progress_shipped=return_in_progress_shipped,
+            returned_shipped=returned_shipped,
         )
     else:
         verifiable_remaining = compute_verifiable_remaining(
@@ -210,7 +222,10 @@ def line_units_ledger(
         order_splits=order_splits,
         open_reqs=open_reqs,
     )
-    if row is None:
+    needs_fulfillment = row is None or not (
+        row.get("ti_fulfillment_method") or row.get("fulfillment_method")
+    )
+    if needs_fulfillment:
         q = db.execute(
             """
             SELECT ti_fulfillment_method
@@ -220,7 +235,12 @@ def line_units_ledger(
             (ti_uid, order_uid),
         )
         rows = q.get("result") or []
-        row = rows[0] if rows else {}
+        fetched = rows[0] if rows else {}
+        if row is None:
+            row = fetched
+        elif fetched.get("ti_fulfillment_method"):
+            row = dict(row)
+            row["ti_fulfillment_method"] = fetched.get("ti_fulfillment_method")
 
     if open_reqs is None:
         open_reqs = _open_return_requests_for_order(db, order_uid)

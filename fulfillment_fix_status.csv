@@ -1,0 +1,9 @@
+Fix,Area,Status,Needed for thread bugs?,Notes
+Receivable / PUT delivery verification ignores completed returns,transactions.py + order_quantity_context.py,DONE in code,Yes Thread #1,"purchased - cancels only; allows verify after return-then-ship"
+Pickup verifiable ignores verified-covered open returns,units_ledger.py + display call sites,DONE in code,Yes Thread #2,"stops modal showing 1 instead of 2"
+Deploy BE changes to dev/API,infra,UNKNOWN / confirm,Yes,Until deployed APIs still show old behavior
+FE pickup/virtual line_shipping_amount must be 0,Front end,NOT DONE (BE kept strict),No (separate checkout 400),Prompt already provided; BE will 400 if FE sends Delivered shipping on pickup
+Pickup verified=0 Buyer Rec sheet=No vs BE=Verify,product/sheet alignment,DECISION NEEDED,No,BE intentional; update sheet if accepting BE
+units_ledger active vs order_quantity_context active_units (returns),consistency cleanup,OPTIONAL,Low risk,"ledger active ignores returns; qty_context still subtracts returns in places - do not use qty_context active for Verify UI"
+Cancel return_status naming / Cancelling chip edge cases,order_display.py,PRE-EXISTING quirk,No,Not required for the two thread bugs
+E2E retest Thread #1 and #2 after deploy,QA,PENDING,Yes,Confirm modal count + PUT verify succeed

@@ -50,6 +50,15 @@ _EXPERTISE_NON_DB_KEYS = frozenset(
     }
 )
 
+# UI-only seeking keys — never persist these (FE uses profile_wish_shipping*).
+_WISH_NON_DB_KEYS = frozenset(
+    {
+        "profile_wish_free_shipping",
+        "profile_wish_buyer_pays_shipping",
+        "profile_wish_shipping_cost_type",
+    }
+)
+
 
 def _derive_expertise_shipping_fields(expertise_data):
     """
@@ -100,6 +109,60 @@ def _derive_expertise_shipping_fields(expertise_data):
         )
     else:
         expertise_data.pop("profile_expertise_shipping_refundable", None)
+
+
+def _derive_wish_shipping_fields(wish_data):
+    """
+    Persist profile_wish_shipping + profile_wish_shipping_amount from FE.
+
+    Same rules as offering (_derive_expertise_shipping_fields). Do not store
+    profile_wish_free_shipping / buyer_pays_shipping / shipping_cost_type.
+    """
+    wish_data.pop("profile_wish_free_shipping", None)
+    wish_data.pop("profile_wish_buyer_pays_shipping", None)
+    wish_data.pop("profile_wish_shipping_cost_type", None)
+
+    if (
+        "profile_wish_shipping" not in wish_data
+        or wish_data.get("profile_wish_shipping") in (None, "")
+    ):
+        if "profile_wish_shipping" in wish_data:
+            wish_data["profile_wish_shipping"] = None
+        wish_data.pop("profile_wish_shipping_amount", None)
+        if wish_data.get("profile_wish_shipping_refundable") not in (None, ""):
+            wish_data["profile_wish_shipping_refundable"] = (
+                1 if _truthy_flag(wish_data["profile_wish_shipping_refundable"]) else 0
+            )
+        else:
+            wish_data.pop("profile_wish_shipping_refundable", None)
+        return
+
+    shipping = _normalize_bs_shipping_value(wish_data.get("profile_wish_shipping"))
+    amount = _parse_shipping_amount(wish_data.get("profile_wish_shipping_amount"))
+
+    if shipping == _BS_SHIPPING_BUYER_FIXED:
+        wish_data["profile_wish_shipping"] = _BS_SHIPPING_BUYER_FIXED
+        wish_data["profile_wish_shipping_amount"] = 0.0 if amount is None else amount
+    elif shipping in (_BS_SHIPPING_FREE, _BS_SHIPPING_BUYER_ACTUAL):
+        wish_data["profile_wish_shipping"] = shipping
+        wish_data["profile_wish_shipping_amount"] = None
+    else:
+        wish_data["profile_wish_shipping"] = None
+        wish_data["profile_wish_shipping_amount"] = None
+
+    if wish_data.get("profile_wish_shipping_refundable") not in (None, ""):
+        wish_data["profile_wish_shipping_refundable"] = (
+            1 if _truthy_flag(wish_data["profile_wish_shipping_refundable"]) else 0
+        )
+    else:
+        wish_data.pop("profile_wish_shipping_refundable", None)
+
+
+def _finalize_wish_fields(wish_data):
+    """Strip UI-only keys and normalize persisted seeking shipping columns."""
+    _derive_wish_shipping_fields(wish_data)
+    for key in _WISH_NON_DB_KEYS:
+        wish_data.pop(key, None)
 
 
 def _derive_expertise_quantity_fields(expertise_data):
@@ -244,6 +307,11 @@ def _wish_dict_from_payload(wish_data):
     _set_if_present(m, wish_data, "profile_wish_refund_policy", "refundPolicy")
     _set_if_present(m, wish_data, "profile_wish_return_window_days", "returnWindowDays")
     _set_if_present(m, wish_data, "profile_wish_is_returnable", "isReturnable")
+    _set_if_present(m, wish_data, "profile_wish_shipping", "shipping")
+    _set_if_present(m, wish_data, "profile_wish_shipping_amount", "shippingAmount")
+    _set_if_present(
+        m, wish_data, "profile_wish_shipping_refundable", "shippingRefundable"
+    )
     if "startDateTime" in wish_data:
         m["profile_wish_start"] = wish_data["startDateTime"]
     elif "start" in wish_data:
@@ -277,8 +345,13 @@ def _wish_dict_from_payload(wish_data):
             "profile_wish_uid",
             "profile_wish_profile_personal_id",
             "profile_wish_moderated",
+            *_WISH_NON_DB_KEYS,
         ):
             m[k] = v
+    for key in _WISH_NON_DB_KEYS:
+        if key in wish_data:
+            m[key] = wish_data[key]
+    _finalize_wish_fields(m)
     return m
 
 
@@ -302,6 +375,32 @@ def _stamp_messages_off_timestamp(personal_info):
     """
     if str(personal_info.get('profile_personal_messages_off')) in ('1', 'True', 'true'):
         personal_info['profile_personal_messages_off_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _coerce_messages_allow_transaction(value, *, default=1):
+    """Normalize profile_personal_messages_allow_transaction to 0 or 1 (default ON)."""
+    if value is None or value == "":
+        return 1 if default else 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    s = str(value).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return 0
+    if s in ("1", "true", "yes", "on"):
+        return 1
+    return 1 if default else 0
+
+
+def _normalize_messages_allow_transaction(personal_info):
+    """Ensure allow_transaction is present as 0/1; NULL/missing → 1."""
+    if not isinstance(personal_info, dict):
+        return personal_info
+    personal_info["profile_personal_messages_allow_transaction"] = (
+        _coerce_messages_allow_transaction(
+            personal_info.get("profile_personal_messages_allow_transaction")
+        )
+    )
+    return personal_info
 
 
 def _normalize_record_uid(value):
@@ -563,10 +662,13 @@ def _filter_and_enrich_business_info(db, business_rows, is_owner_view, viewer_is
 
 def _enrich_personal_info_for_owner(db, personal_info, profile_id, is_owner_view):
     """Attach user moderation metadata on login / owner profile views."""
-    if not personal_info or not is_owner_view:
+    if not personal_info:
         return personal_info
 
-    enriched = dict(personal_info)
+    enriched = _normalize_messages_allow_transaction(dict(personal_info))
+    if not is_owner_view:
+        return enriched
+
     enriched.pop("profile_personal_moderated", None)
     enriched["moderation"] = build_user_moderation_metadata(db, profile_id)
     return enriched
@@ -1427,6 +1529,9 @@ class UserProfileInfo(Resource):
                         INNER JOIN every_circle.business_user bu ON b.business_uid = bu.bu_business_id
                         INNER JOIN every_circle.profile_personal p ON p.profile_personal_user_id = bu.bu_user_id
                         WHERE p.profile_personal_uid = '{profile_id}'
+                          AND bu.bu_role IS NOT NULL
+                          AND TRIM(bu.bu_role) <> ''
+                          AND LOWER(TRIM(bu.bu_role)) NOT IN ('unclaimed', 'null', 'none', 'n/a', 'na')
                           AND bu.bu_uid = (
                               SELECT MIN(bu2.bu_uid)
                               FROM every_circle.business_user bu2
@@ -1554,6 +1659,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
+                    'profile_personal_messages_allow_transaction',
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
@@ -1564,6 +1670,14 @@ class UserProfileInfo(Resource):
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
+                if "profile_personal_messages_allow_transaction" in personal_info:
+                    personal_info["profile_personal_messages_allow_transaction"] = (
+                        _coerce_messages_allow_transaction(
+                            personal_info["profile_personal_messages_allow_transaction"]
+                        )
+                    )
+                else:
+                    personal_info["profile_personal_messages_allow_transaction"] = 1
 
                 # Process profile image if provided
                 if 'profile_image' in request.files:
@@ -2114,6 +2228,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
+                    'profile_personal_messages_allow_transaction',
                     'profile_personal_experience_is_public',
                     'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public',
@@ -2127,6 +2242,12 @@ class UserProfileInfo(Resource):
                         personal_info[field] = payload.pop(field)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
+                if "profile_personal_messages_allow_transaction" in personal_info:
+                    personal_info["profile_personal_messages_allow_transaction"] = (
+                        _coerce_messages_allow_transaction(
+                            personal_info["profile_personal_messages_allow_transaction"]
+                        )
+                    )
 
                 print("Remaining payload fields: ", payload)
                 
