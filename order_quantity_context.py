@@ -355,11 +355,12 @@ def compute_seller_proceeds_breakdown(db, order_uid, *, qty=None):
     Full seller proceeds breakdown from checkout line snapshots.
 
     amount = merchandise + sales_tax + shipping + bounty_amount (bounty negative).
+    Seeking (165-*) buyer-funded bounty is not subtracted (bounty_amount = 0).
     Per-unit fields use purchased_qty at order placement.
     """
     from transactions import _tax_amount_for_line
     from wallet_service import _round_money, _to_float
-    from wallet_transactions_service import _order_bounty_paid, _parse_unit_cost
+    from wallet_transactions_service import _parse_unit_cost
 
     if qty is None:
         qty = order_quantity_context(db, order_uid)
@@ -392,7 +393,9 @@ def compute_seller_proceeds_breakdown(db, order_uid, *, qty=None):
     merchandise = _round_money(merchandise)
     sales_tax = _round_money(sales_tax)
     shipping = _round_money(shipping)
-    bounty_paid = _order_bounty_paid(db, order_uid)
+    from transactions import _order_seller_funded_bounty_paid
+
+    bounty_paid = _order_seller_funded_bounty_paid(db, order_uid)
     bounty_amount = _round_money(-bounty_paid)
     amount = _round_money(merchandise + sales_tax + shipping + bounty_amount)
 

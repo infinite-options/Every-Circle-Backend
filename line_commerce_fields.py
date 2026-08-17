@@ -339,6 +339,7 @@ def compute_line_proceeds_breakdown(db, order_uid, line_row):
     Seller proceeds breakdown for one sale line (wallet ledger lines[]).
 
     net_amount = merchandise + tax + shipping + bounty_amount (bounty negative).
+    Seeking (165-*) buyer-funded bounty is not subtracted.
     """
     if not isinstance(line_row, dict):
         return None
@@ -368,7 +369,12 @@ def compute_line_proceeds_breakdown(db, order_uid, line_row):
     line_bounty = round_money(
         _line_bounty_totals(db, [ti_uid]).get(ti_uid, 0.0) if ti_uid else 0.0
     )
-    bounty_amount = round_money(-line_bounty)
+    from transactions import is_seeking_sale_line
+
+    if is_seeking_sale_line(line_row):
+        bounty_amount = 0.0
+    else:
+        bounty_amount = round_money(-line_bounty)
     net_amount = round_money(merchandise + tax_amount + shipping_amount + bounty_amount)
 
     return {

@@ -294,12 +294,14 @@ def _normalize_shipping_refundable(value, default=0):
 
 
 def _shipping_amount_from_product(product_data):
-    """Derive line shipping charge from business_services or profile_expertise snapshot."""
+    """Derive line shipping charge from business / expertise / wish listing snapshot."""
     if not product_data:
         return None
     sh = product_data.get("bs_shipping")
     if sh is None or str(sh).strip() == "":
         sh = product_data.get("profile_expertise_shipping")
+    if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_wish_shipping")
     if sh is None or str(sh).strip() == "":
         return None
     low = str(sh).strip().lower()
@@ -309,7 +311,11 @@ def _shipping_amount_from_product(product_data):
         amt = _parse_line_shipping_amount(
             product_data.get("bs_shipping_amount")
             if product_data.get("bs_shipping_amount") is not None
-            else product_data.get("profile_expertise_shipping_amount")
+            else (
+                product_data.get("profile_expertise_shipping_amount")
+                if product_data.get("profile_expertise_shipping_amount") is not None
+                else product_data.get("profile_wish_shipping_amount")
+            )
         )
         return 0.0 if amt is None else amt
     return None
@@ -321,6 +327,8 @@ def _shipping_refundable_from_product(product_data, default=0):
     raw = product_data.get("bs_shipping_refundable")
     if raw is None or raw == "":
         raw = product_data.get("profile_expertise_shipping_refundable")
+    if raw is None or raw == "":
+        raw = product_data.get("profile_wish_shipping_refundable")
     return _normalize_shipping_refundable(raw, default=default)
 
 
@@ -370,6 +378,32 @@ def _listing_unit_cost(bs_data):
         if bs_data.get(key) is not None:
             return round(_to_float(bs_data.get(key)), 2)
     return 0.0
+
+
+def _line_buyer_bounty_amount(item, bs_data, qty, is_wish):
+    """
+    Buyer-paid bounty for seeking (wish) lines only.
+
+    Offering (150) / product (250) bounty is seller-funded and must not enter
+    checkout paid-total math. Returns 0 for non-wish lines.
+    """
+    if not is_wish:
+        return 0.0
+    bounty_raw = item.get("bounty")
+    if bounty_raw is None or bounty_raw == "":
+        return 0.0
+    bounty = _to_float(bounty_raw)
+    if bounty <= 0:
+        return 0.0
+    bounty_type = (
+        item.get("bounty_type")
+        or (bs_data or {}).get("profile_wish_bounty_type")
+        or "per_item"
+    )
+    bounty_type = str(bounty_type).strip().lower()
+    if bounty_type == "total":
+        return round(bounty, 2)
+    return round(bounty * int(qty), 2)
 
 
 def _listing_tax_config(bs_data):
@@ -620,6 +654,8 @@ def _listing_shipping_type(product_data):
     if sh is None or str(sh).strip() == "":
         sh = product_data.get("profile_expertise_shipping")
     if sh is None or str(sh).strip() == "":
+        sh = product_data.get("profile_wish_shipping")
+    if sh is None or str(sh).strip() == "":
         return None
     return str(sh).strip()
 
@@ -710,7 +746,11 @@ def _compute_expected_line_shipping(fulfillment_method, product_data, qty):
         amt = _parse_line_shipping_amount(
             product_data.get("bs_shipping_amount")
             if product_data.get("bs_shipping_amount") is not None
-            else product_data.get("profile_expertise_shipping_amount")
+            else (
+                product_data.get("profile_expertise_shipping_amount")
+                if product_data.get("profile_expertise_shipping_amount") is not None
+                else product_data.get("profile_wish_shipping_amount")
+            )
         )
         per_unit = 0.0 if amt is None else amt
         return round(per_unit * int(qty or 1), 2)
@@ -853,8 +893,10 @@ def _plan_checkout(db, items, payload, shipping_fields):
     order_shipping = 0.0
     order_merchandise = 0.0
     order_tax = 0.0
+    order_buyer_bounty = 0.0
     shipping_actual_pending = 0
     any_ship = False
+    any_wish = False
 
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
@@ -866,11 +908,14 @@ def _plan_checkout(db, items, payload, shipping_fields):
         ):
             continue
 
-        bs_data, ti_bs_id, listing_mode, _is_wish, err = _fetch_listing_for_checkout_item(
+        bs_data, ti_bs_id, listing_mode, is_wish, err = _fetch_listing_for_checkout_item(
             db, item
         )
         if err:
             return False, err, None
+
+        if is_wish:
+            any_wish = True
 
         qty = _purchase_qty(item)
         method, err_msg = _resolve_fulfillment_method(item, listing_mode, bs_data)
@@ -887,6 +932,9 @@ def _plan_checkout(db, items, payload, shipping_fields):
             choices_extra = _to_float(item.get("choices_extra_cost") or 0)
         line_merchandise = round(unit_cost * qty + choices_extra, 2)
         order_merchandise += line_merchandise
+
+        line_buyer_bounty = _line_buyer_bounty_amount(item, bs_data, qty, is_wish)
+        order_buyer_bounty += line_buyer_bounty
 
         line_tax_raw = item.get("line_tax_amount")
         if line_tax_raw is None or line_tax_raw == "":
@@ -1009,6 +1057,8 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "line_shipping_amount": declared_line_ship,
                 "line_tax_amount": line_tax,
                 "line_merchandise": line_merchandise,
+                "line_buyer_bounty": line_buyer_bounty,
+                "is_wish": is_wish,
                 "unit_price": unit_cost,
                 "ti_tax_rate": tax_rate,
                 "ti_shipping_amount_per_unit": per_unit_ship,
@@ -1028,6 +1078,7 @@ def _plan_checkout(db, items, payload, shipping_fields):
     order_shipping = round(order_shipping, 2)
     order_merchandise = round(order_merchandise, 2)
     order_tax = round(order_tax, 2)
+    order_buyer_bounty = round(order_buyer_bounty, 2)
 
     if not _money_close(_to_float(payload.get("total_costs")), order_merchandise):
         return False, {
@@ -1060,16 +1111,29 @@ def _plan_checkout(db, items, payload, shipping_fields):
                 "code": 400,
             }, None
 
+    payload_bounty = payload.get("total_bounty")
+    if payload_bounty is not None and payload_bounty != "":
+        if not _money_close(_to_float(payload_bounty), order_buyer_bounty):
+            return False, {
+                "message": (
+                    f"total_bounty mismatch (expected {order_buyer_bounty:.2f}, "
+                    f"got {_to_float(payload_bounty):.2f})"
+                ),
+                "code": 400,
+            }, None
+
     shipping_for_total = (
         order_shipping
         if payload_shipping is None
         else round(_to_float(payload_shipping), 2)
     )
+    buyer_bounty_for_paid = order_buyer_bounty if any_wish else 0.0
     expected_paid = round(
         _to_float(payload.get("total_costs"))
         + _to_float(payload.get("total_taxes"))
         + shipping_for_total
-        + _to_float(payload.get("total_fees")),
+        + _to_float(payload.get("total_fees"))
+        + buyer_bounty_for_paid,
         2,
     )
     if not _money_close(_to_float(payload.get("total_amount_paid")), expected_paid):
@@ -1086,7 +1150,9 @@ def _plan_checkout(db, items, payload, shipping_fields):
         "order_shipping": order_shipping,
         "order_merchandise": order_merchandise,
         "order_tax": order_tax,
+        "order_buyer_bounty": order_buyer_bounty,
         "any_ship": any_ship,
+        "any_wish": any_wish,
         "shipping_actual_pending": shipping_actual_pending,
     }
 
@@ -1652,8 +1718,13 @@ def _apply_item_options_to_tx_item(tx_item, item, ti_bs_id):
     if item.get("choices_extra_cost") is not None:
         tx_item["ti_choices_extra_cost"] = _to_float(item.get("choices_extra_cost"))
 
+    # Seeking: keep listing profile_wish_cost as ti_bs_cost (do not fold buyer
+    # bounty into unit cost via amortized unit_price). Offering/product may still
+    # overwrite from FE unit_price.
     unit_price = item.get("unit_price")
-    if unit_price is not None:
+    if unit_price is not None and not (
+        ti_bs_id and str(ti_bs_id).startswith("165")
+    ):
         tx_item["ti_bs_cost"] = _normalize_stored_cost(unit_price)
 
 
@@ -1803,6 +1874,62 @@ def _network_participants_capped(middle_uids, effective_bounty):
                 }
             )
     return participants
+
+
+def _plan_seeking_bounty_shares(
+    effective_bounty, buyer_id, recommender_id, combined_path, seller_id=None
+):
+    """
+    Seeking-only bounty allocation (buyer-funded).
+
+    Roles:
+      BUYER       = Seeking ad poster (pays unit cost × qty); no fixed bounty share
+      SELLER      = Wish responder (receives merchandise); fixed share only when
+                    they are also the recommender
+      RECOMMENDER = Who introduced seller and buyer
+
+    Split (both scenarios — recommender is / is not seller):
+      - Recommender: 40%  (seller receives this when recommender == seller)
+      - Network:     40%  between recommender ↔ buyer (exclude endpoints);
+                     max 20% per node; excess → charity.
+                     Seller may appear here only when not the recommender.
+      - Every Circle: 20%
+
+    Returns (known_participants, network_participants).
+    """
+    known = []
+    if recommender_id:
+        known.append(
+            {
+                "tb_profile_id": recommender_id,
+                **_bounty_pct_amount(effective_bounty, 0.40),
+            }
+        )
+    known.append(
+        {
+            "tb_profile_id": EC_WALLET_ID,
+            **_bounty_pct_amount(effective_bounty, 0.20),
+        }
+    )
+    seen = {p["tb_profile_id"] for p in known if p["tb_profile_id"]}
+    # Defensive: never treat buyer as a network intermediary.
+    if buyer_id:
+        seen.add(buyer_id)
+    middle = _middle_path_nodes(combined_path, seen)
+    network = _network_participants_capped(middle, effective_bounty)
+
+    recommender_is_seller = bool(
+        recommender_id
+        and seller_id
+        and str(recommender_id) == str(seller_id)
+    )
+    print(
+        "Seeking bounty plan: "
+        f"buyer={buyer_id}, seller={seller_id}, recommender={recommender_id}, "
+        f"recommender_is_seller={recommender_is_seller}, "
+        f"path={combined_path}, middle={middle}"
+    )
+    return known, network
 
 
 def _network_participants_business(middle_uids, effective_bounty, seen):
@@ -4261,7 +4388,7 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                         WHEN ti.ti_bs_id LIKE '150-%%' THEN
                             CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
                         WHEN ti.ti_bs_id LIKE '165-%%' THEN
-                            CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                            CONCAT(seller_pp.profile_personal_first_name, ' ', seller_pp.profile_personal_last_name)
                         ELSE NULL
                     END AS business_name,
                     CASE
@@ -4295,7 +4422,7 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                     LEFT JOIN every_circle.business biz
                     ON bs.bs_business_id = biz.business_uid
                     LEFT JOIN every_circle.profile_personal seller_pp
-                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    ON t.transaction_business_id = seller_pp.profile_personal_uid
                     LEFT JOIN every_circle.profile_expertise pe
                     ON ti.ti_bs_id = pe.profile_expertise_uid
                     LEFT JOIN every_circle.profile_personal expertise_pp
@@ -4304,8 +4431,6 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                     ON ti.ti_bs_id = wr.wish_response_uid
                     LEFT JOIN every_circle.profile_wish pw
                     ON wr.wr_profile_wish_id = pw.profile_wish_uid
-                    LEFT JOIN every_circle.profile_personal wish_pp
-                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
                     WHERE t.transaction_profile_id = %s{order_filter}
                     GROUP BY
                     t.transaction_uid,
@@ -4879,7 +5004,7 @@ class Transactions(Resource):
                         tx_item["ti_bs_is_returnable"] = _normalize_is_returnable(
                             bs_data.get("profile_wish_is_returnable")
                         )
-                        _apply_line_shipping_snapshot(tx_item, item)
+                        _apply_line_shipping_snapshot(tx_item, item, bs_data)
                         _apply_line_tax_snapshot(tx_item, item, bs_data)
                         item_bounty_type = (
                             bs_data.get("profile_wish_bounty_type", "per_item") or "per_item"
@@ -5052,6 +5177,7 @@ class Transactions(Resource):
                         is_expertise_item = (
                             ti_bs_id and str(ti_bs_id).startswith("150")
                         )
+                        seller_profile_id = payload.get("business_id")
 
                         if is_expertise_item:
                             seller_profile_id = (
@@ -5060,23 +5186,27 @@ class Transactions(Resource):
                             )
                             path_from, path_to = seller_profile_id, profile_id
                         elif is_wish_item:
-                            path_from, path_to = profile_id, recommender_profile_id
+                            # Seeking: network path is recommender ↔ buyer
+                            path_from, path_to = recommender_profile_id, profile_id
                         else:
                             path_from, path_to = profile_id, recommender_profile_id
 
                         combined_path = _fetch_connection_path(path_from, path_to)
 
-                        known_participants = []
-                        if is_expertise_item:
-                            if profile_id:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
+                        if is_wish_item:
+                            # Seeking-only allocation (do not change 150/250).
+                            known_participants, network_participants = (
+                                _plan_seeking_bounty_shares(
+                                    effective_bounty,
+                                    profile_id,
+                                    recommender_profile_id,
+                                    combined_path,
+                                    seller_id=seller_profile_id,
                                 )
-                        elif is_wish_item:
-                            if buyer_is_recommender:
+                            )
+                        else:
+                            known_participants = []
+                            if is_expertise_item:
                                 if profile_id:
                                     known_participants.append(
                                         {
@@ -5085,64 +5215,53 @@ class Transactions(Resource):
                                         }
                                     )
                             else:
-                                if profile_id:
+                                if buyer_is_recommender:
                                     known_participants.append(
                                         {
                                             "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
+                                            **_bounty_pct_amount(effective_bounty, 0.40),
                                         }
                                     )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        else:
-                            if buyer_is_recommender:
-                                known_participants.append(
-                                    {
-                                        "tb_profile_id": profile_id,
-                                        **_bounty_pct_amount(effective_bounty, 0.40),
-                                    }
+                                else:
+                                    if profile_id:
+                                        known_participants.append(
+                                            {
+                                                "tb_profile_id": profile_id,
+                                                **_bounty_pct_amount(
+                                                    effective_bounty, 0.20
+                                                ),
+                                            }
+                                        )
+                                    if recommender_profile_id:
+                                        known_participants.append(
+                                            {
+                                                "tb_profile_id": recommender_profile_id,
+                                                **_bounty_pct_amount(
+                                                    effective_bounty, 0.20
+                                                ),
+                                            }
+                                        )
+                            known_participants.append(
+                                {
+                                    "tb_profile_id": EC_WALLET_ID,
+                                    **_bounty_pct_amount(effective_bounty, 0.20),
+                                }
+                            )
+                            seen = {
+                                p["tb_profile_id"]
+                                for p in known_participants
+                                if p["tb_profile_id"]
+                            }
+
+                            middle_nodes = _middle_path_nodes(combined_path, seen)
+                            if is_expertise_item:
+                                network_participants = _network_participants_capped(
+                                    middle_nodes, effective_bounty
                                 )
                             else:
-                                if profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                                if recommender_profile_id:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": recommender_profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.20),
-                                        }
-                                    )
-                        known_participants.append(
-                            {
-                                "tb_profile_id": EC_WALLET_ID,
-                                **_bounty_pct_amount(effective_bounty, 0.20),
-                            }
-                        )
-                        seen = {
-                            p["tb_profile_id"]
-                            for p in known_participants
-                            if p["tb_profile_id"]
-                        }
-
-                        middle_nodes = _middle_path_nodes(combined_path, seen)
-                        if is_expertise_item or is_wish_item:
-                            network_participants = _network_participants_capped(
-                                middle_nodes, effective_bounty
-                            )
-                        else:
-                            network_participants = _network_participants_business(
-                                middle_nodes, effective_bounty, seen
-                            )
+                                network_participants = _network_participants_business(
+                                    middle_nodes, effective_bounty, seen
+                                )
                         print("network_participants: ", network_participants)
 
                         # Process known participants (buyer, recommender, ec-wallet)
@@ -6084,6 +6203,48 @@ def _order_bounty_paid(db, order_uid):
     return _batch_order_bounty_paid(db, [order_uid]).get(order_uid, 0.0)
 
 
+def is_seeking_sale_line(ti_row_or_id):
+    """
+    True for Seeking / wish sale lines (buyer-funded bounty).
+
+    Accepts a line dict (ti_bs_id / purchase_type) or a raw bs id string.
+    """
+    if ti_row_or_id is None:
+        return False
+    if isinstance(ti_row_or_id, dict):
+        bs_id = str(ti_row_or_id.get("ti_bs_id") or "")
+        if bs_id.startswith("165"):
+            return True
+        purchase_type = str(ti_row_or_id.get("purchase_type") or "").strip().lower()
+        return purchase_type in ("wish", "seeking")
+    return str(ti_row_or_id).startswith("165")
+
+
+def _order_seller_funded_bounty_paid(db, order_uid):
+    """
+    Bounty that reduces seller sale proceeds.
+
+    Excludes Seeking (165-*) lines: that bounty is buyer-funded at checkout and
+    paid out via transactions_bounty, not clawed from seller merchandise.
+    """
+    if not order_uid:
+        return 0.0
+    q = db.execute(
+        """
+        SELECT COALESCE(SUM(tb.tb_amount), 0) AS seller_funded_bounty
+        FROM every_circle.transactions_items ti
+        LEFT JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        WHERE ti.ti_transaction_id = %s
+          AND ti.ti_bs_id NOT LIKE '165-%%'
+        """,
+        (order_uid,),
+    )
+    rows = q.get("result") or []
+    if not rows:
+        return 0.0
+    return round(_to_float(rows[0].get("seller_funded_bounty")), 4)
+
+
 def _sale_line_count(db, order_uid):
     if not order_uid:
         return 0
@@ -6173,6 +6334,9 @@ def _seller_bounty_to_reclaim_for_line(ti_row, return_qty, *, line_bounty_ledger
     """Seller bounty reversed for a partial/full line return."""
     if not ti_row:
         return 0.0
+    # Seeking bounty is buyer-funded — never reclaim from seller proceeds.
+    if is_seeking_sale_line(ti_row):
+        return 0.0
     try:
         rq = int(return_qty)
     except (TypeError, ValueError):
@@ -6242,6 +6406,9 @@ def _bounty_to_reclaim_for_line(
         return 0.0
 
     if _sale_line_count(db, order_uid) == 1:
+        # Seeking single-line orders: order bounty is buyer-funded, not seller reclaim.
+        if is_seeking_sale_line(ti_row):
+            return 0.0
         order_bounty = _order_bounty_paid(db, order_uid)
         if order_bounty > 0:
             return round(order_bounty * scale, 4)
@@ -7021,7 +7188,7 @@ class SellerTransactions(Resource):
                             WHEN ti.ti_bs_id LIKE '150-%%' THEN
                                 CONCAT(expertise_pp.profile_personal_first_name, ' ', expertise_pp.profile_personal_last_name)
                             WHEN ti.ti_bs_id LIKE '165-%%' THEN
-                                CONCAT(wish_pp.profile_personal_first_name, ' ', wish_pp.profile_personal_last_name)
+                                CONCAT(seller_pp.profile_personal_first_name, ' ', seller_pp.profile_personal_last_name)
                             ELSE NULL
                         END AS business_name,
                         CASE
@@ -7067,7 +7234,7 @@ class SellerTransactions(Resource):
                     LEFT JOIN every_circle.users buyer_u
                     ON buyer_pp.profile_personal_user_id = buyer_u.user_uid
                     LEFT JOIN every_circle.profile_personal seller_pp
-                    ON t.transaction_business_id = seller_pp.profile_personal_user_id
+                    ON t.transaction_business_id = seller_pp.profile_personal_uid
                     LEFT JOIN every_circle.profile_expertise pe
                     ON ti.ti_bs_id = pe.profile_expertise_uid
                     LEFT JOIN every_circle.profile_personal expertise_pp
@@ -7076,8 +7243,6 @@ class SellerTransactions(Resource):
                     ON ti.ti_bs_id = wr.wish_response_uid
                     LEFT JOIN every_circle.profile_wish pw
                     ON wr.wr_profile_wish_id = pw.profile_wish_uid
-                    LEFT JOIN every_circle.profile_personal wish_pp
-                    ON pw.profile_wish_profile_personal_id = wish_pp.profile_personal_uid
                     WHERE t.transaction_business_id = %s
                     -- WHERE t.transaction_business_id = '110-000014'
                     GROUP BY

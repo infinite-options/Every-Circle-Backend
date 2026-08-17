@@ -237,8 +237,10 @@ _RECEIPT_LINE_SELECT = """
         ON ti.ti_bs_id = bs.bs_uid
     LEFT JOIN every_circle.profile_expertise pe
         ON ti.ti_bs_id = pe.profile_expertise_uid
+    LEFT JOIN every_circle.wish_response wr
+        ON ti.ti_bs_id = wr.wish_response_uid
     LEFT JOIN every_circle.profile_wish pw
-        ON ti.ti_bs_id = pw.profile_wish_uid
+        ON wr.wr_profile_wish_id = pw.profile_wish_uid
     WHERE t.transaction_profile_id = %s
         AND t.transaction_uid = %s
 """

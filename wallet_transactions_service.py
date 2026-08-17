@@ -169,10 +169,11 @@ def _order_bounty_paid(db, transaction_uid):
 def compute_seller_eligible_total(db, transaction_uid):
     """
     Order-level seller pool:
-      merchandise + sales_tax + shipping − bounty
+      merchandise + sales_tax + shipping − seller-funded bounty
 
+    Seeking (165-*) bounty is buyer-funded and is not subtracted.
     Uses checkout snapshots on the sale header (transaction_amount,
-    transaction_taxes, transaction_shipping) minus bounty ledger rows.
+    transaction_taxes, transaction_shipping) minus seller-funded bounty rows.
     """
     if not transaction_uid:
         return 0.0
@@ -191,7 +192,9 @@ def compute_seller_eligible_total(db, transaction_uid):
     amount = _to_float(tx.get("transaction_amount"))
     taxes = _to_float(tx.get("transaction_taxes"))
     shipping = _to_float(tx.get("transaction_shipping"))
-    bounty = _order_bounty_paid(db, transaction_uid)
+    from transactions import _order_seller_funded_bounty_paid
+
+    bounty = _order_seller_funded_bounty_paid(db, transaction_uid)
     return _round_money(amount + taxes + shipping - bounty)
 
 
@@ -465,7 +468,8 @@ def credit_seller_proceeds_at_checkout(db, transaction_uid):
     """
     Credit seller wallet_pending for every sale line at order placement.
 
-    Amount per line = merchandise + tax + shipping − bounty (full purchased qty).
+    Amount per line = merchandise + tax + shipping − seller-funded bounty
+    (full purchased qty). Seeking (165-*) buyer-funded bounty is not subtracted.
     Creates one held ``partial_delivery_credit`` row per line with
     ``wt_available_at = NULL`` (not releasable until buyer verifies).
 
