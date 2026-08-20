@@ -62,9 +62,13 @@ class ProfileExpertiseResponse(Resource):
         response = {}
 
         try:
+            from auth import bind_actor
+
             payload = request.get_json() or {}
             profile_expertise_id = payload.get("profile_expertise_id")
-            responder_id = payload.get("responder_id")
+            responder_id, actor_error = bind_actor(payload.get("responder_id"))
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             missing = [
                 field

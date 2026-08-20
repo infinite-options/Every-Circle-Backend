@@ -32,21 +32,33 @@ class UserInfo(Resource):
     def put(self):
         print("In Update User")
         try:
+            payload = request.get_json(silent=True) or {}
+            print(payload)
+
+            from auth import bind_actor, get_current_user_uid, jwt_auth_required
+
+            requested = payload.get("user_uid")
+            if jwt_auth_required() and not requested:
+                requested = get_current_user_uid()
+            actor, error = bind_actor(requested)
+            if error:
+                return error, error["code"]
+            if not actor:
+                raise BadRequest("Request failed, no UID in payload.")
+
+            # Flag on: persist against the JWT user even if the client sent a
+            # matching profile_id as user_uid.
+            user_uid = get_current_user_uid() if jwt_auth_required() else actor
+            payload.pop("user_uid", None)
+            key = {"user_uid": user_uid}
+            print(key)
+
             with connect() as db:
-                payload = request.get_json()
-                print(payload)
+                response = db.update("every_circle.users", key, payload)
 
-                if payload["user_uid"] is None:
-                    raise BadRequest("Request failed, no UID in payload.")
-                
-                key = {'user_uid': payload.pop('user_uid')}
-                print(key)
-                # print(payload)
-                
-                with connect() as db:
-                    response = db.update('every_circle.users', key, payload)
+            return response
 
-                return response
-            
+        except BadRequest as e:
+            return {"code": 400, "message": str(e)}, 400
         except Exception as e:
             return {"code": 500, "message": str(e)}, 500

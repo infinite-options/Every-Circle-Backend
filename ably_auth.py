@@ -17,7 +17,15 @@ class AblyToken(Resource):
         if not api_key:
             return {"message": "ABLY_API_KEY not configured on server", "code": 500}, 500
 
-        client_id = request.args.get("client_id") or request.args.get("profile_uid") or "anonymous-client"
+        from auth import get_current_profile_id, get_current_user_uid
+
+        client_id = (
+            get_current_profile_id()
+            or get_current_user_uid()
+            or request.args.get("client_id")
+            or request.args.get("profile_uid")
+            or "anonymous-client"
+        )
 
         async def _make_token_request():
             import ably

@@ -356,8 +356,12 @@ class NearbyLocation(Resource):
     """
 
     def patch(self):
+        from auth import bind_actor
+
         data = request.get_json(silent=True) or {}
-        profile_uid  = data.get('profile_uid')
+        profile_uid, actor_error = bind_actor(data.get('profile_uid'))
+        if actor_error:
+            return actor_error, actor_error['code']
         lat          = data.get('lat')
         lng          = data.get('lng')
         live_sharing = data.get('live_sharing', False)

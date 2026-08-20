@@ -86,11 +86,17 @@ class Circles(Resource):
         response = {}
         
         try:
+            from auth import bind_actor
+
             payload = request.get_json()
             print(f"POST payload received: {payload}")
+
+            circle_profile_id, actor_error = bind_actor(payload.get('circle_profile_id'))
+            if actor_error:
+                return actor_error, actor_error['code']
             
             required_fields = ['circle_profile_id']
-            missing_fields = [field for field in required_fields if not payload.get(field)]
+            missing_fields = [field for field in required_fields if not circle_profile_id]
             
             if missing_fields:
                 response['message'] = f"Missing required fields: {', '.join(missing_fields)}"
@@ -99,7 +105,7 @@ class Circles(Resource):
                 return response, 400
             
             circle_data = {
-                'circle_profile_id': payload.get('circle_profile_id'),
+                'circle_profile_id': circle_profile_id,
                 'circle_related_person_id': payload.get('circle_related_person_id'),
                 'circle_relationship': payload.get('circle_relationship'),
                 'circle_date': payload.get('circle_date'),
@@ -158,6 +164,8 @@ class Circles(Resource):
         response = {}
 
         try:
+            from auth import bind_actor
+
             if not circle_uid:
                 response['message'] = 'circle_uid is required'
                 response['code'] = 400
@@ -169,6 +177,10 @@ class Circles(Resource):
                     response['message'] = f'Circle with UID {circle_uid} not found'
                     response['code'] = 404
                     return response, 404
+
+                _, actor_error = bind_actor(existing['result'][0].get('circle_profile_id'))
+                if actor_error:
+                    return actor_error, actor_error['code']
 
                 delete_response = db.delete(f"DELETE FROM every_circle.circles WHERE circle_uid = '{circle_uid}'")
                 print(f"Delete response: {delete_response}")
@@ -223,6 +235,14 @@ class Circles(Resource):
                     response['code'] = 404
                     print(f"PUT failed: {response['message']}")
                     return response, 404
+
+                from auth import bind_actor
+
+                _, actor_error = bind_actor(
+                    existing_circle['result'][0].get('circle_profile_id')
+                )
+                if actor_error:
+                    return actor_error, actor_error['code']
                 
                 # Prepare update data (only include fields that are provided)
                 update_data = {}

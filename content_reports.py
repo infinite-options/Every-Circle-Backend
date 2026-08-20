@@ -130,14 +130,54 @@ def _get_latest_resubmission(db, target_uid):
     return rows[0] if rows else None
 
 
+def _bind_requester_profile(payload):
+    """Resolve acknowledge requester from JWT when JWT_AUTH_REQUIRED is on."""
+    from auth import bind_actor
+
+    requested = str(
+        payload.get("profile_uid")
+        or payload.get("requester_profile_uid")
+        or ""
+    ).strip() or None
+    return bind_actor(requested)
+
+
+def _require_admin_actor():
+    """Require JWT admin when JWT_AUTH_REQUIRED is on."""
+    from auth import require_admin
+
+    admin_uid, error = require_admin()
+    if error:
+        return None, error
+    return admin_uid, None
+
+
+def _resolve_admin_uid(payload):
+    """JWT admin actor when flag is on; legacy body admin_uid otherwise."""
+    from auth import require_admin
+
+    admin_uid, error = require_admin()
+    if error:
+        return None, error
+    if admin_uid is None:
+        admin_uid = str(payload.get("admin_uid", "")).strip() or None
+    return admin_uid, None
+
+
 class ContentReports(Resource):
     def post(self):
         """Submit a content flag against an offering, seeking post, or user profile."""
         print("In ContentReports POST")
         response = {}
         try:
+            from auth import bind_actor
+
             payload = request.get_json(force=True) or {}
-            reporter_profile_uid = str(payload.get("reporter_profile_uid", "")).strip()
+            reporter_profile_uid, actor_error = bind_actor(
+                payload.get("reporter_profile_uid")
+            )
+            if actor_error:
+                return actor_error, actor_error["code"]
             target_uid = str(payload.get("target_uid", "")).strip()
             reason_category = str(payload.get("reason_category", "")).strip()
             reason_text = payload.get("reason_text")
@@ -237,6 +277,10 @@ class ContentReports(Resource):
         print("In ContentReports GET")
         response = {}
         try:
+            _, admin_error = _require_admin_actor()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             status = request.args.get("status", "pending").strip()
             target_uid = request.args.get("target_uid", "").strip()
 
@@ -283,7 +327,9 @@ class ContentReports(Resource):
             report_uid = str(
                 report_uid or payload.get("report_uid") or payload.get("content_reports_uid", "")
             ).strip()
-            admin_uid = str(payload.get("admin_uid", "")).strip()
+            admin_uid, admin_error = _resolve_admin_uid(payload)
+            if admin_error:
+                return admin_error, admin_error["code"]
 
             if not report_uid:
                 response["message"] = "report_uid is required"
@@ -340,6 +386,10 @@ class ContentModerationReview(Resource):
         print("In ContentModerationReview GET")
         response = {}
         try:
+            _, admin_error = _require_admin_actor()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             with connect() as db:
                 if not profile_expertise_uid or profile_expertise_uid == "review-queue":
                     query = """
@@ -418,7 +468,9 @@ class ContentModerationReview(Resource):
 
             payload = request.get_json(force=True) or {}
             action = str(payload.get("action", "")).strip().lower()
-            admin_uid = str(payload.get("admin_uid", "")).strip()
+            admin_uid, admin_error = _resolve_admin_uid(payload)
+            if admin_error:
+                return admin_error, admin_error["code"]
             note = payload.get("note")
 
             if not profile_expertise_uid or action not in ("approve", "reject"):
@@ -481,11 +533,9 @@ class ContentModerationReview(Resource):
                 return response, 400
 
             payload = request.get_json(force=True) or {}
-            requester_profile_uid = str(
-                payload.get("profile_uid")
-                or payload.get("requester_profile_uid")
-                or ""
-            ).strip()
+            requester_profile_uid, actor_error = _bind_requester_profile(payload)
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             if not profile_expertise_uid or not requester_profile_uid:
                 response["message"] = (
@@ -532,6 +582,10 @@ class SeekingContentModerationReview(Resource):
         print("In SeekingContentModerationReview GET")
         response = {}
         try:
+            _, admin_error = _require_admin_actor()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             with connect() as db:
                 if not profile_wish_uid or profile_wish_uid == "review-queue":
                     query = """
@@ -610,7 +664,9 @@ class SeekingContentModerationReview(Resource):
 
             payload = request.get_json(force=True) or {}
             action = str(payload.get("action", "")).strip().lower()
-            admin_uid = str(payload.get("admin_uid", "")).strip()
+            admin_uid, admin_error = _resolve_admin_uid(payload)
+            if admin_error:
+                return admin_error, admin_error["code"]
             note = payload.get("note")
 
             if not profile_wish_uid or action not in ("approve", "reject"):
@@ -673,11 +729,9 @@ class SeekingContentModerationReview(Resource):
                 return response, 400
 
             payload = request.get_json(force=True) or {}
-            requester_profile_uid = str(
-                payload.get("profile_uid")
-                or payload.get("requester_profile_uid")
-                or ""
-            ).strip()
+            requester_profile_uid, actor_error = _bind_requester_profile(payload)
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             if not profile_wish_uid or not requester_profile_uid:
                 response["message"] = (
@@ -724,6 +778,10 @@ class UserModerationReview(Resource):
         print("In UserModerationReview GET")
         response = {}
         try:
+            _, admin_error = _require_admin_actor()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             with connect() as db:
                 if not profile_personal_uid or profile_personal_uid == "review-queue":
                     query = """
@@ -801,7 +859,9 @@ class UserModerationReview(Resource):
 
             payload = request.get_json(force=True) or {}
             action = str(payload.get("action", "")).strip().lower()
-            admin_uid = str(payload.get("admin_uid", "")).strip()
+            admin_uid, admin_error = _resolve_admin_uid(payload)
+            if admin_error:
+                return admin_error, admin_error["code"]
             note = payload.get("note")
 
             if not profile_personal_uid or action not in ("approve", "reject"):
@@ -864,11 +924,9 @@ class UserModerationReview(Resource):
                 return response, 400
 
             payload = request.get_json(force=True) or {}
-            requester_profile_uid = str(
-                payload.get("profile_uid")
-                or payload.get("requester_profile_uid")
-                or ""
-            ).strip()
+            requester_profile_uid, actor_error = _bind_requester_profile(payload)
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             if not profile_personal_uid or not requester_profile_uid:
                 response["message"] = (
@@ -915,6 +973,10 @@ class BusinessModerationReview(Resource):
         print("In BusinessModerationReview GET")
         response = {}
         try:
+            _, admin_error = _require_admin_actor()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             with connect() as db:
                 if not business_uid or business_uid == "review-queue":
                     query = """
@@ -990,7 +1052,9 @@ class BusinessModerationReview(Resource):
 
             payload = request.get_json(force=True) or {}
             action = str(payload.get("action", "")).strip().lower()
-            admin_uid = str(payload.get("admin_uid", "")).strip()
+            admin_uid, admin_error = _resolve_admin_uid(payload)
+            if admin_error:
+                return admin_error, admin_error["code"]
             note = payload.get("note")
 
             if not business_uid or action not in ("approve", "reject"):
@@ -1053,11 +1117,9 @@ class BusinessModerationReview(Resource):
                 return response, 400
 
             payload = request.get_json(force=True) or {}
-            requester_profile_uid = str(
-                payload.get("profile_uid")
-                or payload.get("requester_profile_uid")
-                or ""
-            ).strip()
+            requester_profile_uid, actor_error = _bind_requester_profile(payload)
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             if not business_uid or not requester_profile_uid:
                 response["message"] = (

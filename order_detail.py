@@ -6,6 +6,14 @@ from flask import request
 from flask_restful import Resource
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
+from auth import (
+    actor_may_use_uid,
+    bind_actor,
+    current_user_is_admin,
+    get_current_profile_id,
+    jwt_auth_required,
+)
+
 from data_ec import connect
 from datetime_utils import enrich_datetime_fields
 from transaction_receipt import _parse_selected_options_field, _enrich_receipt_line
@@ -130,6 +138,12 @@ def resolve_order_uid(db, transaction_uid):
 
 
 def _viewer_profile_id():
+    jwt_profile_id = get_current_profile_id()
+    if jwt_profile_id:
+        return jwt_profile_id
+    if jwt_auth_required():
+        return None
+
     profile_id = request.args.get("profile_id")
     if profile_id:
         return str(profile_id)
@@ -146,7 +160,8 @@ def _viewer_profile_id():
 
 
 def _viewer_business_uid():
-    return request.args.get("business_uid") or request.args.get("seller_id")
+    requested = request.args.get("business_uid") or request.args.get("seller_id")
+    return str(requested) if requested else None
 
 
 def _can_view_order(sale_row, profile_id, business_uid):
@@ -160,6 +175,13 @@ def _can_view_order(sale_row, profile_id, business_uid):
     # Personal sellers often use profile_personal_uid as transaction_business_id.
     if profile_id and seller_business_id == str(profile_id):
         return True
+    if jwt_auth_required():
+        if current_user_is_admin():
+            return True
+        if actor_may_use_uid(seller_business_id, allow_business=True):
+            return True
+        if actor_may_use_uid(sale_row.get("transaction_profile_id")):
+            return True
     return False
 
 
@@ -845,12 +867,26 @@ class OrderDetail(Resource):
             profile_id = _viewer_profile_id()
             business_uid = _viewer_business_uid()
 
+            if jwt_auth_required():
+                requested_profile = request.args.get("profile_id")
+                if requested_profile:
+                    _, error = bind_actor(requested_profile)
+                    if error:
+                        return error, error["code"]
+                if business_uid:
+                    _, error = bind_actor(business_uid, allow_business=True)
+                    if error:
+                        return error, error["code"]
+
             if not profile_id and not business_uid:
-                response["message"] = (
-                    "profile_id or business_uid is required to view this order"
-                )
-                response["code"] = 403
-                return response, 403
+                if jwt_auth_required() and get_current_profile_id():
+                    profile_id = get_current_profile_id()
+                else:
+                    response["message"] = (
+                        "profile_id or business_uid is required to view this order"
+                    )
+                    response["code"] = 403
+                    return response, 403
 
             with connect() as db:
                 from order_quantity_context import clear_ledger_quantity_caches

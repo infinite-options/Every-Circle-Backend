@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from zappa_prebuild import exit_if_crypto_broken
-exit_if_crypto_broken()
+# from zappa_prebuild import exit_if_crypto_broken
+# exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
@@ -94,7 +94,17 @@ from flask import Flask, request, Request as FlaskRequest, render_template, url_
 from flask_restful import Resource, Api
 from flask_cors import CORS
 from flask_mail import Mail, Message  # used for email
-from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt_identity, jwt_required, create_access_token 
+from flask_jwt_extended import JWTManager
+from auth import (
+    AuthLogin,
+    AuthLogout,
+    AuthMe,
+    AuthRefresh,
+    AuthRegister,
+    AuthSalt,
+    AuthSocial,
+    register_jwt_auth,
+) 
 from pytz import timezone as ptz  # Not sure what the difference is
 from decimal import Decimal
 from hashlib import sha512
@@ -372,11 +382,12 @@ app.config['DEBUG'] = True
 
 # Setup the Flask-JWT-Extended extension
 app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
-app.config['JWT_TOKEN_LOCATION'] = ['headers'] 
-app.config['JWT_HEADER_NAME'] = 'Authorization' 
+app.config['JWT_TOKEN_LOCATION'] = ['headers']
+app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
 
 jwtManager = JWTManager(app)
+register_jwt_auth(app, jwtManager)
 
 
 # --------------- Google Scopes and Credentials------------------
@@ -622,12 +633,18 @@ class stripe_key(Resource):
 
 class Refer(Resource):
     def post(self):
+        from auth import bind_actor
+
         print("In Refer POST")
         # current user_id, email or number of the person being referred
-        payload = request.get_json()
+        payload = request.get_json() or {}
         response = {}
 
-        if 'profile_uid' not in payload:
+        profile_uid, actor_error = bind_actor(payload.get('profile_uid'))
+        if actor_error:
+            return actor_error, actor_error['code']
+
+        if not profile_uid:
             response['message'] = 'profile_uid is required to refer a friend'
             response['code'] = 400
             return response, 400
@@ -639,7 +656,7 @@ class Refer(Resource):
         
         try:
             with connect() as db:
-                profile_exists_query = db.select('every_circle.profile_personal', where={'profile_personal_uid': payload['profile_uid']})
+                profile_exists_query = db.select('every_circle.profile_personal', where={'profile_personal_uid': profile_uid})
                 if not profile_exists_query['result']:
                     response['message'] = 'User does not exist'
                     response['code'] = 404
@@ -659,7 +676,7 @@ class Refer(Resource):
             
             if 'message' in payload:
                 message = payload['message']
-                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['profile_uid']}"
+                message = message + f" Please click on the link to sign up. https://everycircle.netlify.app?referral_id={profile_uid}"
             else:
                 message = f"Hi, {user_profile_details['profile_first_name']} {user_profile_details['profile_last_name']} has referred you to Every-Circle.  Please click on the link to sign up. https://everycircle.netlify.app?referral_id={payload['user_uid']}"
             
@@ -904,6 +921,13 @@ def SellerHoldRelease_CRON(Resource):
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
 
+api.add_resource(AuthSalt, "/api/v1/auth/salt")
+api.add_resource(AuthLogin, "/api/v1/auth/login")
+api.add_resource(AuthRegister, "/api/v1/auth/register")
+api.add_resource(AuthRefresh, "/api/v1/auth/refresh")
+api.add_resource(AuthSocial, "/api/v1/auth/social")
+api.add_resource(AuthMe, "/api/v1/auth/me")
+api.add_resource(AuthLogout, "/api/v1/auth/logout")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
@@ -1011,9 +1035,13 @@ api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
 class GooglePlacesInfo(Resource):
     def post(self):
         try:
-            data = request.get_json()
+            data = request.get_json() or {}
             place_id = data.get('place_id')
-            user_uid = data.get('user_uid')
+            from auth import bind_user_uid
+
+            user_uid, error = bind_user_uid(data.get('user_uid'))
+            if error:
+                return error, error['code']
             
             if not place_id:
                 return {'error': 'place_id is required'}, 400

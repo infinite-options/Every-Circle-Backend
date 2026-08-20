@@ -227,6 +227,8 @@ class Ratings(Resource):
         #     return business_uid, payload
 
         try:
+            from auth import bind_actor
+
             payload = request.form.to_dict()
             print("payload: ", payload)
 
@@ -235,7 +237,10 @@ class Ratings(Resource):
                     response['code'] = 400
                     return response, 400
 
-            profile_uid = payload.pop('rating_profile_id')
+            profile_uid, actor_error = bind_actor(payload.get('rating_profile_id'))
+            if actor_error:
+                return actor_error, actor_error['code']
+            payload.pop('rating_profile_id', None)
             business_google_id = payload.pop('rating_business_id')
 
             with connect() as db:
@@ -295,6 +300,8 @@ class Ratings(Resource):
         response = {}
 
         try:
+            from auth import bind_actor
+
             payload = request.form.to_dict()
 
             if 'rating_uid' not in payload:
@@ -307,7 +314,11 @@ class Ratings(Resource):
 
             # rating response handling
             if 'ratings_response' in payload:
-                responding_profile_uid = payload.pop('responding_profile_uid', None)
+                responding_profile_uid, actor_error = bind_actor(
+                    payload.pop('responding_profile_uid', None)
+                )
+                if actor_error:
+                    return actor_error, actor_error['code']
                 if not responding_profile_uid:
                     response['message'] = 'responding_profile_uid is required to post a response'
                     response['code'] = 400
@@ -368,6 +379,13 @@ class Ratings(Resource):
                     response['message'] = 'ratings does not exist'
                     response['code'] = 404
                     return response, 404
+
+                if 'ratings_response' not in payload:
+                    reviewer_id = rating_exists_query['result'][0].get('rating_profile_id')
+                    _, actor_error = bind_actor(reviewer_id)
+                    if actor_error:
+                        return actor_error, actor_error['code']
+
                 payload.pop('responding_profile_uid', None)
                 transaction_uid = payload.pop('transaction_uid', None)
                 if transaction_uid:

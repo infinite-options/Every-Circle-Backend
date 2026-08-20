@@ -9,6 +9,15 @@ import re
 import requests as http_requests
 
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+from auth import (
+    actor_may_use_uid,
+    bind_actor,
+    current_user_is_admin,
+    get_current_profile_id,
+    jwt_auth_required,
+    require_actor_or_admin,
+    require_admin,
+)
 
 from data_ec import connect, processImage
 from moderation import (
@@ -1758,6 +1767,13 @@ def _network_participants_business(middle_uids, effective_bounty, seen):
 
 
 def _get_authenticated_profile_id():
+    """JWT profile when present. Body ``profile_id`` only when the flag is off."""
+    profile_id = get_current_profile_id()
+    if profile_id:
+        return profile_id
+    if jwt_auth_required():
+        return None
+
     try:
         verify_jwt_in_request(optional=True)
         identity = get_jwt_identity()
@@ -1769,6 +1785,77 @@ def _get_authenticated_profile_id():
     body = request.get_json(silent=True) or {}
     profile_id = body.get("profile_id")
     return str(profile_id) if profile_id else None
+
+
+def _bind_buyer_profile_id(requested=None):
+    """Checkout/return/delivery buyer from JWT when the flag is on.
+
+    Flag off → ``requested`` (legacy). Flag on → ``bind_actor`` (403 on mismatch).
+    Returns ``(profile_id, error)``.
+    """
+    actor, error = bind_actor(requested)
+    if error:
+        return None, error
+    if not actor:
+        return None, {"message": "profile_id is required", "code": 400}
+    return str(actor), None
+
+
+def _bind_seller_actor(requested=None):
+    """Seller from JWT profile/user or an owned ``200-*`` business when the flag is on.
+
+    Flag off → ``requested`` unchanged (may be None). Flag on → ``bind_actor``
+    with ``allow_business=True``; omitted requested uses the JWT actor.
+    Returns ``(seller_id, error)``.
+    """
+    requested = str(requested).strip() if requested else None
+    if not jwt_auth_required():
+        return requested, None
+    seller_id, error = bind_actor(requested, allow_business=True)
+    if error:
+        return None, error
+    if not seller_id:
+        return None, {"message": "seller_id is required", "code": 400}
+    return str(seller_id), None
+
+
+def _seller_forbidden_for_transaction(
+    seller_id, transaction_business_id, message=None
+):
+    """403 unless ``seller_id`` is the sale seller, or (flag on) JWT owns that business."""
+    if str(transaction_business_id or "") == str(seller_id or ""):
+        return None
+    if jwt_auth_required() and actor_may_use_uid(
+        transaction_business_id, allow_business=True
+    ):
+        return None
+    return {
+        "message": message
+        or "seller_id does not match the seller on this transaction",
+        "code": 403,
+    }
+
+
+def _party_forbidden_for_transaction(transaction_profile_id, transaction_business_id):
+    """403 when the flag is on unless JWT is buyer, seller, owned business, or admin."""
+    if not jwt_auth_required():
+        return None
+    if current_user_is_admin():
+        return None
+    if actor_may_use_uid(transaction_profile_id, allow_business=False):
+        return None
+    if actor_may_use_uid(transaction_business_id, allow_business=True):
+        return None
+    return {
+        "message": "Not authorized to update this transaction",
+        "code": 403,
+    }
+
+
+def _path_actor_error(requested_uid, *, allow_business=True):
+    """403/401 when the flag is on and the path uid is not the JWT actor or admin."""
+    _, error = require_actor_or_admin(requested_uid, allow_business=allow_business)
+    return error
 
 
 def _resolve_transaction_item(db, transaction_uid, transaction_item_uid):
@@ -3274,7 +3361,9 @@ class ReturnTransaction(Resource):
                 response["code"] = 400
                 return response, 400
 
-            profile_id = payload.get("profile_id")
+            profile_id, actor_error = _bind_buyer_profile_id(payload.get("profile_id"))
+            if actor_error:
+                return actor_error, actor_error["code"]
             original_tx_uid = payload.get("transaction_uid")
             items_payload = payload.get("transaction_return_items") or []
             return_note = payload.get("transaction_return_note")
@@ -3537,11 +3626,14 @@ class ConfirmReturnTransaction(Resource):
             transaction_uid = payload.get("transaction_uid")
             trr_uids = _parse_trr_uids_from_payload(payload)
             trr_uid = trr_uids[0] if trr_uids else None
-            seller_id = (
+            requested_seller_id = (
                 payload.get("seller_id")
                 or payload.get("business_uid")
                 or payload.get("transaction_business_id")
             )
+            seller_id, seller_error = _bind_seller_actor(requested_seller_id)
+            if seller_error:
+                return seller_error, seller_error["code"]
             action = (payload.get("action") or "confirm").lower()
             seller_note = payload.get("transaction_return_seller_note")
 
@@ -3561,12 +3653,11 @@ class ConfirmReturnTransaction(Resource):
                     response["code"] = 404
                     return response, 404
 
-                if str(orig_tx.get("transaction_business_id")) != str(seller_id):
-                    response["message"] = (
-                        "seller_id does not match the seller on this transaction"
-                    )
-                    response["code"] = 403
-                    return response, 403
+                seller_denied = _seller_forbidden_for_transaction(
+                    seller_id, orig_tx.get("transaction_business_id")
+                )
+                if seller_denied:
+                    return seller_denied, seller_denied["code"]
 
                 if len(trr_uids) > 1:
                     requests, resolve_err = _load_return_request_wave(
@@ -3941,6 +4032,10 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
 
+            path_error = _path_actor_error(profile_id, allow_business=True)
+            if path_error:
+                return path_error, path_error["code"]
+
             with connect() as db:
                 rows = _finalize_buyer_purchase_list_rows(
                     db, _query_buyer_purchase_list_rows(db, profile_id)
@@ -3972,8 +4067,14 @@ class Transactions(Resource):
 
         try:
             # Get JSON payload from request
-            payload = request.get_json()
+            payload = request.get_json() or {}
             print(payload)
+
+            buyer_id, actor_error = bind_actor(payload.get("profile_id"))
+            if actor_error:
+                return actor_error, actor_error["code"]
+            if buyer_id:
+                payload["profile_id"] = buyer_id
 
             # Enter Data in Transactions Table
             # Validate required fields
@@ -5091,6 +5192,29 @@ class Transactions(Resource):
                 return response, 400
 
             with connect() as db:
+                tx_row_q = db.execute(
+                    """
+                    SELECT transaction_uid, transaction_profile_id,
+                           transaction_business_id
+                    FROM every_circle.transactions
+                    WHERE transaction_uid = %s
+                    """,
+                    (transaction_uid,),
+                )
+                tx_rows = (tx_row_q or {}).get("result") or []
+                if not tx_rows:
+                    response["message"] = "Transaction not found"
+                    response["code"] = 404
+                    return response, 404
+
+                tx_row = tx_rows[0]
+                party_denied = _party_forbidden_for_transaction(
+                    tx_row.get("transaction_profile_id"),
+                    tx_row.get("transaction_business_id"),
+                )
+                if party_denied:
+                    return party_denied, party_denied["code"]
+
                 update_response = db.update(
                     "every_circle.transactions",
                     {"transaction_uid": transaction_uid},
@@ -5128,19 +5252,32 @@ class Transactions(Resource):
             response["code"] = 400
             return response, 400
 
-        seller_id = (
+        requested_seller_id = (
             payload.get("seller_id")
             or payload.get("business_uid")
             or payload.get("business_id")
-            or payload.get("profile_id")
-            or _get_authenticated_profile_id()
         )
-        if not seller_id:
-            response["message"] = (
-                "seller_id, business_uid, or authenticated seller identity is required"
+        if jwt_auth_required():
+            extra_profile = payload.get("profile_id")
+            if extra_profile:
+                _, extra_error = bind_actor(extra_profile, allow_business=True)
+                if extra_error:
+                    return extra_error, extra_error["code"]
+            seller_id, seller_error = _bind_seller_actor(requested_seller_id)
+            if seller_error:
+                return seller_error, seller_error["code"]
+        else:
+            seller_id = (
+                requested_seller_id
+                or payload.get("profile_id")
+                or _get_authenticated_profile_id()
             )
-            response["code"] = 403
-            return response, 403
+            if not seller_id:
+                response["message"] = (
+                    "seller_id, business_uid, or authenticated seller identity is required"
+                )
+                response["code"] = 403
+                return response, 403
 
         seller_id = str(seller_id)
         seen_ti = set()
@@ -5173,12 +5310,13 @@ class Transactions(Resource):
                     response["code"] = 400
                     return response, 400
 
-                if str(tx_row.get("transaction_business_id") or "") != seller_id:
-                    response["message"] = (
-                        "Caller is not the seller on this transaction"
-                    )
-                    response["code"] = 403
-                    return response, 403
+                seller_denied = _seller_forbidden_for_transaction(
+                    seller_id,
+                    tx_row.get("transaction_business_id"),
+                    message="Caller is not the seller on this transaction",
+                )
+                if seller_denied:
+                    return seller_denied, seller_denied["code"]
 
                 for entry in fulfillment_updates:
                     if not isinstance(entry, dict):
@@ -5420,7 +5558,14 @@ class Transactions(Resource):
             response["code"] = 400
             return response, 400
 
-        buyer_profile_id = _get_authenticated_profile_id()
+        if jwt_auth_required():
+            buyer_profile_id, actor_error = _bind_buyer_profile_id(
+                payload.get("profile_id")
+            )
+            if actor_error:
+                return actor_error, actor_error["code"]
+        else:
+            buyer_profile_id = _get_authenticated_profile_id()
         if not buyer_profile_id:
             response["message"] = "Authenticated buyer profile is required"
             response["code"] = 403
@@ -6519,6 +6664,10 @@ class SellerTransactions(Resource):
                 response["code"] = 400
                 return response, 400
 
+            path_error = _path_actor_error(profile_id, allow_business=True)
+            if path_error:
+                return path_error, path_error["code"]
+
             with connect() as db:
                 ensure_fulfillment_list_rollups(db)
                 fulfillment_summary = fulfillment_list_summary_sql("ti")
@@ -6662,6 +6811,10 @@ class DeclinedReturns(Resource):
         response = {}
 
         try:
+            _, admin_error = require_admin()
+            if admin_error:
+                return admin_error, admin_error["code"]
+
             with connect() as db:
                 query = """
                     SELECT
@@ -6737,6 +6890,22 @@ class DeclinedReturns(Resource):
             action = data.get("action", "decline")
 
             with connect() as db:
+                orig_tx = _load_sale_for_return(db, transaction_uid)
+                if jwt_auth_required():
+                    if not orig_tx:
+                        response["message"] = "Original transaction not found"
+                        response["code"] = 404
+                        return response, 404
+                    if not current_user_is_admin() and not actor_may_use_uid(
+                        orig_tx.get("transaction_business_id"),
+                        allow_business=True,
+                    ):
+                        response["message"] = (
+                            "Not authorized to update this return"
+                        )
+                        response["code"] = 403
+                        return response, 403
+
                 if action == "resolve":
                     favor = data.get("resolved_in_favor_of", "seller")
                     if favor == "buyer":

@@ -32,6 +32,12 @@ class BountyResults(Resource):
         response = {}
 
         try:
+            from auth import require_actor_or_admin
+
+            _, error = require_actor_or_admin(profile_id, allow_business=True)
+            if error:
+                return error, error["code"]
+
             with connect() as db:
                 # Query to get bounty results for the specific profile_id
                 # bounty_query = f"""
@@ -143,6 +149,12 @@ class BusinessBountyResults(Resource):
         response = {}
 
         try:
+            from auth import require_actor_or_admin
+
+            _, error = require_actor_or_admin(business_id, allow_business=True)
+            if error:
+                return error, error["code"]
+
             with connect() as db:
                 # Query to get bounty results for transactions where this business was the seller
 

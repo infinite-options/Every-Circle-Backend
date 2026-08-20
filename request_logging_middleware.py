@@ -7,10 +7,15 @@ from datetime import datetime
 from flask import g, request
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
+from auth import get_current_profile_id
 from data_ec import connect
 
 
 def _get_profile_id():
+    jwt_profile_id = get_current_profile_id()
+    if jwt_profile_id:
+        return str(jwt_profile_id)[:10]
+
     try:
         verify_jwt_in_request(optional=True)
         identity = get_jwt_identity()

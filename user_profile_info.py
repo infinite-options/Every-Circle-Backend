@@ -418,8 +418,23 @@ def _db_write_succeeded(res):
 
 def _viewer_context_from_request(profile_id):
     """Resolve optional viewer identity for expertise moderation visibility."""
-    viewer_profile_uid = (request.args.get("viewer_profile_uid") or "").strip() or None
-    viewer_is_admin = _form_truthy_public(request.args.get("viewer_is_admin"))
+    from auth import current_user_is_admin, get_current_identity, get_current_profile_id, jwt_auth_required
+
+    identity = get_current_identity()
+    jwt_profile_id = get_current_profile_id()
+    if jwt_profile_id:
+        viewer_profile_uid = jwt_profile_id
+    elif jwt_auth_required():
+        viewer_profile_uid = None
+    else:
+        viewer_profile_uid = (request.args.get("viewer_profile_uid") or "").strip() or None
+
+    if identity:
+        viewer_is_admin = current_user_is_admin()
+    elif jwt_auth_required():
+        viewer_is_admin = False
+    else:
+        viewer_is_admin = _form_truthy_public(request.args.get("viewer_is_admin"))
     is_owner_view = bool(
         viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
     )
@@ -1113,6 +1128,16 @@ class ProfileExpertiseRestock(Resource):
                 str(payload.get("seller_id") or payload.get("profile_id") or "").strip()
                 or None
             )
+            from auth import bind_actor, jwt_auth_required
+
+            if jwt_auth_required():
+                if not seller_id:
+                    response["message"] = "seller_id is required"
+                    response["code"] = 400
+                    return response, 400
+                seller_id, error = bind_actor(seller_id, allow_business=True)
+                if error:
+                    return error, error["code"]
             trr_uid = str(payload.get("trr_uid") or "").strip() or None
             order_uid = str(payload.get("order_uid") or "").strip() or None
             quantity = payload.get("quantity")
@@ -1278,6 +1303,30 @@ class ProfileExpertiseRestock(Resource):
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
+
+
+def _forbidden_if_not_actor(requested_uid):
+    """When JWT_AUTH_REQUIRED, require requested_uid to be the JWT actor.
+
+    Nested listing deletes pass the parent profile uid. Returns a
+    ``(body, status)`` tuple for the handler to return, or ``None`` to proceed.
+    """
+    from auth import bind_actor, jwt_auth_required
+
+    if not requested_uid:
+        if jwt_auth_required():
+            return (
+                {
+                    "message": "Actor id does not match the authenticated user",
+                    "code": 403,
+                },
+                403,
+            )
+        return None
+    _, error = bind_actor(requested_uid)
+    if error:
+        return error, error["code"]
+    return None
 
 
 class UserProfileInfo(Resource):
@@ -1568,6 +1617,21 @@ class UserProfileInfo(Resource):
         try:
             payload = request.form.to_dict() 
             print("payload", payload)
+
+            from auth import actor_may_use_uid, get_current_user_uid, jwt_auth_required
+
+            jwt_user_uid = get_current_user_uid()
+            if jwt_user_uid:
+                form_uid = payload.get("user_uid")
+                if form_uid and not actor_may_use_uid(form_uid):
+                    response["message"] = "user_uid does not match the authenticated user"
+                    response["code"] = 403
+                    return response, 403
+                payload["user_uid"] = jwt_user_uid
+            elif jwt_auth_required():
+                response["message"] = "Missing or invalid authorization token"
+                response["code"] = 401
+                return response, 401
 
             if 'user_uid' not in payload:
                 response['message'] = 'user_uid is required'
@@ -2051,12 +2115,17 @@ class UserProfileInfo(Resource):
                 if qa:
                     payload['profile_uid'] = qa.strip()
 
-            if 'profile_uid' not in payload:
+            from auth import bind_actor
+
+            requested_profile_uid = payload.pop('profile_uid', None)
+            profile_uid, error = bind_actor(requested_profile_uid)
+            if error:
+                return error, error['code']
+            if not profile_uid:
                 response['message'] = 'profile_uid is required'
                 response['code'] = 400
                 return response, 400
 
-            profile_uid = payload.pop('profile_uid')
             key = {'profile_personal_uid': profile_uid}
             print("UPDATED Payload: ", payload)
             updated_uids = {}
@@ -2980,9 +3049,16 @@ class UserProfileInfo(Resource):
         response = {}
         
         try:
+            prefix = uid[:3] if uid else ""
+
+            # Case 1: User UID (100) or Profile UID (110) — bind before any delete
+            if prefix in ["100", "110"]:
+                denied = _forbidden_if_not_actor(uid)
+                if denied:
+                    return denied
+
             with connect() as db:
                 # Handle different types of UIDs based on prefix
-                prefix = uid[:3]
                 
                 # Case 1: User UID (100) or Profile UID (110) - Delete all profile data
                 if prefix in ["100", "110"]:
@@ -3084,6 +3160,13 @@ class UserProfileInfo(Resource):
                         response['message'] = f'No experience found with UID {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    parent_profile_uid = experience_exists_query['result'][0].get(
+                        'profile_experience_profile_personal_id'
+                    )
+                    denied = _forbidden_if_not_actor(parent_profile_uid)
+                    if denied:
+                        return denied
                     
                     _delete_experience_s3_assets(uid)
 
@@ -3103,6 +3186,13 @@ class UserProfileInfo(Resource):
                         response['message'] = f'No education found with UID {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    parent_profile_uid = education_exists_query['result'][0].get(
+                        'profile_education_profile_personal_id'
+                    )
+                    denied = _forbidden_if_not_actor(parent_profile_uid)
+                    if denied:
+                        return denied
                     
                     _delete_education_s3_assets(uid)
 
@@ -3122,6 +3212,13 @@ class UserProfileInfo(Resource):
                         response['message'] = f'No link found with UID {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    parent_profile_uid = link_exists_query['result'][0].get(
+                        'profile_link_profile_personal_id'
+                    )
+                    denied = _forbidden_if_not_actor(parent_profile_uid)
+                    if denied:
+                        return denied
                     
                     # Delete the specific link
                     link_query = f"DELETE FROM every_circle.profile_link WHERE profile_link_uid = '{uid}'"
@@ -3139,6 +3236,13 @@ class UserProfileInfo(Resource):
                         response['message'] = f'No expertise found with UID {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    parent_profile_uid = expertise_exists_query['result'][0].get(
+                        'profile_expertise_profile_personal_id'
+                    )
+                    denied = _forbidden_if_not_actor(parent_profile_uid)
+                    if denied:
+                        return denied
                     
                     _delete_expertise_s3_assets(uid)
 
@@ -3158,6 +3262,13 @@ class UserProfileInfo(Resource):
                         response['message'] = f'No wish found with UID {uid}'
                         response['code'] = 404
                         return response, 404
+
+                    parent_profile_uid = wish_exists_query['result'][0].get(
+                        'profile_wish_profile_personal_id'
+                    )
+                    denied = _forbidden_if_not_actor(parent_profile_uid)
+                    if denied:
+                        return denied
                     
                     _delete_wish_s3_assets(uid)
 

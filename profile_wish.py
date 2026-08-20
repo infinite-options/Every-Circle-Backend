@@ -8,19 +8,30 @@ from moderation import MODERATED_ACTIVE, get_wish, is_owner_available_for_public
 
 
 def _create_wish_response(payload):
+    from auth import bind_actor
+
     response = {}
 
     required_fields = ['profile_wish_id', 'responder_id', 'responder_note']
-    missing_fields = [field for field in required_fields if not payload.get(field)]
-
-    if missing_fields:
-        response['message'] = f"Missing required fields: {', '.join(missing_fields)}"
-        response['code'] = 400
-        return response, 400
+    missing_fields = [field for field in required_fields if field != 'responder_id' and not payload.get(field)]
 
     profile_wish_id = payload.get('profile_wish_id')
-    responder_id = payload.get('responder_id')
+    responder_id, actor_error = bind_actor(payload.get('responder_id'))
+    if actor_error:
+        return actor_error, actor_error['code']
     responder_note = payload.get('responder_note')
+
+    if not profile_wish_id or not responder_id or not responder_note:
+        missing = []
+        if not profile_wish_id:
+            missing.append('profile_wish_id')
+        if not responder_id:
+            missing.append('responder_id')
+        if not responder_note:
+            missing.append('responder_note')
+        response['message'] = f"Missing required fields: {', '.join(missing)}"
+        response['code'] = 400
+        return response, 400
 
     with connect() as db:
         wish = get_wish(db, profile_wish_id)

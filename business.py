@@ -9,6 +9,61 @@ import uuid
 from data_ec import connect, uploadImage, s3, processImage, encrypt_data, decrypt_data
 
 
+def _bound_user_uid(payload, missing_message):
+    """Resolve user_uid from JWT when the flag is on; legacy otherwise."""
+    from auth import bind_user_uid
+
+    user_uid, error = bind_user_uid(payload.get("user_uid") if payload else None)
+    if error:
+        return None, error
+    if not user_uid:
+        return None, {"message": missing_message, "code": 400}
+    if payload is not None:
+        payload.pop("user_uid", None)
+    return str(user_uid), None
+
+
+def _owned_business_error(business_uid):
+    """403/401 when the flag is on and the JWT user does not own the business."""
+    from auth import require_owned_business
+
+    _, error = require_owned_business(business_uid)
+    return error
+
+
+def _bound_seller_id(requested):
+    """seller_id must be JWT profile/user or an owned business when the flag is on."""
+    from auth import bind_actor, jwt_auth_required
+
+    requested = str(requested).strip() if requested else None
+    if not jwt_auth_required():
+        return requested, None
+    if not requested:
+        return None, {"message": "seller_id is required", "code": 400}
+    seller_id, error = bind_actor(requested, allow_business=True)
+    if error:
+        return None, error
+    return seller_id, None
+
+
+def _seller_forbidden_for_business(seller_id, business_id):
+    """403 when seller_id is not this business and the JWT user does not own it."""
+    from auth import jwt_auth_required, require_owned_business
+
+    if not business_id:
+        return None
+    if jwt_auth_required():
+        if seller_id and str(seller_id) == str(business_id):
+            return None
+        _, error = require_owned_business(business_id)
+        if error:
+            return {"message": "Seller does not own this product", "code": 403}
+        return None
+    if seller_id and str(seller_id) != str(business_id):
+        return {"message": "Seller does not own this product", "code": 403}
+    return None
+
+
 def _parse_bounty_amount(value):
     """Parse bs_bounty from DB (may include $, commas, or numeric types)."""
     if value is None:
@@ -194,14 +249,12 @@ class Business(Resource):
 
         try:
             payload = request.form.to_dict()
-            
 
-            if 'user_uid' not in payload:
-                    response['message'] = 'user_uid is required to register a business'
-                    response['code'] = 400
-                    return response, 400
-
-            user_uid = payload.pop('user_uid')
+            user_uid, error = _bound_user_uid(
+                payload, "user_uid is required to register a business"
+            )
+            if error:
+                return error, error["code"]
 
             with connect() as db:
 
@@ -273,6 +326,9 @@ class Business(Resource):
                     return response, 400
 
             business_uid = payload.pop('business_uid')
+            owner_error = _owned_business_error(business_uid)
+            if owner_error:
+                return owner_error, owner_error["code"]
             key = {'business_uid': business_uid}
 
             with connect() as db:
@@ -362,12 +418,11 @@ class Business_v2(Resource):
         try:
             payload = request.form.to_dict()
 
-            if 'user_uid' not in payload:
-                    response['message'] = 'user_uid is required to register a business'
-                    response['code'] = 400
-                    return response, 400
-
-            user_uid = payload.pop('user_uid')
+            user_uid, error = _bound_user_uid(
+                payload, "user_uid is required to register a business"
+            )
+            if error:
+                return error, error["code"]
 
             with connect() as db:
 
@@ -462,6 +517,9 @@ class Business_v2(Resource):
                     return response, 400
 
             business_uid = payload.pop('business_uid')
+            owner_error = _owned_business_error(business_uid)
+            if owner_error:
+                return owner_error, owner_error["code"]
             key = {'business_uid': business_uid}
 
             with connect() as db:
@@ -777,6 +835,9 @@ class BusinessServicePurchase(Resource):
             bs_uid = payload.get("bs_uid", "").strip()
             qty_purchased = payload.get("quantity", 1)
             transaction_uid = (payload.get("transaction_uid") or "").strip()
+            seller_id, seller_error = _bound_seller_id(payload.get("seller_id"))
+            if seller_error:
+                return seller_error, seller_error["code"]
 
             if not bs_uid:
                 response["message"] = "bs_uid is required"
@@ -811,6 +872,12 @@ class BusinessServicePurchase(Resource):
                         remaining = None
                         if svc_query.get("result"):
                             remaining = svc_query["result"][0].get("bs_quantity")
+                            forbidden = _seller_forbidden_for_business(
+                                seller_id,
+                                svc_query["result"][0].get("bs_business_id"),
+                            )
+                            if forbidden:
+                                return forbidden, forbidden["code"]
                         response["message"] = (
                             "Purchase already recorded via checkout"
                         )
@@ -831,6 +898,11 @@ class BusinessServicePurchase(Resource):
                     return response, 404
 
                 row = svc_query["result"][0]
+                forbidden = _seller_forbidden_for_business(
+                    seller_id, row.get("bs_business_id")
+                )
+                if forbidden:
+                    return forbidden, forbidden["code"]
                 current_qty = row.get("bs_quantity")
 
                 # If null or "unlimited" — nothing to decrement
@@ -950,7 +1022,9 @@ class BusinessServiceRestock(Resource):
         try:
             payload = getattr(request, "_decrypted_json", None) or request.get_json(force=True) or {}
             bs_uid = str(payload.get("bs_uid") or "").strip()
-            seller_id = str(payload.get("seller_id") or "").strip() or None
+            seller_id, seller_error = _bound_seller_id(payload.get("seller_id"))
+            if seller_error:
+                return seller_error, seller_error["code"]
             trr_uid = str(payload.get("trr_uid") or "").strip() or None
             order_uid = str(payload.get("order_uid") or "").strip() or None
             quantity = payload.get("quantity")
@@ -1011,10 +1085,9 @@ class BusinessServiceRestock(Resource):
                 row = svc_query["result"][0]
                 business_id = str(row.get("bs_business_id") or "").strip()
 
-                if seller_id and business_id and seller_id != business_id:
-                    response["message"] = "Seller does not own this product"
-                    response["code"] = 403
-                    return response, 403
+                forbidden = _seller_forbidden_for_business(seller_id, business_id)
+                if forbidden:
+                    return forbidden, forbidden["code"]
 
                 current_qty = row.get("bs_quantity")
                 if current_qty is None or str(current_qty).strip().lower() == "unlimited":
@@ -1131,7 +1204,12 @@ class BusinessClaim(Resource):
             payload = request.form.to_dict()
             print("Form keys:", list(payload.keys()))
 
-            profile_uid  = payload.get("profile_uid", "").strip()
+            from auth import bind_actor
+
+            profile_uid, error = bind_actor(payload.get("profile_uid"))
+            if error:
+                return error, error["code"]
+            profile_uid = (profile_uid or "").strip()
             business_uid = payload.get("business_uid", "").strip()
             claim_role   = payload.get("claim_role", "").strip()
             claim_note   = payload.get("claim_note", "").strip()

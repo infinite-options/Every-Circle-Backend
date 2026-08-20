@@ -96,6 +96,12 @@ class AccountScreenPersonal(Resource):
         if not profile_id:
             return {"code": 400, "message": "profile_id is required"}, 400
 
+        from auth import require_actor_or_admin
+
+        _, error = require_actor_or_admin(profile_id, allow_business=True)
+        if error:
+            return error, error["code"]
+
         tz_name = _request_timezone()
         ledger_limit, ledger_offset = _parse_ledger_pagination(request.args)
 
@@ -177,6 +183,12 @@ class AccountScreenBusiness(Resource):
     def get(self, business_uid):
         if not business_uid:
             return {"code": 400, "message": "business_uid is required"}, 400
+
+        from auth import require_actor_or_admin
+
+        _, error = require_actor_or_admin(business_uid, allow_business=True)
+        if error:
+            return error, error["code"]
 
         tz_name = _request_timezone()
         ledger_limit, ledger_offset = _parse_ledger_pagination(request.args)

@@ -87,6 +87,14 @@ class BusinessServiceOptions(Resource):
                 if not svc_check['result']:
                     return {'message': 'Service not found', 'code': 404}, 404
 
+                from auth import require_owned_business
+
+                _, owner_error = require_owned_business(
+                    svc_check['result'][0].get('bs_business_id')
+                )
+                if owner_error:
+                    return owner_error, owner_error['code']
+
                 # Soft-delete all existing options for this service
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 db.execute(f"""
@@ -164,8 +172,21 @@ class BusinessServiceOptions(Resource):
         print("In BusinessServiceOptions DELETE")
         response = {}
         try:
+            from auth import jwt_auth_required, require_owned_business
+
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             with connect() as db:
+                if jwt_auth_required():
+                    svc_check = db.select(
+                        'every_circle.business_services', where={'bs_uid': bs_uid}
+                    )
+                    if not svc_check.get('result'):
+                        return {'message': 'Service not found', 'code': 404}, 404
+                    _, owner_error = require_owned_business(
+                        svc_check['result'][0].get('bs_business_id')
+                    )
+                    if owner_error:
+                        return owner_error, owner_error['code']
                 db.execute(f"""
                     UPDATE every_circle.business_services_options
                     SET bso_is_active = 0, bso_updated_at = '{now}'

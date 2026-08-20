@@ -60,12 +60,19 @@ class ProfileViews(Resource):
             return response, 500
 
     def post(self):
+        from auth import bind_actor
+
         print("In ProfileViews POST")
         response = {}
         try:
             payload = request.get_json(force=True, silent=True) or {}
             view_profile_id = (payload.get("profile_view_profile_id") or "").strip()
-            view_viewer_id = (payload.get("profile_view_viewer_id") or "").strip()
+            view_viewer_id, actor_error = bind_actor(
+                payload.get("profile_view_viewer_id")
+            )
+            if actor_error:
+                return actor_error, actor_error["code"]
+            view_viewer_id = (view_viewer_id or "").strip()
             print(
                 f"ProfileViews POST received - view_profile_id: {view_profile_id}, view_viewer_id: {view_viewer_id}"
             )

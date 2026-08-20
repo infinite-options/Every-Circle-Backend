@@ -14,6 +14,12 @@ class WalletReconcile(Resource):
         if not profile_id:
             return {"code": 400, "message": "profile_id is required"}, 400
 
+        from auth import require_actor_or_admin
+
+        _, error = require_actor_or_admin(profile_id, allow_business=True)
+        if error:
+            return error, error["code"]
+
         try:
             with connect() as db:
                 result = reconcile_profile_wallet(db, profile_id)
@@ -30,6 +36,12 @@ class WalletReconcileAll(Resource):
     """
 
     def get(self):
+        from auth import require_admin
+
+        _, error = require_admin()
+        if error:
+            return error, error["code"]
+
         try:
             with connect() as db:
                 result = reconcile_all_profile_wallets(db)

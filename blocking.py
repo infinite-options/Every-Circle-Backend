@@ -41,6 +41,12 @@ class BlockedUsers(Resource):
         data = request.get_json(silent=True) or {}
         blocker_uid = data.get("blocker_uid")
         blocked_uid = data.get("blocked_uid")
+        from auth import actor_may_use_uid, get_current_profile_id
+
+        if not blocker_uid:
+            blocker_uid = get_current_profile_id()
+        elif not actor_may_use_uid(blocker_uid):
+            return {"message": "blocker_uid does not match the authenticated user", "code": 403}, 403
         if not blocker_uid or not blocked_uid:
             return {"message": "blocker_uid and blocked_uid are required", "code": 400}, 400
         if blocker_uid == blocked_uid:
@@ -59,6 +65,12 @@ class BlockedUsers(Resource):
         data = request.get_json(silent=True) or {}
         blocker_uid = data.get("blocker_uid")
         blocked_uid = data.get("blocked_uid")
+        from auth import actor_may_use_uid, get_current_profile_id
+
+        if not blocker_uid:
+            blocker_uid = get_current_profile_id()
+        elif not actor_may_use_uid(blocker_uid):
+            return {"message": "blocker_uid does not match the authenticated user", "code": 403}, 403
         if not blocker_uid or not blocked_uid:
             return {"message": "blocker_uid and blocked_uid are required", "code": 400}, 400
 

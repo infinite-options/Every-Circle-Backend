@@ -296,10 +296,16 @@ class Business_v3(Resource):
             payload = request.form.to_dict()
             print(f"Received payload: {payload}")
 
-            if 'user_uid' not in payload:
-                response['message'] = 'user_uid is required'
-                response['code'] = 400
+            from auth import bind_user_uid
+
+            user_uid, error = bind_user_uid(payload.get("user_uid"))
+            if error:
+                return error, error["code"]
+            if not user_uid:
+                response["message"] = "user_uid is required"
+                response["code"] = 400
                 return response, 400
+            payload.pop("user_uid", None)
 
             if 'business_tags' not in payload:
                 response['message'] = 'business_tags list is required'
@@ -317,8 +323,6 @@ class Business_v3(Resource):
                 response['message'] = 'invalid business_tags format'
                 response['code'] = 400
                 return response, 400
-
-            user_uid = payload.pop('user_uid')
 
             with connect() as db:
                 # Check if user exists
@@ -401,6 +405,11 @@ class Business_v3(Resource):
                 return response, 400
 
             business_uid = payload.pop('business_uid')
+            from auth import require_owned_business
+
+            _, owner_error = require_owned_business(business_uid)
+            if owner_error:
+                return owner_error, owner_error["code"]
             key = {'business_uid': business_uid}
 
             # Check for tags update

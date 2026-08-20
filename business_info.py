@@ -718,12 +718,16 @@ class BusinessInfo(Resource):
         try:
             payload = request.form.to_dict()
 
-            if "user_uid" not in payload:
+            from auth import bind_user_uid, jwt_auth_required
+
+            user_uid, error = bind_user_uid(payload.get("user_uid"))
+            if error:
+                return error, error["code"]
+            if not user_uid:
                 response["message"] = "user_uid is required to register a business"
                 response["code"] = 400
                 return response, 400
-
-            user_uid = payload.pop("user_uid")
+            payload.pop("user_uid", None)
 
             with connect() as db:
                 # What do we do with the user info?
@@ -840,9 +844,18 @@ class BusinessInfo(Resource):
                             custom_tags = None
 
                     # Extract business_user fields from payload
-                    business_user_id = payload.pop(
-                        "business_user_id", user_uid
-                    )  # Default to user_uid if not provided
+                    requested_business_user_id = payload.pop("business_user_id", None)
+                    if requested_business_user_id:
+                        from auth import bind_actor
+
+                        _, bu_error = bind_actor(requested_business_user_id)
+                        if bu_error:
+                            return bu_error, bu_error["code"]
+                    business_user_id = (
+                        user_uid
+                        if jwt_auth_required()
+                        else (requested_business_user_id or user_uid)
+                    )
                     business_role = payload.pop("business_role", None)
                     business_uid_param = payload.pop(
                         "business_uid", None
@@ -1119,6 +1132,11 @@ class BusinessInfo(Resource):
                 return response, 400
 
             business_uid = payload.pop("business_uid")
+            from auth import require_owned_business
+
+            _, owner_error = require_owned_business(business_uid)
+            if owner_error:
+                return owner_error, owner_error["code"]
             # Service image (first service only): not business table columns
             print("Popping service_image_0_is_public - PUT")
             service_image_0_is_public = payload.pop(
@@ -1856,6 +1874,12 @@ class BusinessInfo(Resource):
         response = {}
 
         try:
+            from auth import require_owned_business
+
+            _, owner_error = require_owned_business(uid)
+            if owner_error:
+                return owner_error, owner_error["code"]
+
             with connect() as db:
                 business_exists_query = db.select(
                     "every_circle.business", where={"business_uid": uid}
@@ -2487,9 +2511,14 @@ class BusinessInfo(Resource):
     def get_google_places_info(self, place_id, user_uid):
         """Get business information from Google Places API and save to database"""
         try:
+            from auth import bind_user_uid
+
             if not place_id:
                 return {"error": "place_id is required"}, 400
 
+            user_uid, error = bind_user_uid(user_uid)
+            if error:
+                return error, error["code"]
             if not user_uid:
                 return {"error": "user_uid is required"}, 400
 

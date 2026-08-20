@@ -683,8 +683,12 @@ class Conversations(Resource):
     """
 
     def post(self):
+        from auth import bind_actor
+
         data = request.get_json(silent=True) or {}
-        uid_a = data.get("uid_a")
+        uid_a, actor_error = bind_actor(data.get("uid_a"))
+        if actor_error:
+            return actor_error, actor_error["code"]
         uid_b = data.get("uid_b")
 
         if not uid_a or not uid_b:
@@ -879,7 +883,9 @@ class Messages(Resource):
     def get(self, conversation_uid):
         limit = int(request.args.get("limit", 50))
         before = request.args.get("before")
-        viewer_uid = request.args.get("viewer_uid")
+        from auth import get_current_profile_id
+
+        viewer_uid = get_current_profile_id() or request.args.get("viewer_uid")
 
         query = """
             SELECT *
@@ -928,6 +934,13 @@ class Messages(Resource):
         conv_uid = data.get("conversation_uid")
         sender_uid = data.get("sender_uid")
         body = (data.get("body") or "").strip()
+
+        from auth import actor_may_use_uid, get_current_profile_id
+
+        if not sender_uid:
+            sender_uid = get_current_profile_id()
+        elif not actor_may_use_uid(sender_uid):
+            return {"message": "sender_uid does not match the authenticated user", "code": 403}, 403
 
         if not conv_uid or not sender_uid or not body:
             return {
@@ -1013,10 +1026,60 @@ class Messages(Resource):
         }, 200
 
     def put(self, conversation_uid=None):
+        from auth import actor_may_use_uid, bind_actor
+
         data = request.get_json(silent=True) or {}
         message_uid = data.get("message_uid")
         if not message_uid:
             return {"message": "message_uid is required", "code": 400}, 400
+
+        _, actor_error = bind_actor()
+        if actor_error:
+            return actor_error, actor_error["code"]
+
+        conv_uid = conversation_uid
+        if not conv_uid:
+            with connect() as db:
+                msg_row = db.execute(
+                    """
+                    SELECT message_conversation_id
+                    FROM every_circle.messages
+                    WHERE message_uid = %s
+                    LIMIT 1
+                    """,
+                    args=(message_uid,),
+                )
+            rows = (msg_row or {}).get("result") or []
+            if not rows:
+                return {
+                    "message": "No message updated (check message_uid or conversation)",
+                    "code": 404,
+                }, 404
+            conv_uid = rows[0].get("message_conversation_id")
+
+        with connect() as db:
+            conv_row = db.execute(
+                """
+                SELECT participant_a_uid, participant_b_uid
+                FROM every_circle.conversations
+                WHERE conversation_uid = %s
+                LIMIT 1
+                """,
+                args=(conv_uid,),
+            )
+        conv = ((conv_row or {}).get("result") or [{}])[0]
+        participant_uids = [
+            str(conv.get("participant_a_uid") or ""),
+            str(conv.get("participant_b_uid") or ""),
+        ]
+        if not any(
+            uid and actor_may_use_uid(uid, allow_business=True)
+            for uid in participant_uids
+        ):
+            return {
+                "message": "Only a conversation participant may mark messages read",
+                "code": 403,
+            }, 403
 
         read_at = data.get("message_read_at")
         if read_at:
