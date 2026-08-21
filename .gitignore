@@ -9,6 +9,8 @@
 # Backend Specific project files 
 zappa_settings.json
 zappa*
+# Keep the Lambda cryptography helper (otherwise matched by zappa* above)
+!zappa_prebuild.py
 
 # misc
 .DS_Store

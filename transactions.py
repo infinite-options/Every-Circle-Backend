@@ -3134,7 +3134,7 @@ def _finalize_pending_return(
                             prefer_pending = not bounty_was_released_to_useable_at(_db_168, line['original_ti_uid'], utc_now_str())
                             wallet_result = debit_bounty_from_wallet(_db_168, br.get('tb_profile_id'), reversal_abs, prefer_pending=prefer_pending)
                             if wallet_result.get('code') != 200:
-                                print(f'Warning: Failed to debit wallet on return for {br.get('tb_profile_id')}: {wallet_result}')
+                                print(f"Warning: Failed to debit wallet on return for {br.get('tb_profile_id')}: {wallet_result}")
                 if _r__create_return_ledger_166__returned:
                     break
                 return_shipped_qty = int(line.get('return_shipped_qty') or 0)
@@ -3145,7 +3145,7 @@ def _finalize_pending_return(
                     line_trr_uid = (_trr_by_ti_169 or {}).get(line['original_ti_uid'])
                     clawback_result = clawback_seller_proceeds_on_return(_db_168, original_ti_uid=line['original_ti_uid'], return_ti_uid=new_ti_uid, return_qty=claw_qty, transaction_uid=_original_tx_uid_172, trr_uid=line_trr_uid)
                     if clawback_result.get('code') != 200:
-                        print(f'Warning: Failed to claw back seller proceeds on return for {line['original_ti_uid']}: {clawback_result}')
+                        print(f"Warning: Failed to claw back seller proceeds on return for {line['original_ti_uid']}: {clawback_result}")
                     else:
                         total_seller_clawed = round(total_seller_clawed + _to_float(clawback_result.get('clawed')), 4)
                 cancel_adjust_result = None
@@ -3165,9 +3165,9 @@ def _finalize_pending_return(
                     if cancel_clawed > 0:
                         total_seller_clawed = round(total_seller_clawed + cancel_clawed, 4)
                     if cancel_adjust_result and cancel_adjust_result.get('code') != 200:
-                        print(f'Warning: Failed to adjust seller proceeds for cancel on {line['original_ti_uid']}: {cancel_adjust_result}')
+                        print(f"Warning: Failed to adjust seller proceeds for cancel on {line['original_ti_uid']}: {cancel_adjust_result}")
                     elif cancel_hold_result and cancel_hold_result.get('code') not in (None, 200):
-                        print(f'Warning: Failed to finalize cancel clawback hold on {line['original_ti_uid']}: {cancel_hold_result}')
+                        print(f"Warning: Failed to finalize cancel clawback hold on {line['original_ti_uid']}: {cancel_hold_result}")
                 response_lines.append({'original_transaction_item_uid': line['original_ti_uid'], 'new_transaction_item_uid': new_ti_uid, 'return_quantity': rq, 'return_shipped_qty': line.get('return_shipped_qty', 0), 'cancel_unshipped_qty': line.get('cancel_unshipped_qty', 0), 'line_subtotal': line['line_subtotal'], 'line_tax': line['line_tax'], 'line_shipping': line.get('line_shipping', 0), 'seller_proceeds_clawback': clawback_result.get('clawed', 0) if clawback_result else 0})
             if not _r__create_return_ledger_166__returned:
                 wallet_credit_result = None
@@ -6550,7 +6550,7 @@ def _enrich_list_transaction_rows(db, rows):
                 else:
                     order_uid = _sale_row_165.get('transaction_uid')
                     if not order_uid:
-                        print(f'Error: _synthetic_pending_return_row missing sale transaction_uid (trr_uids={[_p_154.get('trr_uid') for _p_154 in pending_reqs]!r})')
+                        print(f"Error: _synthetic_pending_return_row missing sale transaction_uid (trr_uids={[_p_154.get('trr_uid') for _p_154 in pending_reqs]!r})")
                         row = None
                     else:
                         primary = pending_reqs[0]
