@@ -2,6 +2,7 @@ from flask import Response
 from flask_restful import Resource
 import json
 from data_ec import connect
+from profile_status import is_profile_deleted, tombstone_network_fields
 
 ZERO_NODE = '110-000001'
 # System profile linked above the zero node; not a real user (shows as Unknown / 000 in UI).
@@ -140,8 +141,10 @@ def _get_zn_branch_roots(db, circle_member_uids, zero_node=ZERO_NODE):
 
 
 def _map_descendant_row(item):
-    return {
+    is_deleted = is_profile_deleted(item)
+    row = {
         'uid': item['profile_personal_uid'],
+        'is_deleted': is_deleted,
         'profile_personal_referred_by': _visible_referred_by(item.get('profile_personal_referred_by')),
         'profile_personal_first_name': item.get('profile_personal_first_name'),
         'profile_personal_last_name': item.get('profile_personal_last_name'),
@@ -160,11 +163,17 @@ def _map_descendant_row(item):
         'circle_city': item.get('circle_city'),
         'circle_state': item.get('circle_state'),
     }
+    if is_deleted:
+        row.update(tombstone_network_fields(item['profile_personal_uid'], True))
+    return row
 
 
 def _map_ancestor_row(item):
-    return {
-        'uid': item['profile_personal_referred_by'],
+    is_deleted = is_profile_deleted(item)
+    uid = item['profile_personal_referred_by']
+    row = {
+        'uid': uid,
+        'is_deleted': is_deleted,
         'profile_personal_referred_by': _visible_referred_by(item.get('profile_personal_uid')),
         'profile_personal_first_name': item.get('profile_personal_first_name'),
         'profile_personal_last_name': item.get('profile_personal_last_name'),
@@ -183,6 +192,9 @@ def _map_ancestor_row(item):
         'circle_city': item.get('circle_city'),
         'circle_state': item.get('circle_state'),
     }
+    if is_deleted:
+        row.update(tombstone_network_fields(uid, True))
+    return row
 
 
 def _fetch_descendants(db, referrer_uids, target_uid, uid_filter=None):
@@ -208,6 +220,7 @@ def _fetch_descendants(db, referrer_uids, target_uid, uid_filter=None):
             pp.profile_personal_phone_number_is_public,
             pp.profile_personal_tag_line_is_public,
             pp.profile_personal_image_is_public,
+            pp.profile_personal_is_deleted,
             c.*
         FROM profile_personal AS pp
         LEFT JOIN every_circle.circles AS c
@@ -244,6 +257,7 @@ def _fetch_ancestors(db, frontier_uids, target_uid):
             pp_parent.profile_personal_phone_number_is_public,
             pp_parent.profile_personal_tag_line_is_public,
             pp_parent.profile_personal_image_is_public,
+            pp_parent.profile_personal_is_deleted,
             c.*
         FROM profile_personal AS pp
         LEFT JOIN profile_personal AS pp_parent
@@ -304,9 +318,10 @@ def _fetch_neighbors(
 
 
 def _to_response_row(target_uid, item):
-    return {
+    row = {
         "target_uid": target_uid,
         "network_profile_personal_uid": item['uid'],
+        "is_deleted": bool(item.get('is_deleted')),
         "profile_personal_referred_by": _visible_referred_by(item.get('profile_personal_referred_by')),
         "profile_personal_first_name": item.get('profile_personal_first_name'),
         "profile_personal_last_name": item.get('profile_personal_last_name'),
@@ -326,6 +341,7 @@ def _to_response_row(target_uid, item):
         "circle_state": item.get('circle_state'),
         "degree": item['degree'],
     }
+    return row
 
 
 class NetworkPath(Resource):
@@ -367,15 +383,17 @@ class NetworkPath(Resource):
                         continue
 
                     on_essential_path = uid in essential_uids
+                    is_tombstone = bool(item.get('is_deleted'))
                     if not on_essential_path and non_essential_count >= max_nodes:
                         continue
 
                     seen.add(uid)
-                    if not on_essential_path:
+                    if not on_essential_path and not is_tombstone:
                         non_essential_count += 1
                     item['degree'] = current_degree
                     nodes_by_uid[uid] = item
-                    next_frontier.append(uid)
+                    if not is_tombstone:
+                        next_frontier.append(uid)
 
                 frontier = next_frontier
 

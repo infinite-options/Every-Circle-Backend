@@ -4,6 +4,7 @@ from werkzeug.exceptions import BadRequest
 from datetime import datetime
 
 from data_ec import connect
+from profile_status import build_connection_path_nodes
 
 class ConnectionsPath(Resource):
     def get(self, first_uid, second_uid):
@@ -169,7 +170,12 @@ class ConnectionsPath(Resource):
 
             print("Combined path:", combined)
 
-            return {'combined_path': combined}, 200
+            path_nodes = build_connection_path_nodes(db, combined)
+
+            return {
+                'combined_path': combined,
+                'path_nodes': path_nodes,
+            }, 200
 
             # return jsonify({'combined':combined}), 200
 

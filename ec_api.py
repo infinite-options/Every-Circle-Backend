@@ -53,6 +53,7 @@ from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertis
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from order_detail import OrderDetail
+from account_deletion import AccountDelete
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from seller_hold_release import (
@@ -928,6 +929,7 @@ api.add_resource(AuthRefresh, "/api/v1/auth/refresh")
 api.add_resource(AuthSocial, "/api/v1/auth/social")
 api.add_resource(AuthMe, "/api/v1/auth/me")
 api.add_resource(AuthLogout, "/api/v1/auth/logout")
+api.add_resource(AccountDelete, "/api/v1/account")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Business, "/business", "/business/<string:uid>")

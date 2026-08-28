@@ -1,6 +1,7 @@
 from flask_restful import Resource
 from flask import request
 from data_ec import connect
+from profile_status import deleted_profile_sql_clause, is_profile_deleted
 import datetime
 import os
 from dotenv import load_dotenv
@@ -102,6 +103,7 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
                 ON  rc.circle_profile_id        = pp.profile_personal_uid
                 AND rc.circle_related_person_id = %s
             WHERE pp.profile_personal_uid != %s
+              AND COALESCE(pp.profile_personal_is_deleted, 0) = 0
               AND pp.profile_personal_nearby_lat IS NOT NULL
               AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
             HAVING distance_meters < {NEARBY_RADIUS_METERS}
@@ -130,6 +132,7 @@ def _build_share_query(share_with, share_with_types, profile_uid, lat, lng):
             ON  rc.circle_profile_id        = pp.profile_personal_uid
             AND rc.circle_related_person_id = %s
         WHERE c.circle_profile_id = %s
+          AND COALESCE(pp.profile_personal_is_deleted, 0) = 0
           AND pp.profile_personal_nearby_lat IS NOT NULL
           AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
           {rel_filter}
@@ -168,6 +171,7 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
                 ON  mc.circle_profile_id        = %s
                 AND mc.circle_related_person_id = pp.profile_personal_uid
             WHERE pp.profile_personal_uid != %s
+              AND COALESCE(pp.profile_personal_is_deleted, 0) = 0
               AND pp.profile_personal_nearby_lat IS NOT NULL
               AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
               {consent}
@@ -192,6 +196,7 @@ def _build_receive_query(receive_from, receive_from_types, profile_uid, lat, lng
         JOIN every_circle.profile_personal pp
             ON pp.profile_personal_uid = c.circle_related_person_id
         WHERE c.circle_profile_id = %s
+          AND COALESCE(pp.profile_personal_is_deleted, 0) = 0
           AND pp.profile_personal_nearby_lat IS NOT NULL
           AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
           {rel_filter}
@@ -442,7 +447,8 @@ class NearbyUsers(Resource):
                 """
                 SELECT profile_personal_nearby_lat,
                        profile_personal_nearby_lng,
-                       profile_personal_nearby_updated_at
+                       profile_personal_nearby_updated_at,
+                       profile_personal_is_deleted
                 FROM every_circle.profile_personal
                 WHERE profile_personal_uid = %s
                 """,
@@ -450,6 +456,9 @@ class NearbyUsers(Resource):
             )
 
         if not user_resp.get('result'):
+            return {'message': 'User not found', 'code': 404}, 404
+
+        if is_profile_deleted(user_resp['result'][0]):
             return {'message': 'User not found', 'code': 404}, 404
 
         user = user_resp['result'][0]
@@ -541,6 +550,7 @@ class NearbyUsers(Resource):
                     ON  c.circle_related_person_id = pp.profile_personal_uid
                     AND c.circle_profile_id        = %s
                 WHERE pp.profile_personal_nearby_lat IS NOT NULL
+                  AND COALESCE(pp.profile_personal_is_deleted, 0) = 0
                   AND pp.profile_personal_nearby_updated_at > NOW() - INTERVAL {LOCATION_EXPIRY_HOURS} HOUR
                   {rel_filter}
                   {consent_clause}

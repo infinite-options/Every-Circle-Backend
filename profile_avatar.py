@@ -8,6 +8,7 @@ from flask import request
 from flask_restful import Resource
 
 from data_ec import connect
+from profile_status import is_profile_deleted, stub_deleted_profile_row
 
 
 def _escape_uid(uid):
@@ -15,6 +16,18 @@ def _escape_uid(uid):
 
 
 def _row_to_avatar(row):
+    if is_profile_deleted(row):
+        uid = row.get("profile_personal_uid")
+        stub = stub_deleted_profile_row(uid)
+        return {
+            "profile_uid": uid,
+            "first_name": "",
+            "last_name": "",
+            "image_url": "",
+            "image_is_public": False,
+            "is_deleted": True,
+        }
+
     image_is_public = row.get("profile_personal_image_is_public")
     try:
         image_public = int(image_is_public) == 1
@@ -57,7 +70,8 @@ def _fetch_avatars(db, uids):
             profile_personal_first_name,
             profile_personal_last_name,
             profile_personal_image,
-            profile_personal_image_is_public
+            profile_personal_image_is_public,
+            profile_personal_is_deleted
         FROM every_circle.profile_personal
         WHERE profile_personal_uid IN ({placeholders})
         """

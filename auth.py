@@ -117,6 +117,66 @@ def _user_row_by_email(db, email):
     return db.select("every_circle.users", where={"user_email_id": email})
 
 
+def _deleted_account_lookup(db, *, email=None, user_uid=None, social_id=None):
+    """Return True when the identifier matches a prior account deletion."""
+    email = _normalize_email(email) if email else None
+    user_uid = str(user_uid or "").strip() or None
+    social_id = str(social_id or "").strip() or None
+    if not email and not user_uid and not social_id:
+        return False
+
+    conditions = []
+    params = []
+    if email:
+        conditions.append("user_email_id = %s")
+        params.append(email)
+    if user_uid:
+        conditions.append("user_uid = %s")
+        params.append(user_uid)
+    if social_id:
+        conditions.append("user_social_id = %s")
+        params.append(social_id)
+
+    try:
+        res = db.execute(
+            f"""
+            SELECT 1
+            FROM every_circle.account_deletion_log
+            WHERE {' OR '.join(conditions)}
+            LIMIT 1
+            """,
+            tuple(params),
+        )
+        return bool(res.get("result"))
+    except Exception:
+        if not user_uid:
+            return False
+        res = db.execute(
+            """
+            SELECT 1
+            FROM every_circle.account_deletion_log
+            WHERE user_uid = %s
+            LIMIT 1
+            """,
+            (user_uid,),
+        )
+        return bool(res.get("result"))
+
+
+def _login_not_found_response(db, email):
+    if _deleted_account_lookup(db, email=email):
+        return {"message": "Account deleted", "code": 401}, 401
+    return {"message": "Invalid email or password", "code": 401}, 401
+
+
+def _deleted_user_response(db, *, email=None, user_uid=None, social_id=None):
+    if _deleted_account_lookup(
+        db, email=email, user_uid=user_uid, social_id=social_id
+    ):
+        return {"message": "Account deleted", "code": 401}, 401
+    return None
+
+
 def _profile_for_user(db, user_uid):
     result = db.select(
         "every_circle.profile_personal",
@@ -533,6 +593,9 @@ class AuthSalt(Resource):
             with connect() as db:
                 user = _load_user_for_login(db, email)
             if not user or not user.get("user_password_salt"):
+                deleted = _deleted_user_response(db, email=email)
+                if deleted:
+                    return deleted
                 return {"message": "Email is not valid", "code": 404}, 404
             return {
                 "message": "Success",
@@ -557,7 +620,7 @@ class AuthLogin(Resource):
             with connect() as db:
                 user = _load_user_for_login(db, email)
                 if not user:
-                    return {"message": "Invalid email or password", "code": 401}, 401
+                    return _login_not_found_response(db, email)
                 if not verify_password(
                     password,
                     user.get("user_password_salt"),
@@ -634,6 +697,9 @@ class AuthRefresh(Resource):
                 result = db.select("every_circle.users", where={"user_uid": user_uid})
                 rows = (result or {}).get("result") or []
                 if not rows:
+                    deleted = _deleted_user_response(db, user_uid=user_uid)
+                    if deleted:
+                        return deleted
                     return {"message": "User not found", "code": 401}, 401
                 user = rows[0]
                 profile = _profile_for_user(db, user_uid)
@@ -653,6 +719,9 @@ class AuthMe(Resource):
                 result = db.select("every_circle.users", where={"user_uid": user_uid})
                 rows = (result or {}).get("result") or []
                 if not rows:
+                    deleted = _deleted_user_response(db, user_uid=user_uid)
+                    if deleted:
+                        return deleted
                     return {"message": "User not found", "code": 404}, 404
                 user = rows[0]
                 profile = _profile_for_user(db, user_uid)
@@ -775,6 +844,13 @@ class AuthSocial(Resource):
             with connect() as db:
                 user = _find_social_user(db, social.get("email"), social.get("social_id"))
                 if not user:
+                    deleted = _deleted_user_response(
+                        db,
+                        email=social.get("email"),
+                        social_id=social.get("social_id"),
+                    )
+                    if deleted:
+                        return deleted
                     return {
                         "message": "No account for this social login. Sign up first.",
                         "code": 404,

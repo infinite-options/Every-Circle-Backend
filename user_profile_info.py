@@ -14,6 +14,7 @@ from business_info import (
     _truthy_flag,
 )
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
+from profile_status import is_profile_deleted, stub_deleted_profile_row
 from transactions import _parse_limited_quantity
 from moderation import (
     MODERATED_ACKNOWLEDGED,
@@ -414,6 +415,22 @@ def _normalize_record_uid(value):
 
 def _db_write_succeeded(res):
     return bool(res) and res.get("code") == 200
+
+
+def _deleted_profile_get_response(profile_id):
+    """API payload for an anonymized deletion tombstone."""
+    return {
+        "message": "Profile deleted",
+        "code": 200,
+        "personal_info": stub_deleted_profile_row(profile_id),
+        "links_info": [],
+        "experience_info": [],
+        "expertise_info": [],
+        "education_info": [],
+        "wishes_info": [],
+        "ratings_info": [],
+        "business_info": [],
+    }
 
 
 def _viewer_context_from_request(profile_id):
@@ -1346,10 +1363,17 @@ class UserProfileInfo(Resource):
                         response['code'] = 404
                         return response, 404
 
+                    profile_row = profile_response['result'][0]
+                    if is_profile_deleted(profile_row):
+                        return _deleted_profile_get_response(uid), 200
+
                     # print("profile_response: ", profile_response)
                     profile_id = uid
-                    user_uid = profile_response['result'][0]['profile_personal_user_id']
+                    user_uid = profile_row.get('profile_personal_user_id')
                     print("User UID: ", user_uid)
+
+                    if not user_uid:
+                        return _deleted_profile_get_response(profile_id), 200
 
                     # Get Email ID
                     user_response = db.select('every_circle.users', where={'user_uid': user_uid})
@@ -1404,6 +1428,12 @@ class UserProfileInfo(Resource):
                         response['message'] = 'Profile not found for this user'
                         response['code'] = 404
                         return response, 404
+
+                    profile_row = profile_response['result'][0]
+                    if is_profile_deleted(profile_row):
+                        return _deleted_profile_get_response(
+                            profile_row.get('profile_personal_uid')
+                        ), 200
 
                     # print("profile_response: ", profile_response)
                     # print("profile_response: ", profile_response['result'][0])
