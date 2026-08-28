@@ -1,6 +1,6 @@
 # EVERY CIRCLE BACKEND PYTHON FILE
 # https://o7t5ikn907.execute-api.us-west-1.amazonaws.com/dev /<enter_endpoint_details>
-# No production endpoint yet
+# https://ml7xmrvue6.execute-api.us-west-1.amazonaws.com/production /<enter_endpoint_details>
 
 
 # To run program:  python3 ec_api.py
@@ -122,88 +122,9 @@ from werkzeug.datastructures import ImmutableMultiDict
 # used for serializer email and error handling
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
-# from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-# from cryptography.hazmat.primitives.padding import PKCS7
-# from cryptography.hazmat.backends import default_backend
-import json
-import base64
 import googlemaps
 
-# import awsgi
-# def lambda_handler(event, context):
-#    return awsgi.response(app, event, context, base64_content_types={"image/png"})
-
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
-
-# == Using Cryptography library for AES encryption ==
-
-# load_dotenv()
-# AES_SECRET_KEY = os.getenv('AES_SECRET_KEY')
-# # print("AES Secret Key: ", AES_SECRET_KEY)
-# AES_KEY = AES_SECRET_KEY.encode('utf-8')
-# BLOCK_SIZE = int(os.getenv('BLOCK_SIZE'))
-# # print("Block Size: ", BLOCK_SIZE)
-# POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
-# # print("POSTMAN_SECRET: ", POSTMAN_SECRET)
-# OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
-# print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
-
-
-# Encrypt dictionary - Currently commented
-# def encrypt_dict(data_dict):
-#     try:
-#         print("In encrypt_dict: ", data_dict)
-#         # Convert dictionary to JSON string
-#         json_data = json.dumps(data_dict).encode()
-
-#         # Pad the JSON data
-#         padder = PKCS7(BLOCK_SIZE * 8).padder()
-#         padded_data = padder.update(json_data) + padder.finalize()
-
-#         # Generate a random initialization vector (IV)
-#         iv = os.urandom(BLOCK_SIZE)
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         encryptor = cipher.encryptor()
-
-#         # Encrypt the padded data
-#         encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-
-#         # Combine IV and encrypted data, then Base64 encode
-#         encrypted_blob = base64.b64encode(iv + encrypted_data).decode()
-#         return encrypted_blob
-#     except Exception as e:
-#         print(f"Encryption error: {e}")
-#         return None
-
-# Decrypt dictionary - Currently commented
-# def decrypt_dict(encrypted_blob):
-#     print("Actual decryption started")
-#     try:
-#         # Base64 decode the encrypted blob
-#         encrypted_data = base64.b64decode(encrypted_blob)
-
-#         # Extract the IV (first BLOCK_SIZE bytes) and the encrypted content
-#         iv = encrypted_data[:BLOCK_SIZE]
-#         encrypted_content = encrypted_data[BLOCK_SIZE:]
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         decryptor = cipher.decryptor()
-
-#         # Decrypt the encrypted content
-#         decrypted_padded_data = decryptor.update(encrypted_content) + decryptor.finalize()
-
-#         # Unpad the decrypted content
-#         unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
-#         decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-
-#         # Convert the JSON string back to a dictionary
-#         return json.loads(decrypted_data.decode())
-#     except Exception as e:
-#         print(f"Decryption error: {e}")
-#         return None
 
 def encrypt_response(data):
     json_str = json.dumps(data)
@@ -291,50 +212,6 @@ class DecryptingRequest(FlaskRequest):
                 print(f"Request decryption error: {e}")
         return data
 
-# Middleware — wraps every response with encryption
-# @app.after_request
-# def encrypt_all_responses(response):
-#     if response.content_type == "application/json":
-#         try:
-#             data = response.get_json()
-#             if data is not None:
-#                 encrypted = encrypt_response(data)
-#                 response.data = json.dumps(encrypted)
-#                 response.content_type = "application/json"
-#         except Exception as e:
-#             print(f"Response encryption error: {e}")
-#     return response
-
-# @app.before_request
-# def decrypt_all_requests():
-#     if request.content_type == "application/json":
-#         try:
-#             payload = request.get_json(silent=True)
-#             if payload and payload.get("encrypted") and payload.get("data"):
-#                 decrypted_str = decrypt_data(payload["data"])
-#                 decrypted = json.loads(decrypted_str)
-#                 # Store decrypted data so endpoints can access it
-#                 request._decrypted_json = decrypted
-#         except Exception as e:
-#             print(f"Request decryption error: {e}")
-
-
-
-# NEED to figure out where the NotFound or InternalServerError is displayed
-# from werkzeug.exceptions import BadRequest, InternalServerError
-
-#  NEED TO SOLVE THIS
-# from NotificationHub import Notification
-# from NotificationHub import NotificationHub
-
-# BING API KEY
-# Import Bing API key into bing_api_key.py
-
-#  NEED TO SOLVE THIS
-# from env_keys import BING_API_KEY, RDS_PW
-
-
-
 
 app = Flask(__name__)
 app.request_class = DecryptingRequest
@@ -377,8 +254,9 @@ register_request_logging(app)
 
 CORS(app)
 
-# Set this to false when deploying to live application
-app.config['DEBUG'] = True
+# DEBUG_FLAG env var (default true for local dev). Set false in production.
+app.config["DEBUG"] = os.getenv("DEBUG_FLAG", "true").strip().lower() == "true"
+
 
 # Setup the Flask-JWT-Extended extension
 app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
@@ -434,11 +312,6 @@ app.config["MAIL_PORT"] = 587
 
 app.config["MAIL_USE_TLS"] = True
 app.config["MAIL_USE_SSL"] = False
-
-
-# Set this to false when deploying to live application
-app.config["DEBUG"] = True
-# app.config["DEBUG"] = False
 
 # MAIL  -- This statement has to be below the Mail Variables
 mail = Mail(app)
@@ -1057,7 +930,7 @@ def decode():
         decrypted = decrypt_dict(encrypted_data)
         if decrypted is None:
             return jsonify({
-                'error': 'Decryption failed — verify AES_SECRET_KEY matches the environment that encrypted this data',
+                'error': 'Decryption failed — verify ENCRYPTION_KEY matches the environment that encrypted this data',
                 'decode': None,
             }), 400
         return jsonify({'decode': decrypted})
