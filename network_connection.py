@@ -388,12 +388,14 @@ class NetworkPath(Resource):
                         continue
 
                     seen.add(uid)
+                    # Tombstones stay in the graph (greyed) but do not count toward the 200 cap.
                     if not on_essential_path and not is_tombstone:
                         non_essential_count += 1
                     item['degree'] = current_degree
                     nodes_by_uid[uid] = item
-                    if not is_tombstone:
-                        next_frontier.append(uid)
+                    # Always expand through tombstones so referral-tree descendants remain
+                    # visible past deleted accounts (tombstone itself stays is_deleted).
+                    next_frontier.append(uid)
 
                 frontier = next_frontier
 
