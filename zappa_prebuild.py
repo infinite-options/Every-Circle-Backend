@@ -30,7 +30,7 @@ CRYPTO_RESTORE_HINT = """
 cryptography native extensions failed to load (wrong OS wheel).
 
 If this is your Mac after `zappa update`, restore local wheels:
-  pip install --force-reinstall 'cryptography==41.0.7' 'cffi==1.17.1'
+  pip3 install --force-reinstall 'cryptography==41.0.7' 'cffi==1.17.1'
 
 If this is AWS Lambda, redeploy so zappa_prebuild.install_lambda_crypto
 packages manylinux x86_64 wheels (python3.10).
