@@ -83,3 +83,32 @@ TRUNCATE TABLE every_circle.transactions_items;
 -- Parent orders (includes sale + return transaction rows)
 TRUNCATE TABLE every_circle.transactions;
 SET FOREIGN_KEY_CHECKS = 1;
+
+SEEKING ALLOCATION
+BUYER is the one who posted the Seeking ad (the one paying the unit cost _ qty)
+SELLER is the one who will provide the product or service (the one receiving the unit cost _ qty)
+RECOMMENDER is the one who put the Seller and Buyer in touch with each other
+
+There are two scenarios:
+
+1.  The Recommender is the Seller
+2.  The Recommender is NOT the Seller
+
+3.  The Recommender is the Seller
+    a. Recommender/Seller gets 40%
+    b. The Nodes between the Recommender and the BUYER (excluding the Recommender and the BUYER) get 40% with a maximum 20% per node. Any excess goes to Charity
+    c. Every Circle gets 20%
+
+    EXAMPLED: B - N1 - N2 - N3 - R/S
+
+4.  The Recommender is NOT the Seller
+    a. Recommender gets 40%
+    b. The Nodes between the Recommender and the BUYER (excluding the Recommender and the BUYER) get 40% with a maximum 20% per node. Any excess goes to Charity. NOTE: This may include the Seller depending on how the network is connected.  
+    c. Every Circle gets 20%
+
+    EXAMPLE
+    B - N1 - N2 - N3 - R S does not get any of the bounty
+    B - N1 - S - N3 - R S is in the chain so gets part of the bounty
+
+FULFILLMENT CSV FILES
+For scenarios of how order-return-cancel are handled, see fulfillment_states.csv and fulfillment_fix_status.csv

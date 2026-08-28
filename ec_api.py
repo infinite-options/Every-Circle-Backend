@@ -17,8 +17,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# from zappa_prebuild import exit_if_crypto_broken
-# exit_if_crypto_broken()
+from zappa_prebuild import exit_if_crypto_broken
+exit_if_crypto_broken()
 
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
@@ -422,19 +422,19 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 app.config['MAIL_USERNAME'] = os.getenv('SUPPORT_EMAIL')
 app.config['MAIL_PASSWORD'] = os.getenv('SUPPORT_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
-# print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
+print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
 
 
 # Setting for mydomain.com
-app.config["MAIL_SERVER"] = "smtp.mydomain.com"
-app.config["MAIL_PORT"] = 465
+app.config["MAIL_SERVER"] = "smtp.office365.com"
+app.config["MAIL_PORT"] = 587
 
 # Setting for gmail
 # app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 # app.config['MAIL_PORT'] = 465
 
-app.config["MAIL_USE_TLS"] = False
-app.config["MAIL_USE_SSL"] = True
+app.config["MAIL_USE_TLS"] = True
+app.config["MAIL_USE_SSL"] = False
 
 
 # Set this to false when deploying to live application
@@ -531,76 +531,54 @@ else:
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
 def sendEmail(recipient, subject, body):
+    print('in sendEmail')
+    print('Confirming correct function call')
+    print('recipient received', recipient)
+    # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
+    if isinstance(recipient, str):
+        recipient = [recipient]
+    print(recipient)
+    print(subject)
+    print(body)
     with app.app_context():
-        print("In sendEmail: ", recipient, subject, body)
-        sender="support@manifestmy.space"
-        print("sender: ", sender)
         msg = Message(
-            sender=sender,
-            recipients=[recipient],
+            sender="support@everycircle.com",
+            recipients=recipient,
             subject=subject,
             body=body
         )
-        print("sender: ", sender)
-        # print("Email message: ", msg)
         mail.send(msg)
-        # print("email sent")
+        print('after mail send')
 
-# app.sendEmail = sendEmail
 
-    
+app.sendEmail = sendEmail
+
+
 class SendEmail(Resource):
+    def __call__(self):
+        print("In SendEmail")
+
     def post(self):
-        payload = request.get_json()
-        print(payload)
-
-        # Check if each field in the payload is not null
-        if all(field is not None for field in payload.values()):
-            sendEmail(payload["receiver"], payload["email_subject"], payload["email_body"])
-            return "Email Sent"
-        else:
-            return "Some fields are missing in the payload", 400
-
-
-class SendEmail_CLASS(Resource):
-    def get(self):
-        print("In Send EMail CRON get")
+        print("In Send EMail post")
         try:
-            conn = connect()
-
-            recipient = "pmarathay@gmail.com"
-            subject = "MySpace CRON Jobs Completed"
-            body = "The Following CRON Jobs Ran:"
-            # mail.send(msg)
-            sendEmail(recipient, subject, body)
-
+            data = request.get_json(force=True)
+            print(data)
+            email = data["email"]
+            body = ("Test from everyCircle")
+            # body = (
+            #     "Hi !\n\n"
+            #     "We are looking forward to meeting with you! \n"
+            #     "Email support@nityaayurveda.com if you need to get in touch with us directly.\n"
+            #     "Thank you - Nitya Ayurveda\n\n"
+            # )
+            sendEmail([email], "Thanks for your Note!", body)
             return "Email Sent", 200
 
-        except:
-            raise BadRequest("Request failed, please try again later.")
-        finally:
-            print("exit SendEmail")
+        except Exception:
+            raise BadRequest("Request failed mail, please try again later.")
 
 
-def SendEmail_CRON(self):
-        print("In Send EMail CRON get")
-        try:
-            conn = connect()
-
-            recipient = "pmarathay@gmail.com"
-            subject = "MySpace CRON Jobs Completed"
-            body = "The Following CRON Jobs Ran:"
-            # mail.send(msg)
-            sendEmail(recipient, subject, body)
-
-            return "Email Sent", 200
-
-        except:
-            raise BadRequest("Request failed, please try again later.")
-        finally:
-            print("exit SendEmail")
-
-
+# -- Send SMS Endpoints start here -------------------------------------------------------------------------------
 def Send_Twilio_SMS(message, phone_number):
     # print("In Twilio: ", message, phone_number)
     items = {}
@@ -1032,6 +1010,9 @@ api.add_resource(
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
+
+
+api.add_resource(SendEmail, "/api/v1/sendEmail")
 
 
 class GooglePlacesInfo(Resource):
