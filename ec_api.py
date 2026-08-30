@@ -478,7 +478,7 @@ def Send_Twilio_SMS(message, phone_number):
 class stripe_key(Resource):
     def get(self, desc):
         print(desc)
-        if desc == "ECTEST":
+        if desc and str(desc).strip().upper() == "ECTEST":
             return {"publicKey": stripe_public_test_key}
         else:
             return {"publicKey": stripe_public_live_key}

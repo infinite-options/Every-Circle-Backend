@@ -2565,6 +2565,28 @@ def _estimated_refund_api_payload(refund_meta, *, compact=False):
 
 
 
+TRANSACTION_BUYER_NOTE_MAX_LEN = 500
+
+
+def _normalize_transaction_buyer_note(raw):
+    """
+    Trim optional buyer checkout note. Returns None when omitted/blank.
+    Raises ValueError when trimmed length exceeds TRANSACTION_BUYER_NOTE_MAX_LEN.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raw = str(raw)
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if len(trimmed) > TRANSACTION_BUYER_NOTE_MAX_LEN:
+        raise ValueError(
+            f"transaction_buyer_note must be at most {TRANSACTION_BUYER_NOTE_MAX_LEN} characters"
+        )
+    return trimmed
+
+
 def _normalize_stripe_payment_intent_id(raw):
     """
     Accept a PaymentIntent id (pi_…) or a client secret (pi_…_secret_…).
@@ -3935,6 +3957,7 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                     t.transaction_in_escrow,
                     t.transaction_return_requested,
                     t.transaction_return_note,
+                    t.transaction_buyer_note,
                     t.transaction_business_id AS seller_id,
                     CASE
                         WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
@@ -4163,6 +4186,18 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
 
+            if "transaction_buyer_note" in payload:
+                try:
+                    buyer_note = _normalize_transaction_buyer_note(
+                        payload.get("transaction_buyer_note")
+                    )
+                except ValueError as note_err:
+                    response["message"] = str(note_err)
+                    response["code"] = 400
+                    return response, 400
+            else:
+                buyer_note = None
+
             # Extract required fields from payload
             transaction = {
                 "transaction_profile_id": payload.get("profile_id"),
@@ -4179,6 +4214,8 @@ class Transactions(Resource):
                 ),
                 "transaction_type": "sale",
             }
+            if buyer_note is not None:
+                transaction["transaction_buyer_note"] = buyer_note
 
             with connect() as db:
                 if stripe_pi:
@@ -5143,6 +5180,8 @@ class Transactions(Resource):
                 response["message"] = "Transaction completed successfully"
                 response["code"] = 200
                 response["schema_version"] = 3
+                if buyer_note is not None:
+                    response["transaction_buyer_note"] = buyer_note
                 purchase_row = None
                 try:
                     from account_screen_v3 import build_buyer_purchase_row_v3
@@ -6718,6 +6757,7 @@ class SellerTransactions(Resource):
                         t.transaction_in_escrow,
                         t.transaction_return_requested,
                         t.transaction_return_note,
+                        t.transaction_buyer_note,
                         
                         -- ti.*,
                         CASE

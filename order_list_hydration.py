@@ -8,6 +8,7 @@ _SALE_HEADER_KEYS = frozenset(
         "transaction_uid",
         "transaction_return_requested",
         "transaction_return_note",
+        "transaction_buyer_note",
         "fulfillment_status",
         "shipping_status",
         "unshipped_item_count",
@@ -126,6 +127,7 @@ _TOP_KEYS = frozenset(
         "transaction_return_items",
         "transaction_return_requested",
         "transaction_return_note",
+        "transaction_buyer_note",
     }
 )
 
