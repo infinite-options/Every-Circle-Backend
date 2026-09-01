@@ -552,6 +552,18 @@ class BusinessInfo(Resource):
 
                 business_data = business_query["result"][0]
 
+                # Owner-removed business (soft delete): inactive and not under
+                # moderation. Hidden from everyone, including the owner. A
+                # moderation take-down also sets business_is_active = 0 but keeps
+                # business_moderated set, and must still be returned so the owner
+                # sees the moderation banner.
+                _is_active = business_data.get("business_is_active")
+                _moderated = int(business_data.get("business_moderated") or 0)
+                if (_is_active == 0 or _is_active == "0") and _moderated == 0:
+                    response["message"] = f"No business found for {uid}"
+                    response["code"] = 404
+                    return response, 404
+
                 # Get all business_user records for this business with user email and profile information
                 business_users_query = f"""
                     SELECT bu.*, 
@@ -1200,7 +1212,21 @@ class BusinessInfo(Resource):
                         existing_record = business_user_query["result"][0]
                         existing_role = existing_record.get("bu_role")
 
-                        if existing_role != business_role:
+                        _senior = {"owner", "partner"}
+                        _cur = str(existing_role or "").strip().lower()
+                        _new = str(business_role or "").strip().lower()
+
+                        if existing_role != business_role and (
+                            _cur in _senior or _new in _senior
+                        ):
+                            # Owner/partner roles are protected: a member cannot
+                            # change their own role to/from owner or partner here.
+                            print(
+                                f"Blocked self business_role change '{existing_role}' -> "
+                                f"'{business_role}' for user {business_user_id} on business "
+                                f"{business_uid} (owner/partner is protected)"
+                            )
+                        elif existing_role != business_role:
                             # Role is different, update it
                             bu_uid = existing_record["bu_uid"]
                             db.update(
@@ -1281,6 +1307,7 @@ class BusinessInfo(Resource):
                         additional_business_user,
                         additional_business_role,
                         exclude_user_id=exclude_id,
+                        actor_user_id=(business_user_id or service_user_id),
                     )
 
                 # Handle business_users_individual_public: update bu_individual_business_is_public per user
@@ -1873,7 +1900,15 @@ class BusinessInfo(Resource):
             return response, 500
 
     def delete(self, uid):
-        print(f"In Business DELETE with uid: {uid}")
+        """Owner-initiated 'delete': soft-remove the business.
+
+        The row and all its related data (services, links, categories,
+        memberships) are kept in the database. We only clear
+        ``business_is_active`` so the business drops out of search, the map, the
+        owners' profiles, and the business/edit-business screens (its GET 404s).
+        This is intentionally NOT a hard delete.
+        """
+        print(f"In Business DELETE (soft) with uid: {uid}")
         response = {}
 
         try:
@@ -1883,7 +1918,7 @@ class BusinessInfo(Resource):
             if owner_error:
                 return owner_error, owner_error["code"]
 
-            # Only a member whose role is "owner" may delete the business outright.
+            # Only a member whose role is "owner" may remove the business.
             acting_user_uid, actor_error = bind_user_uid(request.args.get("user_uid"))
             if actor_error:
                 return actor_error, actor_error["code"]
@@ -1917,35 +1952,15 @@ class BusinessInfo(Resource):
                         response["code"] = 403
                         return response, 403
 
-                # Delete business services
-                db.delete(
-                    f"""DELETE FROM every_circle.business_services
-                              WHERE bs_business_id = "{uid}";"""
-                )
-
-                db.delete(
-                    f"""DELETE FROM every_circle.business_link
-                              WHERE business_link_business_id = "{uid}";"""
-                )
-
-                db.delete(
-                    f"""DELETE FROM every_circle.business_category
-                              WHERE bc_business_id = "{uid}";"""
-                )
-
-                # Remove every user's membership so it drops off their profiles.
-                db.delete(
-                    f"""DELETE FROM every_circle.business_user
-                              WHERE bu_business_id = "{uid}";"""
-                )
-
-                db.delete(
-                    f"""DELETE FROM every_circle.business
-                              WHERE business_uid = "{uid}";"""
+                # Soft delete: keep every row, just deactivate the business.
+                db.update(
+                    "every_circle.business",
+                    {"business_uid": uid},
+                    {"business_is_active": 0},
                 )
 
                 response = {
-                    "message": "Business and associated data deleted successfully",
+                    "message": "Business removed from your profile and search (data retained)",
                     "code": 200,
                 }
 
@@ -2145,6 +2160,7 @@ class BusinessInfo(Resource):
         additional_business_user,
         additional_business_role,
         exclude_user_id=None,
+        actor_user_id=None,
     ):
         """
         Handle additional business users from email arrays.
@@ -2153,12 +2169,21 @@ class BusinessInfo(Resource):
         - Insert new records if they don't exist
         - Delete records that exist in DB but not in the new arrays (excluding exclude_user_id)
 
+        Permission rules (only owner/partner may change roles; owner/partner rows
+        are protected from edits — symmetric between owners and partners):
+        - ``actor_user_id`` must resolve to an ``owner`` or ``partner`` membership
+          for any role change / new member / deletion to take effect.
+        - A member whose current role is ``owner`` or ``partner`` cannot have that
+          role changed here (a promotion of a lower-role member to owner/partner
+          is still allowed).
+
         Args:
             db: Database connection
             business_uid: Business UID
             additional_business_user: List of email addresses
             additional_business_role: List of roles (must match length of additional_business_user)
             exclude_user_id: User ID to exclude from deletion (typically the primary business_user_id)
+            actor_user_id: users.user_uid of the caller, used to enforce the rules above
         """
         summary = {
             "added": [],
@@ -2166,7 +2191,10 @@ class BusinessInfo(Resource):
             "unchanged": [],
             "not_found": [],
             "deleted": [],
+            "protected": [],
+            "forbidden": [],
         }
+        senior_roles = {"owner", "partner"}
         try:
             # Parse the arrays if they're strings
             if isinstance(additional_business_user, str):
@@ -2193,6 +2221,12 @@ class BusinessInfo(Resource):
             if existing_records_query["result"]:
                 for record in existing_records_query["result"]:
                     existing_records[record["bu_user_id"]] = record
+
+            # Resolve the caller's own role on this business to enforce who may edit.
+            actor_role = ""
+            if actor_user_id and actor_user_id in existing_records:
+                actor_role = str(existing_records[actor_user_id].get("bu_role") or "").strip().lower()
+            actor_is_editor = actor_role in senior_roles
 
             # Track which user_ids we're processing (to identify deletions later)
             processed_user_ids = set()
@@ -2230,22 +2264,44 @@ class BusinessInfo(Resource):
                     existing_role = existing_record.get("bu_role")
 
                     if existing_role != role:
-                        # Role changed, update it
-                        bu_uid = existing_record["bu_uid"]
-                        db.update(
-                            "every_circle.business_user",
-                            {"bu_uid": bu_uid},
-                            {"bu_role": role},
-                        )
-                        summary["updated"].append(email)
-                        print(
-                            f"Updated business_user role from '{existing_role}' to '{role}' for business {business_uid}, user {user_id} (email: {email})"
-                        )
+                        existing_role_l = str(existing_role or "").strip().lower()
+                        if existing_role_l in senior_roles:
+                            # An owner/partner's role is protected from edits here.
+                            summary["protected"].append(email)
+                            print(
+                                f"Blocked role change for '{email}' on business {business_uid}: "
+                                f"current role '{existing_role}' is owner/partner (protected)"
+                            )
+                        elif not actor_is_editor:
+                            # Only an owner/partner may change roles.
+                            summary["forbidden"].append(email)
+                            print(
+                                f"Blocked role change for '{email}' on business {business_uid}: "
+                                f"caller role '{actor_role or 'none'}' is not owner/partner"
+                            )
+                        else:
+                            bu_uid = existing_record["bu_uid"]
+                            db.update(
+                                "every_circle.business_user",
+                                {"bu_uid": bu_uid},
+                                {"bu_role": role},
+                            )
+                            summary["updated"].append(email)
+                            print(
+                                f"Updated business_user role from '{existing_role}' to '{role}' for business {business_uid}, user {user_id} (email: {email})"
+                            )
                     else:
                         summary["unchanged"].append(email)
                         print(
                             f"Business_user role unchanged: '{role}' for business {business_uid}, user {user_id} (email: {email})"
                         )
+                elif not actor_is_editor:
+                    # Only an owner/partner may add members.
+                    summary["forbidden"].append(email)
+                    print(
+                        f"Blocked new member '{email}' on business {business_uid}: "
+                        f"caller role '{actor_role or 'none'}' is not owner/partner"
+                    )
                 else:
                     # Record doesn't exist - insert new one
                     try:
@@ -2275,10 +2331,12 @@ class BusinessInfo(Resource):
                         )
                         traceback.print_exc()
 
-            # Delete records that exist in DB but not in the new arrays (excluding exclude_user_id)
+            # Delete records that exist in DB but not in the new arrays (excluding exclude_user_id).
+            # Only an owner/partner may remove members this way.
             for existing_user_id, existing_record in existing_records.items():
                 if (
-                    existing_user_id not in processed_user_ids
+                    actor_is_editor
+                    and existing_user_id not in processed_user_ids
                     and existing_user_id != exclude_user_id
                 ):
                     # This record exists in DB but wasn't in the new arrays - delete it (unless it's the excluded user)

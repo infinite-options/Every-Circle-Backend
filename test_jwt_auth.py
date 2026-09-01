@@ -789,7 +789,7 @@ class BusinessActorBindingTests(unittest.TestCase):
         self.assertIn("owner", res.get_json().get("message", "").lower())
         db.delete.assert_not_called()
 
-    def test_delete_businessinfo_owner_role_deletes(self):
+    def test_delete_businessinfo_owner_role_soft_deletes(self):
         db = _mock_db({"business_uid": "200-owned"})
         db.execute.return_value = {"result": [{"bu_role": "owner"}]}
         with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(
@@ -800,7 +800,11 @@ class BusinessActorBindingTests(unittest.TestCase):
                 headers=self._alice_headers(),
             )
         self.assertEqual(res.status_code, 200)
-        db.delete.assert_called()
+        # Soft delete: the row is kept, only deactivated.
+        db.delete.assert_not_called()
+        db.update.assert_called_once_with(
+            "every_circle.business", {"business_uid": "200-owned"}, {"business_is_active": 0}
+        )
 
     def test_post_business_flag_on_mismatched_user_uid_is_403(self):
         db = _mock_db()
