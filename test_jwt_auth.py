@@ -775,6 +775,33 @@ class BusinessActorBindingTests(unittest.TestCase):
         self.assertEqual(res.status_code, 403)
         db.delete.assert_not_called()
 
+    def test_delete_businessinfo_member_but_not_owner_is_403(self):
+        db = _mock_db({"business_uid": "200-owned"})
+        db.execute.return_value = {"result": [{"bu_role": "manager"}]}
+        with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(
+            "auth._user_owns_business", return_value=True
+        ), patch("business_info.connect", return_value=db):
+            res = self.client.delete(
+                "/api/v1/businessinfo/200-owned",
+                headers=self._alice_headers(),
+            )
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("owner", res.get_json().get("message", "").lower())
+        db.delete.assert_not_called()
+
+    def test_delete_businessinfo_owner_role_deletes(self):
+        db = _mock_db({"business_uid": "200-owned"})
+        db.execute.return_value = {"result": [{"bu_role": "owner"}]}
+        with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(
+            "auth._user_owns_business", return_value=True
+        ), patch("business_info.connect", return_value=db):
+            res = self.client.delete(
+                "/api/v1/businessinfo/200-owned",
+                headers=self._alice_headers(),
+            )
+        self.assertEqual(res.status_code, 200)
+        db.delete.assert_called()
+
     def test_post_business_flag_on_mismatched_user_uid_is_403(self):
         db = _mock_db()
         with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(

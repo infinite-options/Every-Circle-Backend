@@ -1269,12 +1269,13 @@ class BusinessInfo(Resource):
                 # Handle additional business users if provided
                 additional_business_user = payload.pop("additional_business_user", None)
                 additional_business_role = payload.pop("additional_business_role", None)
+                business_users_summary = None
                 if additional_business_user and additional_business_role:
                     # Exclude the primary business_user_id from deletion
                     exclude_id = (
                         business_user_id if business_user_id else service_user_id
                     )
-                    self._handle_additional_business_users(
+                    business_users_summary = self._handle_additional_business_users(
                         db,
                         business_uid,
                         additional_business_user,
@@ -1859,6 +1860,8 @@ class BusinessInfo(Resource):
                 }
                 if service_update_errors:
                     response["service_update_errors"] = service_update_errors
+                if business_users_summary is not None:
+                    response["business_users"] = business_users_summary
 
                 return response, 200
 
@@ -1874,11 +1877,16 @@ class BusinessInfo(Resource):
         response = {}
 
         try:
-            from auth import require_owned_business
+            from auth import require_owned_business, bind_user_uid
 
             _, owner_error = require_owned_business(uid)
             if owner_error:
                 return owner_error, owner_error["code"]
+
+            # Only a member whose role is "owner" may delete the business outright.
+            acting_user_uid, actor_error = bind_user_uid(request.args.get("user_uid"))
+            if actor_error:
+                return actor_error, actor_error["code"]
 
             with connect() as db:
                 business_exists_query = db.select(
@@ -1889,24 +1897,50 @@ class BusinessInfo(Resource):
                     response["code"] = 404
                     return response, 404
 
+                if acting_user_uid:
+                    role_query = db.execute(
+                        """
+                        SELECT bu_role
+                        FROM every_circle.business_user
+                        WHERE bu_business_id = %s AND bu_user_id = %s
+                        """,
+                        (str(uid), str(acting_user_uid)),
+                    )
+                    member_roles = [
+                        str(row.get("bu_role") or "").strip().lower()
+                        for row in (role_query.get("result") or [])
+                    ]
+                    if "owner" not in member_roles:
+                        response["message"] = (
+                            "Only the business owner can delete this business"
+                        )
+                        response["code"] = 403
+                        return response, 403
+
                 # Delete business services
                 db.delete(
-                    f"""DELETE FROM every_circle.business_services 
+                    f"""DELETE FROM every_circle.business_services
                               WHERE bs_business_id = "{uid}";"""
                 )
 
                 db.delete(
-                    f"""DELETE FROM every_circle.business_link 
+                    f"""DELETE FROM every_circle.business_link
                               WHERE business_link_business_id = "{uid}";"""
                 )
 
                 db.delete(
-                    f"""DELETE FROM every_circle.business_category 
+                    f"""DELETE FROM every_circle.business_category
                               WHERE bc_business_id = "{uid}";"""
                 )
 
+                # Remove every user's membership so it drops off their profiles.
                 db.delete(
-                    f"""DELETE FROM every_circle.business 
+                    f"""DELETE FROM every_circle.business_user
+                              WHERE bu_business_id = "{uid}";"""
+                )
+
+                db.delete(
+                    f"""DELETE FROM every_circle.business
                               WHERE business_uid = "{uid}";"""
                 )
 
@@ -2126,6 +2160,13 @@ class BusinessInfo(Resource):
             additional_business_role: List of roles (must match length of additional_business_user)
             exclude_user_id: User ID to exclude from deletion (typically the primary business_user_id)
         """
+        summary = {
+            "added": [],
+            "updated": [],
+            "unchanged": [],
+            "not_found": [],
+            "deleted": [],
+        }
         try:
             # Parse the arrays if they're strings
             if isinstance(additional_business_user, str):
@@ -2133,12 +2174,16 @@ class BusinessInfo(Resource):
             if isinstance(additional_business_role, str):
                 additional_business_role = ast.literal_eval(additional_business_role)
 
-            # Validate arrays have same length
+            # Validate arrays have same length. `zip` below already stops at the
+            # shorter one, so keep going (and report it) rather than dropping the
+            # whole update silently.
             if len(additional_business_user) != len(additional_business_role):
                 print(
-                    f"Error: additional_business_user and additional_business_role arrays must have same length"
+                    f"Warning: additional_business_user ({len(additional_business_user)}) and "
+                    f"additional_business_role ({len(additional_business_role)}) length mismatch; "
+                    f"processing the overlapping entries only"
                 )
-                return
+                summary["length_mismatch"] = True
 
             # Get all existing business_user records for this business
             existing_records_query = db.select(
@@ -2167,6 +2212,7 @@ class BusinessInfo(Resource):
                 )
                 if not user_query["result"]:
                     print(f"Warning: User with email '{email}' not found, skipping")
+                    summary["not_found"].append(email)
                     continue
 
                 user_id = user_query["result"][0]["user_uid"]
@@ -2191,10 +2237,12 @@ class BusinessInfo(Resource):
                             {"bu_uid": bu_uid},
                             {"bu_role": role},
                         )
+                        summary["updated"].append(email)
                         print(
                             f"Updated business_user role from '{existing_role}' to '{role}' for business {business_uid}, user {user_id} (email: {email})"
                         )
                     else:
+                        summary["unchanged"].append(email)
                         print(
                             f"Business_user role unchanged: '{role}' for business {business_uid}, user {user_id} (email: {email})"
                         )
@@ -2217,6 +2265,7 @@ class BusinessInfo(Resource):
                             "bu_role": role,
                         }
                         db.insert("every_circle.business_user", business_user_payload)
+                        summary["added"].append(email)
                         print(
                             f"Inserted new business_user record for business {business_uid}, user {user_id} (email: {email}), role {role}"
                         )
@@ -2237,9 +2286,12 @@ class BusinessInfo(Resource):
                     db.delete(
                         f"""DELETE FROM every_circle.business_user WHERE bu_uid = "{bu_uid}";"""
                     )
+                    summary["deleted"].append(existing_user_id)
                     print(
                         f"Deleted business_user record for business {business_uid}, user {existing_user_id} (not in new arrays)"
                     )
+
+            return summary
 
         except Exception as e:
             print(f"Error processing additional business users: {str(e)}")
