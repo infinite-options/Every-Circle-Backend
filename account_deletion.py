@@ -1,17 +1,20 @@
 """Account deletion orchestrator (App Store / Play Store compliant).
 
-Hard-deletes auth and PII, retains financial ledger rows, and leaves an
+Soft-deletes on user request (30-day grace), then permanently purges via cron:
+hard-deletes auth and PII, retains financial ledger rows, and leaves an
 anonymized profile_personal tombstone for referral-tree integrity.
 """
+
+from datetime import datetime, timedelta, timezone
 
 from flask import request
 from flask_restful import Resource
 
 from data_ec import connect, deleteFolder
 from datetime_utils import format_utc_iso, utc_now_str
-from profile_status import is_profile_deleted
+from profile_status import is_permanently_deleted, is_profile_deleted, is_soft_deleted
 from business_info import _is_unclaimed_business_role
-from wallet_service import freeze_wallet
+from wallet_service import freeze_wallet, get_wallet_row, unfreeze_wallet
 
 _PROFILE_PERSONAL_TABLE = "every_circle.profile_personal"
 _USERS_TABLE = "every_circle.users"
@@ -23,6 +26,8 @@ _WISH_S3_PREFIX = "profile_wish"
 _EXPERIENCE_S3_PREFIX = "profile_experience"
 _EDUCATION_S3_PREFIX = "profile_education"
 
+GRACE_DAYS = 30
+
 
 class AccountDeletionError(Exception):
     """Base error for account deletion failures."""
@@ -33,7 +38,11 @@ class ProfileNotFoundError(AccountDeletionError):
 
 
 class AccountAlreadyDeletedError(AccountDeletionError):
-    """The profile is already an anonymized deletion tombstone."""
+    """The profile is already soft-deleted or permanently purged."""
+
+
+class AccountPurgeWindowExpiredError(AccountDeletionError):
+    """Grace period ended; account must be treated as permanently deleted."""
 
 
 def _delete_s3_folder(prefix, uid):
@@ -64,6 +73,13 @@ def _resolve_profile_row(db, user_uid, profile_uid=None):
     if not rows.get("result"):
         raise ProfileNotFoundError(f"No profile found for user_uid={user_uid}")
     return rows["result"][0]
+
+
+def _purge_scheduled_at_str(from_dt=None):
+    base = from_dt or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    return (base + timedelta(days=GRACE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _delete_profile_personal_s3_assets(profile_uid):
@@ -160,6 +176,28 @@ def _delete_listings(db, profile_uid):
     db.delete(
         f"DELETE FROM every_circle.profile_wish "
         f"WHERE profile_wish_profile_personal_id = '{profile_uid}'"
+    )
+
+
+def _hide_public_listings(db, profile_uid):
+    """Hide offerings/wishes during soft-delete without destroying rows."""
+    db.execute(
+        """
+        UPDATE every_circle.profile_expertise
+        SET profile_expertise_is_public = 0
+        WHERE profile_expertise_profile_personal_id = %s
+        """,
+        (profile_uid,),
+        cmd="post",
+    )
+    db.execute(
+        """
+        UPDATE every_circle.profile_wish
+        SET profile_wish_is_public = 0
+        WHERE profile_wish_profile_personal_id = %s
+        """,
+        (profile_uid,),
+        cmd="post",
     )
 
 
@@ -345,7 +383,8 @@ def _anonymize_profile_tombstone(db, profile_uid, deleted_at):
             profile_personal_nearby_share_types = NULL,
             profile_personal_last_updated_at = %s,
             profile_personal_is_deleted = 1,
-            profile_personal_deleted_at = %s
+            profile_personal_deleted_at = %s,
+            profile_personal_purge_scheduled_at = NULL
         WHERE profile_personal_uid = %s
         """,
         (deleted_at, deleted_at, profile_uid),
@@ -388,8 +427,55 @@ def _log_account_deletion(db, user_uid, profile_uid, deleted_at, *, user_email=N
             print(f"[ACCOUNT DELETION] Failed to write deletion log (fallback): {fallback_exc}")
 
 
-def delete_user_account(db, user_uid, profile_uid=None):
-    """Permanently delete a user account and associated personal data.
+def soft_delete_user_account(db, user_uid, profile_uid=None):
+    """Schedule account deletion (30-day grace). Keeps PII and auth until purge.
+
+    Returns a confirmation dict suitable for API responses.
+    """
+    profile_row = _resolve_profile_row(db, user_uid, profile_uid)
+    profile_uid = profile_row.get("profile_personal_uid")
+    if not profile_uid:
+        raise ProfileNotFoundError("profile_personal_uid missing on profile row")
+
+    if is_profile_deleted(profile_row):
+        raise AccountAlreadyDeletedError(f"Profile {profile_uid} is already deleted")
+
+    user_rows = db.select(_USERS_TABLE, where={"user_uid": user_uid})
+    if not user_rows.get("result"):
+        raise ProfileNotFoundError(f"No auth user found for user_uid={user_uid}")
+
+    deleted_at = utc_now_str()
+    purge_at = _purge_scheduled_at_str()
+
+    db.execute(
+        """
+        UPDATE every_circle.profile_personal
+        SET profile_personal_is_deleted = 1,
+            profile_personal_deleted_at = %s,
+            profile_personal_purge_scheduled_at = %s
+        WHERE profile_personal_uid = %s
+        """,
+        (deleted_at, purge_at, profile_uid),
+        cmd="post",
+    )
+
+    _hide_public_listings(db, profile_uid)
+    wallet_frozen = freeze_wallet(db, profile_uid)
+
+    return {
+        "deleted_at": format_utc_iso(deleted_at),
+        "purge_scheduled_at": format_utc_iso(purge_at),
+        "grace_days": GRACE_DAYS,
+        "profile_personal_uid": profile_uid,
+        "wallet_frozen": wallet_frozen,
+        "personal_data_deleted": False,
+        "financial_records_retained": True,
+        "reactivation_available": True,
+    }
+
+
+def permanently_purge_account(db, user_uid, profile_uid=None):
+    """Irreversibly purge PII/auth after the soft-delete grace window.
 
     Steps (order matters for FK integrity):
       1. Resolve profile_uid
@@ -409,13 +495,20 @@ def delete_user_account(db, user_uid, profile_uid=None):
     if not profile_uid:
         raise ProfileNotFoundError("profile_personal_uid missing on profile row")
 
-    if is_profile_deleted(profile_row):
-        raise AccountAlreadyDeletedError(f"Profile {profile_uid} is already deleted")
+    if is_permanently_deleted(profile_row) and not str(
+        profile_row.get("profile_personal_user_id") or ""
+    ).strip():
+        raise AccountAlreadyDeletedError(
+            f"Profile {profile_uid} is already permanently deleted"
+        )
+
+    linked_user = str(profile_row.get("profile_personal_user_id") or "").strip()
+    user_uid = linked_user or str(user_uid or "").strip()
+    if not user_uid:
+        raise ProfileNotFoundError(f"No auth user linked for profile_uid={profile_uid}")
 
     user_rows = db.select(_USERS_TABLE, where={"user_uid": user_uid})
-    if not user_rows.get("result"):
-        raise ProfileNotFoundError(f"No auth user found for user_uid={user_uid}")
-    user_row = user_rows["result"][0]
+    user_row = (user_rows.get("result") or [None])[0] or {}
     user_email = user_row.get("user_email_id")
     user_social_id = user_row.get("user_social_id")
 
@@ -434,7 +527,8 @@ def delete_user_account(db, user_uid, profile_uid=None):
 
     wallet_frozen = freeze_wallet(db, profile_uid)
     _anonymize_profile_tombstone(db, profile_uid, deleted_at)
-    _delete_auth_user(db, user_uid)
+    if user_rows.get("result"):
+        _delete_auth_user(db, user_uid)
     _log_account_deletion(
         db,
         user_uid,
@@ -453,14 +547,83 @@ def delete_user_account(db, user_uid, profile_uid=None):
     }
 
 
+def delete_user_account(db, user_uid, profile_uid=None):
+    """Soft-delete entry point used by DELETE /api/v1/account."""
+    return soft_delete_user_account(db, user_uid, profile_uid=profile_uid)
+
+
 def delete_user_account_with_connect(user_uid, profile_uid=None):
     """Convenience wrapper that opens its own DB connection."""
     with connect() as db:
         return delete_user_account(db, user_uid, profile_uid=profile_uid)
 
 
+def reactivate_user_account(db, email, password):
+    """Clear soft-delete flags and unfreeze wallet after explicit confirmation."""
+    from auth import (
+        _load_user_for_login,
+        _normalize_email,
+        _profile_for_user,
+        verify_password,
+    )
+
+    email = _normalize_email(email)
+    if not email or not password:
+        raise AccountDeletionError("email and password are required")
+
+    user = _load_user_for_login(db, email)
+    if not user:
+        raise ProfileNotFoundError("No account found for this email")
+
+    profile = _profile_for_user(db, user["user_uid"])
+    if not profile:
+        raise ProfileNotFoundError(f"No profile found for user_uid={user['user_uid']}")
+
+    if is_permanently_deleted(profile):
+        raise AccountPurgeWindowExpiredError("Account deleted")
+
+    if not is_soft_deleted(profile):
+        raise AccountDeletionError("Account is not scheduled for deletion")
+
+    if not verify_password(
+        password,
+        user.get("user_password_salt"),
+        user.get("user_password_hash"),
+    ):
+        raise AccountDeletionError("Invalid email or password")
+
+    profile_uid = profile.get("profile_personal_uid")
+    reactivated_at = utc_now_str()
+
+    db.execute(
+        """
+        UPDATE every_circle.profile_personal
+        SET profile_personal_is_deleted = 0,
+            profile_personal_deleted_at = NULL,
+            profile_personal_purge_scheduled_at = NULL
+        WHERE profile_personal_uid = %s
+        """,
+        (profile_uid,),
+        cmd="post",
+    )
+
+    unfreeze_wallet(db, profile_uid)
+    wallet_row = get_wallet_row(db, profile_uid)
+    wallet_is_frozen = bool(wallet_row and int(wallet_row.get("wallet_is_frozen") or 0))
+
+    return {
+        "user": user,
+        "profile": profile,
+        "confirmation": {
+            "reactivated_at": format_utc_iso(reactivated_at),
+            "profile_personal_uid": profile_uid,
+            "wallet_frozen": wallet_is_frozen,
+        },
+    }
+
+
 class AccountDelete(Resource):
-    """DELETE /api/v1/account — permanently delete the authenticated user's account."""
+    """DELETE /api/v1/account — soft-delete the authenticated user's account (30-day grace)."""
 
     def delete(self):
         payload = request.get_json(silent=True) or {}
@@ -498,7 +661,7 @@ class AccountDelete(Resource):
                 if not user_uid:
                     return {"message": "user_uid is required", "code": 400}, 400
 
-                confirmation = delete_user_account(
+                confirmation = soft_delete_user_account(
                     db,
                     str(user_uid).strip(),
                     profile_uid=profile_uid,
@@ -514,7 +677,47 @@ class AccountDelete(Resource):
             return {"message": "Internal Server Error", "code": 500}, 500
 
         return {
-            "message": "Your account has been deleted.",
+            "message": "Your account is scheduled for deletion.",
             "code": 200,
             "confirmation": confirmation,
         }, 200
+
+
+class AccountReactivate(Resource):
+    """POST /api/v1/account/reactivate — restore a soft-deleted account (public, password gate)."""
+
+    def post(self):
+        payload = request.get_json(silent=True) or {}
+
+        if not payload.get("confirm_reactivation"):
+            return {
+                "message": "confirm_reactivation must be true to reactivate your account",
+                "code": 400,
+            }, 400
+
+        email = payload.get("email")
+        password = payload.get("password") or ""
+        if not email or not password:
+            return {"message": "email and password are required", "code": 400}, 400
+
+        try:
+            with connect() as db:
+                result = reactivate_user_account(db, email, password)
+            from auth import _auth_success
+
+            body, code = _auth_success(result["user"], result["profile"])
+            body["message"] = "Your account has been reactivated."
+            body["confirmation"] = result["confirmation"]
+            return body, code
+        except AccountPurgeWindowExpiredError as exc:
+            return {"message": str(exc), "code": 410}, 410
+        except ProfileNotFoundError as exc:
+            return {"message": str(exc), "code": 404}, 404
+        except AccountDeletionError as exc:
+            msg = str(exc)
+            if msg == "Invalid email or password":
+                return {"message": msg, "code": 401}, 401
+            return {"message": msg, "code": 400}, 400
+        except Exception as exc:
+            print(f"AccountReactivate error: {exc}")
+            return {"message": "Internal Server Error", "code": 500}, 500

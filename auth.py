@@ -34,6 +34,8 @@ from flask_jwt_extended import (
 from flask_restful import Resource
 
 from data_ec import connect
+from datetime_utils import format_utc_iso
+from profile_status import is_permanently_deleted, is_soft_deleted
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -47,11 +49,13 @@ _PUBLIC_PATHS = (
     "/api/v1/auth/refresh",
     "/api/v1/auth/social",
     "/api/v1/auth/logout",
+    "/api/v1/account/reactivate",
     "/stripe_key",
     "/decode",
     "/api/v1/lists_cron",
     "/api/v1/escrow_release_cron",
     "/api/v1/seller_hold_release_cron",
+    "/api/v1/account_purge_cron",
 )
 
 _PROTECTED_GET_PREFIXES = (
@@ -173,6 +177,37 @@ def _deleted_user_response(db, *, email=None, user_uid=None, social_id=None):
     if _deleted_account_lookup(
         db, email=email, user_uid=user_uid, social_id=social_id
     ):
+        return {"message": "Account deleted", "code": 401}, 401
+    return None
+
+
+def _pending_deletion_response(profile):
+    """403 when soft-deleted account is still within the grace window."""
+    return {
+        "message": "Account scheduled for deletion",
+        "code": 403,
+        "pending_deletion": True,
+        "purge_scheduled_at": format_utc_iso(
+            profile.get("profile_personal_purge_scheduled_at")
+        ),
+        "can_reactivate": True,
+    }, 403
+
+
+def _soft_delete_gate(db, user):
+    """
+    Block login/salt/social for soft-deleted (or expired-grace) profiles.
+
+    Returns (body, status) when blocked, else None.
+    """
+    if not user:
+        return None
+    profile = _profile_for_user(db, user.get("user_uid"))
+    if not profile:
+        return None
+    if is_soft_deleted(profile):
+        return _pending_deletion_response(profile)
+    if is_permanently_deleted(profile):
         return {"message": "Account deleted", "code": 401}, 401
     return None
 
@@ -592,16 +627,20 @@ class AuthSalt(Resource):
         try:
             with connect() as db:
                 user = _load_user_for_login(db, email)
-            if not user or not user.get("user_password_salt"):
-                deleted = _deleted_user_response(db, email=email)
-                if deleted:
-                    return deleted
-                return {"message": "Email is not valid", "code": 404}, 404
-            return {
-                "message": "Success",
-                "code": 200,
-                "result": [{"password_salt": user["user_password_salt"]}],
-            }, 200
+                if user:
+                    blocked = _soft_delete_gate(db, user)
+                    if blocked:
+                        return blocked
+                if not user or not user.get("user_password_salt"):
+                    deleted = _deleted_user_response(db, email=email)
+                    if deleted:
+                        return deleted
+                    return {"message": "Email is not valid", "code": 404}, 404
+                return {
+                    "message": "Success",
+                    "code": 200,
+                    "result": [{"password_salt": user["user_password_salt"]}],
+                }, 200
         except Exception as e:
             print(f"AuthSalt error: {e}")
             return {"message": "Internal Server Error", "code": 500}, 500
@@ -627,6 +666,9 @@ class AuthLogin(Resource):
                     user.get("user_password_hash"),
                 ):
                     return {"message": "Invalid email or password", "code": 401}, 401
+                blocked = _soft_delete_gate(db, user)
+                if blocked:
+                    return blocked
                 profile = _profile_for_user(db, user["user_uid"])
             return _auth_success(user, profile)
         except Exception as e:
@@ -649,6 +691,18 @@ class AuthRegister(Resource):
             with connect() as db:
                 existing = _load_user_for_login(db, email)
                 if existing:
+                    profile = _profile_for_user(db, existing.get("user_uid"))
+                    if profile and is_soft_deleted(profile):
+                        return {
+                            "message": "Reactivate existing account",
+                            "code": 409,
+                            "pending_deletion": True,
+                            "purge_scheduled_at": format_utc_iso(
+                                profile.get("profile_personal_purge_scheduled_at")
+                            ),
+                            "can_reactivate": True,
+                            "user_uid": existing.get("user_uid"),
+                        }, 409
                     return {
                         "message": "User already exists",
                         "code": 409,
@@ -855,6 +909,9 @@ class AuthSocial(Resource):
                         "message": "No account for this social login. Sign up first.",
                         "code": 404,
                     }, 404
+                blocked = _soft_delete_gate(db, user)
+                if blocked:
+                    return blocked
                 profile = _profile_for_user(db, user["user_uid"])
             return _auth_success(user, profile)
         except Exception as e:

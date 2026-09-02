@@ -59,6 +59,21 @@ def freeze_wallet(db, profile_id):
     return result.get("code") == 200
 
 
+def unfreeze_wallet(db, profile_id):
+    """Clear wallet freeze after account reactivation. Balances are unchanged."""
+    wallet_profile_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return False
+
+    result = db.execute(
+        "UPDATE every_circle.wallet SET wallet_is_frozen = 0 WHERE wallet_profile_id = %s",
+        (wallet_profile_id,),
+        cmd="post",
+    )
+    return result.get("code") == 200
+
+
 def get_wallet_row(db, bounty_profile_id):
     wallet_id = resolve_wallet_profile_id(bounty_profile_id)
     wallet_q = db.execute(

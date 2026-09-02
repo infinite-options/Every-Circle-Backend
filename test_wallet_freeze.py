@@ -12,6 +12,7 @@ from wallet_service import (
     freeze_wallet,
     release_bounty_to_useable,
     release_seller_hold_to_useable,
+    unfreeze_wallet,
     wallet_row_is_frozen,
 )
 
@@ -38,6 +39,26 @@ class FreezeWalletTests(unittest.TestCase):
         db = MagicMock()
         with patch("wallet_service.get_wallet_row", return_value=None):
             self.assertFalse(freeze_wallet(db, "110-missing"))
+        db.execute.assert_not_called()
+
+
+class UnfreezeWalletTests(unittest.TestCase):
+    def test_unfreeze_wallet_updates_row(self):
+        db = MagicMock()
+        with patch(
+            "wallet_service.get_wallet_row",
+            return_value={"wallet_profile_id": "110-1", "wallet_is_frozen": 1},
+        ):
+            db.execute.return_value = {"code": 200}
+            self.assertTrue(unfreeze_wallet(db, "110-1"))
+        db.execute.assert_called_once()
+        sql = db.execute.call_args[0][0]
+        self.assertIn("wallet_is_frozen = 0", sql)
+
+    def test_unfreeze_wallet_no_row(self):
+        db = MagicMock()
+        with patch("wallet_service.get_wallet_row", return_value=None):
+            self.assertFalse(unfreeze_wallet(db, "110-missing"))
         db.execute.assert_not_called()
 
 
