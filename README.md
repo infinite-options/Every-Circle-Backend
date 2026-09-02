@@ -1,6 +1,14 @@
 # Every Circle Backend
 
-Zappa Base URL: https://o7t5ikn907.execute-api.us-west-1.amazonaws.com/dev
+Zappa Base URL for development: https://o7t5ikn907.execute-api.us-west-1.amazonaws.com/dev
+Zappa Base URL for production: https://ml7xmrvue6.execute-api.us-west-1.amazonaws.com/production
+
+Database for development: every_circle_test
+Database for production: every_circle
+
+zappa update dev updates Backend code to /dev
+zappa update production updates Backend code to /production
+NOTE: Make sure database is set propertly in zappa_settings.json
 
 # README: if conn error make sure password is set properly in RDS PASSWORD section
 

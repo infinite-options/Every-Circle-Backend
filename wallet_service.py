@@ -257,7 +257,6 @@ def ensure_bounty_release_column(db):
                     ON ti.ti_transaction_id = t.transaction_uid
                 SET ti.ti_bounty_released_at = COALESCE(ti.ti_received_at, t.transaction_datetime)
                 WHERE ti.ti_bounty_released_at IS NULL
-                  AND COALESCE(t.transaction_in_escrow, 0) = 0
                   AND COALESCE(ti.ti_received_qty, 0) >= CAST(ti.ti_bs_qty AS SIGNED)
                   AND CAST(ti.ti_bs_qty AS UNSIGNED) > 0
                   AND EXISTS (
@@ -781,7 +780,7 @@ def _release_existing_wallet(db, wallet, bounty_profile_id, amount):
 
 def release_bounty_to_useable(db, bounty_profile_id, amount):
     """
-    Move escrowed bounty to useable when transaction_in_escrow clears.
+    Move escrowed bounty to useable when ti_bounty_released_at is set.
     Does not change lifetime/actual when purchase credited correctly.
     """
     wallet = get_wallet_row(db, bounty_profile_id)

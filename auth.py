@@ -50,7 +50,6 @@ _PUBLIC_PATHS = (
     "/stripe_key",
     "/decode",
     "/api/v1/lists_cron",
-    "/api/v1/escrow_release_cron",
     "/api/v1/seller_hold_release_cron",
 )
 
@@ -735,7 +734,6 @@ class AuthMe(Resource):
 class AuthLogout(Resource):
     """Client should discard tokens. Endpoint exists so the FE has a single logout call."""
 
-    @jwt_required(optional=True)
     def post(self):
         return {"message": "Logged out", "code": 200}, 200
 

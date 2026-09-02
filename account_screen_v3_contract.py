@@ -61,6 +61,8 @@ _V2_STRIP_KEYS = frozenset(
         "trr_transaction_uid",
         "original_transaction_uid",
         "transaction_type",
+        "transaction_in_escrow",
+        "in_escrow",
         "count",
         "code",
         "message",
@@ -450,9 +452,8 @@ def _buyer_purchase_delivered_label(row, units):
     if total > 0 and shipped < total:
         return f"{shipped}/{total}"
 
-    in_escrow = row.get("transaction_in_escrow") in (1, "1", True)
     verified = int(units.get("verified_qty") or 0)
-    if not in_escrow and verified >= total and total > 0:
+    if verified >= total and total > 0:
         return "Delivered"
     return "Shipped"
 

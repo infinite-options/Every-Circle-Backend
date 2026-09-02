@@ -234,9 +234,9 @@ def _load_sale_header(db, order_uid):
             t.transaction_fees,
             t.transaction_shipping,
             COALESCE(t.transaction_wallet_amount, 0) AS transaction_wallet_amount,
-            t.transaction_in_escrow,
             t.transaction_return_requested,
             t.transaction_return_note,
+            t.transaction_buyer_note,
             COALESCE(t.transaction_type, 'sale') AS transaction_type,
             NULLIF(
                 TRIM(
@@ -756,6 +756,9 @@ def build_order_payload(db, order_uid, *, requested_transaction_uid=None):
     note = sale_payload.get("transaction_return_note")
     if note:
         payload["transaction_return_note"] = note
+    buyer_note = sale_payload.get("transaction_buyer_note")
+    if buyer_note:
+        payload["transaction_buyer_note"] = buyer_note
     if stripe_refund is not None:
         payload["stripe_refund"] = stripe_refund
     return payload
@@ -780,7 +783,7 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
     header.update(
         {
             k: payload.get(k)
-            for k in ("requires_shipping", "fulfillment_method", "transaction_in_escrow")
+            for k in ("requires_shipping", "fulfillment_method")
             if payload.get(k) is not None
         }
     )

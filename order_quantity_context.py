@@ -846,7 +846,7 @@ def verification_complete(received_qty, purchased_qty, cancelled_qty, returned_q
 
 def apply_list_verification_status(db, rows):
     """
-    Set all_items_received (and clear stale escrow) on buyer/seller list rows.
+    Set all_items_received on buyer/seller list rows.
 
     Verification completes when verified qty reaches receivable units
     (purchased − pre-ship cancels), not full ti_bs_qty.
@@ -870,15 +870,6 @@ def apply_list_verification_status(db, rows):
         all_received = verification_complete(verified, purchased, cancelled)
 
         row["all_items_received"] = 1 if all_received else 0
-
-        if all_received and int(row.get("transaction_in_escrow") or 0) == 1:
-            upd = db.update(
-                "every_circle.transactions",
-                {"transaction_uid": order_uid},
-                {"transaction_in_escrow": 0},
-            )
-            if upd.get("code") == 200:
-                row["transaction_in_escrow"] = 0
 
     return rows
 
