@@ -23,7 +23,7 @@ exit_if_crypto_broken()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
-from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessServiceRestock, BusinessClaim, ProfileConnectionDegrees
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessServiceRestock, BusinessClaim, BusinessMemberRole, ProfileConnectionDegrees
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -56,7 +56,6 @@ from order_detail import OrderDetail
 from account_deletion import AccountDelete, AccountReactivate
 from account_purge import AccountPurgeJob, format_account_purge_email
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
-from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from seller_hold_release import (
     SellerHoldReleaseJob,
     format_seller_hold_release_email,
@@ -479,7 +478,7 @@ def Send_Twilio_SMS(message, phone_number):
 class stripe_key(Resource):
     def get(self, desc):
         print(desc)
-        if desc == "ECTEST":
+        if desc and str(desc).strip().upper() == "ECTEST":
             return {"publicKey": stripe_public_test_key}
         else:
             return {"publicKey": stripe_public_live_key}
@@ -617,81 +616,6 @@ def Lists_CRON(Resource):
                         'code': 500}
 
         return response
-
-
-def _escrow_release_cron_wrapper():
-    print("\nIn Escrow Release CRON\n\n\n")
-    response = {}
-    dt = datetime.today()
-    recipients = [
-        "pmarathay@gmail.com",
-        "pmarathay@infiniteoptions.com",
-    ]
-    try:
-        response = EscrowReleaseJob.get()
-
-        if "cron fail" in response.keys():
-            raise Exception("Error in cronjob")
-
-        try:
-            subject = f"Every-Circle Escrow Release CRON — SUCCESS ({dt})"
-            body = format_escrow_release_email(response, run_dt=dt)
-
-            for recipient in recipients:
-                sendEmail(recipient, subject, body)
-
-            response["email"] = {
-                "message": f"Every-Circle Escrow Release CRON Job Email for {dt} sent!",
-                "code": 200,
-            }
-
-        except Exception:
-            response["email fail"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Email for {dt} "
-                    "could not be sent"
-                ),
-                "code": 500,
-            }
-
-    except Exception:
-        try:
-            failed_count = response.get("failed_count", 0)
-            subject = (
-                f"Every-Circle Escrow Release CRON — FAILED "
-                f"({failed_count} errors, {dt})"
-            )
-            body = format_escrow_release_email(response, run_dt=dt)
-
-            for recipient in recipients:
-                sendEmail(recipient, subject, body)
-
-            response["email"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} sent!"
-                ),
-                "code": 201,
-            }
-
-        except Exception:
-            response["email fail"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} "
-                    "could not be sent"
-                ),
-                "code": 500,
-            }
-
-    return response
-
-
-class EscrowReleaseCron_CLASS(Resource):
-    def get(self):
-        return _escrow_release_cron_wrapper()
-
-
-def EscrowRelease_CRON(Resource):
-    return _escrow_release_cron_wrapper()
 
 
 def _seller_hold_release_cron_wrapper():
@@ -922,6 +846,7 @@ api.add_resource(BusinessServiceRestock, "/business/service/restock")
 api.add_resource(ProfileExpertiseRestock, "/api/v1/profile-expertise/restock")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
+api.add_resource(BusinessMemberRole, "/api/v1/business_member_role")
 api.add_resource(ContentReports, "/api/v1/reports", "/api/v1/reports/<string:report_uid>")
 api.add_resource(
     ContentModerationReview,
@@ -953,7 +878,6 @@ api.add_resource(
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
-api.add_resource(EscrowReleaseCron_CLASS, "/api/v1/escrow_release_cron")
 api.add_resource(
     SellerHoldReleaseCron_CLASS, "/api/v1/seller_hold_release_cron"
 )

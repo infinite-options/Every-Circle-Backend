@@ -1394,3 +1394,105 @@ class BusinessClaim(Resource):
             response["message"] = "Internal Server Error"
             response["code"] = 500
             return response, 500
+
+
+class BusinessMemberRole(Resource):
+    """Change one member's role on a business.
+
+    Permission rules (enforced server-side):
+    - The acting user must be an ``owner`` or ``partner`` of the business.
+    - A member whose current role is ``owner`` or ``partner`` is protected: no
+      one may change their role through this endpoint (an owner cannot demote a
+      partner/owner, and vice-versa).
+    - Any other member (employee / admin / other) may be set to any valid role,
+      including a promotion to owner or partner.
+    """
+
+    ALLOWED_ROLES = {"owner", "partner", "employee", "admin", "other"}
+    SENIOR_ROLES = {"owner", "partner"}
+
+    def put(self):
+        print("In BusinessMemberRole PUT")
+        response = {}
+        try:
+            payload = request.get_json(silent=True) or request.form.to_dict()
+
+            actor_uid, error = _bound_user_uid(payload, "user_uid is required")
+            if error:
+                return error, error["code"]
+
+            business_uid = str(payload.get("business_uid", "") or "").strip()
+            target_user_id = str(payload.get("target_user_id", "") or "").strip()
+            new_role = str(payload.get("role", "") or "").strip().lower()
+
+            if not business_uid or not target_user_id or not new_role:
+                response["message"] = "business_uid, target_user_id, and role are required"
+                response["code"] = 400
+                return response, 400
+
+            if new_role not in self.ALLOWED_ROLES:
+                response["message"] = (
+                    "role must be one of: " + ", ".join(sorted(self.ALLOWED_ROLES))
+                )
+                response["code"] = 400
+                return response, 400
+
+            with connect() as db:
+                business_check = db.select(
+                    "every_circle.business", where={"business_uid": business_uid}
+                )
+                if not business_check["result"]:
+                    response["message"] = "Business not found"
+                    response["code"] = 404
+                    return response, 404
+
+                actor_rows = db.select(
+                    "every_circle.business_user",
+                    where={"bu_business_id": business_uid, "bu_user_id": actor_uid},
+                )
+                actor_roles = {
+                    str(r.get("bu_role") or "").strip().lower()
+                    for r in (actor_rows.get("result") or [])
+                }
+                if not (actor_roles & self.SENIOR_ROLES):
+                    response["message"] = "Only an owner or partner can change member roles"
+                    response["code"] = 403
+                    return response, 403
+
+                target_rows = db.select(
+                    "every_circle.business_user",
+                    where={"bu_business_id": business_uid, "bu_user_id": target_user_id},
+                )
+                target_result = target_rows.get("result") or []
+                if not target_result:
+                    response["message"] = "That member is not part of this business"
+                    response["code"] = 404
+                    return response, 404
+
+                current_target_roles = {
+                    str(r.get("bu_role") or "").strip().lower() for r in target_result
+                }
+                if current_target_roles & self.SENIOR_ROLES:
+                    response["message"] = "You cannot change the role of an owner or partner"
+                    response["code"] = 403
+                    return response, 403
+
+                for row in target_result:
+                    db.update(
+                        "every_circle.business_user",
+                        {"bu_uid": row["bu_uid"]},
+                        {"bu_role": new_role},
+                    )
+
+            response["message"] = "Role updated"
+            response["business_user_id"] = target_user_id
+            response["role"] = new_role
+            response["code"] = 200
+            return response, 200
+
+        except Exception as e:
+            print(f"Error in BusinessMemberRole PUT: {str(e)}")
+            traceback.print_exc()
+            response["message"] = "Internal Server Error"
+            response["code"] = 500
+            return response, 500

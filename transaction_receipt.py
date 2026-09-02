@@ -172,7 +172,6 @@ _RECEIPT_LINE_SELECT = """
         t.transaction_taxes,
         t.transaction_fees,
         t.transaction_shipping,
-        t.transaction_in_escrow,
         ti.ti_uid,
         ti.ti_bs_id,
         ti.ti_bs_qty,

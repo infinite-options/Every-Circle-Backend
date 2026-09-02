@@ -1611,6 +1611,13 @@ class UserProfileInfo(Resource):
                           AND bu.bu_role IS NOT NULL
                           AND TRIM(bu.bu_role) <> ''
                           AND LOWER(TRIM(bu.bu_role)) NOT IN ('unclaimed', 'null', 'none', 'n/a', 'na')
+                          -- Hide owner-removed (soft-deleted) businesses: inactive and not
+                          -- under moderation. Moderation take-downs stay so the owner sees the banner.
+                          -- COALESCE keeps legacy NULL rows visible.
+                          AND NOT (
+                              COALESCE(b.business_is_active, 1) = 0
+                              AND COALESCE(b.business_moderated, 0) = 0
+                          )
                           AND bu.bu_uid = (
                               SELECT MIN(bu2.bu_uid)
                               FROM every_circle.business_user bu2

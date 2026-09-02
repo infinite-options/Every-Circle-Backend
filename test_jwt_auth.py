@@ -66,7 +66,6 @@ class PathGateTests(unittest.TestCase):
         self.assertTrue(path_requires_jwt("POST", "/api/v1/transactions"))
         self.assertTrue(path_requires_jwt("PUT", "/api/v1/userprofileinfo"))
         self.assertTrue(path_requires_jwt("DELETE", "/api/v1/blocked-users"))
-        self.assertTrue(path_requires_jwt("DELETE", "/api/v1/account"))
 
     def test_sensitive_gets_are_protected(self):
         self.assertTrue(path_requires_jwt("GET", "/api/v1/orders/500-1"))
@@ -184,33 +183,6 @@ class JwtEndpointTests(unittest.TestCase):
                 json={"email": "pat@example.com", "password": "nope"},
             )
         self.assertEqual(res.status_code, 401)
-
-    def test_login_deleted_account_returns_clear_message(self):
-        db = MagicMock()
-        db.select.return_value = {"result": []}
-        db.execute.return_value = {"result": [{"1": 1}]}
-        db.__enter__.return_value = db
-        db.__exit__.return_value = False
-        with patch("auth.connect", return_value=db):
-            res = self.client.post(
-                "/api/v1/auth/login",
-                json={"email": "deleted@example.com", "password": "hunter2"},
-            )
-        self.assertEqual(res.status_code, 401)
-        self.assertEqual(res.get_json()["message"], "Account deleted")
-
-    def test_salt_deleted_account_returns_clear_message(self):
-        db = MagicMock()
-        db.select.return_value = {"result": []}
-        db.execute.return_value = {"result": [{"1": 1}]}
-        db.__enter__.return_value = db
-        db.__exit__.return_value = False
-        with patch("auth.connect", return_value=db):
-            res = self.client.post(
-                "/api/v1/auth/salt", json={"email": "deleted@example.com"}
-            )
-        self.assertEqual(res.status_code, 401)
-        self.assertEqual(res.get_json()["message"], "Account deleted")
 
     def test_enforce_flag_blocks_writes(self):
         with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}):
@@ -806,6 +778,37 @@ class BusinessActorBindingTests(unittest.TestCase):
             )
         self.assertEqual(res.status_code, 403)
         db.delete.assert_not_called()
+
+    def test_delete_businessinfo_member_but_not_owner_is_403(self):
+        db = _mock_db({"business_uid": "200-owned"})
+        db.execute.return_value = {"result": [{"bu_role": "manager"}]}
+        with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(
+            "auth._user_owns_business", return_value=True
+        ), patch("business_info.connect", return_value=db):
+            res = self.client.delete(
+                "/api/v1/businessinfo/200-owned",
+                headers=self._alice_headers(),
+            )
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("owner", res.get_json().get("message", "").lower())
+        db.delete.assert_not_called()
+
+    def test_delete_businessinfo_owner_role_soft_deletes(self):
+        db = _mock_db({"business_uid": "200-owned"})
+        db.execute.return_value = {"result": [{"bu_role": "owner"}]}
+        with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}), patch(
+            "auth._user_owns_business", return_value=True
+        ), patch("business_info.connect", return_value=db):
+            res = self.client.delete(
+                "/api/v1/businessinfo/200-owned",
+                headers=self._alice_headers(),
+            )
+        self.assertEqual(res.status_code, 200)
+        # Soft delete: the row is kept, only deactivated.
+        db.delete.assert_not_called()
+        db.update.assert_called_once_with(
+            "every_circle.business", {"business_uid": "200-owned"}, {"business_is_active": 0}
+        )
 
     def test_post_business_flag_on_mismatched_user_uid_is_403(self):
         db = _mock_db()

@@ -1191,6 +1191,12 @@ def serializeJSON(unserialized):
     elif type(unserialized) == datetime.datetime:
         # print("in date")
         return str(unserialized)
+    elif type(unserialized) == datetime.date:
+        # DATE columns (e.g. users.users_cookies_date) come back from pymysql as plain
+        # datetime.date, not datetime.datetime — the check above doesn't catch those
+        # (strict type() equality), so they'd otherwise pass through unserialized and
+        # blow up JSON encoding downstream.
+        return str(unserialized)
     elif type(unserialized) == bytes:
         # print("in bytes")
         return str(unserialized)
