@@ -734,7 +734,6 @@ class AuthMe(Resource):
 class AuthLogout(Resource):
     """Client should discard tokens. Endpoint exists so the FE has a single logout call."""
 
-    @jwt_required(optional=True)
     def post(self):
         return {"message": "Logged out", "code": 200}, 200
 
