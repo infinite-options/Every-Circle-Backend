@@ -23,7 +23,7 @@ exit_if_crypto_broken()
 # SECTION 1:  IMPORT FILES AND FUNCTIONS
 from data_ec import connect, uploadImage, s3, encrypt_data, decrypt_data
 from users import UserInfo
-from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessServiceRestock, BusinessClaim, ProfileConnectionDegrees
+from business import Business, Business_v2, BusinessDetails, Businesses, BusinessTagSearch, BusinessServicePurchase, BusinessServiceRestock, BusinessClaim, BusinessMemberRole, ProfileConnectionDegrees
 from business_v3 import Business_v3
 from ratings import Ratings
 from lists import Lists
@@ -769,6 +769,7 @@ api.add_resource(BusinessServiceRestock, "/business/service/restock")
 api.add_resource(ProfileExpertiseRestock, "/api/v1/profile-expertise/restock")
 api.add_resource(BusinessServiceOptions, '/api/business_service_options/<string:bs_uid>')
 api.add_resource(BusinessClaim, "/api/v1/business_claim")
+api.add_resource(BusinessMemberRole, "/api/v1/business_member_role")
 api.add_resource(ContentReports, "/api/v1/reports", "/api/v1/reports/<string:report_uid>")
 api.add_resource(
     ContentModerationReview,
