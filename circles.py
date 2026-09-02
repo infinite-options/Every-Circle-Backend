@@ -2,8 +2,43 @@ from flask import request
 from flask_restful import Resource
 from datetime import datetime
 from data_ec import connect
+from profile_status import is_profile_deleted, tombstone_network_fields
 
 class Circles(Resource):
+
+    @staticmethod
+    def _apply_tombstone_to_circle_row(row):
+        if not row:
+            return row
+        if not is_profile_deleted(row):
+            row["is_deleted"] = False
+            return row
+        uid = row.get("profile_personal_uid") or row.get("circle_related_person_id")
+        row["is_deleted"] = True
+        tombstone = tombstone_network_fields(uid, True)
+        for key in (
+            "profile_personal_user_id",
+            "profile_personal_first_name",
+            "profile_personal_last_name",
+            "user_email_id",
+            "profile_personal_email_is_public",
+            "profile_personal_phone_number",
+            "profile_personal_phone_number_is_public",
+            "profile_personal_image",
+            "profile_personal_image_is_public",
+            "profile_personal_city",
+            "profile_personal_state",
+            "profile_personal_country",
+            "profile_personal_location_is_public",
+            "profile_personal_latitude",
+            "profile_personal_longitude",
+        ):
+            if key in tombstone:
+                row[key] = tombstone.get(key)
+            elif key in row:
+                row[key] = None
+        row.update({k: tombstone.get(k) for k in tombstone if k.startswith("profile_personal_")})
+        return row
     
     def get(self, circle_id):
         circle_profile_id = circle_id
@@ -23,10 +58,16 @@ class Circles(Resource):
             with connect() as db:
                 # Build query based on whether circle_related_person_id is provided
                 if circle_related_person_id:
-                    # Query to get circles for a profile filtered by related person
                     circles_query = """
-                        SELECT * 
+                        SELECT circles.*
+                            , pp.profile_personal_uid, pp.profile_personal_user_id, pp.profile_personal_first_name, pp.profile_personal_last_name
+                            , u.user_email_id, pp.profile_personal_email_is_public, pp.profile_personal_phone_number, pp.profile_personal_phone_number_is_public
+                            , pp.profile_personal_image, pp.profile_personal_image_is_public
+                            , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country, pp.profile_personal_location_is_public, pp.profile_personal_latitude, pp.profile_personal_longitude
+                            , pp.profile_personal_is_deleted
                         FROM every_circle.circles
+                        LEFT JOIN profile_personal pp ON circle_related_person_id = profile_personal_uid
+                        LEFT JOIN users u ON pp.profile_personal_user_id = user_uid
                         WHERE circle_profile_id = %s
                         AND circle_related_person_id = %s
                         ORDER BY circle_date DESC, circle_uid DESC
@@ -47,6 +88,7 @@ class Circles(Resource):
                             , u.user_email_id, pp.profile_personal_email_is_public, pp.profile_personal_phone_number, pp.profile_personal_phone_number_is_public
                             , pp.profile_personal_image, pp.profile_personal_image_is_public
                             , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country, pp.profile_personal_location_is_public, pp.profile_personal_latitude, pp.profile_personal_longitude
+                            , pp.profile_personal_is_deleted
                         FROM every_circle.circles
                         LEFT JOIN profile_personal pp ON circle_related_person_id = profile_personal_uid
                         LEFT JOIN users u ON pp.profile_personal_user_id = user_uid
@@ -63,8 +105,12 @@ class Circles(Resource):
                 if query_response.get('code') == 200:
                     response['message'] = 'Circles retrieved successfully'
                     response['code'] = 200
-                    response['data'] = query_response.get('result', [])
-                    response['count'] = len(query_response.get('result', []))
+                    rows = [
+                        self._apply_tombstone_to_circle_row(dict(row))
+                        for row in (query_response.get('result') or [])
+                    ]
+                    response['data'] = rows
+                    response['count'] = len(rows)
                     print(f"Successfully retrieved {response['count']} circles")
                 else:
                     response['message'] = 'Query execution failed'

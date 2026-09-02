@@ -1,6 +1,6 @@
 # EVERY CIRCLE BACKEND PYTHON FILE
 # https://o7t5ikn907.execute-api.us-west-1.amazonaws.com/dev /<enter_endpoint_details>
-# No production endpoint yet
+# https://ml7xmrvue6.execute-api.us-west-1.amazonaws.com/production /<enter_endpoint_details>
 
 
 # To run program:  python3 ec_api.py
@@ -53,6 +53,7 @@ from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertis
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from order_detail import OrderDetail
+from account_deletion import AccountDelete
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from seller_hold_release import (
@@ -122,88 +123,9 @@ from werkzeug.datastructures import ImmutableMultiDict
 # used for serializer email and error handling
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
-# from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-# from cryptography.hazmat.primitives.padding import PKCS7
-# from cryptography.hazmat.backends import default_backend
-import json
-import base64
 import googlemaps
 
-# import awsgi
-# def lambda_handler(event, context):
-#    return awsgi.response(app, event, context, base64_content_types={"image/png"})
-
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
-
-# == Using Cryptography library for AES encryption ==
-
-# load_dotenv()
-# AES_SECRET_KEY = os.getenv('AES_SECRET_KEY')
-# # print("AES Secret Key: ", AES_SECRET_KEY)
-# AES_KEY = AES_SECRET_KEY.encode('utf-8')
-# BLOCK_SIZE = int(os.getenv('BLOCK_SIZE'))
-# # print("Block Size: ", BLOCK_SIZE)
-# POSTMAN_SECRET = os.getenv('POSTMAN_SECRET')
-# # print("POSTMAN_SECRET: ", POSTMAN_SECRET)
-# OPEN_SEARCH_HOST = os.getenv('OPENSEARCH_HOST')
-# print("OPEN_SEARCH_HOST: ", OPEN_SEARCH_HOST)
-
-
-# Encrypt dictionary - Currently commented
-# def encrypt_dict(data_dict):
-#     try:
-#         print("In encrypt_dict: ", data_dict)
-#         # Convert dictionary to JSON string
-#         json_data = json.dumps(data_dict).encode()
-
-#         # Pad the JSON data
-#         padder = PKCS7(BLOCK_SIZE * 8).padder()
-#         padded_data = padder.update(json_data) + padder.finalize()
-
-#         # Generate a random initialization vector (IV)
-#         iv = os.urandom(BLOCK_SIZE)
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         encryptor = cipher.encryptor()
-
-#         # Encrypt the padded data
-#         encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-
-#         # Combine IV and encrypted data, then Base64 encode
-#         encrypted_blob = base64.b64encode(iv + encrypted_data).decode()
-#         return encrypted_blob
-#     except Exception as e:
-#         print(f"Encryption error: {e}")
-#         return None
-
-# Decrypt dictionary - Currently commented
-# def decrypt_dict(encrypted_blob):
-#     print("Actual decryption started")
-#     try:
-#         # Base64 decode the encrypted blob
-#         encrypted_data = base64.b64decode(encrypted_blob)
-
-#         # Extract the IV (first BLOCK_SIZE bytes) and the encrypted content
-#         iv = encrypted_data[:BLOCK_SIZE]
-#         encrypted_content = encrypted_data[BLOCK_SIZE:]
-
-#         # Create a new AES cipher
-#         cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend())
-#         decryptor = cipher.decryptor()
-
-#         # Decrypt the encrypted content
-#         decrypted_padded_data = decryptor.update(encrypted_content) + decryptor.finalize()
-
-#         # Unpad the decrypted content
-#         unpadder = PKCS7(BLOCK_SIZE * 8).unpadder()
-#         decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-
-#         # Convert the JSON string back to a dictionary
-#         return json.loads(decrypted_data.decode())
-#     except Exception as e:
-#         print(f"Decryption error: {e}")
-#         return None
 
 def encrypt_response(data):
     json_str = json.dumps(data)
@@ -291,50 +213,6 @@ class DecryptingRequest(FlaskRequest):
                 print(f"Request decryption error: {e}")
         return data
 
-# Middleware — wraps every response with encryption
-# @app.after_request
-# def encrypt_all_responses(response):
-#     if response.content_type == "application/json":
-#         try:
-#             data = response.get_json()
-#             if data is not None:
-#                 encrypted = encrypt_response(data)
-#                 response.data = json.dumps(encrypted)
-#                 response.content_type = "application/json"
-#         except Exception as e:
-#             print(f"Response encryption error: {e}")
-#     return response
-
-# @app.before_request
-# def decrypt_all_requests():
-#     if request.content_type == "application/json":
-#         try:
-#             payload = request.get_json(silent=True)
-#             if payload and payload.get("encrypted") and payload.get("data"):
-#                 decrypted_str = decrypt_data(payload["data"])
-#                 decrypted = json.loads(decrypted_str)
-#                 # Store decrypted data so endpoints can access it
-#                 request._decrypted_json = decrypted
-#         except Exception as e:
-#             print(f"Request decryption error: {e}")
-
-
-
-# NEED to figure out where the NotFound or InternalServerError is displayed
-# from werkzeug.exceptions import BadRequest, InternalServerError
-
-#  NEED TO SOLVE THIS
-# from NotificationHub import Notification
-# from NotificationHub import NotificationHub
-
-# BING API KEY
-# Import Bing API key into bing_api_key.py
-
-#  NEED TO SOLVE THIS
-# from env_keys import BING_API_KEY, RDS_PW
-
-
-
 
 app = Flask(__name__)
 app.request_class = DecryptingRequest
@@ -377,8 +255,9 @@ register_request_logging(app)
 
 CORS(app)
 
-# Set this to false when deploying to live application
-app.config['DEBUG'] = True
+# DEBUG_FLAG env var (default true for local dev). Set false in production.
+app.config["DEBUG"] = os.getenv("DEBUG_FLAG", "true").strip().lower() == "true"
+
 
 # Setup the Flask-JWT-Extended extension
 app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
@@ -421,24 +300,19 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 app.config['MAIL_USERNAME'] = os.getenv('SUPPORT_EMAIL')
 app.config['MAIL_PASSWORD'] = os.getenv('SUPPORT_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
-# print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
+print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
 
 
 # Setting for mydomain.com
-app.config["MAIL_SERVER"] = "smtp.mydomain.com"
-app.config["MAIL_PORT"] = 465
+app.config["MAIL_SERVER"] = "smtp.office365.com"
+app.config["MAIL_PORT"] = 587
 
 # Setting for gmail
 # app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 # app.config['MAIL_PORT'] = 465
 
-app.config["MAIL_USE_TLS"] = False
-app.config["MAIL_USE_SSL"] = True
-
-
-# Set this to false when deploying to live application
-app.config["DEBUG"] = True
-# app.config["DEBUG"] = False
+app.config["MAIL_USE_TLS"] = True
+app.config["MAIL_USE_SSL"] = False
 
 # MAIL  -- This statement has to be below the Mail Variables
 mail = Mail(app)
@@ -530,76 +404,54 @@ else:
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
 def sendEmail(recipient, subject, body):
+    print('in sendEmail')
+    print('Confirming correct function call')
+    print('recipient received', recipient)
+    # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
+    if isinstance(recipient, str):
+        recipient = [recipient]
+    print(recipient)
+    print(subject)
+    print(body)
     with app.app_context():
-        print("In sendEmail: ", recipient, subject, body)
-        sender="support@manifestmy.space"
-        print("sender: ", sender)
         msg = Message(
-            sender=sender,
-            recipients=[recipient],
+            sender="support@everycircle.com",
+            recipients=recipient,
             subject=subject,
             body=body
         )
-        print("sender: ", sender)
-        # print("Email message: ", msg)
         mail.send(msg)
-        # print("email sent")
+        print('after mail send')
 
-# app.sendEmail = sendEmail
 
-    
+app.sendEmail = sendEmail
+
+
 class SendEmail(Resource):
+    def __call__(self):
+        print("In SendEmail")
+
     def post(self):
-        payload = request.get_json()
-        print(payload)
-
-        # Check if each field in the payload is not null
-        if all(field is not None for field in payload.values()):
-            sendEmail(payload["receiver"], payload["email_subject"], payload["email_body"])
-            return "Email Sent"
-        else:
-            return "Some fields are missing in the payload", 400
-
-
-class SendEmail_CLASS(Resource):
-    def get(self):
-        print("In Send EMail CRON get")
+        print("In Send EMail post")
         try:
-            conn = connect()
-
-            recipient = "pmarathay@gmail.com"
-            subject = "MySpace CRON Jobs Completed"
-            body = "The Following CRON Jobs Ran:"
-            # mail.send(msg)
-            sendEmail(recipient, subject, body)
-
+            data = request.get_json(force=True)
+            print(data)
+            email = data["email"]
+            body = ("Test from everyCircle")
+            # body = (
+            #     "Hi !\n\n"
+            #     "We are looking forward to meeting with you! \n"
+            #     "Email support@nityaayurveda.com if you need to get in touch with us directly.\n"
+            #     "Thank you - Nitya Ayurveda\n\n"
+            # )
+            sendEmail([email], "Thanks for your Note!", body)
             return "Email Sent", 200
 
-        except:
-            raise BadRequest("Request failed, please try again later.")
-        finally:
-            print("exit SendEmail")
+        except Exception:
+            raise BadRequest("Request failed mail, please try again later.")
 
 
-def SendEmail_CRON(self):
-        print("In Send EMail CRON get")
-        try:
-            conn = connect()
-
-            recipient = "pmarathay@gmail.com"
-            subject = "MySpace CRON Jobs Completed"
-            body = "The Following CRON Jobs Ran:"
-            # mail.send(msg)
-            sendEmail(recipient, subject, body)
-
-            return "Email Sent", 200
-
-        except:
-            raise BadRequest("Request failed, please try again later.")
-        finally:
-            print("exit SendEmail")
-
-
+# -- Send SMS Endpoints start here -------------------------------------------------------------------------------
 def Send_Twilio_SMS(message, phone_number):
     # print("In Twilio: ", message, phone_number)
     items = {}
@@ -626,7 +478,7 @@ def Send_Twilio_SMS(message, phone_number):
 class stripe_key(Resource):
     def get(self, desc):
         print(desc)
-        if desc == "ECTEST":
+        if desc and str(desc).strip().upper() == "ECTEST":
             return {"publicKey": stripe_public_test_key}
         else:
             return {"publicKey": stripe_public_live_key}
@@ -928,6 +780,7 @@ api.add_resource(AuthRefresh, "/api/v1/auth/refresh")
 api.add_resource(AuthSocial, "/api/v1/auth/social")
 api.add_resource(AuthMe, "/api/v1/auth/me")
 api.add_resource(AuthLogout, "/api/v1/auth/logout")
+api.add_resource(AccountDelete, "/api/v1/account")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
@@ -1033,6 +886,9 @@ api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>"
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
 
 
+api.add_resource(SendEmail, "/api/v1/sendEmail")
+
+
 class GooglePlacesInfo(Resource):
     def post(self):
         try:
@@ -1077,7 +933,7 @@ def decode():
         decrypted = decrypt_dict(encrypted_data)
         if decrypted is None:
             return jsonify({
-                'error': 'Decryption failed — verify AES_SECRET_KEY matches the environment that encrypted this data',
+                'error': 'Decryption failed — verify ENCRYPTION_KEY matches the environment that encrypted this data',
                 'decode': None,
             }), 400
         return jsonify({'decode': decrypted})

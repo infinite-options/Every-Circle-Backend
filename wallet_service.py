@@ -29,6 +29,36 @@ def _round_money(value):
     return round(_to_float(value), 4)
 
 
+def wallet_row_is_frozen(wallet):
+    if not wallet:
+        return False
+    return bool(int(wallet.get("wallet_is_frozen") or 0))
+
+
+def _frozen_wallet_response(profile_id):
+    return {
+        "code": 403,
+        "message": "Wallet is frozen",
+        "wallet_profile_id": profile_id,
+        "skipped": True,
+    }
+
+
+def freeze_wallet(db, profile_id):
+    """Mark a wallet non-spendable (account deletion tombstone). Balances are retained."""
+    wallet_profile_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return False
+
+    result = db.execute(
+        "UPDATE every_circle.wallet SET wallet_is_frozen = 1 WHERE wallet_profile_id = %s",
+        (wallet_profile_id,),
+        cmd="post",
+    )
+    return result.get("code") == 200
+
+
 def get_wallet_row(db, bounty_profile_id):
     wallet_id = resolve_wallet_profile_id(bounty_profile_id)
     wallet_q = db.execute(
@@ -40,7 +70,8 @@ def get_wallet_row(db, bounty_profile_id):
             wallet_actual_balance,
             wallet_lifetime_earning,
             wallet_reserve,
-            wallet_lifetime_spent
+            wallet_lifetime_spent,
+            wallet_is_frozen
         FROM every_circle.wallet
         WHERE wallet_profile_id = %s
         """,
@@ -58,6 +89,8 @@ def adjust_wallet_reserve(db, profile_id, delta):
 
     wallet_id = resolve_wallet_profile_id(profile_id)
     wallet = get_wallet_row(db, profile_id)
+    if wallet and wallet_row_is_frozen(wallet) and delta < 0:
+        return _frozen_wallet_response(profile_id)
     if not wallet:
         if delta < 0:
             return {"code": 200, "skipped": True, "delta": 0}
@@ -200,6 +233,7 @@ def build_wallet_summary(db, profile_id):
         "wallet_actual_balance": _round_money(wallet.get("wallet_actual_balance")),
         "wallet_lifetime_earning": _round_money(wallet.get("wallet_lifetime_earning")),
         "wallet_lifetime_spent": _round_money(wallet.get("wallet_lifetime_spent")),
+        "wallet_is_frozen": wallet_row_is_frozen(wallet),
     }
 
 
@@ -635,6 +669,8 @@ def credit_bounty_to_wallet(db, bounty_profile_id, amount, in_escrow=False):
 
     wallet_id = resolve_wallet_profile_id(bounty_profile_id)
     wallet = get_wallet_row(db, bounty_profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(bounty_profile_id)
 
     if wallet:
         actual = _to_float(wallet.get("wallet_actual_balance"))
@@ -748,6 +784,10 @@ def release_bounty_to_useable(db, bounty_profile_id, amount):
     Move escrowed bounty to useable when transaction_in_escrow clears.
     Does not change lifetime/actual when purchase credited correctly.
     """
+    wallet = get_wallet_row(db, bounty_profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(bounty_profile_id)
+
     amount = _round_money(amount)
     if not bounty_profile_id or amount <= 0:
         return {
@@ -817,6 +857,8 @@ def credit_seller_proceeds_to_wallet(db, profile_id, amount, hold=False):
 
     wallet_id = resolve_wallet_profile_id(profile_id)
     wallet = get_wallet_row(db, profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(profile_id)
 
     if wallet:
         actual = _to_float(wallet.get("wallet_actual_balance"))
@@ -904,6 +946,8 @@ def release_seller_hold_to_useable(db, profile_id, amount):
 
     wallet_id = resolve_wallet_profile_id(profile_id)
     wallet = get_wallet_row(db, profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(profile_id)
     if not wallet:
         return {
             "code": 404,
@@ -1012,6 +1056,8 @@ def debit_useable_for_purchase(db, profile_id, amount):
 
     wallet_id = resolve_wallet_profile_id(profile_id)
     wallet = get_wallet_row(db, profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(profile_id)
     if not wallet:
         return {
             "code": 400,
@@ -1071,6 +1117,8 @@ def credit_useable_from_refund(db, profile_id, amount):
 
     wallet_id = resolve_wallet_profile_id(profile_id)
     wallet = get_wallet_row(db, profile_id)
+    if wallet and wallet_row_is_frozen(wallet):
+        return _frozen_wallet_response(profile_id)
 
     if wallet:
         useable = _to_float(wallet.get("wallet_useable_balance"))

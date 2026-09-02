@@ -145,7 +145,7 @@ def compute_profile_degrees_from_viewer(db, viewer_uid, target_profile_uids, max
 
         r_down = db.execute(
             f"""
-            SELECT profile_personal_uid
+            SELECT profile_personal_uid, profile_personal_is_deleted
             FROM every_circle.profile_personal
             WHERE profile_personal_referred_by IN ({ph})
             """
@@ -153,10 +153,13 @@ def compute_profile_degrees_from_viewer(db, viewer_uid, target_profile_uids, max
 
         r_up = db.execute(
             f"""
-            SELECT profile_personal_referred_by AS uid
-            FROM every_circle.profile_personal
-            WHERE profile_personal_uid IN ({ph})
-            AND profile_personal_referred_by IS NOT NULL
+            SELECT pp.profile_personal_referred_by AS uid,
+                   parent.profile_personal_is_deleted AS profile_personal_is_deleted
+            FROM every_circle.profile_personal pp
+            LEFT JOIN every_circle.profile_personal parent
+                ON parent.profile_personal_uid = pp.profile_personal_referred_by
+            WHERE pp.profile_personal_uid IN ({ph})
+            AND pp.profile_personal_referred_by IS NOT NULL
             """
         )
 
@@ -165,6 +168,10 @@ def compute_profile_degrees_from_viewer(db, viewer_uid, target_profile_uids, max
             uid = row.get("profile_personal_uid") or row.get("uid")
             if uid and uid not in seen:
                 seen.add(uid)
+                if int(row.get("profile_personal_is_deleted") or 0):
+                    if uid in target_set:
+                        degrees[uid] = degree
+                    continue
                 next_frontier.append(uid)
                 if uid in target_set:
                     degrees[uid] = degree

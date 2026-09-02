@@ -28,6 +28,7 @@ from moderation import (
 )
 from user_path_connection import ConnectionsPath
 from wallet_ids import EC_WALLET_ID
+from profile_status import batch_deleted_status
 from wallet_service import (
     bounty_was_released_to_useable_at,
     credit_bounty_to_wallet,
@@ -1624,14 +1625,33 @@ def _charity_share_is_payable(charity_amount, charity_pct):
         return charity_amount > 0
 
 
-def _middle_path_nodes(combined_path, seen):
+def _filter_deleted_profile_uids(db, uids):
+    if not uids or db is None:
+        return list(uids or [])
+    deleted_map = batch_deleted_status(db, uids)
+    return [uid for uid in uids if uid and not deleted_map.get(uid)]
+
+
+def _profile_id_is_deleted_tombstone(db, profile_id):
+    if not profile_id or not db:
+        return False
+    profile_id = str(profile_id).strip()
+    if not profile_id.startswith("110-"):
+        return False
+    return bool(batch_deleted_status(db, [profile_id]).get(profile_id))
+
+
+def _middle_path_nodes(combined_path, seen, db=None):
     """Nodes strictly between path endpoints, excluding known bounty recipients."""
     if not combined_path:
         return []
     try:
         uids = combined_path.split(",")
         middle = uids[1:-1] if len(uids) > 2 else []
-        return [uid for uid in middle if uid and uid not in seen]
+        middle = [uid for uid in middle if uid and uid not in seen]
+        if db is not None:
+            middle = _filter_deleted_profile_uids(db, middle)
+        return middle
     except Exception as e:
         print(f"Error processing network path: {str(e)}")
         return []
@@ -1692,7 +1712,7 @@ def _network_participants_capped(middle_uids, effective_bounty):
 
 
 def _plan_seeking_bounty_shares(
-    effective_bounty, buyer_id, recommender_id, combined_path, seller_id=None
+    effective_bounty, buyer_id, recommender_id, combined_path, seller_id=None, db=None
 ):
     """
     Seeking-only bounty allocation (buyer-funded).
@@ -1713,7 +1733,7 @@ def _plan_seeking_bounty_shares(
     Returns (known_participants, network_participants).
     """
     known = []
-    if recommender_id:
+    if recommender_id and not _profile_id_is_deleted_tombstone(db, recommender_id):
         known.append(
             {
                 "tb_profile_id": recommender_id,
@@ -1730,7 +1750,7 @@ def _plan_seeking_bounty_shares(
     # Defensive: never treat buyer as a network intermediary.
     if buyer_id:
         seen.add(buyer_id)
-    middle = _middle_path_nodes(combined_path, seen)
+    middle = _middle_path_nodes(combined_path, seen, db=db)
     network = _network_participants_capped(middle, effective_bounty)
 
     recommender_is_seller = bool(
@@ -2543,6 +2563,28 @@ def _estimated_refund_api_payload(refund_meta, *, compact=False):
     return payload
 
 
+
+
+TRANSACTION_BUYER_NOTE_MAX_LEN = 500
+
+
+def _normalize_transaction_buyer_note(raw):
+    """
+    Trim optional buyer checkout note. Returns None when omitted/blank.
+    Raises ValueError when trimmed length exceeds TRANSACTION_BUYER_NOTE_MAX_LEN.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raw = str(raw)
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if len(trimmed) > TRANSACTION_BUYER_NOTE_MAX_LEN:
+        raise ValueError(
+            f"transaction_buyer_note must be at most {TRANSACTION_BUYER_NOTE_MAX_LEN} characters"
+        )
+    return trimmed
 
 
 def _normalize_stripe_payment_intent_id(raw):
@@ -3915,6 +3957,7 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                     t.transaction_in_escrow,
                     t.transaction_return_requested,
                     t.transaction_return_note,
+                    t.transaction_buyer_note,
                     t.transaction_business_id AS seller_id,
                     CASE
                         WHEN ti.ti_bs_id LIKE '250-%%' THEN biz.business_name
@@ -4143,6 +4186,18 @@ class Transactions(Resource):
                 response["code"] = 400
                 return response, 400
 
+            if "transaction_buyer_note" in payload:
+                try:
+                    buyer_note = _normalize_transaction_buyer_note(
+                        payload.get("transaction_buyer_note")
+                    )
+                except ValueError as note_err:
+                    response["message"] = str(note_err)
+                    response["code"] = 400
+                    return response, 400
+            else:
+                buyer_note = None
+
             # Extract required fields from payload
             transaction = {
                 "transaction_profile_id": payload.get("profile_id"),
@@ -4159,6 +4214,8 @@ class Transactions(Resource):
                 ),
                 "transaction_type": "sale",
             }
+            if buyer_note is not None:
+                transaction["transaction_buyer_note"] = buyer_note
 
             with connect() as db:
                 if stripe_pi:
@@ -4822,12 +4879,13 @@ class Transactions(Resource):
                                     recommender_profile_id,
                                     combined_path,
                                     seller_id=seller_profile_id,
+                                    db=db,
                                 )
                             )
                         else:
                             known_participants = []
                             if is_expertise_item:
-                                if profile_id:
+                                if profile_id and not _profile_id_is_deleted_tombstone(db, profile_id):
                                     known_participants.append(
                                         {
                                             "tb_profile_id": profile_id,
@@ -4836,14 +4894,15 @@ class Transactions(Resource):
                                     )
                             else:
                                 if buyer_is_recommender:
-                                    known_participants.append(
-                                        {
-                                            "tb_profile_id": profile_id,
-                                            **_bounty_pct_amount(effective_bounty, 0.40),
-                                        }
-                                    )
+                                    if profile_id and not _profile_id_is_deleted_tombstone(db, profile_id):
+                                        known_participants.append(
+                                            {
+                                                "tb_profile_id": profile_id,
+                                                **_bounty_pct_amount(effective_bounty, 0.40),
+                                            }
+                                        )
                                 else:
-                                    if profile_id:
+                                    if profile_id and not _profile_id_is_deleted_tombstone(db, profile_id):
                                         known_participants.append(
                                             {
                                                 "tb_profile_id": profile_id,
@@ -4852,7 +4911,9 @@ class Transactions(Resource):
                                                 ),
                                             }
                                         )
-                                    if recommender_profile_id:
+                                    if recommender_profile_id and not _profile_id_is_deleted_tombstone(
+                                        db, recommender_profile_id
+                                    ):
                                         known_participants.append(
                                             {
                                                 "tb_profile_id": recommender_profile_id,
@@ -4873,7 +4934,7 @@ class Transactions(Resource):
                                 if p["tb_profile_id"]
                             }
 
-                            middle_nodes = _middle_path_nodes(combined_path, seen)
+                            middle_nodes = _middle_path_nodes(combined_path, seen, db=db)
                             if is_expertise_item:
                                 network_participants = _network_participants_capped(
                                     middle_nodes, effective_bounty
@@ -4888,6 +4949,8 @@ class Transactions(Resource):
                         for participant in known_participants:
                             participant_id = participant.get("tb_profile_id")
                             if not participant_id:
+                                continue
+                            if _profile_id_is_deleted_tombstone(db, participant_id):
                                 continue
 
                             print(f"Processing known participant: {participant_id}")
@@ -4974,6 +5037,8 @@ class Transactions(Resource):
                         for participant in network_participants:
                             participant_id = participant.get("tb_profile_id")
                             if not participant_id:
+                                continue
+                            if _profile_id_is_deleted_tombstone(db, participant_id):
                                 continue
 
                             print(f"Processing network participant: {participant_id}")
@@ -5115,6 +5180,8 @@ class Transactions(Resource):
                 response["message"] = "Transaction completed successfully"
                 response["code"] = 200
                 response["schema_version"] = 3
+                if buyer_note is not None:
+                    response["transaction_buyer_note"] = buyer_note
                 purchase_row = None
                 try:
                     from account_screen_v3 import build_buyer_purchase_row_v3
@@ -6690,6 +6757,7 @@ class SellerTransactions(Resource):
                         t.transaction_in_escrow,
                         t.transaction_return_requested,
                         t.transaction_return_note,
+                        t.transaction_buyer_note,
                         
                         -- ti.*,
                         CASE

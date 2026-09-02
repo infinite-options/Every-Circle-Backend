@@ -1,6 +1,7 @@
 from flask import request
 from flask_restful import Resource
 from data_ec import connect
+from profile_status import deleted_profile_sql_clause
 
 class SearchReferral(Resource):
     def get(self):
@@ -101,7 +102,8 @@ class SearchReferral(Resource):
                     profile_personal_tag_line_is_public
                 FROM every_circle.profile_personal
                 LEFT JOIN every_circle.users u ON profile_personal_user_id = user_uid
-                WHERE {' OR '.join(where_clauses)}
+                WHERE COALESCE(profile_personal_is_deleted, 0) = 0
+                AND ({' OR '.join(where_clauses)})
                 LIMIT 50
             """
             
