@@ -40,6 +40,10 @@ s3 = boto3.client(
     aws_secret_access_key=os.getenv('S3_SECRET'),
     region_name=os.getenv('S3_REGION')
 )
+# print(
+#     "[S3] S3_KEY ends with ...%s, S3_SECRET ends with ...%s"
+#     % ((os.getenv("S3_KEY") or "")[-4:], (os.getenv("S3_SECRET") or "")[-4:])
+# )
 
 def encrypt_data(plain_text):
     if not plain_text:
