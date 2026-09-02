@@ -55,7 +55,6 @@ from transaction_receipt import TransactionReceipt
 from order_detail import OrderDetail
 from account_deletion import AccountDelete
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
-from escrow_release import EscrowReleaseJob, format_escrow_release_email
 from seller_hold_release import (
     SellerHoldReleaseJob,
     format_seller_hold_release_email,
@@ -618,81 +617,6 @@ def Lists_CRON(Resource):
         return response
 
 
-def _escrow_release_cron_wrapper():
-    print("\nIn Escrow Release CRON\n\n\n")
-    response = {}
-    dt = datetime.today()
-    recipients = [
-        "pmarathay@gmail.com",
-        "pmarathay@infiniteoptions.com",
-    ]
-    try:
-        response = EscrowReleaseJob.get()
-
-        if "cron fail" in response.keys():
-            raise Exception("Error in cronjob")
-
-        try:
-            subject = f"Every-Circle Escrow Release CRON — SUCCESS ({dt})"
-            body = format_escrow_release_email(response, run_dt=dt)
-
-            for recipient in recipients:
-                sendEmail(recipient, subject, body)
-
-            response["email"] = {
-                "message": f"Every-Circle Escrow Release CRON Job Email for {dt} sent!",
-                "code": 200,
-            }
-
-        except Exception:
-            response["email fail"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Email for {dt} "
-                    "could not be sent"
-                ),
-                "code": 500,
-            }
-
-    except Exception:
-        try:
-            failed_count = response.get("failed_count", 0)
-            subject = (
-                f"Every-Circle Escrow Release CRON — FAILED "
-                f"({failed_count} errors, {dt})"
-            )
-            body = format_escrow_release_email(response, run_dt=dt)
-
-            for recipient in recipients:
-                sendEmail(recipient, subject, body)
-
-            response["email"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} sent!"
-                ),
-                "code": 201,
-            }
-
-        except Exception:
-            response["email fail"] = {
-                "message": (
-                    f"Every-Circle Escrow Release CRON Job Fail Email for {dt} "
-                    "could not be sent"
-                ),
-                "code": 500,
-            }
-
-    return response
-
-
-class EscrowReleaseCron_CLASS(Resource):
-    def get(self):
-        return _escrow_release_cron_wrapper()
-
-
-def EscrowRelease_CRON(Resource):
-    return _escrow_release_cron_wrapper()
-
-
 def _seller_hold_release_cron_wrapper():
     print("\nIn Seller Hold Release CRON\n\n\n")
     response = {}
@@ -876,7 +800,6 @@ api.add_resource(
 )
 api.add_resource(BusinessMap, "/api/v1/business_map")
 api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
-api.add_resource(EscrowReleaseCron_CLASS, "/api/v1/escrow_release_cron")
 api.add_resource(
     SellerHoldReleaseCron_CLASS, "/api/v1/seller_hold_release_cron"
 )

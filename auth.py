@@ -50,7 +50,6 @@ _PUBLIC_PATHS = (
     "/stripe_key",
     "/decode",
     "/api/v1/lists_cron",
-    "/api/v1/escrow_release_cron",
     "/api/v1/seller_hold_release_cron",
 )
 
