@@ -234,7 +234,6 @@ def _load_sale_header(db, order_uid):
             t.transaction_fees,
             t.transaction_shipping,
             COALESCE(t.transaction_wallet_amount, 0) AS transaction_wallet_amount,
-            t.transaction_in_escrow,
             t.transaction_return_requested,
             t.transaction_return_note,
             t.transaction_buyer_note,
@@ -784,7 +783,7 @@ def enrich_order_v2(db, order_uid, payload, *, audience="buyer"):
     header.update(
         {
             k: payload.get(k)
-            for k in ("requires_shipping", "fulfillment_method", "transaction_in_escrow")
+            for k in ("requires_shipping", "fulfillment_method")
             if payload.get(k) is not None
         }
     )

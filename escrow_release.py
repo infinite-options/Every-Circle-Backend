@@ -8,6 +8,9 @@ bounty to useable while the verify + return-window table rules are in effect.
 Eligible orders must be fully shipped (or have no shippable lines). Unshipped
 physical orders stay in escrow until the seller ships or the buyer verifies.
 
+Uses ti_bounty_released_at (not the retired transaction_in_escrow column) when
+invoked manually via GET /api/v1/escrow_release_cron.
+
 Used by EscrowReleaseCron_CLASS (Postman) and EscrowRelease_CRON (Zappa).
 Manual buyer confirmation previously called release_escrow_for_transaction();
 delivery verification now releases bounty per line via wallet_service instead.
@@ -42,10 +45,10 @@ def _suggested_action_for_error(message):
             "Inspect the wallet row for that profile_id in every_circle.wallet "
             "and check API/DB logs."
         )
-    if "failed to clear transaction_in_escrow" in msg:
+    if "failed to clear bounty release flags" in msg:
         return (
-            "Verify the transaction row exists in every_circle.transactions "
-            "and is not locked."
+            "Verify transactions_items.ti_bounty_released_at for the order lines "
+            "and check API/DB logs."
         )
     if "transaction not found" in msg:
         return "Confirm transaction_uid still exists in every_circle.transactions."
@@ -191,7 +194,7 @@ def format_escrow_release_email(response, run_dt=None):
                 "  1. Review each failure group above and follow the suggested action.",
                 "  2. After fixing data or code, re-run:",
                 "       GET /api/v1/escrow_release_cron",
-                "  3. Unreleased transactions still have transaction_in_escrow = 1",
+                "  3. Orders with pending bounty still have NULL ti_bounty_released_at",
                 "     and will be picked up on the next run.",
             ]
         )
@@ -247,11 +250,17 @@ def _order_is_shipped_for_auto_release(db, transaction_uid):
 
 def _eligible_transactions_query(days):
     return f"""
-        SELECT t.transaction_uid, t.transaction_datetime
+        SELECT DISTINCT t.transaction_uid, t.transaction_datetime
         FROM every_circle.transactions t
-        WHERE t.transaction_in_escrow = 1
-          AND t.transaction_datetime < NOW() - INTERVAL %s DAY
+        INNER JOIN every_circle.transactions_items ti
+            ON ti.ti_transaction_id = t.transaction_uid
+        INNER JOIN every_circle.transactions_bounty tb
+            ON tb.tb_ti_id = ti.ti_uid
+        WHERE t.transaction_datetime < NOW() - INTERVAL %s DAY
           AND COALESCE(t.transaction_return_requested, 0) = 0
+          AND COALESCE(t.transaction_type, 'sale') = 'sale'
+          AND ti.ti_bounty_released_at IS NULL
+          AND tb.tb_amount > 0.0001
           AND NOT ({_unshipped_shippable_lines_sql("t")})
         ORDER BY t.transaction_datetime ASC
     """
@@ -263,12 +272,13 @@ def _release_bounty_to_wallet(db, profile_id, amount):
 
 def release_escrow_for_transaction(db, transaction_uid, reason="auto_5_day"):
     """
-    Move bounty from wallet_pending to wallet_useable_balance and clear escrow.
-    Idempotent: no-op if transaction is not in escrow.
+    Move bounty from wallet_pending to wallet_useable_balance for a sale.
+
+    Idempotent: no-op when bounty is already released on all lines.
     """
     tx_q = db.execute(
         """
-        SELECT transaction_uid, transaction_in_escrow, transaction_return_requested
+        SELECT transaction_uid, transaction_return_requested
         FROM every_circle.transactions
         WHERE transaction_uid = %s
         """,
@@ -284,10 +294,23 @@ def release_escrow_for_transaction(db, transaction_uid, reason="auto_5_day"):
         }
 
     tx_row = tx_rows[0]
-    if int(tx_row.get("transaction_in_escrow") or 0) != 1:
+    pending_q = db.execute(
+        """
+        SELECT COUNT(*) AS pending_count
+        FROM every_circle.transactions_items ti
+        INNER JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        WHERE ti.ti_transaction_id = %s
+          AND ti.ti_bounty_released_at IS NULL
+          AND tb.tb_amount > 0.0001
+        """,
+        (transaction_uid,),
+    )
+    pending_rows = pending_q.get("result") or []
+    pending_count = int((pending_rows[0] or {}).get("pending_count") or 0)
+    if pending_count == 0:
         return {
             "code": 200,
-            "message": "Transaction already out of escrow",
+            "message": "Bounty already released for this transaction",
             "transaction_uid": transaction_uid,
             "reason": reason,
             "skipped": True,
@@ -351,16 +374,23 @@ def release_escrow_for_transaction(db, transaction_uid, reason="auto_5_day"):
 
         wallet_updates.append(wallet_result)
 
-    update_tx = db.update(
-        "every_circle.transactions",
-        {"transaction_uid": transaction_uid},
-        {"transaction_in_escrow": 0},
+    stamp_q = db.execute(
+        """
+        UPDATE every_circle.transactions_items ti
+        INNER JOIN every_circle.transactions_bounty tb ON tb.tb_ti_id = ti.ti_uid
+        SET ti.ti_bounty_released_at = COALESCE(ti.ti_bounty_released_at, NOW())
+        WHERE ti.ti_transaction_id = %s
+          AND ti.ti_bounty_released_at IS NULL
+          AND tb.tb_amount > 0.0001
+        """,
+        (transaction_uid,),
+        cmd="post",
     )
-    if update_tx.get("code") != 200:
+    if stamp_q.get("code") != 200:
         return {
-            "code": update_tx.get("code", 500),
-            "message": update_tx.get(
-                "message", "Failed to clear transaction_in_escrow"
+            "code": stamp_q.get("code", 500),
+            "message": stamp_q.get(
+                "message", "Failed to clear bounty release flags"
             ),
             "transaction_uid": transaction_uid,
             "reason": reason,

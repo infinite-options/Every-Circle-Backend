@@ -3107,7 +3107,7 @@ def _finalize_pending_return(
     else:
         new_transaction_uid = new_uid_resp['result'][0]['new_id']
         transactions_datetime = utc_now_str()
-        new_transaction = {'transaction_uid': new_transaction_uid, 'transaction_datetime': transactions_datetime, 'transaction_profile_id': _orig_tx_170.get('transaction_profile_id'), 'transaction_business_id': _orig_tx_170.get('transaction_business_id'), 'transaction_stripe_pi': _orig_tx_170.get('transaction_stripe_pi'), 'transaction_total': f'{-refund_grand:.4f}', 'transaction_amount': f'{-refund_subtotal:.4f}', 'transaction_taxes': f'{-refund_tax:.4f}', 'transaction_fees': '0.0000', 'transaction_wallet_amount': f'{-wallet_refund:.4f}', 'transaction_in_escrow': 0, 'transaction_return_note': _return_note_173, 'transaction_type': 'return', 'transaction_original_uid': _original_tx_uid_172}
+        new_transaction = {'transaction_uid': new_transaction_uid, 'transaction_datetime': transactions_datetime, 'transaction_profile_id': _orig_tx_170.get('transaction_profile_id'), 'transaction_business_id': _orig_tx_170.get('transaction_business_id'), 'transaction_stripe_pi': _orig_tx_170.get('transaction_stripe_pi'), 'transaction_total': f'{-refund_grand:.4f}', 'transaction_amount': f'{-refund_subtotal:.4f}', 'transaction_taxes': f'{-refund_tax:.4f}', 'transaction_fees': '0.0000', 'transaction_wallet_amount': f'{-wallet_refund:.4f}', 'transaction_return_note': _return_note_173, 'transaction_type': 'return', 'transaction_original_uid': _original_tx_uid_172}
         if refund_shipping:
             new_transaction['transaction_shipping'] = f'{-refund_shipping:.4f}'
         tx_insert = _db_168.insert('every_circle.transactions', new_transaction)
@@ -3954,7 +3954,6 @@ def _buyer_purchase_list_query(*, order_uid_filter=False):
                     t.transaction_fees,
                     t.transaction_shipping,
                     t.transaction_profile_id,
-                    t.transaction_in_escrow,
                     t.transaction_return_requested,
                     t.transaction_return_note,
                     t.transaction_buyer_note,
@@ -4209,9 +4208,6 @@ class Transactions(Resource):
                 "transaction_taxes": payload.get("total_taxes"),
                 "transaction_fees": payload.get("total_fees"),
                 "transaction_wallet_amount": wallet_amount,
-                "transaction_in_escrow": (
-                    1 if payload.get("transaction_in_escrow") else 0
-                ),
                 "transaction_type": "sale",
             }
             if buyer_note is not None:
@@ -5241,11 +5237,6 @@ class Transactions(Resource):
 
             update_fields = {}
 
-            if "transaction_in_escrow" in payload:
-                update_fields["transaction_in_escrow"] = (
-                    1 if payload.get("transaction_in_escrow") else 0
-                )
-
             if "transaction_return_requested" in payload:
                 update_fields["transaction_return_requested"] = (
                     1 if payload.get("transaction_return_requested") else 0
@@ -5620,11 +5611,6 @@ class Transactions(Resource):
             response["code"] = 400
             return response, 400
 
-        if "transaction_in_escrow" not in payload:
-            response["message"] = "transaction_in_escrow is required"
-            response["code"] = 400
-            return response, 400
-
         if jwt_auth_required():
             buyer_profile_id, actor_error = _bind_buyer_profile_id(
                 payload.get("profile_id")
@@ -5646,7 +5632,7 @@ class Transactions(Resource):
             with connect() as db:
                 tx_row_q = db.execute(
                     """
-                    SELECT transaction_uid, transaction_profile_id, transaction_in_escrow
+                    SELECT transaction_uid, transaction_profile_id
                     FROM every_circle.transactions
                     WHERE transaction_uid = %s
                     """,
@@ -5826,11 +5812,6 @@ class Transactions(Resource):
                         all_received = False
                         break
                 update_fields = {}
-
-                if all_received:
-                    update_fields["transaction_in_escrow"] = 0
-                elif int(tx_row.get("transaction_in_escrow") or 0) == 1:
-                    update_fields["transaction_in_escrow"] = 1
 
                 if "transaction_return_requested" in payload:
                     update_fields["transaction_return_requested"] = (
@@ -6754,7 +6735,6 @@ class SellerTransactions(Resource):
                         t.transaction_shipping,
                         t.transaction_business_id AS seller_id,
                         t.transaction_profile_id,
-                        t.transaction_in_escrow,
                         t.transaction_return_requested,
                         t.transaction_return_note,
                         t.transaction_buyer_note,

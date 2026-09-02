@@ -861,12 +861,9 @@ def _bounty_proceeds_status(row, db, *, reserved_amount=0.0, earned_net=None):
     if reserved_amount > 0.0001 and earned_net <= 0.0001:
         return "reserved"
 
-    in_escrow = row.get("in_escrow")
     released = row.get("ti_bounty_released_at") or row.get("bounty_released_at")
     if released:
         return "useable"
-    if in_escrow in (1, "1", True):
-        return "pending"
     ti_uid = row.get("ti_uid")
     if ti_uid:
         q = db.execute(

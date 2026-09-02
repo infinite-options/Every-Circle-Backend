@@ -285,12 +285,20 @@ def _row_needs_shipping_hydration(row):
 def _row_needs_received_hydration(row):
     if _is_return_list_row(row):
         return False
-    if int(row.get("transaction_in_escrow") or 0) != 1:
-        return False
     # Row-level ti_received_qty is always on list payloads; hydration adds per-line detail.
     if row.get("received_item_count") is not None and row.get("ti_received_qty") is not None:
         return False
-    return True
+    if int(row.get("all_items_received") or 0) == 1:
+        return False
+    verifiable = int(row.get("verifiable_remaining_qty") or 0)
+    if verifiable > 0:
+        return True
+    units = row.get("units") or {}
+    if int(units.get("verifiable_remaining_qty") or 0) > 0:
+        return True
+    purchased = int(row.get("ti_bs_qty") or row.get("purchased_units") or 0)
+    received = int(row.get("ti_received_qty") or row.get("received_item_count") or 0)
+    return purchased > 0 and received < purchased
 
 
 def _sale_uid_for_hydration(row):
