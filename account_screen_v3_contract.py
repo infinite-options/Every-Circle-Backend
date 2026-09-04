@@ -646,6 +646,10 @@ def build_v3_display(row, money, *, audience="buyer", tz_name=None):
             )
             display["bounty_label"] = format_money_label(bounty_amt)
         display["days_open"] = v2_display.get("days_open") or "—"
+        if kind not in _RETURN_ROW_KINDS:
+            display["return_window_closes_label"] = (
+                row.get("return_window_closes_label") or "—"
+            )
 
     return display
 

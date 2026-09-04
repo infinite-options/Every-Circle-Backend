@@ -1185,6 +1185,82 @@ def line_return_eligibility(ti_row, now=None):
     return result
 
 
+def line_return_window_api_fields(ti_row, *, now=None, tz_name=None):
+    """
+    Per-line return-window snapshot + expiry for account-screen seller rows.
+
+    Window start = ti_received_at (last buyer verification), matching seller
+    proceeds hold (wt_available_at = received_at + window_days).
+    """
+    from datetime_utils import format_utc_iso, parse_stored_datetime
+    from wallet_transactions_service import _parse_positive_window_days
+
+    is_returnable = _as_returnable_flag(ti_row.get("ti_bs_is_returnable"), default=True)
+    window_days_raw = ti_row.get("ti_bs_return_window_days")
+    window_days = _parse_positive_window_days(window_days_raw)
+    if window_days is None and window_days_raw is not None:
+        s = str(window_days_raw).strip()
+        if s != "":
+            try:
+                parsed = int(window_days_raw)
+                if parsed == 0:
+                    window_days = 0
+            except (TypeError, ValueError):
+                pass
+
+    api_window_days = window_days if window_days is not None else 0
+    out = {
+        "ti_bs_is_returnable": 1 if is_returnable else 0,
+        "is_returnable": is_returnable,
+        "returnable": is_returnable,
+        "ti_bs_return_window_days": window_days_raw if window_days_raw is not None else 0,
+        "return_window_days": api_window_days,
+        "return_window_expires_at": None,
+        "return_window_expired": False,
+        "is_return_window_expired": False,
+    }
+
+    if not is_returnable:
+        out["return_window_closes_label"] = "Not returnable"
+        return out
+
+    received_at = parse_stored_datetime(ti_row.get("ti_received_at"))
+    if received_at is None or window_days is None:
+        out["return_window_closes_label"] = "—"
+        return out
+
+    now = now or datetime.now(timezone.utc)
+    expires_at = received_at + timedelta(days=window_days)
+    expired = now > expires_at
+
+    out["return_window_expires_at"] = format_utc_iso(expires_at)
+    out["return_window_expired"] = expired
+    out["is_return_window_expired"] = expired
+    out["return_window_closes_label"] = (
+        "Closed"
+        if expired
+        else format_return_window_close_date_label(expires_at, tz_name)
+    )
+    return out
+
+
+def format_return_window_close_date_label(expires_at, tz_name=None):
+    """Human-readable return-window close date in account-screen timezone."""
+    from datetime_utils import parse_stored_datetime
+
+    dt = parse_stored_datetime(expires_at)
+    if dt is None:
+        return "—"
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            dt = dt.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return dt.strftime("%b ") + str(dt.day) + f", {dt.year}"
+
+
 def _display_return_status(return_status, refund_status):
     """FE label: e.g. 'Returning - Pending' / 'Cancelled - Refunded'."""
     r = (return_status or "").strip().capitalize()
