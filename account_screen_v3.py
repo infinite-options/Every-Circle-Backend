@@ -489,12 +489,27 @@ def _return_snapshot_view(row, sale_line):
     return view
 
 
+def _attach_return_window_fields(row, *, tz_name=None):
+    """Per-line return-window snapshot fields for seller sale rows."""
+    from transactions import line_return_window_api_fields
+
+    if not isinstance(row, dict):
+        return row
+    if row.get("row_kind") in ("return", "pending_return"):
+        return row
+    if map_row_kind_v3(row.get("row_kind")) != "order":
+        return row
+    row.update(line_return_window_api_fields(row, tz_name=tz_name))
+    return row
+
+
 def transform_sale_row_v3(row, *, db=None, tz_name=None, sale_line=None):
     money = build_row_money(row, sale_line=sale_line)
     bounty_block = _seller_bounty_block(row, db=db, sale_line=sale_line)
     order_bounty = bounty_block.get("order_bounty_paid") or 0
     reclaim = bounty_block.get("bounty_to_reclaim")
     row_for_display = dict(row)
+    _attach_return_window_fields(row_for_display, tz_name=tz_name)
     row_for_display["order_bounty_paid"] = order_bounty
     row_for_display["line_bounty_paid"] = order_bounty
     row_for_display["bounty_to_reclaim"] = reclaim
@@ -510,6 +525,18 @@ def transform_sale_row_v3(row, *, db=None, tz_name=None, sale_line=None):
     v3["display"] = build_v3_display(
         row_for_display, money, audience="seller", tz_name=tz_name
     )
+    for key in (
+        "returnable",
+        "is_returnable",
+        "ti_bs_is_returnable",
+        "return_window_days",
+        "ti_bs_return_window_days",
+        "return_window_expires_at",
+        "return_window_expired",
+        "is_return_window_expired",
+    ):
+        if key in row_for_display:
+            v3[key] = row_for_display[key]
     v3["attention_level"] = attention_level_for_row(row)
     v3["return_logistics"] = build_return_logistics(row)
     v3["actions"] = build_v3_actions(row)

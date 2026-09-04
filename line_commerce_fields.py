@@ -1420,7 +1420,10 @@ def batch_line_checkout_snapshots(db, ti_uids):
             ti_line_shipping_amount,
             ti_shipping_refundable,
             ti_listing_shipping,
-            ti_choices_extra_cost
+            ti_choices_extra_cost,
+            ti_bs_is_returnable,
+            ti_bs_return_window_days,
+            ti_received_at
         FROM every_circle.transactions_items
         WHERE ti_uid IN ({placeholders})
         """,
@@ -1459,6 +1462,9 @@ def attach_line_snapshots_to_rows(db, rows):
                 "ti_shipping_refundable",
                 "ti_listing_shipping",
                 "ti_choices_extra_cost",
+                "ti_bs_is_returnable",
+                "ti_bs_return_window_days",
+                "ti_received_at",
             ):
                 if skip_qty and key == "ti_bs_qty":
                     continue

@@ -51,6 +51,7 @@ _PUBLIC_PATHS = (
     "/decode",
     "/api/v1/lists_cron",
     "/api/v1/seller_hold_release_cron",
+    "/api/v1/account_deletion_purge_cron",
 )
 
 _PROTECTED_GET_PREFIXES = (
@@ -172,6 +173,15 @@ def _deleted_user_response(db, *, email=None, user_uid=None, social_id=None):
     if _deleted_account_lookup(
         db, email=email, user_uid=user_uid, social_id=social_id
     ):
+        return {"message": "Account deleted", "code": 401}, 401
+    return None
+
+
+def _soft_deleted_profile_response(profile):
+    """Block login when the profile is soft-deleted (pending 30-day purge)."""
+    from profile_status import is_profile_deleted
+
+    if profile and is_profile_deleted(profile):
         return {"message": "Account deleted", "code": 401}, 401
     return None
 
@@ -627,6 +637,9 @@ class AuthLogin(Resource):
                 ):
                     return {"message": "Invalid email or password", "code": 401}, 401
                 profile = _profile_for_user(db, user["user_uid"])
+                soft_deleted = _soft_deleted_profile_response(profile)
+                if soft_deleted:
+                    return soft_deleted
             return _auth_success(user, profile)
         except Exception as e:
             print(f"AuthLogin error: {e}")
@@ -702,6 +715,9 @@ class AuthRefresh(Resource):
                     return {"message": "User not found", "code": 401}, 401
                 user = rows[0]
                 profile = _profile_for_user(db, user_uid)
+                soft_deleted = _soft_deleted_profile_response(profile)
+                if soft_deleted:
+                    return soft_deleted
             return _auth_success(user, profile)
         except Exception as e:
             print(f"AuthRefresh error: {e}")
@@ -724,6 +740,9 @@ class AuthMe(Resource):
                     return {"message": "User not found", "code": 404}, 404
                 user = rows[0]
                 profile = _profile_for_user(db, user_uid)
+                soft_deleted = _soft_deleted_profile_response(profile)
+                if soft_deleted:
+                    return soft_deleted
             payload = _identity_payload(user, profile)
             return {"message": "Success", "code": 200, "result": payload}, 200
         except Exception as e:
@@ -854,6 +873,9 @@ class AuthSocial(Resource):
                         "code": 404,
                     }, 404
                 profile = _profile_for_user(db, user["user_uid"])
+                soft_deleted = _soft_deleted_profile_response(profile)
+                if soft_deleted:
+                    return soft_deleted
             return _auth_success(user, profile)
         except Exception as e:
             print(f"AuthSocial error: {e}")
