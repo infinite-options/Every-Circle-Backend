@@ -3010,6 +3010,50 @@ def _update_return_statuses(
                 req_fields['trr_stripe_refund_id'] = _stripe_refund_id_102
             _db_101.update('every_circle.transaction_return_requests', {'trr_uid': _trr_uid_106}, req_fields)
 
+    _notify_return_status_change(db, transaction_uid, refund_status)
+
+
+def _notify_return_status_change(db, transaction_uid, refund_status):
+    """
+    SMS fallback for return/refund status changes. All seven call sites of
+    _update_return_statuses funnel through here — refund_status alone is
+    enough to know who needs to hear about it:
+      PENDING  → a return was just requested/re-opened, seller needs to act
+      REFUNDED → buyer's refund went through
+      REJECTED → buyer's return/refund request was declined
+    Best-effort only: never raises, never blocks the caller's transaction.
+    """
+    try:
+        rows = db.execute(
+            """SELECT transaction_profile_id, transaction_business_id
+               FROM every_circle.transactions WHERE transaction_uid = %s""",
+            (transaction_uid,),
+        )
+        row = (rows.get("result") or [{}])[0]
+        buyer_id = row.get("transaction_profile_id")
+        seller_id = row.get("transaction_business_id")
+    except Exception as e:
+        print(f"_notify_return_status_change lookup error for {transaction_uid}: {e}")
+        return
+
+    try:
+        from notifications_service import notify_uid_if_away
+
+        if refund_status == REFUND_STATUS_PENDING and seller_id:
+            notify_uid_if_away(
+                seller_id,
+                "A buyer has requested a return on Every Circle. Review it under Seller Tools.",
+            )
+        elif refund_status == REFUND_STATUS_REFUNDED and buyer_id:
+            notify_uid_if_away(buyer_id, "Your refund has been issued on Every Circle.")
+        elif refund_status == REFUND_STATUS_REJECTED and buyer_id:
+            notify_uid_if_away(
+                buyer_id,
+                "Your return request was declined on Every Circle. Open the app for details.",
+            )
+    except Exception as e:
+        print(f"_notify_return_status_change notify error for {transaction_uid}: {e}")
+
 
 def _finalize_pending_return(
     db,
@@ -5666,6 +5710,19 @@ class Transactions(Resource):
                     )
                     if purchase_row:
                         response["purchase_row"] = purchase_row
+
+                    shipped_lines = [
+                        line for line in updated_lines
+                        if line.get("fulfillment_status") == FULFILLMENT_STATUS_IN_TRANSIT
+                    ]
+                    if shipped_lines:
+                        from notifications_service import notify_uid_if_away
+
+                        item_phrase = "item has" if len(shipped_lines) == 1 else f"{len(shipped_lines)} items have"
+                        notify_uid_if_away(
+                            buyer_profile_id,
+                            f"Good news — your {item_phrase} shipped! Check tracking in Every Circle under My Purchases.",
+                        )
                 return response, 200
 
         except Exception as e:
@@ -5708,7 +5765,7 @@ class Transactions(Resource):
             with connect() as db:
                 tx_row_q = db.execute(
                     """
-                    SELECT transaction_uid, transaction_profile_id
+                    SELECT transaction_uid, transaction_profile_id, transaction_business_id
                     FROM every_circle.transactions
                     WHERE transaction_uid = %s
                     """,
@@ -5926,6 +5983,16 @@ class Transactions(Resource):
                 )
                 if purchase_row:
                     response["purchase_row"] = purchase_row
+
+                seller_id = tx_row.get("transaction_business_id")
+                if seller_id:
+                    from notifications_service import notify_uid_if_away
+
+                    if all_received:
+                        seller_msg = "The buyer has confirmed receipt of the full order on Every Circle."
+                    else:
+                        seller_msg = "The buyer has confirmed receipt of part of an order on Every Circle."
+                    notify_uid_if_away(seller_id, seller_msg)
                 return response, 200
 
         except Exception as e:

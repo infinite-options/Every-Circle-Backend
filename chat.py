@@ -10,6 +10,7 @@ import ably
 import asyncio
 from nearby import RELATIONSHIP_MAP
 from datetime_utils import parse_stored_datetime
+from notifications_service import notify_uid_if_away
 
 load_dotenv()
 
@@ -668,6 +669,14 @@ def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sen
         asyncio.run(_pub())
     except Exception as e:
         print(f"Error publishing chat message: {e}")
+
+    # SMS fallback — only actually sends if recipient's app isn't open right now
+    # (see notifications_service.is_uid_present). Independent of whether the
+    # Ably publish above succeeded, since a dead/absent client is exactly the
+    # case this exists for.
+    if recipient_uid:
+        preview = body if len(body) <= 120 else body[:117] + "..."
+        notify_uid_if_away(recipient_uid, f"{sender_name or 'Someone'} sent you a message on Every Circle: {preview}")
 
 
 # --------------- resources ---------------
