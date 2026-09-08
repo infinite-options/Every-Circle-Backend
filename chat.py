@@ -711,7 +711,7 @@ def _publish_message(
         sender = sender_name or "Someone"
         if context_type in ("offering", "seeking"):
             # Offering/seeking inquiry — name what it's about, don't quote the message body.
-            kind = "offering" if context_type == "offering" else "seeking post"
+            kind = "offering" if context_type == "offering" else "wish"
             title = _offering_or_seeking_title(context_type, context_uid)
             if title:
                 sms_text = f'{sender} sent you a message about your {kind} "{title}" on Every Circle.'
