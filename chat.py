@@ -623,11 +623,44 @@ def _latest_visible_message(conversation_uid, viewer_uid, cutoff):
         return None
 
 
-def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sender_image, body, sent_at, recipient_uid):
+def _offering_or_seeking_title(context_type, context_uid):
+    """Human-readable title for a message's offering/seeking context, if any."""
+    if not context_type or not context_uid:
+        return None
+    try:
+        with connect() as db:
+            if context_type == "offering":
+                rows = db.execute(
+                    "SELECT profile_expertise_title FROM every_circle.profile_expertise WHERE profile_expertise_uid = %s",
+                    args=(context_uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return row.get("profile_expertise_title")
+            elif context_type == "seeking":
+                rows = db.execute(
+                    "SELECT profile_wish_title FROM every_circle.profile_wish WHERE profile_wish_uid = %s",
+                    args=(context_uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return row.get("profile_wish_title")
+    except Exception as e:
+        print(f"_offering_or_seeking_title error for {context_type}/{context_uid}: {e}")
+    return None
+
+
+def _publish_message(
+    conversation_uid, message_uid, sender_uid, sender_name, sender_image, body, sent_at, recipient_uid,
+    context_type=None, context_uid=None,
+):
     """
     Publish a new-message event to:
       1. chat::<conversation_uid>  — for the ChatScreen real-time feed
       2. /<recipient_uid>          — for the unread-dot / notification banner
+
+    context_type/context_uid (only set on the first message of a reply-from-offering
+    or reply-from-seeking conversation — see ChatScreen.js pendingReplyContext) drive
+    the SMS fallback copy below: when present, the text names the offering/seeking
+    post instead of quoting the message body.
     """
     try:
         api_key = os.getenv("ABLY_API_KEY", "")
@@ -675,8 +708,19 @@ def _publish_message(conversation_uid, message_uid, sender_uid, sender_name, sen
     # Ably publish above succeeded, since a dead/absent client is exactly the
     # case this exists for.
     if recipient_uid:
-        preview = body if len(body) <= 120 else body[:117] + "..."
-        notify_uid_if_away(recipient_uid, f"{sender_name or 'Someone'} sent you a message on Every Circle: {preview}")
+        sender = sender_name or "Someone"
+        if context_type in ("offering", "seeking"):
+            # Offering/seeking inquiry — name what it's about, don't quote the message body.
+            kind = "offering" if context_type == "offering" else "seeking post"
+            title = _offering_or_seeking_title(context_type, context_uid)
+            if title:
+                sms_text = f'{sender} sent you a message about your {kind} "{title}" on Every Circle.'
+            else:
+                sms_text = f"{sender} sent you a message about your {kind} on Every Circle."
+        else:
+            preview = body if len(body) <= 120 else body[:117] + "..."
+            sms_text = f"{sender} sent you a message on Every Circle: {preview}"
+        notify_uid_if_away(recipient_uid, sms_text)
 
 
 # --------------- resources ---------------
@@ -1023,7 +1067,11 @@ class Messages(Resource):
             except Exception:
                 pass
 
-            _publish_message(conv_uid, msg_uid, sender_uid, sender_name, sender_image, body, now, recipient_uid)
+            _publish_message(
+                conv_uid, msg_uid, sender_uid, sender_name, sender_image, body, now, recipient_uid,
+                context_type=context_fields.get("message_context_type"),
+                context_uid=context_fields.get("message_context_uid"),
+            )
 
         return {
             "message": "Message sent",
