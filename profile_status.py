@@ -1,5 +1,9 @@
 """Shared helpers for deleted-profile tombstones (account deletion)."""
 
+from datetime import datetime, timezone
+
+from datetime_utils import parse_stored_datetime
+
 _PROFILE_PERSONAL_TABLE = "every_circle.profile_personal"
 
 
@@ -9,10 +13,41 @@ def _deleted_flag_from_row(row):
     return bool(int(row.get("profile_personal_is_deleted") or 0))
 
 
+def _user_id_present(row):
+    return bool(str((row or {}).get("profile_personal_user_id") or "").strip())
+
+
+def _purge_is_past(row, *, now=None):
+    purge_at = parse_stored_datetime((row or {}).get("profile_personal_purge_scheduled_at"))
+    if purge_at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return purge_at <= now
+
+
+def is_soft_deleted(row, *, now=None):
+    """True during the grace window: deleted flag set, auth user still linked, purge not past."""
+    if not _deleted_flag_from_row(row):
+        return False
+    if not _user_id_present(row):
+        return False
+    return not _purge_is_past(row, now=now)
+
+
+def is_permanently_deleted(row, *, now=None):
+    """True after hard purge or when the grace window has expired."""
+    if not _deleted_flag_from_row(row):
+        return False
+    if not _user_id_present(row):
+        return True
+    return _purge_is_past(row, now=now)
+
+
 def is_profile_deleted(row_or_uid, db=None):
     """
-    Return True when a profile is an anonymized deletion tombstone.
+    Return True when a profile is soft-deleted or permanently purged.
 
+    Used for search/network/bounty/tombstone visibility (same UX for both states).
     Accepts a profile_personal row dict, or a profile uid string (db required).
     """
     if isinstance(row_or_uid, dict):

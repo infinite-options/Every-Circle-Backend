@@ -58,6 +58,8 @@ class PathGateTests(unittest.TestCase):
         self.assertFalse(path_requires_jwt("POST", "/api/v1/auth/social"))
         self.assertFalse(path_requires_jwt("POST", "/api/v1/auth/logout"))
         self.assertFalse(path_requires_jwt("GET", "/api/v1/escrow_release_cron"))
+        self.assertFalse(path_requires_jwt("GET", "/api/v1/account_purge_cron"))
+        self.assertFalse(path_requires_jwt("POST", "/api/v1/account/reactivate"))
         self.assertFalse(path_requires_jwt("OPTIONS", "/api/v1/transactions"))
 
     def test_writes_are_protected(self):
@@ -140,7 +142,9 @@ class JwtEndpointTests(unittest.TestCase):
         db = MagicMock()
         db.select.side_effect = [
             {"result": [user]},
+            {"result": [profile]},
             {"result": [user]},
+            {"result": [profile]},
             {"result": [profile]},
         ]
         db.__enter__.return_value = db

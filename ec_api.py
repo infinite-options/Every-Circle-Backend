@@ -53,11 +53,8 @@ from profile_expertise_response import ProfileExpertiseResponse, ProfileExpertis
 from bounty_results import BountyResults, BusinessBountyResults
 from transaction_receipt import TransactionReceipt
 from order_detail import OrderDetail
-from account_deletion import (
-    AccountDelete,
-    AccountDeletionPurgeJob,
-    format_account_deletion_purge_email,
-)
+from account_deletion import AccountDelete, AccountReactivate
+from account_purge import AccountPurgeJob, format_account_purge_email
 from account_screen import AccountScreenPersonal, AccountScreenBusiness
 from seller_hold_release import (
     SellerHoldReleaseJob,
@@ -699,8 +696,8 @@ def SellerHoldRelease_CRON(Resource):
     return _seller_hold_release_cron_wrapper()
 
 
-def _account_deletion_purge_cron_wrapper():
-    print("\nIn Account Deletion Purge CRON\n\n\n")
+def _account_purge_cron_wrapper():
+    print("\nIn Account Purge CRON\n\n\n")
     response = {}
     dt = datetime.today()
     recipients = [
@@ -708,29 +705,27 @@ def _account_deletion_purge_cron_wrapper():
         "pmarathay@infiniteoptions.com",
     ]
     try:
-        response = AccountDeletionPurgeJob.get()
+        response = AccountPurgeJob.get()
 
         if "cron fail" in response.keys():
             raise Exception("Error in cronjob")
 
         try:
-            subject = f"Every-Circle Account Deletion Purge CRON — SUCCESS ({dt})"
-            body = format_account_deletion_purge_email(response, run_dt=dt)
+            subject = f"Every-Circle Account Purge CRON — SUCCESS ({dt})"
+            body = format_account_purge_email(response, run_dt=dt)
 
             for recipient in recipients:
                 sendEmail(recipient, subject, body)
 
             response["email"] = {
-                "message": (
-                    f"Every-Circle Account Deletion Purge CRON Job Email for {dt} sent!"
-                ),
+                "message": f"Every-Circle Account Purge CRON Job Email for {dt} sent!",
                 "code": 200,
             }
 
         except Exception:
             response["email fail"] = {
                 "message": (
-                    f"Every-Circle Account Deletion Purge CRON Job Email for {dt} "
+                    f"Every-Circle Account Purge CRON Job Email for {dt} "
                     "could not be sent"
                 ),
                 "code": 500,
@@ -740,18 +735,17 @@ def _account_deletion_purge_cron_wrapper():
         try:
             failed_count = response.get("failed_count", 0)
             subject = (
-                f"Every-Circle Account Deletion Purge CRON — FAILED "
+                f"Every-Circle Account Purge CRON — FAILED "
                 f"({failed_count} errors, {dt})"
             )
-            body = format_account_deletion_purge_email(response, run_dt=dt)
+            body = format_account_purge_email(response, run_dt=dt)
 
             for recipient in recipients:
                 sendEmail(recipient, subject, body)
 
             response["email"] = {
                 "message": (
-                    f"Every-Circle Account Deletion Purge CRON Job Fail Email "
-                    f"for {dt} sent!"
+                    f"Every-Circle Account Purge CRON Job Fail Email for {dt} sent!"
                 ),
                 "code": 201,
             }
@@ -759,7 +753,7 @@ def _account_deletion_purge_cron_wrapper():
         except Exception:
             response["email fail"] = {
                 "message": (
-                    f"Every-Circle Account Deletion Purge CRON Job Fail Email for {dt} "
+                    f"Every-Circle Account Purge CRON Job Fail Email for {dt} "
                     "could not be sent"
                 ),
                 "code": 500,
@@ -768,13 +762,13 @@ def _account_deletion_purge_cron_wrapper():
     return response
 
 
-class AccountDeletionPurgeCron_CLASS(Resource):
+class AccountPurgeCron_CLASS(Resource):
     def get(self):
-        return _account_deletion_purge_cron_wrapper()
+        return _account_purge_cron_wrapper()
 
 
-def AccountDeletionPurge_CRON(Resource):
-    return _account_deletion_purge_cron_wrapper()
+def AccountPurge_CRON(Resource):
+    return _account_purge_cron_wrapper()
 
 
 #  -- ACTUAL ENDPOINTS    -----------------------------------------
@@ -787,6 +781,7 @@ api.add_resource(AuthSocial, "/api/v1/auth/social")
 api.add_resource(AuthMe, "/api/v1/auth/me")
 api.add_resource(AuthLogout, "/api/v1/auth/logout")
 api.add_resource(AccountDelete, "/api/v1/account")
+api.add_resource(AccountReactivate, "/api/v1/account/reactivate")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
 api.add_resource(UserInfo, "/userinfo", "/userinfo/<string:user_id>")
 api.add_resource(Business, "/business", "/business/<string:uid>")
@@ -886,9 +881,7 @@ api.add_resource(Lists_CLASS, "/api/v1/lists_cron")
 api.add_resource(
     SellerHoldReleaseCron_CLASS, "/api/v1/seller_hold_release_cron"
 )
-api.add_resource(
-    AccountDeletionPurgeCron_CLASS, "/api/v1/account_deletion_purge_cron"
-)
+api.add_resource(AccountPurgeCron_CLASS, "/api/v1/account_purge_cron")
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")

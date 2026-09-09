@@ -59,6 +59,21 @@ def freeze_wallet(db, profile_id):
     return result.get("code") == 200
 
 
+def unfreeze_wallet(db, profile_id):
+    """Clear wallet freeze after account reactivation. Balances are unchanged."""
+    wallet_profile_id = resolve_wallet_profile_id(profile_id)
+    wallet = get_wallet_row(db, profile_id)
+    if not wallet:
+        return False
+
+    result = db.execute(
+        "UPDATE every_circle.wallet SET wallet_is_frozen = 0 WHERE wallet_profile_id = %s",
+        (wallet_profile_id,),
+        cmd="post",
+    )
+    return result.get("code") == 200
+
+
 def get_wallet_row(db, bounty_profile_id):
     wallet_id = resolve_wallet_profile_id(bounty_profile_id)
     wallet_q = db.execute(
@@ -1048,12 +1063,19 @@ def debit_useable_for_purchase(db, profile_id, amount):
 
     Debits wallet_useable_balance and wallet_actual_balance only (never pending).
     Increments wallet_lifetime_spent. Leaves wallet_lifetime_earning unchanged.
+
+    Reconciles the wallet row from the bounty/proceeds ledger first so spendable
+    balance matches account-screen (which shows computed useable even when the
+    wallet table row is stale).
     """
     amount = _round_money(abs(amount))
     if not profile_id or amount <= 0:
         return {"code": 200, "skipped": True, "wallet_profile_id": profile_id, "debited": 0.0}
 
     wallet_id = resolve_wallet_profile_id(profile_id)
+    # Account-screen useable is ledger-computed; debit previously used a stale row.
+    reconcile_profile_wallet(db, profile_id)
+
     wallet = get_wallet_row(db, profile_id)
     if wallet and wallet_row_is_frozen(wallet):
         return _frozen_wallet_response(profile_id)
