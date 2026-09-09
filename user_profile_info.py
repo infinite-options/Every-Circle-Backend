@@ -1797,6 +1797,20 @@ class UserProfileInfo(Resource):
                 # Insert personal info
                 db.insert('every_circle.profile_personal', personal_info)
 
+                # Referral SMS notification
+                referred_by_uid = personal_info.get('profile_personal_referred_by')
+                if referred_by_uid and referred_by_uid != "110-000001":
+                    try:
+                        from notifications_service import notify_uid_if_away
+                        new_first = (personal_info.get('profile_personal_first_name') or '').strip()
+                        new_last = (personal_info.get('profile_personal_last_name') or '').strip()
+                        new_name = f"{new_first} {new_last}".strip() or "Someone you referred"
+                        notify_uid_if_away(
+                            referred_by_uid,
+                            f"{new_name} just joined Every Circle using your referral and is now in your circle!",
+                        )
+                    except Exception as e:
+                        print(f"Referral signup notification error: {e}")
 
                 # Determine Path to Main Node
                 personal_path_query = f'''
