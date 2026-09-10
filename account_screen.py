@@ -32,6 +32,8 @@ from account_screen_v3 import (
     build_sales_v3,
     build_wallet_ledger_v3,
     build_wallet_v3,
+    build_tax_owed_v3,
+    build_tax_ledger_v3,
 )
 
 
@@ -120,6 +122,8 @@ class AccountScreenPersonal(Resource):
             "wallet": None,
             "earnings": None,
             "wallet_ledger": None,
+            "tax_owed": None,
+            "tax_ledger": None,
             "purchases": {"rows": []},
             "sales": {"offerings": [], "transactions": []},
             "bounty_results": {"rows": []},
@@ -167,6 +171,14 @@ class AccountScreenPersonal(Resource):
                 limit=ledger_limit,
                 tz_name=tz_name,
             )
+            response["tax_owed"] = build_tax_owed_v3(db, profile_id)
+            response["tax_ledger"] = build_tax_ledger_v3(
+                db,
+                profile_id,
+                offset=ledger_offset,
+                limit=ledger_limit,
+                tz_name=tz_name,
+            )
             response["profile"] = build_profile_v3_personal(db, profile_id)
 
         return response, 200
@@ -205,6 +217,8 @@ class AccountScreenBusiness(Resource):
             "wallet": None,
             "earnings": None,
             "wallet_ledger": None,
+            "tax_owed": None,
+            "tax_ledger": None,
             "purchases": {"rows": []},
             "sales": {"products": [], "transactions": []},
             "bounty_results": {"rows": []},
@@ -243,6 +257,14 @@ class AccountScreenBusiness(Resource):
                     db, wallet_profile_id, tz_name
                 )
                 response["wallet_ledger"] = build_wallet_ledger_v3(
+                    db,
+                    wallet_profile_id,
+                    offset=ledger_offset,
+                    limit=ledger_limit,
+                    tz_name=tz_name,
+                )
+                response["tax_owed"] = build_tax_owed_v3(db, wallet_profile_id)
+                response["tax_ledger"] = build_tax_ledger_v3(
                     db,
                     wallet_profile_id,
                     offset=ledger_offset,

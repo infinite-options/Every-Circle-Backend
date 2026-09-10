@@ -44,6 +44,10 @@ from wallet_transactions_service import (
     resolve_seller_wallet_profile_id,
     _parse_unit_cost,
 )
+from tax_owed_service import (
+    credit_tax_collected_at_checkout,
+    reverse_tax_on_return,
+)
 from datetime_utils import utc_now_str, enrich_datetime_fields, parse_stored_datetime
 from transaction_shipping import (
     normalize_shipping_address,
@@ -3310,6 +3314,25 @@ def _finalize_pending_return(
                         print(f"Warning: Failed to claw back seller proceeds on return for {line['original_ti_uid']}: {clawback_result}")
                     else:
                         total_seller_clawed = round(total_seller_clawed + _to_float(clawback_result.get('clawed')), 4)
+                try:
+                    if rq > 0:
+                        tax_reverse_result = reverse_tax_on_return(
+                            _db_168,
+                            original_ti_uid=line['original_ti_uid'],
+                            return_ti_uid=new_ti_uid,
+                            return_qty=rq,
+                            transaction_uid=_original_tx_uid_172,
+                        )
+                        if tax_reverse_result.get('code') != 200:
+                            print(
+                                f"Warning: Failed to reverse tax owed on return for "
+                                f"{line['original_ti_uid']}: {tax_reverse_result}"
+                            )
+                except Exception as tax_reverse_err:
+                    print(
+                        f"Warning: Exception reversing tax owed on return for "
+                        f"{line['original_ti_uid']}: {tax_reverse_err}"
+                    )
                 cancel_adjust_result = None
                 cancel_hold_result = None
                 if cancel_unshipped_qty > 0 and (not (clawback_result and clawback_result.get('finalized_request_hold'))):
@@ -5275,6 +5298,26 @@ class Transactions(Resource):
                     response["seller_proceeds_credit"] = {
                         "code": 500,
                         "message": str(seller_credit_err),
+                    }
+
+                try:
+                    tax_credit = credit_tax_collected_at_checkout(
+                        db, new_transaction_uid
+                    )
+                    response["tax_owed_credit"] = tax_credit
+                    if tax_credit.get("code") != 200:
+                        print(
+                            "Warning: Failed to credit tax owed at "
+                            f"checkout: {tax_credit}"
+                        )
+                except Exception as tax_credit_err:
+                    print(
+                        "Warning: Exception crediting tax owed at "
+                        f"checkout: {tax_credit_err}"
+                    )
+                    response["tax_owed_credit"] = {
+                        "code": 500,
+                        "message": str(tax_credit_err),
                     }
 
                 if inventory_updates:

@@ -62,6 +62,7 @@ from seller_hold_release import (
 )
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from wallet_ledger import WalletLedger
+from tax_ledger import TaxLedger, TaxLedgerRemit
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -885,6 +886,10 @@ api.add_resource(AccountPurgeCron_CLASS, "/api/v1/account_purge_cron")
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
+api.add_resource(TaxLedger, "/api/v1/tax_ledger/<string:profile_id>")
+api.add_resource(
+    TaxLedgerRemit, "/api/v1/tax_ledger/<string:profile_id>/remit"
+)
 
 
 api.add_resource(SendEmail, "/api/v1/sendEmail")
