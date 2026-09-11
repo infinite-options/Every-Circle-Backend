@@ -405,7 +405,7 @@ else:
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
 def sendEmail(recipient, subject, body):
-    print('in sendEmail')
+    print('in sendEmail function')
     print('Confirming correct function call')
     print('recipient received', recipient)
     # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
@@ -446,6 +446,7 @@ class SendEmail(Resource):
             #     "Thank you - Nitya Ayurveda\n\n"
             # )
             sendEmail([email], "Thanks for your Note!", body)
+            print("In Send EMail post after sendEmail")
             return "Email Sent", 200
 
         except Exception:
