@@ -3045,7 +3045,7 @@ def _notify_bounty_earned(participant_id):
     try:
         from notifications_service import notify_uid_if_away
 
-        notify_uid_if_away(participant_id, "You've earned a bounty from Every Circle.")
+        notify_uid_if_away(participant_id, "You've just earned a bounty from Every Circle.")
     except Exception as e:
         print(f"_notify_bounty_earned error for {participant_id}: {e}")
 
