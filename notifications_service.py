@@ -32,6 +32,7 @@ from data_ec import connect
 
 load_dotenv()
 
+#twilio credentials
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Same sending number already used for referral SMS in ec_api.py.
@@ -39,15 +40,8 @@ TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "+19254815757")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY", "")
 
 
+#checks Ably presence for a given uid
 def is_uid_present(uid):
-    """
-    True if `uid` currently has an active Ably presence entry on its personal
-    channel — i.e. their app is open and in the foreground right now.
-
-    Any failure (no API key, network error, malformed uid) is treated as
-    "not present", so callers fail OPEN toward sending the SMS rather than
-    silently dropping a notification.
-    """
     if not uid or not ABLY_API_KEY:
         return False
 
@@ -63,13 +57,8 @@ def is_uid_present(uid):
         print(f"is_uid_present error for {uid}: {e}")
         return False
 
-
+# Look up phone number for a given uid 
 def get_phone_number_for_uid(uid):
-    """
-    Look up the SMS-reachable phone number for a uid — a personal profile
-    (`profile_personal_uid`) or a business (`business_uid`, prefixed "200",
-    same convention chat.py uses in _get_participant_info).
-    """
     if not uid:
         return None
     try:
@@ -93,9 +82,8 @@ def get_phone_number_for_uid(uid):
         print(f"get_phone_number_for_uid error for {uid}: {e}")
         return None
 
-
+# Convert a raw phone number to twilio-compatible 
 def _to_e164(raw):
-    """Normalise a stored US phone number to E.164 (+1XXXXXXXXXX). None if unusable."""
     if not raw:
         return None
     digits = "".join(ch for ch in str(raw) if ch.isdigit())
@@ -105,9 +93,8 @@ def _to_e164(raw):
         return "+" + digits
     return None
 
-
+# Send an SMS via Twilio
 def send_sms(phone_number, message):
-    """Send a single SMS via Twilio. Returns True on success, False otherwise (never raises)."""
     to_number = _to_e164(phone_number)
     if not to_number:
         print(f"send_sms: no usable phone number ({phone_number!r}) — skipping")
@@ -123,17 +110,8 @@ def send_sms(phone_number, message):
         print(f"send_sms error sending to {to_number}: {e}")
         return False
 
-
+# Notify a user via SMS if they're not currently active in the app
 def notify_uid_if_away(uid, message):
-    """
-    Text `message` to `uid`, but only when they're not currently active in the
-    app. Safe to call unconditionally right alongside an Ably publish — this
-    is just the fallback path for when that publish reaches nobody.
-
-    Best-effort: any failure (no phone on file, Twilio error, Ably error) is
-    logged and swallowed so it can never break the caller's request.
-    Returns True only if an SMS was actually sent.
-    """
     try:
         if is_uid_present(uid):
             return False  # app is open right now — Ably already delivered this live
