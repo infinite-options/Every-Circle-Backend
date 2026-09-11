@@ -126,6 +126,9 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 
 import googlemaps
 
+import msal  # for Azure AD authentication
+import requests  # for HTTP requests
+
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
 def encrypt_response(data):
@@ -304,6 +307,51 @@ app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
 print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
 
 
+TENANT_ID = os.getenv('MS_TENANT_ID')
+CLIENT_ID = os.getenv('MS_CLIENT_ID')
+CLIENT_SECRET = os.getenv('MS_CLIENT_SECRET')
+SENDER_EMAIL = os.getenv('MS_SENDER_EMAIL')
+
+_msal_app = msal.ConfidentialClientApplication(
+    CLIENT_ID,
+    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    client_credential=CLIENT_SECRET,
+)
+
+def get_msal_token():
+    result = _msal_app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"],
+    )
+    if "access_token" in result:
+        return result["access_token"]
+    else:
+        raise Exception(result.get("error_description"))
+    
+def sendEmail(recipient, subject, body):
+    if isinstance(recipient, str):
+        recipient = [recipient]
+    
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"ContentType": "Text", "Content": body},
+            "toRecipients": [
+                {"emailAddress": {"address": r}} for r in recipient
+            ],
+        },
+        "saveToSentItems": True,
+    }
+
+    resp = requests.post(
+        f"https://graph.microsoft.com/v1.0/users/{SENDER_EMAIL}/sendMail",
+        headers={"Authorization": f"Bearer {get_msal_token()}"},
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code != 202:
+        raise Exception(f"Failed to send email: {resp.status_code} {resp.text}")
+
+
 # Setting for mydomain.com
 app.config["MAIL_SERVER"] = "smtp.office365.com"
 app.config["MAIL_PORT"] = 587
@@ -404,28 +452,28 @@ else:
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
-def sendEmail(recipient, subject, body):
-    print('in sendEmail function')
-    print('Confirming correct function call')
-    print('recipient received', recipient)
-    # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
-    if isinstance(recipient, str):
-        recipient = [recipient]
-    print(recipient)
-    print(subject)
-    print(body)
-    with app.app_context():
-        msg = Message(
-            sender="support@everycircle.com",
-            recipients=recipient,
-            subject=subject,
-            body=body
-        )
-        mail.send(msg)
-        print('after mail send')
+# def sendEmail(recipient, subject, body):
+#     print('in sendEmail')
+#     print('Confirming correct function call')
+#     print('recipient received', recipient)
+#     # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
+#     if isinstance(recipient, str):
+#         recipient = [recipient]
+#     print(recipient)
+#     print(subject)
+#     print(body)
+#     with app.app_context():
+#         msg = Message(
+#             sender="support@everycircle.com",
+#             recipients=recipient,
+#             subject=subject,
+#             body=body
+#         )
+#         mail.send(msg)
+#         print('after mail send')
 
 
-app.sendEmail = sendEmail
+# app.sendEmail = sendEmail
 
 
 class SendEmail(Resource):
