@@ -104,6 +104,8 @@ from auth import (
     AuthRegister,
     AuthSalt,
     AuthSocial,
+    PhoneSendOtp,
+    PhoneVerifyOtp,
     register_jwt_auth,
 ) 
 from pytz import timezone as ptz  # Not sure what the difference is
@@ -780,6 +782,8 @@ api.add_resource(AuthRefresh, "/api/v1/auth/refresh")
 api.add_resource(AuthSocial, "/api/v1/auth/social")
 api.add_resource(AuthMe, "/api/v1/auth/me")
 api.add_resource(AuthLogout, "/api/v1/auth/logout")
+api.add_resource(PhoneSendOtp, "/api/v1/auth/phone/send-otp")
+api.add_resource(PhoneVerifyOtp, "/api/v1/auth/phone/verify-otp")
 api.add_resource(AccountDelete, "/api/v1/account")
 api.add_resource(AccountReactivate, "/api/v1/account/reactivate")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")

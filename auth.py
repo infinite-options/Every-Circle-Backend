@@ -34,13 +34,20 @@ from flask_jwt_extended import (
 from flask_restful import Resource
 
 from data_ec import connect
-from datetime_utils import format_utc_iso
+from datetime_utils import format_utc_iso, utc_now_str
+from notifications_service import _to_e164, send_sms
 from profile_status import is_permanently_deleted, is_soft_deleted
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 ACCESS_TOKEN_HOURS = int(os.getenv("JWT_ACCESS_TOKEN_HOURS", "1"))
 REFRESH_TOKEN_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_DAYS", "30"))
+
+OTP_EXPIRES_SECONDS = 600
+OTP_MAX_ATTEMPTS = 5
+OTP_SEND_COOLDOWN_SECONDS = 60
+OTP_MAX_SENDS_PER_HOUR = 5
+OTP_SMS_TEMPLATE = "Your Every Circle code is {code}. Expires in 10 minutes."
 
 _PUBLIC_PATHS = (
     "/api/v1/auth/salt",
@@ -114,6 +121,181 @@ def verify_password(password, salt, stored_hash):
         else hash_password(password, salt)
     )
     return hmac.compare_digest(candidate, stored_hash.lower())
+
+
+def _normalize_phone(raw):
+    """Normalize a US phone to E.164 via notifications_service._to_e164."""
+    return _to_e164(raw)
+
+
+def _generate_otp_code():
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _otp_salt():
+    return secrets.token_hex(32)
+
+
+def _hash_otp(code, salt):
+    return hashlib.sha256(f"{code}{salt}".encode("utf-8")).hexdigest()
+
+
+def _verify_otp(code, salt, stored_hash):
+    if not code or not salt or not stored_hash:
+        return False
+    return hmac.compare_digest(_hash_otp(str(code).strip(), salt), stored_hash)
+
+
+def _dt_str(dt):
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _count_otp_sends_since(db, user_uid, since_str):
+    res = db.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM every_circle.phone_otp_challenges
+        WHERE user_uid = %s AND created_at >= %s
+        """,
+        (user_uid, since_str),
+    )
+    rows = (res or {}).get("result") or []
+    if not rows:
+        return 0
+    try:
+        return int(rows[0].get("cnt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _otp_send_rate_limited(db, user_uid):
+    """Return an error body/status when the user is rate-limited, else None."""
+    now = datetime.now(timezone.utc)
+    hour_ago = _dt_str(now - timedelta(hours=1))
+    cooldown_ago = _dt_str(now - timedelta(seconds=OTP_SEND_COOLDOWN_SECONDS))
+
+    if _count_otp_sends_since(db, user_uid, cooldown_ago) >= 1:
+        return {
+            "message": "Please wait before requesting another code",
+            "code": 429,
+        }, 429
+    if _count_otp_sends_since(db, user_uid, hour_ago) >= OTP_MAX_SENDS_PER_HOUR:
+        return {
+            "message": "Too many verification codes requested. Try again later.",
+            "code": 429,
+        }, 429
+    return None
+
+
+def _invalidate_open_otp_challenges(db, user_uid):
+    now_str = utc_now_str()
+    db.execute(
+        """
+        UPDATE every_circle.phone_otp_challenges
+        SET consumed_at = %s
+        WHERE user_uid = %s AND consumed_at IS NULL
+        """,
+        (now_str, user_uid),
+        cmd="post",
+    )
+
+
+def _latest_open_otp_challenge(db, user_uid, phone_e164):
+    now_str = utc_now_str()
+    res = db.execute(
+        """
+        SELECT *
+        FROM every_circle.phone_otp_challenges
+        WHERE user_uid = %s
+          AND phone_e164 = %s
+          AND consumed_at IS NULL
+          AND expires_at > %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (user_uid, phone_e164, now_str),
+    )
+    rows = (res or {}).get("result") or []
+    return rows[0] if rows else None
+
+
+def _apply_verified_phone(db, user_uid, phone_e164):
+    db.update(
+        "every_circle.users",
+        {"user_uid": user_uid},
+        {
+            "user_phone_number": phone_e164,
+            "user_phone_verified": 1,
+        },
+    )
+    profile = _profile_for_user(db, user_uid)
+    if profile and profile.get("profile_personal_uid"):
+        db.update(
+            "every_circle.profile_personal",
+            {"profile_personal_uid": profile["profile_personal_uid"]},
+            {"profile_personal_phone_number": phone_e164},
+        )
+    return profile
+
+
+def _phone_verified_flag(raw):
+    try:
+        return bool(int(raw)) if raw is not None else False
+    except (TypeError, ValueError):
+        return bool(raw)
+
+
+def normalize_phone_for_storage(raw):
+    """Return E.164 when possible, else stripped raw (or None if empty)."""
+    if raw is None:
+        return None
+    stripped = str(raw).strip()
+    if not stripped:
+        return None
+    return _to_e164(stripped) or stripped
+
+
+def sync_user_phone_from_profile_edit(db, user_uid, new_phone_raw):
+    """Keep ``users`` phone in sync with profile edit; clear verified on change.
+
+    Returns ``{phone_number, phone_verified, phone_needs_verification}``.
+    """
+    store_value = normalize_phone_for_storage(new_phone_raw)
+    new_e164 = _to_e164(store_value) if store_value else None
+
+    user_res = db.select("every_circle.users", where={"user_uid": user_uid})
+    users = (user_res or {}).get("result") or []
+    if not users:
+        return {
+            "phone_number": store_value,
+            "phone_verified": False,
+            "phone_needs_verification": bool(store_value),
+        }
+
+    user = users[0]
+    old_phone = user.get("user_phone_number")
+    old_e164 = _to_e164(old_phone) if old_phone else None
+    was_verified = _phone_verified_flag(user.get("user_phone_verified"))
+
+    same_number = bool(new_e164 and old_e164 and new_e164 == old_e164)
+    keep_verified = same_number and was_verified and bool(store_value)
+    verified = 1 if keep_verified else 0
+
+    db.update(
+        "every_circle.users",
+        {"user_uid": user_uid},
+        {
+            "user_phone_number": store_value,
+            "user_phone_verified": verified,
+        },
+    )
+    return {
+        "phone_number": store_value,
+        "phone_verified": bool(verified),
+        "phone_needs_verification": bool(store_value) and not bool(verified),
+    }
 
 
 def _user_row_by_email(db, email):
@@ -222,15 +404,35 @@ def _profile_for_user(db, user_uid):
 
 def _identity_payload(user, profile=None):
     profile_id = None
+    phone_number = user.get("user_phone_number")
     if profile:
         profile_id = profile.get("profile_personal_uid")
+        # Profile edit phone is the source of truth for display.
+        if profile.get("profile_personal_phone_number") is not None:
+            phone_number = profile.get("profile_personal_phone_number")
+
     role = (user.get("user_role") or "").strip().upper() or None
+    phone_verified = _phone_verified_flag(user.get("user_phone_verified"))
+
+    # Defensive: if profile/user phones diverge, treat as unverified.
+    profile_e164 = _to_e164(phone_number) if phone_number else None
+    user_e164 = _to_e164(user.get("user_phone_number")) if user.get(
+        "user_phone_number"
+    ) else None
+    if phone_verified and profile_e164 and user_e164 and profile_e164 != user_e164:
+        phone_verified = False
+    elif phone_verified and phone_number and not profile_e164:
+        # Non-E.164 / empty after change — require verify again.
+        phone_verified = False
+
     return {
         "user_uid": user.get("user_uid"),
         "profile_id": profile_id,
         "email": user.get("user_email_id"),
         "role": role,
         "is_admin": role == "ADMIN",
+        "phone_number": phone_number,
+        "phone_verified": phone_verified,
     }
 
 
@@ -782,6 +984,151 @@ class AuthMe(Resource):
             return {"message": "Success", "code": 200, "result": payload}, 200
         except Exception as e:
             print(f"AuthMe error: {e}")
+            return {"message": "Internal Server Error", "code": 500}, 500
+
+
+class PhoneSendOtp(Resource):
+    """POST { phone_number } — send a 6-digit SMS OTP to verify/change phone."""
+
+    @jwt_required()
+    def post(self):
+        user_uid = get_current_user_uid() or get_jwt_identity()
+        if not user_uid:
+            return {"message": "Missing or invalid authorization token", "code": 401}, 401
+
+        payload = request.get_json(silent=True) or {}
+        phone_e164 = _normalize_phone(payload.get("phone_number"))
+        if not phone_e164:
+            return {"message": "Invalid US phone number", "code": 400}, 400
+
+        try:
+            with connect() as db:
+                limited = _otp_send_rate_limited(db, user_uid)
+                if limited:
+                    return limited
+
+                code = _generate_otp_code()
+                salt = _otp_salt()
+                now = datetime.now(timezone.utc)
+                expires_at = now + timedelta(seconds=OTP_EXPIRES_SECONDS)
+                created_str = _dt_str(now)
+                expires_str = _dt_str(expires_at)
+
+                _invalidate_open_otp_challenges(db, user_uid)
+                insert = db.insert(
+                    "every_circle.phone_otp_challenges",
+                    {
+                        "user_uid": user_uid,
+                        "phone_e164": phone_e164,
+                        "code_hash": _hash_otp(code, salt),
+                        "code_salt": salt,
+                        "expires_at": expires_str,
+                        "attempts": 0,
+                        "consumed_at": None,
+                        "created_at": created_str,
+                    },
+                )
+                if not insert or insert.get("code") not in (None, 200):
+                    return {
+                        "message": (insert or {}).get("message")
+                        or "Failed to create verification challenge",
+                        "code": 500,
+                    }, 500
+
+                sent = send_sms(phone_e164, OTP_SMS_TEMPLATE.format(code=code))
+                if not sent:
+                    _invalidate_open_otp_challenges(db, user_uid)
+                    return {
+                        "message": "Failed to send verification code",
+                        "code": 503,
+                    }, 503
+
+            return {
+                "message": "Success",
+                "code": 200,
+                "result": {
+                    "phone_number": phone_e164,
+                    "expires_in": OTP_EXPIRES_SECONDS,
+                },
+            }, 200
+        except Exception as e:
+            print(f"PhoneSendOtp error: {e}")
+            return {"message": "Internal Server Error", "code": 500}, 500
+
+
+class PhoneVerifyOtp(Resource):
+    """POST { phone_number, otp } — verify SMS OTP and persist phone on the user."""
+
+    @jwt_required()
+    def post(self):
+        user_uid = get_current_user_uid() or get_jwt_identity()
+        if not user_uid:
+            return {"message": "Missing or invalid authorization token", "code": 401}, 401
+
+        payload = request.get_json(silent=True) or {}
+        phone_e164 = _normalize_phone(payload.get("phone_number"))
+        otp = str(payload.get("otp") or "").strip()
+        if not phone_e164:
+            return {"message": "Invalid US phone number", "code": 400}, 400
+        if not otp or not otp.isdigit() or len(otp) != 6:
+            return {"message": "otp must be a 6-digit code", "code": 400}, 400
+
+        try:
+            with connect() as db:
+                challenge = _latest_open_otp_challenge(db, user_uid, phone_e164)
+                if not challenge:
+                    return {
+                        "message": "No valid verification code found",
+                        "code": 400,
+                    }, 400
+
+                attempts = int(challenge.get("attempts") or 0)
+                if attempts >= OTP_MAX_ATTEMPTS:
+                    return {
+                        "message": "Too many invalid attempts. Request a new code.",
+                        "code": 429,
+                    }, 429
+
+                new_attempts = attempts + 1
+                db.update(
+                    "every_circle.phone_otp_challenges",
+                    {"id": challenge["id"]},
+                    {"attempts": new_attempts},
+                )
+
+                if not _verify_otp(
+                    otp, challenge.get("code_salt"), challenge.get("code_hash")
+                ):
+                    if new_attempts >= OTP_MAX_ATTEMPTS:
+                        return {
+                            "message": "Too many invalid attempts. Request a new code.",
+                            "code": 429,
+                        }, 429
+                    return {"message": "Invalid verification code", "code": 401}, 401
+
+                now_str = utc_now_str()
+                db.update(
+                    "every_circle.phone_otp_challenges",
+                    {"id": challenge["id"]},
+                    {"consumed_at": now_str},
+                )
+                profile = _apply_verified_phone(db, user_uid, phone_e164)
+
+                user_res = db.select(
+                    "every_circle.users", where={"user_uid": user_uid}
+                )
+                users = (user_res or {}).get("result") or []
+                if not users:
+                    return {"message": "User not found", "code": 404}, 404
+                identity = _identity_payload(users[0], profile)
+
+            return {
+                "message": "Success",
+                "code": 200,
+                "result": identity,
+            }, 200
+        except Exception as e:
+            print(f"PhoneVerifyOtp error: {e}")
             return {"message": "Internal Server Error", "code": 500}, 500
 
 
