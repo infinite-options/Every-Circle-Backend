@@ -10,7 +10,7 @@ import ably
 import asyncio
 from nearby import RELATIONSHIP_MAP
 from datetime_utils import parse_stored_datetime
-from notifications_service import notify_uid_if_away
+from notifications_service import notify_uid_if_away #to send SMS if user is away
 
 load_dotenv()
 

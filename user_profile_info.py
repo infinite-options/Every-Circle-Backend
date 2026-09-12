@@ -1810,9 +1810,21 @@ class UserProfileInfo(Resource):
                     'profile_personal_social_is_public'
                 ]
 
+                # Stub signup may send empty first/last/phone; omit so profile can be
+                # created with only referred_by (and completed later).
+                _stub_optional_empty = {
+                    "profile_personal_first_name",
+                    "profile_personal_last_name",
+                    "profile_personal_phone_number",
+                }
                 for field in personal_info_fields:
                     if field in payload:
-                        personal_info[field] = payload.pop(field)
+                        value = payload.pop(field)
+                        if field in _stub_optional_empty and (
+                            value is None or str(value).strip() == ""
+                        ):
+                            continue
+                        personal_info[field] = value
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:

@@ -62,6 +62,7 @@ from seller_hold_release import (
 )
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from wallet_ledger import WalletLedger
+from tax_ledger import TaxLedger, TaxLedgerRemit
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -126,6 +127,9 @@ from werkzeug.datastructures import ImmutableMultiDict
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 import googlemaps
+
+import msal  # for Azure AD authentication
+import requests  # for HTTP requests
 
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
@@ -305,6 +309,51 @@ app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
 print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
 
 
+TENANT_ID = os.getenv('MS_TENANT_ID')
+CLIENT_ID = os.getenv('MS_CLIENT_ID')
+CLIENT_SECRET = os.getenv('MS_CLIENT_SECRET')
+SENDER_EMAIL = os.getenv('MS_SENDER_EMAIL')
+
+_msal_app = msal.ConfidentialClientApplication(
+    CLIENT_ID,
+    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    client_credential=CLIENT_SECRET,
+)
+
+def get_msal_token():
+    result = _msal_app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"],
+    )
+    if "access_token" in result:
+        return result["access_token"]
+    else:
+        raise Exception(result.get("error_description"))
+    
+def sendEmail(recipient, subject, body):
+    if isinstance(recipient, str):
+        recipient = [recipient]
+    
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"ContentType": "Text", "Content": body},
+            "toRecipients": [
+                {"emailAddress": {"address": r}} for r in recipient
+            ],
+        },
+        "saveToSentItems": True,
+    }
+
+    resp = requests.post(
+        f"https://graph.microsoft.com/v1.0/users/{SENDER_EMAIL}/sendMail",
+        headers={"Authorization": f"Bearer {get_msal_token()}"},
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code != 202:
+        raise Exception(f"Failed to send email: {resp.status_code} {resp.text}")
+
+
 # Setting for mydomain.com
 app.config["MAIL_SERVER"] = "smtp.office365.com"
 app.config["MAIL_PORT"] = 587
@@ -405,28 +454,28 @@ else:
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
-def sendEmail(recipient, subject, body):
-    print('in sendEmail')
-    print('Confirming correct function call')
-    print('recipient received', recipient)
-    # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
-    if isinstance(recipient, str):
-        recipient = [recipient]
-    print(recipient)
-    print(subject)
-    print(body)
-    with app.app_context():
-        msg = Message(
-            sender="support@everycircle.com",
-            recipients=recipient,
-            subject=subject,
-            body=body
-        )
-        mail.send(msg)
-        print('after mail send')
+# def sendEmail(recipient, subject, body):
+#     print('in sendEmail')
+#     print('Confirming correct function call')
+#     print('recipient received', recipient)
+#     # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
+#     if isinstance(recipient, str):
+#         recipient = [recipient]
+#     print(recipient)
+#     print(subject)
+#     print(body)
+#     with app.app_context():
+#         msg = Message(
+#             sender="support@everycircle.com",
+#             recipients=recipient,
+#             subject=subject,
+#             body=body
+#         )
+#         mail.send(msg)
+#         print('after mail send')
 
 
-app.sendEmail = sendEmail
+# app.sendEmail = sendEmail
 
 
 class SendEmail(Resource):
@@ -447,6 +496,7 @@ class SendEmail(Resource):
             #     "Thank you - Nitya Ayurveda\n\n"
             # )
             sendEmail([email], "Thanks for your Note!", body)
+            print("In Send EMail post after sendEmail")
             return "Email Sent", 200
 
         except Exception:
@@ -889,6 +939,10 @@ api.add_resource(AccountPurgeCron_CLASS, "/api/v1/account_purge_cron")
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
+api.add_resource(TaxLedger, "/api/v1/tax_ledger/<string:profile_id>")
+api.add_resource(
+    TaxLedgerRemit, "/api/v1/tax_ledger/<string:profile_id>/remit"
+)
 
 
 api.add_resource(SendEmail, "/api/v1/sendEmail")

@@ -69,6 +69,7 @@ _PROTECTED_GET_PREFIXES = (
     "/api/v1/transactions",
     "/api/v1/account-screen",
     "/api/v1/wallet_ledger",
+    "/api/v1/tax_ledger",
     "/api/v1/wallet_reconcile",
     "/api/v1/chat",
     "/api/v1/blocked-users",
