@@ -20,6 +20,7 @@ from auth import (
 )
 
 from data_ec import connect, processImage
+from business_info import _truthy_flag, purchased_item_uids_for_buyer
 from moderation import (
     MODERATED_ACTIVE,
     get_business,
@@ -4533,6 +4534,7 @@ class Transactions(Resource):
                     item_bounty_type = item.get("bounty_type", "per_item")
                     is_wish_item = False
                     stock_decrement = None
+                    bs_data = None
 
                     if ti_bs_id and str(ti_bs_id).startswith("250"):
                         print("ti_bs_id is a business service")
@@ -4939,6 +4941,28 @@ class Transactions(Resource):
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
+                    buyer_profile_id = payload.get("profile_id")
+                    if (
+                        not is_wish_item
+                        and bs_data
+                        and buyer_profile_id
+                        and ti_bs_id
+                    ):
+                        new_customers_only = bs_data.get("bs_new_customers_only")
+                        if new_customers_only is None:
+                            new_customers_only = bs_data.get(
+                                "profile_expertise_new_customers_only"
+                            )
+                        if _truthy_flag(new_customers_only):
+                            prior = purchased_item_uids_for_buyer(
+                                db, buyer_profile_id, [ti_bs_id]
+                            )
+                            if str(ti_bs_id).strip() in prior:
+                                print(
+                                    "Zeroing bounty for repeat buyer of "
+                                    f"new-customer-only item {ti_bs_id}"
+                                )
+                                bounty_amount = 0
                     # item_bounty_type = item.get("bounty_type", "per_item")
                     if bounty_amount and float(bounty_amount) > 0:
                         quantity = item.get("quantity", 1) or 1

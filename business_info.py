@@ -178,6 +178,7 @@ _BUSINESS_SERVICE_UPDATE_COLUMNS = frozenset(
         "bs_shipping_refundable",
         "bs_mode",
         "bs_condition",
+        "bs_new_customers_only",
     }
 )
 
@@ -359,6 +360,85 @@ def _derive_shipping_fields(service_data):
         service_data["bs_shipping_amount"] = None
 
 
+def purchased_item_uids_for_buyer(db, buyer_profile_uid, item_uids):
+    print("Purchased Item UIDs for Buyer", buyer_profile_uid, item_uids)
+    """Return set of listing uids the buyer has previously purchased (sale rows)."""
+    buyer = str(buyer_profile_uid or "").strip()
+    uids = [
+        str(u).strip()
+        for u in (item_uids or [])
+        if u is not None and str(u).strip()
+    ]
+    print("Purchased Item UIDs", buyer, uids)
+    if not buyer or not uids:
+        return set()
+
+    placeholders = ", ".join(["%s"] * len(uids))
+    print("Purchased Item UIDs Placeholders", placeholders)
+    purchased_services_query = f"""
+                    SELECT DISTINCT ti.ti_bs_id AS item_uid
+                    FROM every_circle.transactions_items ti
+                    INNER JOIN every_circle.transactions t
+                        ON t.transaction_uid = ti.ti_transaction_id
+                    WHERE t.transaction_profile_id = %s
+                    AND ti.ti_bs_id IN ({placeholders})
+                    AND COALESCE(t.transaction_type, 'sale') = 'sale'
+                """
+    print("Purchased Services Query", purchased_services_query)
+    print("Purchased Services Parameters", tuple([buyer] + uids))
+    result = db.execute(purchased_services_query,
+        tuple([buyer] + uids),
+    )
+    return {
+        str(row.get("item_uid")).strip()
+        for row in (result.get("result") or [])
+        if row.get("item_uid")
+    }
+
+
+def apply_new_customer_bounty_zero(
+    db,
+    rows,
+    *,
+    viewer_profile_uid,
+    is_owner_view,
+    item_uid_key,
+    bounty_key,
+    flag_key,
+):
+    """
+    For new-customer-only listings, zero bounty when the viewer already bought
+    that item. Owner/seller views keep the configured bounty.
+    """
+    print("In Apply New Customer Bounty Zero")
+    if is_owner_view or not viewer_profile_uid or not rows:
+        return rows
+
+    flagged = [
+        row
+        for row in rows
+        if _truthy_flag(row.get(flag_key)) and row.get(item_uid_key)
+    ]
+    if not flagged:
+        return rows
+
+    purchased = purchased_item_uids_for_buyer(
+        db,
+        viewer_profile_uid,
+        [row.get(item_uid_key) for row in flagged],
+    )
+    if not purchased:
+        return rows
+
+    for row in rows:
+        if (
+            _truthy_flag(row.get(flag_key))
+            and str(row.get(item_uid_key) or "").strip() in purchased
+        ):
+            row[bounty_key] = 0
+    return rows
+
+
 def _derive_business_service_fields(service_data):
     """
     Map frontend-only keys to DB columns and remove keys that are not
@@ -377,6 +457,7 @@ def _derive_business_service_fields(service_data):
         "bs_condition_detail",
         "is_returnable",
         "return_window_days",
+        "newCustomersOnly",
     )
     legacy = {k: service_data.pop(k, None) for k in legacy_keys}
 
@@ -392,6 +473,20 @@ def _derive_business_service_fields(service_data):
     ):
         service_data["bs_is_returnable"] = (
             1 if _truthy_flag(service_data["bs_is_returnable"]) else 0
+        )
+
+    # --- bs_new_customers_only (FE: bs_new_customers_only | newCustomersOnly) ---
+    if "bs_new_customers_only" not in service_data and legacy.get(
+        "newCustomersOnly"
+    ) not in (None, ""):
+        service_data["bs_new_customers_only"] = (
+            1 if _truthy_flag(legacy["newCustomersOnly"]) else 0
+        )
+    elif "bs_new_customers_only" in service_data and service_data[
+        "bs_new_customers_only"
+    ] not in (None, ""):
+        service_data["bs_new_customers_only"] = (
+            1 if _truthy_flag(service_data["bs_new_customers_only"]) else 0
         )
 
     if (
@@ -480,6 +575,8 @@ def _prepare_business_service_update_dict(service_data):
         if k == "bs_shipping" and v is not None and v != "":
             v = _normalize_bs_shipping_value(v)
         if k == "bs_shipping_refundable" and v not in (None, ""):
+            v = 1 if _truthy_flag(v) else 0
+        if k == "bs_new_customers_only" and v not in (None, ""):
             v = 1 if _truthy_flag(v) else 0
         out[k] = v
     return out
@@ -644,6 +741,43 @@ class BusinessInfo(Resource):
                     WHERE bs_business_id = "{business_uid}"
                 """
                 services_response = db.execute(services_query)
+                services_rows = services_response.get("result") or []
+
+                viewer_profile_uid = None
+                try:
+                    from auth import get_current_profile_id, jwt_auth_required
+
+                    viewer_profile_uid = get_current_profile_id()
+                    if not viewer_profile_uid and not jwt_auth_required():
+                        viewer_profile_uid = (
+                            request.args.get("viewer_profile_uid")
+                            or request.args.get("profile_uid")
+                            or ""
+                        ).strip() or None
+                except Exception:
+                    viewer_profile_uid = (
+                        request.args.get("viewer_profile_uid")
+                        or request.args.get("profile_uid")
+                        or ""
+                    ).strip() or None
+
+                viewer_is_business_member = bool(
+                    viewer_profile_uid
+                    and any(
+                        str(u.get("profile_id") or "").strip()
+                        == str(viewer_profile_uid).strip()
+                        for u in business_users
+                    )
+                )
+                apply_new_customer_bounty_zero(
+                    db,
+                    services_rows,
+                    viewer_profile_uid=viewer_profile_uid,
+                    is_owner_view=viewer_is_business_member,
+                    item_uid_key="bs_uid",
+                    bounty_key="bs_bounty",
+                    flag_key="bs_new_customers_only",
+                )
 
                 # Added query for business ratings
                 ratings_query = f"""
@@ -699,11 +833,7 @@ class BusinessInfo(Resource):
                     "social_links": (
                         links_response["result"] if "result" in links_response else []
                     ),
-                    "services": (
-                        services_response["result"]
-                        if "result" in services_response
-                        else []
-                    ),
+                    "services": services_rows,
                     "ratings": (
                         ratings_response["result"]
                         if "result" in ratings_response
@@ -2572,6 +2702,9 @@ class BusinessInfo(Resource):
                     "bs_duration_minutes": service.get("bs_duration_minutes"),
                     "bs_cost": _strip_currency(service.get("bs_cost")),
                     "bs_cost_currency": service.get("bs_cost_currency"),
+                    "bs_new_customers_only": service.get(
+                        "bs_new_customers_only", service.get("newCustomersOnly")
+                    ),
                 }
 
                 blim = service_data.get("bs_bounty_limit")
@@ -2606,6 +2739,7 @@ class BusinessInfo(Resource):
                     "bs_condition",
                     "bs_is_returnable",
                     "bs_return_window_days",
+                    "bs_new_customers_only",
                 ):
                     if k in derived_input:
                         service_data[k] = derived_input[k]

@@ -7,6 +7,7 @@ import traceback
 import uuid
 
 from data_ec import connect, uploadImage, s3, processImage, encrypt_data, decrypt_data
+from business_info import apply_new_customer_bounty_zero
 
 
 def _bound_user_uid(payload, missing_message):
@@ -589,6 +590,7 @@ class BusinessDetails(Resource):
     """
 
     def post(self):
+        print("In BusinessDetails POST")
         try:
             body = request.get_json(silent=True) or {}
             uids = body.get("uids")
@@ -597,6 +599,7 @@ class BusinessDetails(Resource):
             if not isinstance(uids, list):
                 return {"message": "uids must be a JSON array", "code": 400}, 400
 
+            # List of businesses that match the search criteria
             uid_list = [str(u).strip() for u in uids if u is not None and str(u).strip()]
             if not uid_list:
                 return {"message": "uids required", "code": 400}, 400
@@ -623,14 +626,27 @@ class BusinessDetails(Resource):
                     for uid in uid_list
                 }
 
+                # For each business, get the services and see if bounty applies only to new customers
                 services_query = f"""
-                    SELECT bs_business_id, bs_bounty, bs_bounty_type
+                    SELECT bs_uid, bs_business_id, bs_bounty, bs_bounty_type,
+                           bs_new_customers_only
                     FROM every_circle.business_services
                     WHERE bs_business_id IN ({placeholders})
                 """
+                print("Services Query", services_query)
                 services_result = db.execute(services_query)
                 service_rows = services_result.get("result") or []
+                apply_new_customer_bounty_zero(
+                    db,
+                    service_rows,
+                    viewer_profile_uid=viewer_uid or None,
+                    is_owner_view=False,
+                    item_uid_key="bs_uid",
+                    bounty_key="bs_bounty",
+                    flag_key="bs_new_customers_only",
+                )
                 bounty_map = _accumulate_business_bounties(service_rows)
+                print("Bounty Map", bounty_map)
 
                 for bid_key, bounty_data in bounty_map.items():
                     if bid_key in ratings_map:

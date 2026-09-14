@@ -12,6 +12,7 @@ from business_info import (
     _normalize_bs_shipping_value,
     _parse_shipping_amount,
     _truthy_flag,
+    apply_new_customer_bounty_zero,
 )
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from profile_status import is_profile_deleted, stub_deleted_profile_row
@@ -186,6 +187,12 @@ def _finalize_expertise_fields(expertise_data):
     """Strip UI-only keys and normalize persisted offering columns."""
     _derive_expertise_shipping_fields(expertise_data)
     _derive_expertise_quantity_fields(expertise_data)
+    if "profile_expertise_new_customers_only" in expertise_data and expertise_data[
+        "profile_expertise_new_customers_only"
+    ] not in (None, ""):
+        expertise_data["profile_expertise_new_customers_only"] = (
+            1 if _truthy_flag(expertise_data["profile_expertise_new_customers_only"]) else 0
+        )
     for key in _EXPERTISE_NON_DB_KEYS:
         expertise_data.pop(key, None)
 
@@ -242,6 +249,9 @@ def _expertise_dict_from_payload(exp_data):
     _set_if_present(m, exp_data, "profile_expertise_refund_policy", "refundPolicy")
     _set_if_present(m, exp_data, "profile_expertise_return_window_days", "returnWindowDays")
     _set_if_present(m, exp_data, "profile_expertise_is_returnable", "isReturnable")
+    _set_if_present(
+        m, exp_data, "profile_expertise_new_customers_only", "newCustomersOnly"
+    )
     if "startDateTime" in exp_data:
         m["profile_expertise_start"] = exp_data["startDateTime"]
     elif "start" in exp_data:
@@ -552,6 +562,15 @@ def load_expertise_info_for_profile(
     expertise_rows = expertise_info.get("result") or []
 
     effective_viewer_uid = profile_id if is_owner_view else viewer_profile_uid
+    apply_new_customer_bounty_zero(
+        db,
+        expertise_rows,
+        viewer_profile_uid=effective_viewer_uid,
+        is_owner_view=is_owner_view,
+        item_uid_key="profile_expertise_uid",
+        bounty_key="profile_expertise_bounty",
+        flag_key="profile_expertise_new_customers_only",
+    )
     return _filter_and_enrich_expertise_info(
         db,
         expertise_rows,
