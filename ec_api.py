@@ -79,6 +79,7 @@ from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
 from change_referral import ChangeReferral
 from profile_views import ProfileViews
+from email_service import sendEmail
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -128,9 +129,6 @@ from werkzeug.datastructures import ImmutableMultiDict
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 import googlemaps
-
-import msal  # for Azure AD authentication
-import requests  # for HTTP requests
 
 print(f"-------------------- New Program Run ( {os.getenv('RDS_DB')} ) --------------------")
 
@@ -302,58 +300,12 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 
 
 
-# --------------- Mail Variables ------------------
+# --------------- Mail Variables (legacy Flask-Mail; sending uses email_service) ------------------
 # Mail username and password loaded in .env file
 app.config['MAIL_USERNAME'] = os.getenv('SUPPORT_EMAIL')
 app.config['MAIL_PASSWORD'] = os.getenv('SUPPORT_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
 print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
-
-
-TENANT_ID = os.getenv('MS_TENANT_ID')
-CLIENT_ID = os.getenv('MS_CLIENT_ID')
-CLIENT_SECRET = os.getenv('MS_CLIENT_SECRET')
-SENDER_EMAIL = os.getenv('MS_SENDER_EMAIL')
-
-_msal_app = msal.ConfidentialClientApplication(
-    CLIENT_ID,
-    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-    client_credential=CLIENT_SECRET,
-)
-
-def get_msal_token():
-    result = _msal_app.acquire_token_for_client(
-        scopes=["https://graph.microsoft.com/.default"],
-    )
-    if "access_token" in result:
-        return result["access_token"]
-    else:
-        raise Exception(result.get("error_description"))
-    
-def sendEmail(recipient, subject, body):
-    if isinstance(recipient, str):
-        recipient = [recipient]
-    
-    payload = {
-        "message": {
-            "subject": subject,
-            "body": {"ContentType": "Text", "Content": body},
-            "toRecipients": [
-                {"emailAddress": {"address": r}} for r in recipient
-            ],
-        },
-        "saveToSentItems": True,
-    }
-
-    resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/users/{SENDER_EMAIL}/sendMail",
-        headers={"Authorization": f"Bearer {get_msal_token()}"},
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code != 202:
-        raise Exception(f"Failed to send email: {resp.status_code} {resp.text}")
-
 
 # Setting for mydomain.com
 app.config["MAIL_SERVER"] = "smtp.office365.com"
