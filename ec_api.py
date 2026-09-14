@@ -76,6 +76,7 @@ from content_reports import (
 )
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
+from change_referral import ChangeReferral
 from profile_views import ProfileViews
 # from jwtToken import JwtToken
 from functools import wraps
@@ -882,6 +883,7 @@ api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/message
 api.add_resource(BlockedUsers,    '/api/v1/blocked-users', '/api/v1/blocked-users/<string:blocker_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
+api.add_resource(ChangeReferral, '/api/v1/change_referral')
 api.add_resource(BusinessDetails, '/api/v1/business_details')
 api.add_resource(ProfileConnectionDegrees, '/api/v1/profile_connection_degrees')
 # api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
