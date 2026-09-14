@@ -302,6 +302,66 @@ def build_wallet_ledger_v3(db, profile_id, *, offset=0, limit=50, tz_name=None):
     }
 
 
+def build_tax_owed_v3(db, profile_id):
+    """Account-screen slim tax owed card."""
+    from tax_owed_service import build_tax_owed_summary
+
+    summary = build_tax_owed_summary(db, profile_id)
+    balance = round_money(summary.get("tax_owed_balance"))
+    lifetime_collected = round_money(summary.get("tax_owed_lifetime_collected"))
+    lifetime_reversed = round_money(summary.get("tax_owed_lifetime_reversed"))
+    lifetime_remitted = round_money(summary.get("tax_owed_lifetime_remitted"))
+    if (
+        balance == 0
+        and lifetime_collected == 0
+        and lifetime_reversed == 0
+        and lifetime_remitted == 0
+    ):
+        # Still return zeros so FE can show an empty card consistently.
+        pass
+    return {
+        "balance": balance,
+        "lifetime_collected": lifetime_collected,
+        "lifetime_reversed": lifetime_reversed,
+        "lifetime_remitted": lifetime_remitted,
+        "currency": summary.get("currency") or "USD",
+    }
+
+
+def build_tax_ledger_v3(db, profile_id, *, offset=0, limit=50, tz_name=None):
+    from tax_ledger import get_tax_ledger, _apply_tax_entry_display
+
+    raw = get_tax_ledger(db, profile_id, limit=limit, offset=offset)
+    entries = []
+    for row in raw.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        entry = dict(row)
+        entry["ledger_entry_uid"] = (
+            entry.get("ledger_entry_uid")
+            or entry.pop("entry_id", None)
+            or entry.get("tt_uid")
+        )
+        entry["order_uid"] = entry.get("order_uid") or entry.get("transaction_uid")
+        if not entry.get("transaction_uid") and entry.get("order_uid"):
+            entry["transaction_uid"] = entry["order_uid"]
+        for key in ("amount", "balance_after", "tax_rate"):
+            if entry.get(key) is not None:
+                entry[key] = round_money(entry.get(key))
+        entry = _apply_tax_entry_display(entry, tz_name)
+        if tz_name and entry.get("entry_datetime"):
+            enriched = enrich_datetime_fields(entry, "entry_datetime", tz_name)
+            entry["entry_datetime_local"] = enriched.get("entry_datetime_local")
+        entries.append(entry)
+
+    return {
+        "total_entries": raw.get("total_entries") or 0,
+        "offset": offset,
+        "limit": limit,
+        "entries": entries,
+    }
+
+
 def _purchase_type(row):
     bs_id = str(row.get("ti_bs_id") or "")
     if bs_id.startswith("250-"):

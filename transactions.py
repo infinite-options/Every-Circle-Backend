@@ -20,6 +20,7 @@ from auth import (
 )
 
 from data_ec import connect, processImage
+from business_info import _truthy_flag, purchased_item_uids_for_buyer
 from moderation import (
     MODERATED_ACTIVE,
     get_business,
@@ -43,6 +44,10 @@ from wallet_transactions_service import (
     credit_seller_proceeds_at_checkout,
     resolve_seller_wallet_profile_id,
     _parse_unit_cost,
+)
+from tax_owed_service import (
+    credit_tax_collected_at_checkout,
+    reverse_tax_on_return,
 )
 from datetime_utils import utc_now_str, enrich_datetime_fields, parse_stored_datetime
 from transaction_shipping import (
@@ -2959,14 +2964,6 @@ def _update_return_statuses(
     return_transaction_uid=None,
     stripe_refund_id=None,
 ):
-    """
-    Update targeted return-request row(s) by trr_uid / trr_uids.
-
-    On the sale transaction, only maintain transaction_return_requested.
-    Note / return_status / seller_note live on transaction_return_requests:
-      trr_note, trr_return_status, trr_seller_note
-      (sale uid is trr_transaction_uid)
-    """
     uids = []
     if trr_uids:
         uids = [u for u in trr_uids if u]
@@ -3013,16 +3010,8 @@ def _update_return_statuses(
     _notify_return_status_change(db, transaction_uid, refund_status)
 
 
+#SMS for return request status changes
 def _notify_return_status_change(db, transaction_uid, refund_status):
-    """
-    SMS fallback for return/refund status changes. All seven call sites of
-    _update_return_statuses funnel through here — refund_status alone is
-    enough to know who needs to hear about it:
-      PENDING  → a return was just requested/re-opened, seller needs to act
-      REFUNDED → buyer's refund went through
-      REJECTED → buyer's return/refund request was declined
-    Best-effort only: never raises, never blocks the caller's transaction.
-    """
     try:
         rows = db.execute(
             """SELECT transaction_profile_id, transaction_business_id
@@ -3045,14 +3034,25 @@ def _notify_return_status_change(db, transaction_uid, refund_status):
                 "A buyer has requested a return on Every Circle. Review it under Seller Tools.",
             )
         elif refund_status == REFUND_STATUS_REFUNDED and buyer_id:
-            notify_uid_if_away(buyer_id, "Your refund has been issued on Every Circle.")
+            notify_uid_if_away(buyer_id, "Your return has been approved on Every Circle.")
         elif refund_status == REFUND_STATUS_REJECTED and buyer_id:
             notify_uid_if_away(
                 buyer_id,
-                "Your return request was declined on Every Circle. Open the app for details.",
+                "Your return request was declined on Every Circle.",
             )
     except Exception as e:
         print(f"_notify_return_status_change notify error for {transaction_uid}: {e}")
+
+#SMS for bounty
+def _notify_bounty_earned(participant_id):
+    if not participant_id or participant_id in (EC_WALLET_ID, CHARITY_PROFILE_ID):
+        return
+    try:
+        from notifications_service import notify_uid_if_away
+
+        notify_uid_if_away(participant_id, "You've just earned a bounty from Every Circle.")
+    except Exception as e:
+        print(f"_notify_bounty_earned error for {participant_id}: {e}")
 
 
 def _finalize_pending_return(
@@ -3310,6 +3310,25 @@ def _finalize_pending_return(
                         print(f"Warning: Failed to claw back seller proceeds on return for {line['original_ti_uid']}: {clawback_result}")
                     else:
                         total_seller_clawed = round(total_seller_clawed + _to_float(clawback_result.get('clawed')), 4)
+                try:
+                    if rq > 0:
+                        tax_reverse_result = reverse_tax_on_return(
+                            _db_168,
+                            original_ti_uid=line['original_ti_uid'],
+                            return_ti_uid=new_ti_uid,
+                            return_qty=rq,
+                            transaction_uid=_original_tx_uid_172,
+                        )
+                        if tax_reverse_result.get('code') != 200:
+                            print(
+                                f"Warning: Failed to reverse tax owed on return for "
+                                f"{line['original_ti_uid']}: {tax_reverse_result}"
+                            )
+                except Exception as tax_reverse_err:
+                    print(
+                        f"Warning: Exception reversing tax owed on return for "
+                        f"{line['original_ti_uid']}: {tax_reverse_err}"
+                    )
                 cancel_adjust_result = None
                 cancel_hold_result = None
                 if cancel_unshipped_qty > 0 and (not (clawback_result and clawback_result.get('finalized_request_hold'))):
@@ -4515,6 +4534,7 @@ class Transactions(Resource):
                     item_bounty_type = item.get("bounty_type", "per_item")
                     is_wish_item = False
                     stock_decrement = None
+                    bs_data = None
 
                     if ti_bs_id and str(ti_bs_id).startswith("250"):
                         print("ti_bs_id is a business service")
@@ -4921,6 +4941,28 @@ class Transactions(Resource):
 
                     # Process bounty if applicable
                     bounty_amount = item.get("bounty", 0)
+                    buyer_profile_id = payload.get("profile_id")
+                    if (
+                        not is_wish_item
+                        and bs_data
+                        and buyer_profile_id
+                        and ti_bs_id
+                    ):
+                        new_customers_only = bs_data.get("bs_new_customers_only")
+                        if new_customers_only is None:
+                            new_customers_only = bs_data.get(
+                                "profile_expertise_new_customers_only"
+                            )
+                        if _truthy_flag(new_customers_only):
+                            prior = purchased_item_uids_for_buyer(
+                                db, buyer_profile_id, [ti_bs_id]
+                            )
+                            if str(ti_bs_id).strip() in prior:
+                                print(
+                                    "Zeroing bounty for repeat buyer of "
+                                    f"new-customer-only item {ti_bs_id}"
+                                )
+                                bounty_amount = 0
                     # item_bounty_type = item.get("bounty_type", "per_item")
                     if bounty_amount and float(bounty_amount) > 0:
                         quantity = item.get("quantity", 1) or 1
@@ -5138,7 +5180,9 @@ class Transactions(Resource):
                                             f"Warning: Failed to update wallet for "
                                             f"participant {participant_id}: {wallet_result}"
                                         )
-                                    
+
+                                    _notify_bounty_earned(participant_id)
+
                                 else:
                                     print(
                                         f"Warning: Failed to insert bounty for participant {participant_id}: {bounty_response}"
@@ -5226,6 +5270,8 @@ class Transactions(Resource):
                                             f"network participant {participant_id}: {wallet_result}"
                                         )
 
+                                    _notify_bounty_earned(participant_id)
+
                                 else:
                                     print(
                                         f"Warning: Failed to insert bounty for network participant {participant_id}: {bounty_response}"
@@ -5275,6 +5321,26 @@ class Transactions(Resource):
                     response["seller_proceeds_credit"] = {
                         "code": 500,
                         "message": str(seller_credit_err),
+                    }
+
+                try:
+                    tax_credit = credit_tax_collected_at_checkout(
+                        db, new_transaction_uid
+                    )
+                    response["tax_owed_credit"] = tax_credit
+                    if tax_credit.get("code") != 200:
+                        print(
+                            "Warning: Failed to credit tax owed at "
+                            f"checkout: {tax_credit}"
+                        )
+                except Exception as tax_credit_err:
+                    print(
+                        "Warning: Exception crediting tax owed at "
+                        f"checkout: {tax_credit_err}"
+                    )
+                    response["tax_owed_credit"] = {
+                        "code": 500,
+                        "message": str(tax_credit_err),
                     }
 
                 if inventory_updates:
