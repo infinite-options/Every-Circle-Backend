@@ -110,15 +110,34 @@ def send_sms(phone_number, message):
         print(f"send_sms error sending to {to_number}: {e}")
         return False
 
-# Notify a user via SMS if they're not currently active in the app
-def notify_uid_if_away(uid, message):
+# Default link appended to a notification SMS when the caller doesn't have anything
+# more specific to point at. Once everycircle.com hosts the verification files and a
+# rebuild goes out (see app.config.js associatedDomains/intentFilters), these are real
+# Universal/App Links — this exact path ("/") and "/chat" (see build_chat_link below)
+# are the only two paths currently allow-listed on both platforms.
+EVERYCIRCLE_URL = "https://everycircle.com"
+
+
+def build_chat_link(conversation_uid):
+    """Deep link straight to a conversation — matches the Chat route's `path: "chat"`
+    + `parse: { conversation_uid }` in App.js's linking config."""
+    if not conversation_uid:
+        return EVERYCIRCLE_URL
+    return f"{EVERYCIRCLE_URL}/chat?conversation_uid={conversation_uid}"
+
+
+# Notify a user via SMS if they're not currently active in the app. `link`
+# overrides the default EVERYCIRCLE_URL when the caller has somewhere more
+# specific to send them (e.g. build_chat_link) — must be one of the paths
+# allow-listed in app.config.js / the hosted apple-app-site-association.
+def notify_uid_if_away(uid, message, link=None):
     try:
         if is_uid_present(uid):
             return False  # app is open right now — Ably already delivered this live
         phone_number = get_phone_number_for_uid(uid)
         if not phone_number:
             return False
-        return send_sms(phone_number, message)
+        return send_sms(phone_number, f"{message} {link or EVERYCIRCLE_URL}")
     except Exception as e:
         print(f"notify_uid_if_away error for {uid}: {e}")
         return False

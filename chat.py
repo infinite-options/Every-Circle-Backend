@@ -10,7 +10,7 @@ import ably
 import asyncio
 from nearby import RELATIONSHIP_MAP
 from datetime_utils import parse_stored_datetime
-from notifications_service import notify_uid_if_away #to send SMS if user is away
+from notifications_service import notify_uid_if_away, build_chat_link #to send SMS if user is away
 
 load_dotenv()
 
@@ -83,7 +83,7 @@ def _optional_message_context(data):
     fields = {}
 
     context_type = (data.get("message_context_type") or "").strip()
-    if context_type in ("offering", "seeking"):
+    if context_type in ("offering", "seeking", "business"):
         fields["message_context_type"] = context_type
 
     for col in ("message_context_uid", "message_context_response_uid"):
@@ -624,7 +624,7 @@ def _latest_visible_message(conversation_uid, viewer_uid, cutoff):
 
 
 def _offering_or_seeking_title(context_type, context_uid):
-    """Human-readable title for a message's offering/seeking context, if any."""
+    """Human-readable title for a message's offering/seeking/business context, if any."""
     if not context_type or not context_uid:
         return None
     try:
@@ -643,6 +643,13 @@ def _offering_or_seeking_title(context_type, context_uid):
                 )
                 row = (rows.get("result") or [{}])[0]
                 return row.get("profile_wish_title")
+            elif context_type == "business":
+                rows = db.execute(
+                    "SELECT business_name FROM every_circle.business WHERE business_uid = %s",
+                    args=(context_uid,),
+                )
+                row = (rows.get("result") or [{}])[0]
+                return row.get("business_name")
     except Exception as e:
         print(f"_offering_or_seeking_title error for {context_type}/{context_uid}: {e}")
     return None
@@ -680,6 +687,10 @@ def _publish_message(
                         "sender_uid":       sender_uid,
                         "body":             body,
                         "sent_at":          sent_at,
+                        # Included so a business-recommendation bubble is tappable immediately in a
+                        # live-open chat, not only after the screen reloads from GET /chat/messages.
+                        "message_context_type": context_type,
+                        "message_context_uid":  context_uid,
                     },
                 )
 
@@ -717,10 +728,17 @@ def _publish_message(
                 sms_text = f'{sender} sent you a message about your {kind} "{title}" on Every Circle.'
             else:
                 sms_text = f"{sender} sent you a message about your {kind} on Every Circle."
+        elif context_type == "business":
+            # Business recommendation — name the business, don't quote the message body.
+            title = _offering_or_seeking_title(context_type, context_uid)
+            if title:
+                sms_text = f'{sender} recommended "{title}" to you on Every Circle.'
+            else:
+                sms_text = f"{sender} recommended a business to you on Every Circle."
         else:
             preview = body if len(body) <= 120 else body[:117] + "..."
             sms_text = f"{sender} sent you a message on Every Circle: {preview}"
-        notify_uid_if_away(recipient_uid, sms_text)
+        notify_uid_if_away(recipient_uid, sms_text, link=build_chat_link(conversation_uid))
 
 
 # --------------- resources ---------------
