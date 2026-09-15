@@ -15,6 +15,15 @@ from business_info import (
 )
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from profile_status import is_profile_deleted, stub_deleted_profile_row
+from profile_visibility import (
+    FIELD_VISIBILITY,
+    apply_profile_field_visibility,
+    item_visible_to_viewer,
+    resolve_viewer_degree,
+    resolve_viewer_relationships,
+    sync_is_public_from_visibility,
+    sync_item_is_public_from_visibility,
+)
 from transactions import _parse_limited_quantity
 from moderation import (
     MODERATED_ACKNOWLEDGED,
@@ -31,6 +40,10 @@ from moderation import (
     is_offering_publicly_visible,
     is_wish_publicly_visible,
 )
+
+_FIELD_VISIBILITY_COLUMNS = [cfg["visibility_col"] for cfg in FIELD_VISIBILITY.values()] + [
+    cfg["visibility_circles_col"] for cfg in FIELD_VISIBILITY.values() if cfg.get("visibility_circles_col")
+]
 
 
 _EXPERTISE_PREFIX = "profile_expertise_"
@@ -477,6 +490,13 @@ def _filter_and_enrich_expertise_info(
     is_owner_view = bool(
         viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
     )
+    # Resolved once per request (not per item) - same degree/relationship gating as the
+    # personal-info fields (profile_visibility.py), now per individual offering too.
+    viewer_degree = None
+    viewer_relationships = None
+    if not is_owner_view and not viewer_is_admin:
+        viewer_degree = resolve_viewer_degree(db, profile_id, viewer_profile_uid)
+        viewer_relationships = resolve_viewer_relationships(db, profile_id, viewer_profile_uid)
     for row in expertise_rows:
         if not is_offering_publicly_visible(
             row,
@@ -484,6 +504,8 @@ def _filter_and_enrich_expertise_info(
             viewer_is_admin=viewer_is_admin,
             owner_moderated=owner_moderated,
         ):
+            continue
+        if not item_visible_to_viewer(row, "expertise", viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships):
             continue
         item = dict(row)
         if is_owner_view:
@@ -642,6 +664,11 @@ def _filter_and_enrich_wish_info(
     is_owner_view = bool(
         viewer_profile_uid and str(viewer_profile_uid) == str(profile_id)
     )
+    viewer_degree = None
+    viewer_relationships = None
+    if not is_owner_view and not viewer_is_admin:
+        viewer_degree = resolve_viewer_degree(db, profile_id, viewer_profile_uid)
+        viewer_relationships = resolve_viewer_relationships(db, profile_id, viewer_profile_uid)
     for row in wish_rows:
         if not is_wish_publicly_visible(
             row,
@@ -649,6 +676,8 @@ def _filter_and_enrich_wish_info(
             viewer_is_admin=viewer_is_admin,
             owner_moderated=owner_moderated,
         ):
+            continue
+        if not item_visible_to_viewer(row, "wish", viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships):
             continue
         item = dict(row)
         if is_owner_view:
@@ -1488,6 +1517,23 @@ class UserProfileInfo(Resource):
                     profile_id,
                     is_owner_view,
                 )
+                apply_profile_field_visibility(
+                    db,
+                    response['personal_info'],
+                    profile_id,
+                    viewer_profile_uid,
+                    is_owner_view,
+                    viewer_is_admin,
+                )
+                # Email's value lives on users.user_email_id, not personal_info, so it isn't
+                # covered by apply_profile_field_visibility's value_keys - gate it here off the
+                # is_public flag that call just resolved for this viewer.
+                if (
+                    not is_owner_view
+                    and not viewer_is_admin
+                    and response['personal_info'].get('profile_personal_email_is_public') != 1
+                ):
+                    email_id = None
                 response['user_email'] = email_id
                 # print("Get 1")
                 # return profile_response['result'][0], 200
@@ -1764,11 +1810,12 @@ class UserProfileInfo(Resource):
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
-                ]
+                ] + _FIELD_VISIBILITY_COLUMNS
 
                 for field in personal_info_fields:
                     if field in payload:
                         personal_info[field] = payload.pop(field)
+                sync_is_public_from_visibility(personal_info)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:
@@ -1908,6 +1955,7 @@ class UserProfileInfo(Resource):
                             expertise_info['profile_expertise_uid'] = new_expertise_uid
                             expertise_info['profile_expertise_profile_personal_id'] = new_profile_uid
                             expertise_info.update(_expertise_dict_from_payload(exp_data))
+                            sync_item_is_public_from_visibility(expertise_info, "expertise")
                             _apply_profile_expertise_multipart_image(
                                 db,
                                 payload,
@@ -1959,6 +2007,7 @@ class UserProfileInfo(Resource):
                             wish_info['profile_wish_uid'] = new_wish_uid
                             wish_info['profile_wish_profile_personal_id'] = new_profile_uid
                             wish_info.update(_wish_dict_from_payload(wish_data))
+                            sync_item_is_public_from_visibility(wish_info, "wish")
                             _apply_profile_wish_multipart_image(
                                 db,
                                 payload,
@@ -2355,11 +2404,12 @@ class UserProfileInfo(Resource):
                     'profile_personal_wishes_is_public',
                     'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
-                ]
-                
+                ] + _FIELD_VISIBILITY_COLUMNS
+
                 for field in personal_info_fields:
                     if field in payload:
                         personal_info[field] = payload.pop(field)
+                sync_is_public_from_visibility(personal_info)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:
@@ -2453,7 +2503,15 @@ class UserProfileInfo(Resource):
                     personal_info['profile_personal_last_updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     
                     # Update personal info
-                    db.update('every_circle.profile_personal', {'profile_personal_uid': profile_uid}, personal_info)
+                    update_result = db.update('every_circle.profile_personal', {'profile_personal_uid': profile_uid}, personal_info)
+                    # db.update/execute catches DB errors and returns them as a {message, code}
+                    # dict instead of raising - without this check, a failed UPDATE (e.g. a
+                    # migration that hasn't been run yet, so a column genuinely doesn't exist)
+                    # silently reports "success" to the app while nothing was actually saved.
+                    if update_result and update_result.get('code') not in (None, 200):
+                        response['message'] = update_result.get('message') or 'Failed to update profile'
+                        response['code'] = update_result.get('code', 500)
+                        return response, response['code']
 
                     updated_uids['profile_personal_uid'] = profile_uid
                     print("Update complete ", updated_uids['profile_personal_uid'])
@@ -2784,6 +2842,7 @@ class UserProfileInfo(Resource):
                                     )
 
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                sync_item_is_public_from_visibility(expertise_info, "expertise")
                                 _strip_expertise_moderated_fields(expertise_info)
                                 _enforce_moderated_is_public(existing_expertise, expertise_info)
                                 _apply_profile_expertise_multipart_image(
@@ -2814,6 +2873,7 @@ class UserProfileInfo(Resource):
                                 expertise_info['profile_expertise_uid'] = new_expertise_uid
                                 expertise_info['profile_expertise_profile_personal_id'] = profile_uid
                                 expertise_info.update(_expertise_dict_from_payload(exp_data))
+                                sync_item_is_public_from_visibility(expertise_info, "expertise")
                                 _apply_profile_expertise_multipart_image(
                                     db,
                                     payload,
@@ -2874,6 +2934,7 @@ class UserProfileInfo(Resource):
                                     )
 
                                 wish_info.update(_wish_dict_from_payload(wish_data))
+                                sync_item_is_public_from_visibility(wish_info, "wish")
                                 _strip_wish_moderated_fields(wish_info)
                                 _enforce_wish_moderated_is_public(existing_wish, wish_info)
                                 _apply_profile_wish_multipart_image(
@@ -2904,6 +2965,7 @@ class UserProfileInfo(Resource):
                                 wish_info['profile_wish_uid'] = new_wish_uid
                                 wish_info['profile_wish_profile_personal_id'] = profile_uid
                                 wish_info.update(_wish_dict_from_payload(wish_data))
+                                sync_item_is_public_from_visibility(wish_info, "wish")
                                 _apply_profile_wish_multipart_image(
                                     db,
                                     payload,

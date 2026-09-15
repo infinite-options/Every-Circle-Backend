@@ -2,42 +2,113 @@ from flask import request
 from flask_restful import Resource
 from data_ec import connect
 from profile_status import deleted_profile_sql_clause
+from profile_visibility import field_visible_to_viewer
 
+# Raw values + the *_visibility levels needed to gate them per-viewer in Python
+# (_apply_search_row_visibility below) - degree-aware gating can't be expressed
+# as a plain SQL CASE WHEN since it depends on the searching viewer, not just
+# the row. profile_personal_tag_line_is_public is still selected raw for the
+# frontend field name it already reads; _apply_search_row_visibility keeps it
+# in sync with the per-viewer decision.
 PROFILE_SELECT = """
     pp.profile_personal_uid,
     pp.profile_personal_user_id,
     pp.profile_personal_first_name,
     pp.profile_personal_last_name,
-    CASE WHEN pp.profile_personal_email_is_public = 1
-        THEN u.user_email_id
-        ELSE NULL
-    END as profile_email_id,
-    CASE WHEN pp.profile_personal_phone_number_is_public = 1
-        THEN pp.profile_personal_phone_number
-        ELSE NULL
-    END as profile_personal_phone_number,
-    CASE WHEN pp.profile_personal_location_is_public = 1
-        THEN pp.profile_personal_city
-        ELSE NULL
-    END as profile_personal_city,
-    CASE WHEN pp.profile_personal_location_is_public = 1
-        THEN pp.profile_personal_state
-        ELSE NULL
-    END as profile_personal_state,
-    CASE WHEN pp.profile_personal_image_is_public = 1
-        THEN pp.profile_personal_image
-        ELSE NULL
-    END as profile_personal_image,
-    CASE WHEN pp.profile_personal_tag_line_is_public = 1
-        THEN pp.profile_personal_tag_line
-        ELSE NULL
-    END as profile_personal_tag_line,
+    u.user_email_id as profile_email_id,
+    pp.profile_personal_phone_number,
+    pp.profile_personal_city,
+    pp.profile_personal_state,
+    pp.profile_personal_image,
+    pp.profile_personal_tag_line,
     pp.profile_personal_tag_line_is_public,
-    CASE WHEN pp.profile_personal_short_bio_is_public = 1
-        THEN pp.profile_personal_short_bio
-        ELSE NULL
-    END as profile_personal_short_bio
+    pp.profile_personal_short_bio,
+    pp.profile_personal_email_visibility,
+    pp.profile_personal_phone_number_visibility,
+    pp.profile_personal_city_visibility,
+    pp.profile_personal_state_visibility,
+    pp.profile_personal_image_visibility,
+    pp.profile_personal_tag_line_visibility,
+    pp.profile_personal_short_bio_visibility,
+    pp.profile_personal_email_visibility_circles,
+    pp.profile_personal_phone_number_visibility_circles,
+    pp.profile_personal_city_visibility_circles,
+    pp.profile_personal_state_visibility_circles,
+    pp.profile_personal_image_visibility_circles,
+    pp.profile_personal_tag_line_visibility_circles,
+    pp.profile_personal_short_bio_visibility_circles
 """
+
+# Maps each gated search-result field to its *_visibility (+ *_visibility_circles,
+# for the 'specific' level) column and the row key(s) to null out when hidden
+# from a particular viewer.
+_SEARCH_FIELD_GATES = {
+    "email": {
+        "visibility_col": "profile_personal_email_visibility",
+        "circles_col": "profile_personal_email_visibility_circles",
+        "value_keys": ["profile_email_id"],
+    },
+    "phone_number": {
+        "visibility_col": "profile_personal_phone_number_visibility",
+        "circles_col": "profile_personal_phone_number_visibility_circles",
+        "value_keys": ["profile_personal_phone_number"],
+    },
+    "city": {
+        "visibility_col": "profile_personal_city_visibility",
+        "circles_col": "profile_personal_city_visibility_circles",
+        "value_keys": ["profile_personal_city"],
+    },
+    "state": {
+        "visibility_col": "profile_personal_state_visibility",
+        "circles_col": "profile_personal_state_visibility_circles",
+        "value_keys": ["profile_personal_state"],
+    },
+    "image": {
+        "visibility_col": "profile_personal_image_visibility",
+        "circles_col": "profile_personal_image_visibility_circles",
+        "value_keys": ["profile_personal_image"],
+    },
+    "tag_line": {
+        "visibility_col": "profile_personal_tag_line_visibility",
+        "circles_col": "profile_personal_tag_line_visibility_circles",
+        "value_keys": ["profile_personal_tag_line"],
+        "is_public_key": "profile_personal_tag_line_is_public",
+    },
+    "short_bio": {
+        "visibility_col": "profile_personal_short_bio_visibility",
+        "circles_col": "profile_personal_short_bio_visibility_circles",
+        "value_keys": ["profile_personal_short_bio"],
+    },
+}
+
+
+def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relationships_map=None):
+    """
+    Null out any field on each search result row the searching viewer isn't
+    allowed to see at their circle degree/relationship from that profile - the
+    same Everyone/1st-3rd degree/Specific Circles/Only Me levels set in Edit
+    Profile, applied here the same way GET userprofileinfo applies them
+    (profile_visibility.py), just against a batch of rows using precomputed
+    viewer->target degree and relationship maps instead of one DB round trip
+    per row.
+    """
+    relationships_map = relationships_map or {}
+    for row in rows:
+        row_uid = row.get("profile_personal_uid")
+        is_owner_view = bool(viewer_profile_uid) and str(viewer_profile_uid) == str(row_uid)
+        viewer_degree = degree_map.get(row_uid)
+        viewer_relationships = relationships_map.get(row_uid)
+        for cfg in _SEARCH_FIELD_GATES.values():
+            level = row.get(cfg["visibility_col"]) or "everyone"
+            allowed_csv = row.get(cfg["circles_col"])
+            if field_visible_to_viewer(level, viewer_degree, is_owner_view, False, viewer_relationships, allowed_csv):
+                continue
+            for value_key in cfg["value_keys"]:
+                if value_key in row:
+                    row[value_key] = None
+            if cfg.get("is_public_key") and cfg["is_public_key"] in row:
+                row[cfg["is_public_key"]] = 0
+    return rows
 
 
 def _profile_search_clauses(parts, search_term):
@@ -125,8 +196,15 @@ class SearchReferral(Resource):
         - profile_uid: when set, also search this user's circle notes, events, meeting location, etc.
         """
         try:
+            from auth import get_current_profile_id, jwt_auth_required
+
             query = request.args.get('query', '').strip()
             profile_uid = request.args.get('profile_uid', '').strip()
+
+            # Searching viewer, for degree-based field gating below: prefer the JWT identity;
+            # fall back to the profile_uid query param (already sent by the app for circle-
+            # metadata search) only when a JWT isn't required/present.
+            viewer_profile_uid = get_current_profile_id() or (None if jwt_auth_required() else profile_uid or None)
 
             if not query or len(query) < 2:
                 return {
@@ -177,6 +255,37 @@ class SearchReferral(Resource):
                     profile_rows = _merge_profile_rows(
                         profile_rows + ((circle_response or {}).get('result') or [])
                     )
+
+                if profile_rows and viewer_profile_uid:
+                    from business import compute_profile_degrees_from_viewer
+
+                    target_uids = [r.get('profile_personal_uid') for r in profile_rows]
+                    # Only degree1-3 affect gating, so cap the BFS at 3 hops - far cheaper
+                    # than resolving each row's degree with its own ConnectionsPath lookup.
+                    degree_map = compute_profile_degrees_from_viewer(db, viewer_profile_uid, target_uids, max_degree=3)
+
+                    # One batch query for every result owner's circle_relationship with the
+                    # viewer, instead of a resolve_viewer_relationships() round trip per row.
+                    relationships_map = {}
+                    placeholders = ','.join(['%s'] * len(target_uids))
+                    rel_rows = db.execute(
+                        f"""
+                        SELECT circle_profile_id, circle_relationship
+                        FROM every_circle.circles
+                        WHERE circle_profile_id IN ({placeholders})
+                          AND circle_related_person_id = %s
+                          AND circle_relationship IS NOT NULL AND circle_relationship != ''
+                        """,
+                        target_uids + [viewer_profile_uid],
+                    )
+                    for r in (rel_rows or {}).get('result') or []:
+                        relationships_map.setdefault(r['circle_profile_id'], set()).add(r['circle_relationship'])
+
+                    _apply_search_row_visibility(profile_rows, viewer_profile_uid, degree_map, relationships_map)
+                elif profile_rows:
+                    # No known viewer (unauthenticated / no profile_uid sent): only Everyone-level
+                    # fields are visible.
+                    _apply_search_row_visibility(profile_rows, None, {})
 
             if profile_rows:
                 print(f"Found {len(profile_rows)} results")
