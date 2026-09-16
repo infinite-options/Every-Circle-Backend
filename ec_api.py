@@ -62,6 +62,7 @@ from seller_hold_release import (
 )
 from wallet_reconcile import WalletReconcile, WalletReconcileAll
 from wallet_ledger import WalletLedger
+from tax_ledger import TaxLedger, TaxLedgerRemit
 from circles import Circles
 from nearby import NearbyLocation, NearbyUsers
 from chat import Conversations, Messages
@@ -76,7 +77,9 @@ from content_reports import (
 )
 from request_logging_middleware import register_request_logging
 from search_referral import SearchReferral
+from change_referral import ChangeReferral
 from profile_views import ProfileViews
+from email_service import sendEmail
 # from jwtToken import JwtToken
 from functools import wraps
 import jwt
@@ -104,6 +107,8 @@ from auth import (
     AuthRegister,
     AuthSalt,
     AuthSocial,
+    PhoneSendOtp,
+    PhoneVerifyOtp,
     register_jwt_auth,
 ) 
 from pytz import timezone as ptz  # Not sure what the difference is
@@ -295,13 +300,12 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 
 
 
-# --------------- Mail Variables ------------------
+# --------------- Mail Variables (legacy Flask-Mail; sending uses email_service) ------------------
 # Mail username and password loaded in .env file
 app.config['MAIL_USERNAME'] = os.getenv('SUPPORT_EMAIL')
 app.config['MAIL_PASSWORD'] = os.getenv('SUPPORT_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER')
 print("Sender: ", app.config['MAIL_DEFAULT_SENDER'])
-
 
 # Setting for mydomain.com
 app.config["MAIL_SERVER"] = "smtp.office365.com"
@@ -403,28 +407,28 @@ else:
 
 # -- Send Email Endpoints start here -------------------------------------------------------------------------------
 
-def sendEmail(recipient, subject, body):
-    print('in sendEmail')
-    print('Confirming correct function call')
-    print('recipient received', recipient)
-    # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
-    if isinstance(recipient, str):
-        recipient = [recipient]
-    print(recipient)
-    print(subject)
-    print(body)
-    with app.app_context():
-        msg = Message(
-            sender="support@everycircle.com",
-            recipients=recipient,
-            subject=subject,
-            body=body
-        )
-        mail.send(msg)
-        print('after mail send')
+# def sendEmail(recipient, subject, body):
+#     print('in sendEmail')
+#     print('Confirming correct function call')
+#     print('recipient received', recipient)
+#     # Flask-Mail Message.recipients must be a list; if passed a string it iterates per-character.
+#     if isinstance(recipient, str):
+#         recipient = [recipient]
+#     print(recipient)
+#     print(subject)
+#     print(body)
+#     with app.app_context():
+#         msg = Message(
+#             sender="support@everycircle.com",
+#             recipients=recipient,
+#             subject=subject,
+#             body=body
+#         )
+#         mail.send(msg)
+#         print('after mail send')
 
 
-app.sendEmail = sendEmail
+# app.sendEmail = sendEmail
 
 
 class SendEmail(Resource):
@@ -445,6 +449,7 @@ class SendEmail(Resource):
             #     "Thank you - Nitya Ayurveda\n\n"
             # )
             sendEmail([email], "Thanks for your Note!", body)
+            print("In Send EMail post after sendEmail")
             return "Email Sent", 200
 
         except Exception:
@@ -780,6 +785,8 @@ api.add_resource(AuthRefresh, "/api/v1/auth/refresh")
 api.add_resource(AuthSocial, "/api/v1/auth/social")
 api.add_resource(AuthMe, "/api/v1/auth/me")
 api.add_resource(AuthLogout, "/api/v1/auth/logout")
+api.add_resource(PhoneSendOtp, "/api/v1/auth/phone/send-otp")
+api.add_resource(PhoneVerifyOtp, "/api/v1/auth/phone/verify-otp")
 api.add_resource(AccountDelete, "/api/v1/account")
 api.add_resource(AccountReactivate, "/api/v1/account/reactivate")
 api.add_resource(stripe_key, "/stripe_key/<string:desc>")
@@ -834,6 +841,7 @@ api.add_resource(Messages,        '/api/v1/chat/messages', '/api/v1/chat/message
 api.add_resource(BlockedUsers,    '/api/v1/blocked-users', '/api/v1/blocked-users/<string:blocker_uid>')
 api.add_resource(Feedback, '/api/feedback')
 api.add_resource(SearchReferral, '/api/search_referral')
+api.add_resource(ChangeReferral, '/api/v1/change_referral')
 api.add_resource(BusinessDetails, '/api/v1/business_details')
 api.add_resource(ProfileConnectionDegrees, '/api/v1/profile_connection_degrees')
 # api.add_resource(BusinessMaxBounty, '/api/v1/businessmaxbounty')
@@ -885,6 +893,10 @@ api.add_resource(AccountPurgeCron_CLASS, "/api/v1/account_purge_cron")
 api.add_resource(WalletReconcileAll, "/api/v1/wallet_reconcile")
 api.add_resource(WalletReconcile, "/api/v1/wallet_reconcile/<string:profile_id>")
 api.add_resource(WalletLedger, "/api/v1/wallet_ledger/<string:profile_id>")
+api.add_resource(TaxLedger, "/api/v1/tax_ledger/<string:profile_id>")
+api.add_resource(
+    TaxLedgerRemit, "/api/v1/tax_ledger/<string:profile_id>/remit"
+)
 
 
 api.add_resource(SendEmail, "/api/v1/sendEmail")

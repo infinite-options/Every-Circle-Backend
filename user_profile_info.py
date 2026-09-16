@@ -12,6 +12,7 @@ from business_info import (
     _normalize_bs_shipping_value,
     _parse_shipping_amount,
     _truthy_flag,
+    apply_new_customer_bounty_zero,
 )
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from profile_status import is_profile_deleted, stub_deleted_profile_row
@@ -199,6 +200,12 @@ def _finalize_expertise_fields(expertise_data):
     """Strip UI-only keys and normalize persisted offering columns."""
     _derive_expertise_shipping_fields(expertise_data)
     _derive_expertise_quantity_fields(expertise_data)
+    if "profile_expertise_new_customers_only" in expertise_data and expertise_data[
+        "profile_expertise_new_customers_only"
+    ] not in (None, ""):
+        expertise_data["profile_expertise_new_customers_only"] = (
+            1 if _truthy_flag(expertise_data["profile_expertise_new_customers_only"]) else 0
+        )
     for key in _EXPERTISE_NON_DB_KEYS:
         expertise_data.pop(key, None)
 
@@ -255,6 +262,9 @@ def _expertise_dict_from_payload(exp_data):
     _set_if_present(m, exp_data, "profile_expertise_refund_policy", "refundPolicy")
     _set_if_present(m, exp_data, "profile_expertise_return_window_days", "returnWindowDays")
     _set_if_present(m, exp_data, "profile_expertise_is_returnable", "isReturnable")
+    _set_if_present(
+        m, exp_data, "profile_expertise_new_customers_only", "newCustomersOnly"
+    )
     if "startDateTime" in exp_data:
         m["profile_expertise_start"] = exp_data["startDateTime"]
     elif "start" in exp_data:
@@ -574,6 +584,15 @@ def load_expertise_info_for_profile(
     expertise_rows = expertise_info.get("result") or []
 
     effective_viewer_uid = profile_id if is_owner_view else viewer_profile_uid
+    apply_new_customer_bounty_zero(
+        db,
+        expertise_rows,
+        viewer_profile_uid=effective_viewer_uid,
+        is_owner_view=is_owner_view,
+        item_uid_key="profile_expertise_uid",
+        bounty_key="profile_expertise_bounty",
+        flag_key="profile_expertise_new_customers_only",
+    )
     return _filter_and_enrich_expertise_info(
         db,
         expertise_rows,
@@ -727,11 +746,54 @@ def _enrich_personal_info_for_owner(db, personal_info, profile_id, is_owner_view
         return personal_info
 
     enriched = _normalize_messages_allow_transaction(dict(personal_info))
+
+    # Attach phone verification for owners always; for others only when phone is public
+    # so a verified badge can appear next to a visible phone number.
+    user_uid = enriched.get("profile_personal_user_id")
+    phone_is_public = enriched.get("profile_personal_phone_number_is_public") in (
+        1,
+        "1",
+        True,
+    )
+    if is_owner_view or phone_is_public:
+        phone_verified = False
+        if user_uid:
+            try:
+                from auth import _phone_verified_flag
+                from notifications_service import _to_e164
+
+                user_res = db.select("every_circle.users", where={"user_uid": user_uid})
+                user_rows = (user_res or {}).get("result") or []
+                if user_rows:
+                    user = user_rows[0]
+                    phone_verified = _phone_verified_flag(user.get("user_phone_verified"))
+                    profile_phone = enriched.get("profile_personal_phone_number")
+                    profile_e164 = _to_e164(profile_phone) if profile_phone else None
+                    user_e164 = (
+                        _to_e164(user.get("user_phone_number"))
+                        if user.get("user_phone_number")
+                        else None
+                    )
+                    if (
+                        phone_verified
+                        and profile_e164
+                        and user_e164
+                        and profile_e164 != user_e164
+                    ):
+                        phone_verified = False
+                    elif phone_verified and profile_phone and not profile_e164:
+                        phone_verified = False
+            except Exception as e:
+                print(f"phone_verified enrich error: {e}")
+                phone_verified = False
+        enriched["phone_verified"] = phone_verified
+
     if not is_owner_view:
         return enriched
 
     enriched.pop("profile_personal_moderated", None)
     enriched["moderation"] = build_user_moderation_metadata(db, profile_id)
+
     return enriched
 
 
@@ -1722,6 +1784,7 @@ class UserProfileInfo(Resource):
                 return response, 400
 
             user_uid = payload.pop('user_uid')
+            phone_sync = None
 
             with connect() as db:
                 # Check if the user exists
@@ -1812,10 +1875,26 @@ class UserProfileInfo(Resource):
                     'profile_personal_social_is_public'
                 ] + _FIELD_VISIBILITY_COLUMNS
 
+                # Stub signup may send empty first/last/phone; omit so profile can be
+                # created with only referred_by (and completed later).
+                _stub_optional_empty = {
+                    "profile_personal_first_name",
+                    "profile_personal_last_name",
+                    "profile_personal_phone_number",
+                }
                 for field in personal_info_fields:
                     if field in payload:
+<<<<<<< HEAD
                         personal_info[field] = payload.pop(field)
                 sync_is_public_from_visibility(personal_info)
+=======
+                        value = payload.pop(field)
+                        if field in _stub_optional_empty and (
+                            value is None or str(value).strip() == ""
+                        ):
+                            continue
+                        personal_info[field] = value
+>>>>>>> master
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:
@@ -1826,6 +1905,22 @@ class UserProfileInfo(Resource):
                     )
                 else:
                     personal_info["profile_personal_messages_allow_transaction"] = 1
+
+                # Normalize profile phone and keep users.user_phone*_ in sync.
+                phone_sync = None
+                if "profile_personal_phone_number" in personal_info:
+                    from auth import (
+                        normalize_phone_for_storage,
+                        sync_user_phone_from_profile_edit,
+                    )
+
+                    stored_phone = normalize_phone_for_storage(
+                        personal_info.get("profile_personal_phone_number")
+                    )
+                    personal_info["profile_personal_phone_number"] = stored_phone
+                    phone_sync = sync_user_phone_from_profile_edit(
+                        db, user_uid, stored_phone
+                    )
 
                 # Process profile image if provided
                 if 'profile_image' in request.files:
@@ -2190,6 +2285,13 @@ class UserProfileInfo(Resource):
             # Add education UIDs if created
             if education_uids:
                 response['uids']['profile_education_uids'] = education_uids
+
+            if phone_sync is not None:
+                response['phone_number'] = phone_sync.get('phone_number')
+                response['phone_verified'] = phone_sync.get('phone_verified')
+                response['phone_needs_verification'] = phone_sync.get(
+                    'phone_needs_verification'
+                )
             
             response['message'] = 'Profile created successfully'
             return response, 200
@@ -2232,6 +2334,7 @@ class UserProfileInfo(Resource):
             deleted_uids = {}
             expertise_payload_refresh = False
             wishes_payload_refresh = False
+            phone_sync = None
 
             with connect() as db:
                 # Check if the profile exists
@@ -2420,6 +2523,28 @@ class UserProfileInfo(Resource):
                     )
 
                 print("Remaining payload fields: ", payload)
+
+                if "profile_personal_phone_number" in personal_info:
+                    from auth import (
+                        normalize_phone_for_storage,
+                        sync_user_phone_from_profile_edit,
+                    )
+
+                    stored_phone = normalize_phone_for_storage(
+                        personal_info.get("profile_personal_phone_number")
+                    )
+                    personal_info["profile_personal_phone_number"] = stored_phone
+                    existing_user_uid = (
+                        profile_exists_query["result"][0].get(
+                            "profile_personal_user_id"
+                        )
+                        if profile_exists_query.get("result")
+                        else None
+                    )
+                    if existing_user_uid:
+                        phone_sync = sync_user_phone_from_profile_edit(
+                            db, existing_user_uid, stored_phone
+                        )
                 
                 # if 'profile_image' in request.files or 'delete_profile_image' in payload:
                 #     payload_images = {}
@@ -3143,6 +3268,12 @@ class UserProfileInfo(Resource):
             response['updated_uids'] = updated_uids
             if deleted_uids:
                 response['deleted_uids'] = deleted_uids
+            if phone_sync is not None:
+                response['phone_number'] = phone_sync.get('phone_number')
+                response['phone_verified'] = phone_sync.get('phone_verified')
+                response['phone_needs_verification'] = phone_sync.get(
+                    'phone_needs_verification'
+                )
             response['message'] = 'Profile updated successfully'
             return response, 200
         

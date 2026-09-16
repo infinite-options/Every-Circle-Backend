@@ -25,9 +25,16 @@ from auth import (
     require_actor_or_admin,
     require_admin,
     require_owned_business,
+    sync_user_phone_from_profile_edit,
     verify_password,
     AuthLogin,
+    AuthMe,
     AuthSalt,
+    PhoneSendOtp,
+    PhoneVerifyOtp,
+    _hash_otp,
+    _identity_payload,
+    _otp_salt,
 )
 
 
@@ -66,6 +73,8 @@ class PathGateTests(unittest.TestCase):
         self.assertTrue(path_requires_jwt("POST", "/api/v1/transactions"))
         self.assertTrue(path_requires_jwt("PUT", "/api/v1/userprofileinfo"))
         self.assertTrue(path_requires_jwt("DELETE", "/api/v1/blocked-users"))
+        self.assertTrue(path_requires_jwt("POST", "/api/v1/auth/phone/send-otp"))
+        self.assertTrue(path_requires_jwt("POST", "/api/v1/auth/phone/verify-otp"))
 
     def test_sensitive_gets_are_protected(self):
         self.assertTrue(path_requires_jwt("GET", "/api/v1/orders/500-1"))
@@ -198,6 +207,247 @@ class JwtEndpointTests(unittest.TestCase):
         with patch.dict(os.environ, {"JWT_AUTH_REQUIRED": "true"}):
             with self.app.test_request_context("/"):
                 self.assertFalse(actor_may_use_uid("110-000001"))
+
+
+class IdentityPayloadPhoneTests(unittest.TestCase):
+    def test_identity_includes_phone_fields(self):
+        user = {
+            "user_uid": "100-1",
+            "user_email_id": "a@example.com",
+            "user_role": None,
+            "user_phone_number": "+15551234567",
+            "user_phone_verified": 1,
+        }
+        payload = _identity_payload(user, {"profile_personal_uid": "110-1"})
+        self.assertEqual(payload["phone_number"], "+15551234567")
+        self.assertTrue(payload["phone_verified"])
+
+    def test_identity_defaults_phone_unverified(self):
+        user = {
+            "user_uid": "100-1",
+            "user_email_id": "a@example.com",
+            "user_role": None,
+        }
+        payload = _identity_payload(user)
+        self.assertIsNone(payload["phone_number"])
+        self.assertFalse(payload["phone_verified"])
+
+    def test_identity_prefers_profile_phone(self):
+        user = {
+            "user_uid": "100-1",
+            "user_email_id": "a@example.com",
+            "user_role": None,
+            "user_phone_number": "+15551111111",
+            "user_phone_verified": 1,
+        }
+        profile = {
+            "profile_personal_uid": "110-1",
+            "profile_personal_phone_number": "+15552222222",
+        }
+        payload = _identity_payload(user, profile)
+        self.assertEqual(payload["phone_number"], "+15552222222")
+        # Diverged phones → treat as unverified
+        self.assertFalse(payload["phone_verified"])
+
+
+class SyncPhoneOnProfileEditTests(unittest.TestCase):
+    def test_change_clears_verified(self):
+        db = MagicMock()
+        db.select.return_value = {
+            "result": [
+                {
+                    "user_uid": "100-1",
+                    "user_phone_number": "+15551111111",
+                    "user_phone_verified": 1,
+                }
+            ]
+        }
+        db.update.return_value = {"code": 200}
+        out = sync_user_phone_from_profile_edit(db, "100-1", "5552222222")
+        self.assertEqual(out["phone_number"], "+15552222222")
+        self.assertFalse(out["phone_verified"])
+        self.assertTrue(out["phone_needs_verification"])
+        args, _ = db.update.call_args
+        self.assertEqual(args[2]["user_phone_verified"], 0)
+
+    def test_same_number_keeps_verified(self):
+        db = MagicMock()
+        db.select.return_value = {
+            "result": [
+                {
+                    "user_uid": "100-1",
+                    "user_phone_number": "+15551234567",
+                    "user_phone_verified": 1,
+                }
+            ]
+        }
+        db.update.return_value = {"code": 200}
+        out = sync_user_phone_from_profile_edit(db, "100-1", "(555) 123-4567")
+        self.assertTrue(out["phone_verified"])
+        self.assertFalse(out["phone_needs_verification"])
+
+
+class PhoneOtpEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config["JWT_SECRET_KEY"] = "test-jwt-secret"
+        self.app.config["TESTING"] = True
+        jwt = JWTManager(self.app)
+        register_jwt_auth(self.app, jwt)
+        from flask_restful import Api
+
+        api = Api(self.app)
+        api.add_resource(PhoneSendOtp, "/api/v1/auth/phone/send-otp")
+        api.add_resource(PhoneVerifyOtp, "/api/v1/auth/phone/verify-otp")
+        api.add_resource(AuthMe, "/api/v1/auth/me")
+        self.client = self.app.test_client()
+
+    def _headers(self):
+        with self.app.app_context():
+            token = create_access_token(
+                identity="100-alice",
+                additional_claims={
+                    "user_uid": "100-alice",
+                    "profile_id": "110-alice",
+                    "is_admin": False,
+                },
+            )
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_send_otp_rejects_bad_phone(self):
+        with patch("auth.send_sms") as send_sms_mock:
+            res = self.client.post(
+                "/api/v1/auth/phone/send-otp",
+                json={"phone_number": "not-a-phone"},
+                headers=self._headers(),
+            )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("Invalid", res.get_json().get("message", ""))
+        send_sms_mock.assert_not_called()
+
+    def test_send_otp_success_mocks_sms(self):
+        db = MagicMock()
+        db.execute.return_value = {"result": [{"cnt": 0}], "code": 200}
+        db.insert.return_value = {"code": 200}
+        db.__enter__.return_value = db
+        db.__exit__.return_value = False
+
+        with patch("auth.connect", return_value=db), patch(
+            "auth.send_sms", return_value=True
+        ) as send_sms_mock:
+            res = self.client.post(
+                "/api/v1/auth/phone/send-otp",
+                json={"phone_number": "5551234567"},
+                headers=self._headers(),
+            )
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertEqual(body["result"]["phone_number"], "+15551234567")
+        self.assertEqual(body["result"]["expires_in"], 600)
+        self.assertNotIn("otp", body["result"])
+        send_sms_mock.assert_called_once()
+        args, _kwargs = send_sms_mock.call_args
+        self.assertEqual(args[0], "+15551234567")
+        self.assertIn("Every Circle code", args[1])
+
+    def test_verify_otp_rejects_wrong_code(self):
+        salt = _otp_salt()
+        challenge = {
+            "id": 1,
+            "user_uid": "100-alice",
+            "phone_e164": "+15551234567",
+            "code_hash": _hash_otp("123456", salt),
+            "code_salt": salt,
+            "attempts": 0,
+            "consumed_at": None,
+        }
+        db = MagicMock()
+        db.execute.return_value = {"result": [challenge], "code": 200}
+        db.update.return_value = {"code": 200}
+        db.__enter__.return_value = db
+        db.__exit__.return_value = False
+
+        with patch("auth.connect", return_value=db):
+            res = self.client.post(
+                "/api/v1/auth/phone/verify-otp",
+                json={"phone_number": "5551234567", "otp": "000000"},
+                headers=self._headers(),
+            )
+        self.assertEqual(res.status_code, 401)
+        self.assertIn("Invalid", res.get_json().get("message", ""))
+        # Attempts bumped, but phone not applied
+        db.update.assert_called()
+        update_tables = [c.args[0] for c in db.update.call_args_list]
+        self.assertNotIn("every_circle.users", update_tables)
+
+    def test_verify_otp_success_updates_phone(self):
+        salt = _otp_salt()
+        challenge = {
+            "id": 7,
+            "user_uid": "100-alice",
+            "phone_e164": "+15551234567",
+            "code_hash": _hash_otp("654321", salt),
+            "code_salt": salt,
+            "attempts": 0,
+            "consumed_at": None,
+        }
+        user = {
+            "user_uid": "100-alice",
+            "user_email_id": "alice@example.com",
+            "user_role": None,
+            "user_phone_number": "+15551234567",
+            "user_phone_verified": 1,
+        }
+        profile = {
+            "profile_personal_uid": "110-alice",
+            "profile_personal_user_id": "100-alice",
+        }
+
+        db = MagicMock()
+        db.execute.return_value = {"result": [challenge], "code": 200}
+        db.update.return_value = {"code": 200}
+        db.select.side_effect = [
+            {"result": [profile]},  # _apply_verified_phone -> _profile_for_user
+            {"result": [user]},  # reload user for identity
+        ]
+        db.__enter__.return_value = db
+        db.__exit__.return_value = False
+
+        with patch("auth.connect", return_value=db):
+            res = self.client.post(
+                "/api/v1/auth/phone/verify-otp",
+                json={"phone_number": "+1 (555) 123-4567", "otp": "654321"},
+                headers=self._headers(),
+            )
+        self.assertEqual(res.status_code, 200)
+        result = res.get_json()["result"]
+        self.assertEqual(result["phone_number"], "+15551234567")
+        self.assertTrue(result["phone_verified"])
+        self.assertEqual(result["user_uid"], "100-alice")
+
+    def test_auth_me_includes_phone_fields(self):
+        user = {
+            "user_uid": "100-alice",
+            "user_email_id": "alice@example.com",
+            "user_role": None,
+            "user_phone_number": "+15559876543",
+            "user_phone_verified": 0,
+        }
+        profile = {"profile_personal_uid": "110-alice"}
+        db = MagicMock()
+        db.select.side_effect = [
+            {"result": [user]},
+            {"result": [profile]},
+        ]
+        db.__enter__.return_value = db
+        db.__exit__.return_value = False
+
+        with patch("auth.connect", return_value=db):
+            res = self.client.get("/api/v1/auth/me", headers=self._headers())
+        self.assertEqual(res.status_code, 200)
+        result = res.get_json()["result"]
+        self.assertEqual(result["phone_number"], "+15559876543")
+        self.assertFalse(result["phone_verified"])
 
 
 _ALICE = {
