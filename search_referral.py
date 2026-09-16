@@ -36,7 +36,12 @@ PROFILE_SELECT = """
     pp.profile_personal_state_visibility_circles,
     pp.profile_personal_image_visibility_circles,
     pp.profile_personal_tag_line_visibility_circles,
-    pp.profile_personal_short_bio_visibility_circles
+    pp.profile_personal_short_bio_visibility_circles,
+    pp.profile_personal_email_visibility_degrees,
+    pp.profile_personal_phone_number_visibility_degrees,
+    pp.profile_personal_city_visibility_degrees,
+    pp.profile_personal_state_visibility_degrees,
+    pp.profile_personal_image_visibility_degrees
 """
 
 # Maps each gated search-result field to its *_visibility (+ *_visibility_circles,
@@ -46,26 +51,31 @@ _SEARCH_FIELD_GATES = {
     "email": {
         "visibility_col": "profile_personal_email_visibility",
         "circles_col": "profile_personal_email_visibility_circles",
+        "degrees_col": "profile_personal_email_visibility_degrees",
         "value_keys": ["profile_email_id"],
     },
     "phone_number": {
         "visibility_col": "profile_personal_phone_number_visibility",
         "circles_col": "profile_personal_phone_number_visibility_circles",
+        "degrees_col": "profile_personal_phone_number_visibility_degrees",
         "value_keys": ["profile_personal_phone_number"],
     },
     "city": {
         "visibility_col": "profile_personal_city_visibility",
         "circles_col": "profile_personal_city_visibility_circles",
+        "degrees_col": "profile_personal_city_visibility_degrees",
         "value_keys": ["profile_personal_city"],
     },
     "state": {
         "visibility_col": "profile_personal_state_visibility",
         "circles_col": "profile_personal_state_visibility_circles",
+        "degrees_col": "profile_personal_state_visibility_degrees",
         "value_keys": ["profile_personal_state"],
     },
     "image": {
         "visibility_col": "profile_personal_image_visibility",
         "circles_col": "profile_personal_image_visibility_circles",
+        "degrees_col": "profile_personal_image_visibility_degrees",
         "value_keys": ["profile_personal_image"],
     },
     "tag_line": {
@@ -101,7 +111,8 @@ def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relations
         for cfg in _SEARCH_FIELD_GATES.values():
             level = row.get(cfg["visibility_col"]) or "everyone"
             allowed_csv = row.get(cfg["circles_col"])
-            if field_visible_to_viewer(level, viewer_degree, is_owner_view, False, viewer_relationships, allowed_csv):
+            allowed_degrees_csv = row.get(cfg.get("degrees_col"))
+            if field_visible_to_viewer(level, viewer_degree, is_owner_view, False, viewer_relationships, allowed_csv, allowed_degrees_csv):
                 continue
             for value_key in cfg["value_keys"]:
                 if value_key in row:
