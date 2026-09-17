@@ -2,9 +2,9 @@ from flask import request
 from flask_restful import Resource
 from data_ec import connect
 from profile_status import deleted_profile_sql_clause
-from profile_visibility import field_visible_to_viewer
+from profile_visibility import audience_visible_to_viewer
 
-# Raw values + the *_visibility levels needed to gate them per-viewer in Python
+# Raw values + *_audience JSON needed to gate them per-viewer in Python
 # (_apply_search_row_visibility below) - degree-aware gating can't be expressed
 # as a plain SQL CASE WHEN since it depends on the searching viewer, not just
 # the row. profile_personal_tag_line_is_public is still selected raw for the
@@ -23,70 +23,45 @@ PROFILE_SELECT = """
     pp.profile_personal_tag_line,
     pp.profile_personal_tag_line_is_public,
     pp.profile_personal_short_bio,
-    pp.profile_personal_email_visibility,
-    pp.profile_personal_phone_number_visibility,
-    pp.profile_personal_city_visibility,
-    pp.profile_personal_state_visibility,
-    pp.profile_personal_image_visibility,
-    pp.profile_personal_tag_line_visibility,
-    pp.profile_personal_short_bio_visibility,
-    pp.profile_personal_email_visibility_circles,
-    pp.profile_personal_phone_number_visibility_circles,
-    pp.profile_personal_city_visibility_circles,
-    pp.profile_personal_state_visibility_circles,
-    pp.profile_personal_image_visibility_circles,
-    pp.profile_personal_tag_line_visibility_circles,
-    pp.profile_personal_short_bio_visibility_circles,
-    pp.profile_personal_email_visibility_degrees,
-    pp.profile_personal_phone_number_visibility_degrees,
-    pp.profile_personal_city_visibility_degrees,
-    pp.profile_personal_state_visibility_degrees,
-    pp.profile_personal_image_visibility_degrees
+    pp.profile_personal_email_audience,
+    pp.profile_personal_phone_number_audience,
+    pp.profile_personal_city_audience,
+    pp.profile_personal_state_audience,
+    pp.profile_personal_image_audience,
+    pp.profile_personal_tag_line_audience,
+    pp.profile_personal_short_bio_audience
 """
 
-# Maps each gated search-result field to its *_visibility (+ *_visibility_circles,
-# for the 'specific' level) column and the row key(s) to null out when hidden
-# from a particular viewer.
+# Maps each gated search-result field to its *_audience column and the row
+# key(s) to null out when hidden from a particular viewer.
 _SEARCH_FIELD_GATES = {
     "email": {
-        "visibility_col": "profile_personal_email_visibility",
-        "circles_col": "profile_personal_email_visibility_circles",
-        "degrees_col": "profile_personal_email_visibility_degrees",
+        "audience_col": "profile_personal_email_audience",
         "value_keys": ["profile_email_id"],
     },
     "phone_number": {
-        "visibility_col": "profile_personal_phone_number_visibility",
-        "circles_col": "profile_personal_phone_number_visibility_circles",
-        "degrees_col": "profile_personal_phone_number_visibility_degrees",
+        "audience_col": "profile_personal_phone_number_audience",
         "value_keys": ["profile_personal_phone_number"],
     },
     "city": {
-        "visibility_col": "profile_personal_city_visibility",
-        "circles_col": "profile_personal_city_visibility_circles",
-        "degrees_col": "profile_personal_city_visibility_degrees",
+        "audience_col": "profile_personal_city_audience",
         "value_keys": ["profile_personal_city"],
     },
     "state": {
-        "visibility_col": "profile_personal_state_visibility",
-        "circles_col": "profile_personal_state_visibility_circles",
-        "degrees_col": "profile_personal_state_visibility_degrees",
+        "audience_col": "profile_personal_state_audience",
         "value_keys": ["profile_personal_state"],
     },
     "image": {
-        "visibility_col": "profile_personal_image_visibility",
-        "circles_col": "profile_personal_image_visibility_circles",
-        "degrees_col": "profile_personal_image_visibility_degrees",
+        "audience_col": "profile_personal_image_audience",
         "value_keys": ["profile_personal_image"],
     },
     "tag_line": {
-        "visibility_col": "profile_personal_tag_line_visibility",
-        "circles_col": "profile_personal_tag_line_visibility_circles",
+        "audience_col": "profile_personal_tag_line_audience",
         "value_keys": ["profile_personal_tag_line"],
         "is_public_key": "profile_personal_tag_line_is_public",
     },
     "short_bio": {
-        "visibility_col": "profile_personal_short_bio_visibility",
-        "circles_col": "profile_personal_short_bio_visibility_circles",
+        "audience_col": "profile_personal_short_bio_audience",
         "value_keys": ["profile_personal_short_bio"],
     },
 }
@@ -96,11 +71,10 @@ def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relations
     """
     Null out any field on each search result row the searching viewer isn't
     allowed to see at their circle degree/relationship from that profile - the
-    same Everyone/1st-3rd degree/Specific Circles/Only Me levels set in Edit
-    Profile, applied here the same way GET userprofileinfo applies them
-    (profile_visibility.py), just against a batch of rows using precomputed
-    viewer->target degree and relationship maps instead of one DB round trip
-    per row.
+    same audience rules set in Edit Profile, applied here the same way GET
+    userprofileinfo applies them (profile_visibility.py), just against a batch
+    of rows using precomputed viewer->target degree and relationship maps
+    instead of one DB round trip per row.
     """
     relationships_map = relationships_map or {}
     for row in rows:
@@ -109,10 +83,13 @@ def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relations
         viewer_degree = degree_map.get(row_uid)
         viewer_relationships = relationships_map.get(row_uid)
         for cfg in _SEARCH_FIELD_GATES.values():
-            level = row.get(cfg["visibility_col"]) or "everyone"
-            allowed_csv = row.get(cfg["circles_col"])
-            allowed_degrees_csv = row.get(cfg.get("degrees_col"))
-            if field_visible_to_viewer(level, viewer_degree, is_owner_view, False, viewer_relationships, allowed_csv, allowed_degrees_csv):
+            if audience_visible_to_viewer(
+                row.get(cfg["audience_col"]),
+                viewer_degree,
+                is_owner_view,
+                False,
+                viewer_relationships,
+            ):
                 continue
             for value_key in cfg["value_keys"]:
                 if value_key in row:
@@ -124,10 +101,10 @@ def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relations
 
 def _profile_search_clauses(parts, search_term):
     tagline_bio_clauses = [
-        "(pp.profile_personal_tag_line_is_public = 1 AND LOWER(COALESCE(pp.profile_personal_tag_line, '')) LIKE LOWER(%s))",
-        "(pp.profile_personal_short_bio_is_public = 1 AND LOWER(COALESCE(pp.profile_personal_short_bio, '')) LIKE LOWER(%s))",
+        "(pp.profile_personal_tag_line_audience IS NOT NULL AND LOWER(COALESCE(pp.profile_personal_tag_line, '')) LIKE LOWER(%s))",
+        "(pp.profile_personal_short_bio_audience IS NOT NULL AND LOWER(COALESCE(pp.profile_personal_short_bio, '')) LIKE LOWER(%s))",
     ]
-    phone_clause = "(pp.profile_personal_phone_number_is_public = 1 AND LOWER(COALESCE(pp.profile_personal_phone_number, '')) LIKE LOWER(%s))"
+    phone_clause = "(pp.profile_personal_phone_number_audience IS NOT NULL AND LOWER(COALESCE(pp.profile_personal_phone_number, '')) LIKE LOWER(%s))"
 
     if len(parts) >= 2:
         first_pattern = f"%{parts[0]}%"

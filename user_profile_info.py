@@ -17,12 +17,14 @@ from business_info import (
 from data_ec import connect, deleteFolder, processImage, processDocument, processSingleImageUpload
 from profile_status import is_profile_deleted, stub_deleted_profile_row
 from profile_visibility import (
-    FIELD_VISIBILITY,
+    AUDIENCE_COLUMNS,
+    _LEGACY_VISIBILITY_COLUMNS,
     apply_profile_field_visibility,
     item_visible_to_viewer,
+    normalize_audiences_for_response,
     resolve_viewer_degree,
     resolve_viewer_relationships,
-    sync_is_public_from_visibility,
+    sync_audiences,
     sync_item_is_public_from_visibility,
 )
 from transactions import _parse_limited_quantity
@@ -42,11 +44,8 @@ from moderation import (
     is_wish_publicly_visible,
 )
 
-_FIELD_VISIBILITY_COLUMNS = (
-    [cfg["visibility_col"] for cfg in FIELD_VISIBILITY.values()]
-    + [cfg["visibility_circles_col"] for cfg in FIELD_VISIBILITY.values() if cfg.get("visibility_circles_col")]
-    + [cfg["visibility_degrees_col"] for cfg in FIELD_VISIBILITY.values() if cfg.get("visibility_degrees_col")]
-)
+# Accept audience JSON plus legacy visibility keys (converted then stripped in sync_audiences).
+_FIELD_AUDIENCE_COLUMNS = list(AUDIENCE_COLUMNS)
 
 
 _EXPERTISE_PREFIX = "profile_expertise_"
@@ -1589,9 +1588,10 @@ class UserProfileInfo(Resource):
                     is_owner_view,
                     viewer_is_admin,
                 )
+                normalize_audiences_for_response(response['personal_info'])
                 # Email's value lives on users.user_email_id, not personal_info, so it isn't
                 # covered by apply_profile_field_visibility's value_keys - gate it here off the
-                # is_public flag that call just resolved for this viewer.
+                # is_public flag that call just resolved for this viewer (derived from audience).
                 if (
                     not is_owner_view
                     and not viewer_is_admin
@@ -1875,7 +1875,7 @@ class UserProfileInfo(Resource):
                     'profile_personal_experience_is_public', 'profile_personal_education_is_public',
                     'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
-                ] + _FIELD_VISIBILITY_COLUMNS
+                ] + _FIELD_AUDIENCE_COLUMNS
 
                 # Stub signup may send empty first/last/phone; omit so profile can be
                 # created with only referred_by (and completed later).
@@ -1892,7 +1892,10 @@ class UserProfileInfo(Resource):
                         ):
                             continue
                         personal_info[field] = value
-                sync_is_public_from_visibility(personal_info)
+                for field in _LEGACY_VISIBILITY_COLUMNS:
+                    if field in payload:
+                        personal_info[field] = payload.pop(field)
+                sync_audiences(personal_info)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:
@@ -2505,12 +2508,15 @@ class UserProfileInfo(Resource):
                     'profile_personal_wishes_is_public',
                     'profile_personal_business_is_public',
                     'profile_personal_social_is_public'
-                ] + _FIELD_VISIBILITY_COLUMNS
+                ] + _FIELD_AUDIENCE_COLUMNS
 
                 for field in personal_info_fields:
                     if field in payload:
                         personal_info[field] = payload.pop(field)
-                sync_is_public_from_visibility(personal_info)
+                for field in _LEGACY_VISIBILITY_COLUMNS:
+                    if field in payload:
+                        personal_info[field] = payload.pop(field)
+                sync_audiences(personal_info)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:

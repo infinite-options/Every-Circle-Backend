@@ -1,91 +1,69 @@
 """
-Per-field connection-level privacy for profile_personal.
+Per-field connection-level privacy for profile_personal via *_audience JSON.
 
-Each field's *_visibility enum sets a base state:
-    'everyone'  - no degree restriction (mutually exclusive with any degree
-                  selection in the UI - picking Everyone clears them)
-    'degree1'/'degree2'/'degree3' - legacy cumulative cap ("this degree or
-                  closer"), read only when the field has no
-                  visibility_degrees_col value saved (see below)
-    'only_me'   - visible only to the owner (and admins) - always wins,
-                  ignores any degree/circle filter below
-    'specific'  - legacy-only value from before degree+circle could combine;
-                  read as 'everyone' with the circle filter applied
+Each field has one nullable JSON column (e.g. profile_personal_email_audience):
+    NULL  - private (only the owner / admins see the value)
+    object - public to an audience:
+        {"degree": "all" | 1 | 2 | 3, "circles": ["friend", "family", ...]}
 
-For fields with a visibility_degrees_col (the ones whose picker offers
-degree checkboxes: phone, email, city, state, image, and individual
-offering/wish items), a non-empty *_visibility_degrees CSV of exact degree
-numbers ('1'/'2'/'3' - any combination, e.g. '1,3' skipping 2nd degree) is
-the real degree filter, checked by exact membership rather than a cumulative
-cap - this lets an owner pick 1st AND 3rd degree while excluding 2nd, which
-a single "up to degree N" cap can't express. An empty/absent CSV falls back
-to the legacy enum's cumulative degree1/2/3 reading, so rows saved before
-this existed keep working unchanged.
+degree:
+    "all" - no hop-distance restriction
+    N     - viewer must be at hop distance <= N (cumulative; 3 means 1st, 2nd, or 3rd)
 
-Independently (fields with a visibility_circles_col - personal-info fields
-only), a non-empty *_visibility_circles CSV ('friend'/'colleague'/'family' -
-or a mix) ANDs an additional circle_relationship filter on top of the degree
-gate: the viewer must satisfy the degree filter AND be tagged by the owner as
-one of the listed circle types. An empty/absent CSV means no circle filter -
-degree alone decides. So degrees=[2] + circles=['family'] means "2nd degree
-connections who are also tagged Family"; 'everyone' + circles=['family']
-means "any Family member regardless of degree" (what 'specific' used to mean
-on its own); degrees=[2] with no circles means plain "2nd degree, any
-relation". Mirrors Messages Privacy / Nearby Location Privacy's "Specific
-Circles" option (chat.py's _audience_allows, nearby.py's _consent_clause),
-generalized to compose with degree instead of being a separate exclusive
-choice.
+circles:
+    [] / omitted - no circle-relationship filter
+    non-empty   - viewer must also be tagged by the owner as one of those types
+                  (friend / colleague / family); ANDed with the degree gate
 
-Degree is the referral-tree hop distance already used elsewhere in the app as
-"Level N Connection" (see ratings.py's circle_num_nodes and
-user_path_connection.ConnectionsPath).
+Legacy *_visibility / *_visibility_circles / *_visibility_degrees columns are
+no longer written. On write we still derive companion *_is_public (and
+location_is_public) so older SQL that gates on those flags keeps working
+until those call sites are migrated.
 
-FIELD_VISIBILITY maps each logical field to:
-    - the *_visibility enum column that is the source of truth for the
-      everyone/only_me/legacy-cumulative-degree state
-    - the *_is_public boolean column kept in sync for legacy readers, or None
-      when no 1:1 legacy column exists for this field (city/state - see
-      _sync_location_legacy_flag below)
-    - the *_visibility_circles CSV column (fields with the full picker only)
-    - the *_visibility_degrees CSV column (same fields; None where absent)
-    - the personal_info value key(s) to null out when the field is hidden
-      (section-level fields have no value keys - only their _is_public flag
-      is toggled, since the frontend gates the whole section on that flag)
-
-City and state are independent fields (their own picker each), but legacy
-code only ever had a single combined profile_personal_location_is_public
-flag. That flag is kept in sync as "at least one of city/state is visible"
-(_sync_location_legacy_flag) so legacy readers keep seeing a location line
-rather than losing it outright; the precise per-field gating below is what
-actually governs GET userprofileinfo.
+Offering/wish *items* still use the older per-item visibility columns
+(ITEM_VISIBILITY) until those tables get audience columns.
 """
 
+from __future__ import annotations
+
+import json
+
+CIRCLE_TYPES = {"friend", "colleague", "family"}
+VALID_DEGREES = {"all", 1, 2, 3}
+# Legacy enum → cumulative max degree (or "all" / private)
+_LEGACY_LEVEL_TO_DEGREE = {
+    "everyone": "all",
+    "specific": "all",
+    "degree1": 1,
+    "degree2": 2,
+    "degree3": 3,
+    "only_me": None,
+}
 DEGREE_LEVELS = {"degree1": 1, "degree2": 2, "degree3": 3}
 VALID_LEVELS = {"everyone", "degree1", "degree2", "degree3", "specific", "only_me"}
-CIRCLE_TYPES = {"friend", "colleague", "family"}
 DEGREE_NUMBERS = {"1", "2", "3"}
 
 FIELD_VISIBILITY = {
     "phone_number": {
-        "visibility_col": "profile_personal_phone_number_visibility",
+        "audience_col": "profile_personal_phone_number_audience",
         "is_public_col": "profile_personal_phone_number_is_public",
+        "value_keys": ["profile_personal_phone_number"],
+        # Legacy write-compat keys (converted into audience_col, then stripped)
+        "visibility_col": "profile_personal_phone_number_visibility",
         "visibility_circles_col": "profile_personal_phone_number_visibility_circles",
         "visibility_degrees_col": "profile_personal_phone_number_visibility_degrees",
-        "value_keys": ["profile_personal_phone_number"],
     },
     "email": {
-        "visibility_col": "profile_personal_email_visibility",
+        "audience_col": "profile_personal_email_audience",
         "is_public_col": "profile_personal_email_is_public",
+        "value_keys": [],
+        "visibility_col": "profile_personal_email_visibility",
         "visibility_circles_col": "profile_personal_email_visibility_circles",
         "visibility_degrees_col": "profile_personal_email_visibility_degrees",
-        # Email itself lives on every_circle.users, not personal_info; only the flag applies here.
-        "value_keys": [],
     },
     "city": {
-        "visibility_col": "profile_personal_city_visibility",
-        "is_public_col": None,  # see _sync_location_legacy_flag
-        "visibility_circles_col": "profile_personal_city_visibility_circles",
-        "visibility_degrees_col": "profile_personal_city_visibility_degrees",
+        "audience_col": "profile_personal_city_audience",
+        "is_public_col": None,
         "value_keys": [
             "profile_personal_city",
             "profile_personal_country",
@@ -93,152 +71,378 @@ FIELD_VISIBILITY = {
             "profile_personal_latitude",
             "profile_personal_longitude",
         ],
+        "visibility_col": "profile_personal_city_visibility",
+        "visibility_circles_col": "profile_personal_city_visibility_circles",
+        "visibility_degrees_col": "profile_personal_city_visibility_degrees",
     },
     "state": {
+        "audience_col": "profile_personal_state_audience",
+        "is_public_col": None,
+        "value_keys": ["profile_personal_state"],
         "visibility_col": "profile_personal_state_visibility",
-        "is_public_col": None,  # see _sync_location_legacy_flag
         "visibility_circles_col": "profile_personal_state_visibility_circles",
         "visibility_degrees_col": "profile_personal_state_visibility_degrees",
-        "value_keys": ["profile_personal_state"],
     },
     "tag_line": {
-        "visibility_col": "profile_personal_tag_line_visibility",
+        "audience_col": "profile_personal_tag_line_audience",
         "is_public_col": "profile_personal_tag_line_is_public",
-        "visibility_circles_col": "profile_personal_tag_line_visibility_circles",
         "value_keys": ["profile_personal_tag_line"],
+        "visibility_col": "profile_personal_tag_line_visibility",
+        "visibility_circles_col": "profile_personal_tag_line_visibility_circles",
     },
     "short_bio": {
-        "visibility_col": "profile_personal_short_bio_visibility",
+        "audience_col": "profile_personal_short_bio_audience",
         "is_public_col": "profile_personal_short_bio_is_public",
-        "visibility_circles_col": "profile_personal_short_bio_visibility_circles",
         "value_keys": ["profile_personal_short_bio"],
+        "visibility_col": "profile_personal_short_bio_visibility",
+        "visibility_circles_col": "profile_personal_short_bio_visibility_circles",
     },
     "image": {
-        "visibility_col": "profile_personal_image_visibility",
+        "audience_col": "profile_personal_image_audience",
         "is_public_col": "profile_personal_image_is_public",
+        "value_keys": ["profile_personal_image"],
+        "visibility_col": "profile_personal_image_visibility",
         "visibility_circles_col": "profile_personal_image_visibility_circles",
         "visibility_degrees_col": "profile_personal_image_visibility_degrees",
-        "value_keys": ["profile_personal_image"],
+    },
+    "resume": {
+        "audience_col": "profile_personal_resume_audience",
+        "is_public_col": "profile_personal_resume_is_public",
+        "value_keys": ["profile_personal_resume"],
     },
     "experience": {
-        "visibility_col": "profile_personal_experience_visibility",
+        "audience_col": "profile_personal_experience_audience",
         "is_public_col": "profile_personal_experience_is_public",
         "value_keys": [],
+        "visibility_col": "profile_personal_experience_visibility",
     },
     "education": {
-        "visibility_col": "profile_personal_education_visibility",
+        "audience_col": "profile_personal_education_audience",
         "is_public_col": "profile_personal_education_is_public",
         "value_keys": [],
+        "visibility_col": "profile_personal_education_visibility",
     },
     "expertise": {
-        "visibility_col": "profile_personal_expertise_visibility",
+        "audience_col": "profile_personal_expertise_audience",
         "is_public_col": "profile_personal_expertise_is_public",
-        "visibility_circles_col": "profile_personal_expertise_visibility_circles",
         "value_keys": [],
+        "visibility_col": "profile_personal_expertise_visibility",
+        "visibility_circles_col": "profile_personal_expertise_visibility_circles",
     },
     "wishes": {
-        "visibility_col": "profile_personal_wishes_visibility",
+        "audience_col": "profile_personal_wishes_audience",
         "is_public_col": "profile_personal_wishes_is_public",
-        "visibility_circles_col": "profile_personal_wishes_visibility_circles",
         "value_keys": [],
+        "visibility_col": "profile_personal_wishes_visibility",
+        "visibility_circles_col": "profile_personal_wishes_visibility_circles",
     },
     "business": {
-        "visibility_col": "profile_personal_business_visibility",
+        "audience_col": "profile_personal_business_audience",
         "is_public_col": "profile_personal_business_is_public",
         "value_keys": [],
+        "visibility_col": "profile_personal_business_visibility",
     },
     "social": {
-        "visibility_col": "profile_personal_social_visibility",
+        "audience_col": "profile_personal_social_audience",
         "is_public_col": "profile_personal_social_is_public",
         "value_keys": [],
+        "visibility_col": "profile_personal_social_visibility",
     },
 }
 
+AUDIENCE_COLUMNS = [cfg["audience_col"] for cfg in FIELD_VISIBILITY.values()]
+_LEGACY_VISIBILITY_COLUMNS = (
+    [cfg["visibility_col"] for cfg in FIELD_VISIBILITY.values() if cfg.get("visibility_col")]
+    + [
+        cfg["visibility_circles_col"]
+        for cfg in FIELD_VISIBILITY.values()
+        if cfg.get("visibility_circles_col")
+    ]
+    + [
+        cfg["visibility_degrees_col"]
+        for cfg in FIELD_VISIBILITY.values()
+        if cfg.get("visibility_degrees_col")
+    ]
+)
 
-def _sync_location_legacy_flag(personal_info):
+
+def parse_audience(raw):
     """
-    City and state each get their own visibility level but share one legacy
-    profile_personal_location_is_public column - keep it truthy whenever
-    either one is visible to at least Everyone/some degree, so old code that
-    still reads the single flag keeps showing a location line.
+    Normalize a DB/API audience value to a dict {"degree": ..., "circles": [...]}
+    or None (private). Invalid shapes become None.
     """
-    city_level = personal_info.get("profile_personal_city_visibility")
-    state_level = personal_info.get("profile_personal_state_visibility")
-    if city_level is None and state_level is None:
-        return
-    visible = (city_level not in (None, "only_me")) or (state_level not in (None, "only_me"))
-    personal_info["profile_personal_location_is_public"] = 1 if visible else 0
+    if raw is None or raw == "" or raw is False:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw or raw.lower() in ("null", "none", "0", "false"):
+            return None
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+
+    degree = raw.get("degree", "all")
+    if degree == "all":
+        pass
+    else:
+        try:
+            degree = int(degree)
+        except (TypeError, ValueError):
+            return None
+        if degree not in (1, 2, 3):
+            return None
+
+    circles_raw = raw.get("circles") or []
+    if isinstance(circles_raw, str):
+        circles_raw = [t.strip() for t in circles_raw.split(",") if t.strip()]
+    if not isinstance(circles_raw, (list, tuple, set)):
+        return None
+    circles = sorted({str(t).strip() for t in circles_raw if str(t).strip() in CIRCLE_TYPES})
+    return {"degree": degree, "circles": circles}
+
+
+def audience_to_db(audience):
+    """Serialize a parsed audience dict for MySQL JSON storage, or None."""
+    parsed = parse_audience(audience)
+    if parsed is None:
+        return None
+    return json.dumps(parsed, separators=(",", ":"))
 
 
 def _normalize_circles_csv(raw_csv):
-    """Validate/dedupe a submitted circles CSV down to known circle_relationship values."""
     types = {t.strip() for t in (raw_csv or "").split(",") if t.strip()}
     return ",".join(sorted(types & CIRCLE_TYPES))
 
 
 def _normalize_degrees_csv(raw_csv):
-    """Validate/dedupe a submitted degrees CSV down to '1'/'2'/'3', sorted."""
     nums = {t.strip() for t in (raw_csv or "").split(",") if t.strip()}
     return ",".join(sorted(nums & DEGREE_NUMBERS))
 
 
-def sync_is_public_from_visibility(personal_info):
-    """
-    For any *_visibility field present in a PUT/POST payload dict, validate it
-    and set the companion legacy *_is_public boolean from it, so the two never
-    drift apart. Mutates and returns personal_info. Invalid levels are dropped
-    (left unset) rather than trusted.
+def _audience_from_legacy(level, circles_csv=None, degrees_csv=None):
+    """Convert old visibility + circles/degrees CSVs into audience dict or None."""
+    if level not in VALID_LEVELS:
+        return None
+    if level == "only_me":
+        return None
 
-    The circles/degrees CSVs (when the field submits them) are independent
-    filters that AND with whatever base level was chosen, rather than being
-    tied to a single exclusive value - so they're normalized/stored whenever
-    present, regardless of level.
+    circles = [t for t in _normalize_circles_csv(circles_csv).split(",") if t]
+    if level == "specific" and not circles:
+        return None
+
+    degree = _LEGACY_LEVEL_TO_DEGREE.get(level, "all")
+    if degree is None:
+        return None
+
+    # Old exact-set degrees CSV → cumulative max (degree N means <= N).
+    if level != "everyone" and degrees_csv:
+        nums = [int(n) for n in _normalize_degrees_csv(degrees_csv).split(",") if n]
+        if not nums:
+            # Degree checkboxes cleared without Everyone → private.
+            if level in DEGREE_LEVELS:
+                return None
+        else:
+            degree = max(nums)
+
+    return parse_audience({"degree": degree, "circles": circles})
+
+
+def _sync_location_legacy_flag(personal_info):
+    """location_is_public = 1 when city or state audience is non-null."""
+    city = parse_audience(personal_info.get("profile_personal_city_audience"))
+    state = parse_audience(personal_info.get("profile_personal_state_audience"))
+    if (
+        "profile_personal_city_audience" not in personal_info
+        and "profile_personal_state_audience" not in personal_info
+    ):
+        return
+    personal_info["profile_personal_location_is_public"] = 1 if (city or state) else 0
+
+
+def sync_audiences(personal_info):
     """
+    Normalize *_audience on a PUT/POST personal_info dict, convert legacy
+    visibility payloads when audience wasn't sent, strip legacy visibility
+    columns so they are not written, and derive *_is_public / location_is_public.
+
+    Mutates and returns personal_info.
+    """
+    if not personal_info:
+        return personal_info
+
     for field_cfg in FIELD_VISIBILITY.values():
-        visibility_col = field_cfg["visibility_col"]
+        audience_col = field_cfg["audience_col"]
+        visibility_col = field_cfg.get("visibility_col")
         circles_col = field_cfg.get("visibility_circles_col")
         degrees_col = field_cfg.get("visibility_degrees_col")
-        if visibility_col not in personal_info:
-            continue
-        level = personal_info[visibility_col]
-        if level not in VALID_LEVELS:
-            personal_info.pop(visibility_col, None)
-            continue
+        is_public_col = field_cfg.get("is_public_col")
 
-        normalized_circles = ""
-        if circles_col and circles_col in personal_info:
-            normalized_circles = _normalize_circles_csv(personal_info.get(circles_col))
-            personal_info[circles_col] = normalized_circles
+        audience_submitted = audience_col in personal_info
+        legacy_submitted = bool(visibility_col and visibility_col in personal_info)
 
-        normalized_degrees = ""
-        if degrees_col and degrees_col in personal_info:
-            # Everyone is mutually exclusive with a degree selection - clear it here too,
-            # even if the client sent one, so the two columns never disagree.
-            normalized_degrees = "" if level == "everyone" else _normalize_degrees_csv(personal_info.get(degrees_col))
-            personal_info[degrees_col] = normalized_degrees
+        if audience_submitted:
+            personal_info[audience_col] = audience_to_db(personal_info.get(audience_col))
+        elif legacy_submitted:
+            personal_info[audience_col] = audience_to_db(
+                _audience_from_legacy(
+                    personal_info.get(visibility_col),
+                    personal_info.get(circles_col) if circles_col else None,
+                    personal_info.get(degrees_col) if degrees_col else None,
+                )
+            )
+        elif is_public_col and is_public_col in personal_info and audience_col not in personal_info:
+            # Bare legacy boolean: public → everyone/no circles; private → NULL.
+            try:
+                is_pub = int(personal_info.get(is_public_col) or 0) == 1
+            except (TypeError, ValueError):
+                is_pub = False
+            personal_info[audience_col] = (
+                audience_to_db({"degree": "all", "circles": []}) if is_pub else None
+            )
 
-        if level == "only_me":
-            is_visible = False
-        elif level == "specific":
-            # Legacy exclusive value: visible only if it actually has circles to match.
-            is_visible = bool(normalized_circles)
-        elif degrees_col and degrees_col in personal_info and level != "everyone" and not normalized_degrees:
-            # Degree checkboxes were all cleared without picking Everyone - no valid audience.
-            is_visible = False
-        else:
-            is_visible = True
+        # Drop legacy columns so db.insert/update never writes them.
+        for legacy_col in (visibility_col, circles_col, degrees_col):
+            if legacy_col:
+                personal_info.pop(legacy_col, None)
 
-        if field_cfg["is_public_col"]:
-            personal_info[field_cfg["is_public_col"]] = 1 if is_visible else 0
+        if audience_col in personal_info and is_public_col:
+            personal_info[is_public_col] = (
+                1 if parse_audience(personal_info.get(audience_col)) is not None else 0
+            )
+
     _sync_location_legacy_flag(personal_info)
     return personal_info
 
 
-# Per-item (not per-profile-field) config for individual Offering (profile_expertise) and
-# Seeking (profile_wish) entries - same everyone/degree1-3/specific/only_me levels as
-# personal-info fields, via the generic sync_item_is_public_from_visibility /
-# item_visible_to_viewer helpers below instead of a FIELD_VISIBILITY-style value_keys list
-# (callers null the whole item out of the response themselves when it isn't visible).
+# Back-compat alias for call sites still importing the old name.
+sync_is_public_from_visibility = sync_audiences
+
+
+def audience_visible_to_viewer(
+    audience,
+    viewer_degree,
+    is_owner_view,
+    viewer_is_admin,
+    viewer_relationships=None,
+):
+    """True if this audience JSON permits the viewer."""
+    if is_owner_view or viewer_is_admin:
+        return True
+    parsed = parse_audience(audience)
+    if parsed is None:
+        return False
+
+    degree = parsed["degree"]
+    if degree != "all":
+        if viewer_degree is None or viewer_degree > int(degree):
+            return False
+
+    allowed = set(parsed.get("circles") or [])
+    if not allowed:
+        return True
+    return bool(viewer_relationships) and not allowed.isdisjoint(viewer_relationships)
+
+
+def field_visible_to_viewer(
+    level,
+    viewer_degree,
+    is_owner_view,
+    viewer_is_admin,
+    viewer_relationships=None,
+    allowed_types_csv=None,
+    allowed_degrees_csv=None,
+):
+    """
+    Legacy signature kept for offering/wish items and any remaining callers.
+    Prefer audience_visible_to_viewer for profile_personal fields.
+    """
+    if is_owner_view or viewer_is_admin:
+        return True
+    if level not in VALID_LEVELS:
+        level = "everyone"
+    if level == "only_me":
+        return False
+
+    if level != "everyone":
+        allowed_degrees = {d.strip() for d in (allowed_degrees_csv or "").split(",") if d.strip()}
+        if allowed_degrees:
+            # Historical exact-set checkboxes (items still use this).
+            if viewer_degree is None or str(viewer_degree) not in allowed_degrees:
+                return False
+        elif level in DEGREE_LEVELS:
+            max_degree = DEGREE_LEVELS[level]
+            if viewer_degree is None or viewer_degree > max_degree:
+                return False
+
+    allowed = {t.strip() for t in (allowed_types_csv or "").split(",") if t.strip()}
+    if not allowed:
+        return level != "specific"
+    return bool(viewer_relationships) and not allowed.isdisjoint(viewer_relationships)
+
+
+def normalize_audiences_for_response(personal_info):
+    """Ensure *_audience values on a response dict are parsed objects or null."""
+    if not personal_info:
+        return personal_info
+    for col in AUDIENCE_COLUMNS:
+        if col in personal_info:
+            personal_info[col] = parse_audience(personal_info.get(col))
+    return personal_info
+
+
+def apply_profile_field_visibility(
+    db, personal_info, profile_id, viewer_profile_uid, is_owner_view, viewer_is_admin
+):
+    """
+    Null out values / flip *_is_public to 0 for fields the viewer isn't
+    allowed to see. No-op for the owner or an admin.
+    """
+    if not personal_info or is_owner_view or viewer_is_admin:
+        return personal_info
+
+    viewer_degree = resolve_viewer_degree(db, profile_id, viewer_profile_uid)
+    viewer_relationships = resolve_viewer_relationships(db, profile_id, viewer_profile_uid)
+
+    for field_cfg in FIELD_VISIBILITY.values():
+        if audience_visible_to_viewer(
+            personal_info.get(field_cfg["audience_col"]),
+            viewer_degree,
+            is_owner_view,
+            viewer_is_admin,
+            viewer_relationships,
+        ):
+            continue
+        if field_cfg["is_public_col"]:
+            personal_info[field_cfg["is_public_col"]] = 0
+        for value_key in field_cfg["value_keys"]:
+            if value_key in personal_info:
+                personal_info[value_key] = None
+
+    city_ok = audience_visible_to_viewer(
+        personal_info.get("profile_personal_city_audience"),
+        viewer_degree,
+        is_owner_view,
+        viewer_is_admin,
+        viewer_relationships,
+    )
+    state_ok = audience_visible_to_viewer(
+        personal_info.get("profile_personal_state_audience"),
+        viewer_degree,
+        is_owner_view,
+        viewer_is_admin,
+        viewer_relationships,
+    )
+    personal_info["profile_personal_location_is_public"] = 1 if (city_ok or state_ok) else 0
+
+    return personal_info
+
+
+# Per-item (not per-profile-field) config for individual Offering / Seeking rows.
 ITEM_VISIBILITY = {
     "expertise": {
         "visibility_col": "profile_expertise_visibility",
@@ -256,11 +460,7 @@ ITEM_VISIBILITY = {
 
 
 def sync_item_is_public_from_visibility(item, item_type):
-    """
-    Same as sync_is_public_from_visibility but for a single Offering/Seeking
-    item dict (item_type is 'expertise' or 'wish'). No-op if the item's
-    visibility column wasn't submitted. Mutates and returns item.
-    """
+    """Same legacy sync for a single Offering/Seeking item dict."""
     cfg = ITEM_VISIBILITY[item_type]
     visibility_col = cfg["visibility_col"]
     circles_col = cfg["visibility_circles_col"]
@@ -296,29 +496,25 @@ def sync_item_is_public_from_visibility(item, item_type):
     return item
 
 
-def item_visible_to_viewer(item, item_type, viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships=None):
-    """
-    True if an Offering/Seeking item's visibility level permits this viewer.
-    Independent of moderation - callers should AND this with their own
-    moderation check (is_offering_publicly_visible / is_wish_publicly_visible
-    already run first in user_profile_info.py's _filter_and_enrich_* helpers).
-    """
+def item_visible_to_viewer(
+    item, item_type, viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships=None
+):
     cfg = ITEM_VISIBILITY[item_type]
     level = item.get(cfg["visibility_col"]) or "everyone"
     allowed_csv = item.get(cfg["visibility_circles_col"])
     allowed_degrees_csv = item.get(cfg["visibility_degrees_col"])
     return field_visible_to_viewer(
-        level, viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships, allowed_csv, allowed_degrees_csv
+        level,
+        viewer_degree,
+        is_owner_view,
+        viewer_is_admin,
+        viewer_relationships,
+        allowed_csv,
+        allowed_degrees_csv,
     )
 
 
 def resolve_viewer_relationships(db, profile_id, viewer_profile_uid):
-    """
-    circle_relationship values profile_id's owner has recorded for
-    viewer_profile_uid (empty set if none/unknown). Same direction as
-    chat.py's _circle_relationship_types / nearby.py's _consent_clause: only
-    the profile owner's own circle tagging of the viewer counts.
-    """
     if not profile_id or not viewer_profile_uid:
         return set()
     try:
@@ -337,20 +533,6 @@ def resolve_viewer_relationships(db, profile_id, viewer_profile_uid):
 
 
 def resolve_viewer_degree(db, profile_id, viewer_profile_uid):
-    """
-    Circle-degree distance between viewer_profile_uid and profile_id, or None
-    if it could not be determined. Always computed live via ConnectionsPath's
-    referral-tree path (fast in practice: it prefers each side's precomputed
-    profile_personal_path column over the recursive-CTE fallback).
-
-    Deliberately does NOT use every_circle.circles.circle_num_nodes as a
-    shortcut (unlike ratings.py's display-only sort key, which can tolerate
-    a stale value): that column is set directly from whatever circle_num_nodes
-    the client sends on circle creation (circles.py POST), not computed
-    server-side, and was found stale/wrong for most existing rows - trusting
-    it here let a real 2nd-degree viewer read fields gated to 1st-degree-only
-    whenever a stale circles row understated their actual degree.
-    """
     if not viewer_profile_uid or not profile_id or viewer_profile_uid == profile_id:
         return 0 if viewer_profile_uid == profile_id else None
 
@@ -365,94 +547,3 @@ def resolve_viewer_degree(db, profile_id, viewer_profile_uid):
         print(f"resolve_viewer_degree failed for {viewer_profile_uid} -> {profile_id}: {e}")
 
     return None
-
-
-def field_visible_to_viewer(
-    level,
-    viewer_degree,
-    is_owner_view,
-    viewer_is_admin,
-    viewer_relationships=None,
-    allowed_types_csv=None,
-    allowed_degrees_csv=None,
-):
-    """
-    True if a field set to `level` (+ optional allowed_types_csv circle
-    filter and allowed_degrees_csv exact-degree filter) should be shown to
-    this viewer. The degree gate and circle filter are independent and ANDed
-    together: a viewer must satisfy both when both are set. 'specific' is the
-    legacy exclusive value - equivalent to 'everyone' with the circle filter
-    applied. 'everyone' always ignores allowed_degrees_csv (mutually
-    exclusive with a degree selection in the UI).
-    """
-    if is_owner_view or viewer_is_admin:
-        return True
-    if level not in VALID_LEVELS:
-        level = "everyone"
-    if level == "only_me":
-        return False
-
-    if level != "everyone":
-        allowed_degrees = {d.strip() for d in (allowed_degrees_csv or "").split(",") if d.strip()}
-        if allowed_degrees:
-            # New exact-set checkboxes take over entirely when present.
-            if viewer_degree is None or str(viewer_degree) not in allowed_degrees:
-                return False
-        elif level in DEGREE_LEVELS:
-            # No degrees CSV saved for this field - fall back to the legacy cumulative cap.
-            max_degree = DEGREE_LEVELS[level]
-            if viewer_degree is None or viewer_degree > max_degree:
-                return False
-
-    allowed = {t.strip() for t in (allowed_types_csv or "").split(",") if t.strip()}
-    if not allowed:
-        # 'specific' with no circles left to match has no possible audience.
-        return level != "specific"
-    return bool(viewer_relationships) and not allowed.isdisjoint(viewer_relationships)
-
-
-def apply_profile_field_visibility(
-    db, personal_info, profile_id, viewer_profile_uid, is_owner_view, viewer_is_admin
-):
-    """
-    Null out values / flip *_is_public to 0 for fields the viewer isn't
-    allowed to see at their circle degree (or circle relationship, for
-    'specific'-level personal-info fields). No-op for the owner or an admin.
-    Mutates and returns personal_info.
-    """
-    if not personal_info or is_owner_view or viewer_is_admin:
-        return personal_info
-
-    viewer_degree = resolve_viewer_degree(db, profile_id, viewer_profile_uid)
-    viewer_relationships = resolve_viewer_relationships(db, profile_id, viewer_profile_uid)
-
-    def _visible(level, circles_col, degrees_col=None):
-        allowed_csv = personal_info.get(circles_col) if circles_col else None
-        allowed_degrees_csv = personal_info.get(degrees_col) if degrees_col else None
-        return field_visible_to_viewer(
-            level, viewer_degree, is_owner_view, viewer_is_admin, viewer_relationships, allowed_csv, allowed_degrees_csv
-        )
-
-    for field_cfg in FIELD_VISIBILITY.values():
-        level = personal_info.get(field_cfg["visibility_col"]) or "everyone"
-        if _visible(level, field_cfg.get("visibility_circles_col"), field_cfg.get("visibility_degrees_col")):
-            continue
-        if field_cfg["is_public_col"]:
-            personal_info[field_cfg["is_public_col"]] = 0
-        for value_key in field_cfg["value_keys"]:
-            if value_key in personal_info:
-                personal_info[value_key] = None
-
-    # Recompute the legacy combined flag from THIS viewer's actual city/state
-    # visibility (degree/circle-aware, unlike the raw level check
-    # _sync_location_legacy_flag uses for save-time syncing), so old code
-    # reading the single flag doesn't think a gated location is visible to a
-    # viewer who doesn't qualify.
-    city_level = personal_info.get("profile_personal_city_visibility") or "everyone"
-    state_level = personal_info.get("profile_personal_state_visibility") or "everyone"
-    location_visible = _visible(
-        city_level, "profile_personal_city_visibility_circles", "profile_personal_city_visibility_degrees"
-    ) or _visible(state_level, "profile_personal_state_visibility_circles", "profile_personal_state_visibility_degrees")
-    personal_info["profile_personal_location_is_public"] = 1 if location_visible else 0
-
-    return personal_info
