@@ -751,11 +751,9 @@ def _enrich_personal_info_for_owner(db, personal_info, profile_id, is_owner_view
     # Attach phone verification for owners always; for others only when phone is public
     # so a verified badge can appear next to a visible phone number.
     user_uid = enriched.get("profile_personal_user_id")
-    phone_is_public = enriched.get("profile_personal_phone_number_is_public") in (
-        1,
-        "1",
-        True,
-    )
+    from profile_visibility import parse_audience
+
+    phone_is_public = parse_audience(enriched.get("profile_personal_phone_number_audience")) is not None
     if is_owner_view or phone_is_public:
         phone_verified = False
         if user_uid:
@@ -1574,12 +1572,15 @@ class UserProfileInfo(Resource):
                         response["business_info"] = []
                         return response, 200
 
+                personal_row = profile_response['result'][0]
+                normalize_audiences_for_response(personal_row)
                 response['personal_info'] = _enrich_personal_info_for_owner(
                     db,
-                    profile_response['result'][0],
+                    personal_row,
                     profile_id,
                     is_owner_view,
                 )
+                # Gate values / clear audience for fields this viewer can't see.
                 apply_profile_field_visibility(
                     db,
                     response['personal_info'],
@@ -1588,14 +1589,12 @@ class UserProfileInfo(Resource):
                     is_owner_view,
                     viewer_is_admin,
                 )
-                normalize_audiences_for_response(response['personal_info'])
                 # Email's value lives on users.user_email_id, not personal_info, so it isn't
-                # covered by apply_profile_field_visibility's value_keys - gate it here off the
-                # is_public flag that call just resolved for this viewer (derived from audience).
+                # covered by apply_profile_field_visibility's value_keys - gate it here off audience.
                 if (
                     not is_owner_view
                     and not viewer_is_admin
-                    and response['personal_info'].get('profile_personal_email_is_public') != 1
+                    and response['personal_info'].get('profile_personal_email_audience') is None
                 ):
                     email_id = None
                 response['user_email'] = email_id
@@ -1859,22 +1858,18 @@ class UserProfileInfo(Resource):
 
                 # Extract personal info fields from payload
                 personal_info_fields = [
-                    'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
-                    'profile_personal_phone_number', 'profile_personal_phone_number_is_public', 
+                    'profile_personal_first_name', 'profile_personal_last_name',
+                    'profile_personal_phone_number',
                     'profile_personal_city', 'profile_personal_state', 'profile_personal_country',
-                    'profile_personal_location_is_public', 'profile_personal_latitude', 'profile_personal_longitude',
+                    'profile_personal_latitude', 'profile_personal_longitude',
                     'profile_personal_home_address',
-                    'profile_personal_image', 'profile_personal_image_is_public', 'profile_personal_tag_line',
-                    'profile_personal_tag_line_is_public', 'profile_personal_short_bio',
-                    'profile_personal_short_bio_is_public', 'profile_personal_resume',
-                    'profile_personal_resume_is_public', 'profile_personal_notification_preference',
+                    'profile_personal_image', 'profile_personal_tag_line',
+                    'profile_personal_short_bio', 'profile_personal_resume',
+                    'profile_personal_notification_preference',
                     'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
                     'profile_personal_messages_allow_transaction',
-                    'profile_personal_experience_is_public', 'profile_personal_education_is_public',
-                    'profile_personal_expertise_is_public', 'profile_personal_wishes_is_public', 'profile_personal_business_is_public',
-                    'profile_personal_social_is_public'
                 ] + _FIELD_AUDIENCE_COLUMNS
 
                 # Stub signup may send empty first/last/phone; omit so profile can be
@@ -2489,25 +2484,19 @@ class UserProfileInfo(Resource):
                 # Update personal info fields
                 personal_info = {}
                 personal_info_fields = [
-                    'profile_personal_first_name', 'profile_personal_last_name', 'profile_personal_email_is_public', 
-                    'profile_personal_phone_number', 'profile_personal_phone_number_is_public', 
-                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country','profile_personal_location_is_public',
+                    'profile_personal_first_name', 'profile_personal_last_name',
+                    'profile_personal_phone_number',
+                    'profile_personal_city', 'profile_personal_state', 'profile_personal_country',
                     'profile_personal_latitude', 'profile_personal_longitude',
                     'profile_personal_home_address',
-                    'profile_personal_image', 'profile_personal_image_is_public',
-                    'profile_personal_tag_line', 'profile_personal_tag_line_is_public', 
-                    'profile_personal_short_bio', 'profile_personal_short_bio_is_public', 
-                    'profile_personal_resume', 'profile_personal_resume_is_public', 
+                    'profile_personal_image',
+                    'profile_personal_tag_line',
+                    'profile_personal_short_bio',
+                    'profile_personal_resume',
                     'profile_personal_notification_preference', 'profile_personal_location_preference', 'profile_personal_allow_banner_ads', 'profile_personal_banner_ads_bounty',
                     'profile_personal_messages_off',
                     'profile_personal_messages_receive_from', 'profile_personal_messages_receive_types',
                     'profile_personal_messages_allow_transaction',
-                    'profile_personal_experience_is_public',
-                    'profile_personal_education_is_public',
-                    'profile_personal_expertise_is_public',
-                    'profile_personal_wishes_is_public',
-                    'profile_personal_business_is_public',
-                    'profile_personal_social_is_public'
                 ] + _FIELD_AUDIENCE_COLUMNS
 
                 for field in personal_info_fields:

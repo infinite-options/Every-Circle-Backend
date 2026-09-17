@@ -21,15 +21,16 @@ class Circles(Resource):
             "profile_personal_first_name",
             "profile_personal_last_name",
             "user_email_id",
-            "profile_personal_email_is_public",
+            "profile_personal_email_audience",
             "profile_personal_phone_number",
-            "profile_personal_phone_number_is_public",
+            "profile_personal_phone_number_audience",
             "profile_personal_image",
-            "profile_personal_image_is_public",
+            "profile_personal_image_audience",
             "profile_personal_city",
             "profile_personal_state",
             "profile_personal_country",
-            "profile_personal_location_is_public",
+            "profile_personal_city_audience",
+            "profile_personal_state_audience",
             "profile_personal_latitude",
             "profile_personal_longitude",
         ):
@@ -61,9 +62,15 @@ class Circles(Resource):
                     circles_query = """
                         SELECT circles.*
                             , pp.profile_personal_uid, pp.profile_personal_user_id, pp.profile_personal_first_name, pp.profile_personal_last_name
-                            , u.user_email_id, pp.profile_personal_email_is_public, pp.profile_personal_phone_number, pp.profile_personal_phone_number_is_public
-                            , pp.profile_personal_image, pp.profile_personal_image_is_public
-                            , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country, pp.profile_personal_location_is_public, pp.profile_personal_latitude, pp.profile_personal_longitude
+                            , u.user_email_id
+                            , pp.profile_personal_email_audience
+                            , pp.profile_personal_phone_number
+                            , pp.profile_personal_phone_number_audience
+                            , pp.profile_personal_image
+                            , pp.profile_personal_image_audience
+                            , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country
+                            , pp.profile_personal_city_audience, pp.profile_personal_state_audience
+                            , pp.profile_personal_latitude, pp.profile_personal_longitude
                             , pp.profile_personal_is_deleted
                         FROM every_circle.circles
                         LEFT JOIN profile_personal pp ON circle_related_person_id = profile_personal_uid
@@ -76,18 +83,18 @@ class Circles(Resource):
                     print(f"Executing GET query for circle_profile_id: {circle_profile_id} AND circle_related_person_id: {circle_related_person_id}")
                 else:
                     # Query to get all circles for a profile
-                    # circles_query = """
-                    #     SELECT * 
-                    #     FROM every_circle.circles
-                    #     WHERE circle_profile_id = %s AND circle_relationship != ""
-                    #     ORDER BY circle_date DESC, circle_uid DESC
-                    # """
                     circles_query = """
                         SELECT circles.*
                             , pp.profile_personal_uid, pp.profile_personal_user_id, pp.profile_personal_first_name, pp.profile_personal_last_name
-                            , u.user_email_id, pp.profile_personal_email_is_public, pp.profile_personal_phone_number, pp.profile_personal_phone_number_is_public
-                            , pp.profile_personal_image, pp.profile_personal_image_is_public
-                            , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country, pp.profile_personal_location_is_public, pp.profile_personal_latitude, pp.profile_personal_longitude
+                            , u.user_email_id
+                            , pp.profile_personal_email_audience
+                            , pp.profile_personal_phone_number
+                            , pp.profile_personal_phone_number_audience
+                            , pp.profile_personal_image
+                            , pp.profile_personal_image_audience
+                            , pp.profile_personal_city, pp.profile_personal_state, pp.profile_personal_country
+                            , pp.profile_personal_city_audience, pp.profile_personal_state_audience
+                            , pp.profile_personal_latitude, pp.profile_personal_longitude
                             , pp.profile_personal_is_deleted
                         FROM every_circle.circles
                         LEFT JOIN profile_personal pp ON circle_related_person_id = profile_personal_uid

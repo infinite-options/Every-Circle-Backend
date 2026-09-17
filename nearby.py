@@ -512,8 +512,8 @@ class NearbyUsers(Resource):
                     pp.profile_personal_nearby_lat,
                     pp.profile_personal_nearby_lng,
                     pp.profile_personal_nearby_updated_at,
-                    CASE WHEN pp.profile_personal_tag_line_is_public = 1 THEN pp.profile_personal_tag_line ELSE NULL END AS profile_personal_tag_line,
-                    CASE WHEN pp.profile_personal_short_bio_is_public = 1 THEN pp.profile_personal_short_bio ELSE NULL END AS profile_personal_short_bio,
+                    CASE WHEN pp.profile_personal_tag_line_audience IS NOT NULL THEN pp.profile_personal_tag_line ELSE NULL END AS profile_personal_tag_line,
+                    CASE WHEN pp.profile_personal_short_bio_audience IS NOT NULL THEN pp.profile_personal_short_bio ELSE NULL END AS profile_personal_short_bio,
                     mc.circle_relationship,
                     {dist_col}
                 FROM every_circle.profile_personal pp
@@ -541,8 +541,8 @@ class NearbyUsers(Resource):
                     pp.profile_personal_nearby_lat,
                     pp.profile_personal_nearby_lng,
                     pp.profile_personal_nearby_updated_at,
-                    CASE WHEN pp.profile_personal_tag_line_is_public = 1 THEN pp.profile_personal_tag_line ELSE NULL END AS profile_personal_tag_line,
-                    CASE WHEN pp.profile_personal_short_bio_is_public = 1 THEN pp.profile_personal_short_bio ELSE NULL END AS profile_personal_short_bio,
+                    CASE WHEN pp.profile_personal_tag_line_audience IS NOT NULL THEN pp.profile_personal_tag_line ELSE NULL END AS profile_personal_tag_line,
+                    CASE WHEN pp.profile_personal_short_bio_audience IS NOT NULL THEN pp.profile_personal_short_bio ELSE NULL END AS profile_personal_short_bio,
                     c.circle_relationship,
                     {dist_col}
                 FROM every_circle.profile_personal pp

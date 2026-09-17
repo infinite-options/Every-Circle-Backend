@@ -15,10 +15,9 @@ circles:
     non-empty   - viewer must also be tagged by the owner as one of those types
                   (friend / colleague / family); ANDed with the degree gate
 
-Legacy *_visibility / *_visibility_circles / *_visibility_degrees columns are
-no longer written. On write we still derive companion *_is_public (and
-location_is_public) so older SQL that gates on those flags keeps working
-until those call sites are migrated.
+Legacy *_visibility / *_visibility_circles / *_visibility_degrees / *_is_public
+columns are not written or returned. API consumers must use *_audience
+(null = hidden/private).
 
 Offering/wish *items* still use the older per-item visibility columns
 (ITEM_VISIBILITY) until those tables get audience columns.
@@ -252,23 +251,25 @@ def _audience_from_legacy(level, circles_csv=None, degrees_csv=None):
     return parse_audience({"degree": degree, "circles": circles})
 
 
-def _sync_location_legacy_flag(personal_info):
-    """location_is_public = 1 when city or state audience is non-null."""
-    city = parse_audience(personal_info.get("profile_personal_city_audience"))
-    state = parse_audience(personal_info.get("profile_personal_state_audience"))
-    if (
-        "profile_personal_city_audience" not in personal_info
-        and "profile_personal_state_audience" not in personal_info
-    ):
-        return
-    personal_info["profile_personal_location_is_public"] = 1 if (city or state) else 0
+LEGACY_IS_PUBLIC_KEYS = [
+    cfg["is_public_col"] for cfg in FIELD_VISIBILITY.values() if cfg.get("is_public_col")
+] + ["profile_personal_location_is_public"]
+
+
+def strip_legacy_is_public_keys(personal_info):
+    """Remove profile_personal *_is_public keys from an API payload/response dict."""
+    if not personal_info:
+        return personal_info
+    for key in LEGACY_IS_PUBLIC_KEYS:
+        personal_info.pop(key, None)
+    return personal_info
 
 
 def sync_audiences(personal_info):
     """
     Normalize *_audience on a PUT/POST personal_info dict, convert legacy
-    visibility payloads when audience wasn't sent, strip legacy visibility
-    columns so they are not written, and derive *_is_public / location_is_public.
+    visibility / is_public payloads when audience wasn't sent, and strip legacy
+    columns so they are not written to MySQL.
 
     Mutates and returns personal_info.
     """
@@ -306,16 +307,11 @@ def sync_audiences(personal_info):
             )
 
         # Drop legacy columns so db.insert/update never writes them.
-        for legacy_col in (visibility_col, circles_col, degrees_col):
+        for legacy_col in (visibility_col, circles_col, degrees_col, is_public_col):
             if legacy_col:
                 personal_info.pop(legacy_col, None)
 
-        if audience_col in personal_info and is_public_col:
-            personal_info[is_public_col] = (
-                1 if parse_audience(personal_info.get(audience_col)) is not None else 0
-            )
-
-    _sync_location_legacy_flag(personal_info)
+    personal_info.pop("profile_personal_location_is_public", None)
     return personal_info
 
 
@@ -386,24 +382,24 @@ def field_visible_to_viewer(
 
 
 def normalize_audiences_for_response(personal_info):
-    """Ensure *_audience values on a response dict are parsed objects or null."""
+    """Parse *_audience for the API and strip legacy *_is_public keys."""
     if not personal_info:
         return personal_info
     for col in AUDIENCE_COLUMNS:
         if col in personal_info:
             personal_info[col] = parse_audience(personal_info.get(col))
-    return personal_info
+    return strip_legacy_is_public_keys(personal_info)
 
 
 def apply_profile_field_visibility(
     db, personal_info, profile_id, viewer_profile_uid, is_owner_view, viewer_is_admin
 ):
     """
-    Null out values / flip *_is_public to 0 for fields the viewer isn't
-    allowed to see. No-op for the owner or an admin.
+    Null out values / clear *_audience for fields the viewer isn't allowed to
+    see. No-op for the owner or an admin. Does not emit *_is_public flags.
     """
     if not personal_info or is_owner_view or viewer_is_admin:
-        return personal_info
+        return strip_legacy_is_public_keys(personal_info)
 
     viewer_degree = resolve_viewer_degree(db, profile_id, viewer_profile_uid)
     viewer_relationships = resolve_viewer_relationships(db, profile_id, viewer_profile_uid)
@@ -417,29 +413,13 @@ def apply_profile_field_visibility(
             viewer_relationships,
         ):
             continue
-        if field_cfg["is_public_col"]:
-            personal_info[field_cfg["is_public_col"]] = 0
+        # Clear audience so FE treats the field as private for this viewer.
+        personal_info[field_cfg["audience_col"]] = None
         for value_key in field_cfg["value_keys"]:
             if value_key in personal_info:
                 personal_info[value_key] = None
 
-    city_ok = audience_visible_to_viewer(
-        personal_info.get("profile_personal_city_audience"),
-        viewer_degree,
-        is_owner_view,
-        viewer_is_admin,
-        viewer_relationships,
-    )
-    state_ok = audience_visible_to_viewer(
-        personal_info.get("profile_personal_state_audience"),
-        viewer_degree,
-        is_owner_view,
-        viewer_is_admin,
-        viewer_relationships,
-    )
-    personal_info["profile_personal_location_is_public"] = 1 if (city_ok or state_ok) else 0
-
-    return personal_info
+    return strip_legacy_is_public_keys(personal_info)
 
 
 # Per-item (not per-profile-field) config for individual Offering / Seeking rows.

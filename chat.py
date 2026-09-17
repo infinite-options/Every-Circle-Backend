@@ -849,11 +849,11 @@ class Conversations(Resource):
                     pa.profile_personal_first_name AS partipant_a_first_name,
                     pa.profile_personal_last_name AS partipant_a_last_name,
                     pa.profile_personal_image AS partipant_a_image,
-                    pa.profile_personal_image_is_public AS partipant_a_image_is_public,
+                    pa.profile_personal_image_audience AS partipant_a_image_audience,
                     pb.profile_personal_first_name AS partipant_b_first_name,
                     pb.profile_personal_last_name AS partipant_b_last_name,
                     pb.profile_personal_image AS partipant_b_image,
-                    pb.profile_personal_image_is_public AS partipant_b_image_is_public,
+                    pb.profile_personal_image_audience AS partipant_b_image_audience,
 
                     ba.business_name,
                     bb.business_name,
@@ -872,12 +872,12 @@ class Conversations(Resource):
                     bpa.profile_personal_first_name AS bpa_first_name,
                     bpa.profile_personal_last_name AS bpa_last_name,
                     bpa.profile_personal_image AS bpa_partipant_a_image,
-                    bpa.profile_personal_image_is_public AS bpa_partipant_a_image_is_public,
+                    bpa.profile_personal_image_audience AS bpa_partipant_a_image_audience,
                     bpb.profile_personal_uid AS bpb_profile_uid,
                     bpb.profile_personal_first_name AS bpb_first_name,
                     bpb.profile_personal_last_name AS bpb_last_name,
                     bpb.profile_personal_image AS bpb_partipant_a_image,
-                    bpb.profile_personal_image_is_public AS bpb_partipant_a_image_is_public,
+                    bpb.profile_personal_image_audience AS bpb_partipant_a_image_audience,
                     
                     m.*
 

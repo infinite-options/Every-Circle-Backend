@@ -6982,12 +6982,13 @@ class SellerTransactions(Resource):
                         MIN(buyer_pp.profile_personal_first_name) AS buyer_first_name,
                         MIN(buyer_pp.profile_personal_last_name) AS buyer_last_name,
                         MIN(buyer_u.user_email_id) AS buyer_email,
-                        MIN(buyer_pp.profile_personal_email_is_public) AS buyer_email_is_public,
+                        MIN(buyer_pp.profile_personal_email_audience) AS buyer_email_audience,
                         MIN(buyer_pp.profile_personal_phone_number) AS buyer_phone,
-                        MIN(buyer_pp.profile_personal_phone_number_is_public) AS buyer_phone_is_public,
+                        MIN(buyer_pp.profile_personal_phone_number_audience) AS buyer_phone_audience,
                         MIN(buyer_pp.profile_personal_city) AS buyer_city,
                         MIN(buyer_pp.profile_personal_state) AS buyer_state,
-                        MIN(buyer_pp.profile_personal_location_is_public) AS buyer_location_is_public
+                        MIN(buyer_pp.profile_personal_city_audience) AS buyer_city_audience,
+                        MIN(buyer_pp.profile_personal_state_audience) AS buyer_state_audience
                     FROM every_circle.transactions t
                     LEFT JOIN every_circle.transactions_items ti
                     ON t.transaction_uid = ti.ti_transaction_id

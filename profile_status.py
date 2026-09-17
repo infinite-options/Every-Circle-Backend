@@ -124,7 +124,7 @@ def build_connection_path_nodes(db, combined_path):
                 profile_personal_first_name,
                 profile_personal_last_name,
                 profile_personal_image,
-                profile_personal_image_is_public
+                profile_personal_image_audience
             FROM {_PROFILE_PERSONAL_TABLE}
             WHERE profile_personal_uid IN ({placeholders})
             """,
@@ -141,7 +141,7 @@ def build_connection_path_nodes(db, combined_path):
             nodes.append(stub_deleted_profile_row(uid))
             continue
         row = active_rows.get(uid) or {}
-        image_public = int(row.get("profile_personal_image_is_public") or 0) == 1
+        image_public = row.get("profile_personal_image_audience") is not None
         image_url = ""
         if image_public and row.get("profile_personal_image"):
             image_url = str(row.get("profile_personal_image")).strip()
@@ -168,8 +168,8 @@ def tombstone_network_fields(uid, is_deleted=False):
         "profile_personal_tag_line": None,
         "profile_personal_phone_number": None,
         "profile_personal_image": None,
-        "profile_personal_email_is_public": 0,
-        "profile_personal_phone_number_is_public": 0,
-        "profile_personal_tag_line_is_public": 0,
-        "profile_personal_image_is_public": 0,
+        "profile_personal_email_audience": None,
+        "profile_personal_phone_number_audience": None,
+        "profile_personal_tag_line_audience": None,
+        "profile_personal_image_audience": None,
     }

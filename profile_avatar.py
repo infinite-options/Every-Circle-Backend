@@ -8,7 +8,7 @@ from flask import request
 from flask_restful import Resource
 
 from data_ec import connect
-from profile_status import is_profile_deleted, stub_deleted_profile_row
+from profile_status import is_profile_deleted
 
 
 def _escape_uid(uid):
@@ -18,21 +18,17 @@ def _escape_uid(uid):
 def _row_to_avatar(row):
     if is_profile_deleted(row):
         uid = row.get("profile_personal_uid")
-        stub = stub_deleted_profile_row(uid)
         return {
             "profile_uid": uid,
             "first_name": "",
             "last_name": "",
             "image_url": "",
-            "image_is_public": False,
+            "image_audience": None,
             "is_deleted": True,
         }
 
-    image_is_public = row.get("profile_personal_image_is_public")
-    try:
-        image_public = int(image_is_public) == 1
-    except (TypeError, ValueError):
-        image_public = False
+    image_audience = row.get("profile_personal_image_audience")
+    image_public = image_audience is not None
 
     image_url = ""
     if image_public:
@@ -45,7 +41,7 @@ def _row_to_avatar(row):
         "first_name": row.get("profile_personal_first_name") or "",
         "last_name": row.get("profile_personal_last_name") or "",
         "image_url": image_url,
-        "image_is_public": image_public,
+        "image_audience": image_audience,
     }
 
 
@@ -70,7 +66,7 @@ def _fetch_avatars(db, uids):
             profile_personal_first_name,
             profile_personal_last_name,
             profile_personal_image,
-            profile_personal_image_is_public,
+            profile_personal_image_audience,
             profile_personal_is_deleted
         FROM every_circle.profile_personal
         WHERE profile_personal_uid IN ({placeholders})
@@ -105,7 +101,7 @@ class ProfileAvatars(Resource):
     """POST /api/v1/profile_avatars — batch avatar lookup.
 
     Body: { "profile_uids": ["110-...", ...] }
-    Returns: { "avatars": [ { profile_uid, first_name, last_name, image_url, image_is_public }, ... ] }
+    Returns: { "avatars": [ { profile_uid, first_name, last_name, image_url, image_audience }, ... ] }
     """
 
     def post(self):

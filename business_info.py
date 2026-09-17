@@ -665,18 +665,19 @@ class BusinessInfo(Resource):
                 business_users_query = f"""
                     SELECT bu.*, 
                         u.user_email_id,
-                        pp.profile_personal_email_is_public as email_public,
+                        pp.profile_personal_email_audience as email_audience,
                         pp.profile_personal_uid as profile_id,
                         pp.profile_personal_first_name as first_name,
                         pp.profile_personal_last_name as last_name,
                         pp.profile_personal_phone_number as phone,
-                        pp.profile_personal_phone_number_is_public as phone_public,
+                        pp.profile_personal_phone_number_audience as phone_audience,
                         pp.profile_personal_city as city,
                         pp.profile_personal_state as state,
                         pp.profile_personal_country as country,
-                        pp.profile_personal_location_is_public as location_public,
+                        pp.profile_personal_city_audience as city_audience,
+                        pp.profile_personal_state_audience as state_audience,
                         pp.profile_personal_image as profile_photo,
-                        pp.profile_personal_image_is_public as profile_photo_is_public
+                        pp.profile_personal_image_audience as profile_photo_audience
                     FROM every_circle.business_user bu
                     LEFT JOIN every_circle.users u ON bu.bu_user_id = u.user_uid
                     LEFT JOIN every_circle.profile_personal pp ON bu.bu_user_id = pp.profile_personal_user_id
@@ -697,19 +698,20 @@ class BusinessInfo(Resource):
                                 "business_role": bu_record.get("bu_role"),
                                 "business_uid": bu_record.get("bu_uid"),
                                 "user_email": bu_record.get("user_email_id"),
-                                "user_email_is_public": bu_record.get("email_public"),
+                                "user_email_audience": bu_record.get("email_audience"),
                                 "profile_id": bu_record.get("profile_id"),
                                 "first_name": bu_record.get("first_name"),
                                 "last_name": bu_record.get("last_name"),
                                 "phone": bu_record.get("phone"),
-                                "phone_is_public": bu_record.get("phone_public"),
+                                "phone_audience": bu_record.get("phone_audience"),
                                 "city": bu_record.get("city"),
                                 "state": bu_record.get("state"),
                                 "country": bu_record.get("country"),
-                                "location_is_public": bu_record.get("location_public"),
+                                "city_audience": bu_record.get("city_audience"),
+                                "state_audience": bu_record.get("state_audience"),
                                 "profile_photo": bu_record.get("profile_photo"),
-                                "profile_photo_is_public": bu_record.get(
-                                    "profile_photo_is_public"
+                                "profile_photo_audience": bu_record.get(
+                                    "profile_photo_audience"
                                 ),
                                 "bu_individual_business_is_public": bu_record.get(
                                     "bu_individual_business_is_public", 0

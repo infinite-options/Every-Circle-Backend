@@ -7,9 +7,7 @@ from profile_visibility import audience_visible_to_viewer
 # Raw values + *_audience JSON needed to gate them per-viewer in Python
 # (_apply_search_row_visibility below) - degree-aware gating can't be expressed
 # as a plain SQL CASE WHEN since it depends on the searching viewer, not just
-# the row. profile_personal_tag_line_is_public is still selected raw for the
-# frontend field name it already reads; _apply_search_row_visibility keeps it
-# in sync with the per-viewer decision.
+# the row. Hidden fields get value + audience cleared so FE uses audience only.
 PROFILE_SELECT = """
     pp.profile_personal_uid,
     pp.profile_personal_user_id,
@@ -21,7 +19,6 @@ PROFILE_SELECT = """
     pp.profile_personal_state,
     pp.profile_personal_image,
     pp.profile_personal_tag_line,
-    pp.profile_personal_tag_line_is_public,
     pp.profile_personal_short_bio,
     pp.profile_personal_email_audience,
     pp.profile_personal_phone_number_audience,
@@ -58,7 +55,6 @@ _SEARCH_FIELD_GATES = {
     "tag_line": {
         "audience_col": "profile_personal_tag_line_audience",
         "value_keys": ["profile_personal_tag_line"],
-        "is_public_key": "profile_personal_tag_line_is_public",
     },
     "short_bio": {
         "audience_col": "profile_personal_short_bio_audience",
@@ -94,10 +90,8 @@ def _apply_search_row_visibility(rows, viewer_profile_uid, degree_map, relations
             for value_key in cfg["value_keys"]:
                 if value_key in row:
                     row[value_key] = None
-            if cfg.get("is_public_key") and cfg["is_public_key"] in row:
-                row[cfg["is_public_key"]] = 0
+            row[cfg["audience_col"]] = None
     return rows
-
 
 def _profile_search_clauses(parts, search_term):
     tagline_bio_clauses = [

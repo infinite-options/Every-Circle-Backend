@@ -150,13 +150,13 @@ class ProfileExpertiseResponsesForOffering(Resource):
                         responder.profile_personal_first_name AS responder_first_name,
                         responder.profile_personal_last_name AS responder_last_name,
                         responder.profile_personal_image AS responder_image,
-                        responder.profile_personal_image_is_public AS responder_image_is_public,
+                        responder.profile_personal_image_audience AS responder_image_audience,
                         responder.profile_personal_tag_line AS responder_tag_line,
-                        responder.profile_personal_tag_line_is_public AS responder_tag_line_is_public,
-                        responder.profile_personal_email_is_public AS responder_email_is_public,
-                        responder.profile_personal_phone_number_is_public AS responder_phone_is_public,
-                        if (responder.profile_personal_email_is_public = 1, u.user_email_id, null) AS responder_email,
-                        if (responder.profile_personal_phone_number_is_public = 1, responder.profile_personal_phone_number, null) AS responder_phone
+                        responder.profile_personal_tag_line_audience AS responder_tag_line_audience,
+                        responder.profile_personal_email_audience AS responder_email_audience,
+                        responder.profile_personal_phone_number_audience AS responder_phone_audience,
+                        IF(responder.profile_personal_email_audience IS NOT NULL, u.user_email_id, null) AS responder_email,
+                        IF(responder.profile_personal_phone_number_audience IS NOT NULL, responder.profile_personal_phone_number, null) AS responder_phone
                     FROM every_circle.expertise_response er
                     LEFT JOIN every_circle.profile_personal AS responder
                         ON er.er_responder_id = responder.profile_personal_uid
