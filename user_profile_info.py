@@ -1884,17 +1884,13 @@ class UserProfileInfo(Resource):
                 }
                 for field in personal_info_fields:
                     if field in payload:
-<<<<<<< HEAD
-                        personal_info[field] = payload.pop(field)
-                sync_is_public_from_visibility(personal_info)
-=======
                         value = payload.pop(field)
                         if field in _stub_optional_empty and (
                             value is None or str(value).strip() == ""
                         ):
                             continue
                         personal_info[field] = value
->>>>>>> master
+                sync_is_public_from_visibility(personal_info)
                 _normalize_coordinate_fields(personal_info)
                 _stamp_messages_off_timestamp(personal_info)
                 if "profile_personal_messages_allow_transaction" in personal_info:
