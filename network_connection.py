@@ -1,4 +1,50 @@
-from flask import Response
+"""
+GET /api/network/<viewer_profile_uid>/<max_degree>
+
+Returns the viewer's ego-network for Connect (graph + list).
+
+Default response (structured)::
+
+    {
+      "viewer_profile_uid": "110-000030",
+      "max_degree": 2,
+      "nodes": [
+        {
+          "profile_uid": "110-000179",
+          "network_profile_personal_uid": "110-000179",
+          "degree": 1,
+          "parent_uid": "110-000030",
+          "profile_personal_first_name": "Ada",
+          "profile_personal_last_name": "Lovelace",
+          "...": "..."
+        },
+        {
+          "profile_uid": "110-000180",
+          "degree": 2,
+          "parent_uid": "110-000179",
+          "...": "..."
+        }
+      ],
+      "edges": [
+        {"from": "110-000030", "to": "110-000179", "degree": 1},
+        {"from": "110-000179", "to": "110-000180", "degree": 2}
+      ]
+    }
+
+Semantics
+- degree: BFS hop distance from the viewer (cumulative through max_degree).
+- parent_uid: BFS predecessor in the viewer's tree (degree 1 → viewer;
+  degree N → a node at degree N-1). Never a self-loop. Parent is either the
+  viewer or another node in ``nodes``.
+- edges: consistent with parent_uid (from=parent, to=child).
+
+Query params
+- view=full (default): rich MiniCard + filter fields
+- view=graph: lite graph fields only
+- format=flat: legacy JSON array of nodes (each still includes parent_uid)
+"""
+
+from flask import Response, request
 from flask_restful import Resource
 import json
 from data_ec import connect
@@ -7,6 +53,19 @@ from profile_status import is_profile_deleted, tombstone_network_fields
 ZERO_NODE = '110-000001'
 # System profile linked above the zero node; not a real user (shows as Unknown / 000 in UI).
 HIDDEN_NETWORK_UIDS = frozenset({'110-000000'})
+
+_GRAPH_VIEW_KEYS = frozenset({
+    'target_uid',
+    'viewer_profile_uid',
+    'profile_uid',
+    'network_profile_personal_uid',
+    'degree',
+    'parent_uid',
+    'profile_personal_first_name',
+    'profile_personal_last_name',
+    'profile_personal_image',
+    'is_deleted',
+})
 
 
 def _hidden_uid_sql_clause(column):
@@ -20,6 +79,13 @@ def _visible_referred_by(referred_by):
     if referred_by in HIDDEN_NETWORK_UIDS:
         return None
     return referred_by
+
+
+def _phone_verified_bool(raw):
+    try:
+        return bool(int(raw)) if raw is not None else False
+    except (TypeError, ValueError):
+        return bool(raw)
 
 
 def _get_circle_member_uids(db, target_uid):
@@ -140,21 +206,51 @@ def _get_zn_branch_roots(db, circle_member_uids, zero_node=ZERO_NODE):
     }
 
 
-def _map_descendant_row(item):
+def _profile_select_columns(alias='pp'):
+    """Shared SELECT list for live profile fields (descendant / ancestor parent row)."""
+    a = alias
+    return f'''
+            {a}.profile_personal_first_name,
+            {a}.profile_personal_last_name,
+            CASE WHEN {a}.profile_personal_tag_line_audience IS NOT NULL THEN {a}.profile_personal_tag_line ELSE NULL END as profile_personal_tag_line,
+            CASE WHEN {a}.profile_personal_phone_number_audience IS NOT NULL THEN {a}.profile_personal_phone_number ELSE NULL END as profile_personal_phone_number,
+            CASE WHEN {a}.profile_personal_image_audience IS NOT NULL THEN {a}.profile_personal_image ELSE NULL END as profile_personal_image,
+            CASE WHEN {a}.profile_personal_city_audience IS NOT NULL THEN {a}.profile_personal_city ELSE NULL END as profile_personal_city,
+            CASE WHEN {a}.profile_personal_state_audience IS NOT NULL THEN {a}.profile_personal_state ELSE NULL END as profile_personal_state,
+            CASE WHEN {a}.profile_personal_email_audience IS NOT NULL THEN u.user_email_id ELSE NULL END as user_email,
+            u.user_phone_verified,
+            {a}.profile_personal_email_audience,
+            {a}.profile_personal_phone_number_audience,
+            {a}.profile_personal_tag_line_audience,
+            {a}.profile_personal_image_audience,
+            {a}.profile_personal_city_audience,
+            {a}.profile_personal_state_audience,
+            {a}.profile_personal_moderated,
+            {a}.profile_personal_is_deleted
+    '''
+
+
+def _map_common_fields(item, uid):
     is_deleted = is_profile_deleted(item)
     row = {
-        'uid': item['profile_personal_uid'],
+        'uid': uid,
         'is_deleted': is_deleted,
-        'profile_personal_referred_by': _visible_referred_by(item.get('profile_personal_referred_by')),
         'profile_personal_first_name': item.get('profile_personal_first_name'),
         'profile_personal_last_name': item.get('profile_personal_last_name'),
         'profile_personal_tag_line': item.get('profile_personal_tag_line'),
         'profile_personal_phone_number': item.get('profile_personal_phone_number'),
         'profile_personal_image': item.get('profile_personal_image'),
+        'profile_personal_city': item.get('profile_personal_city'),
+        'profile_personal_state': item.get('profile_personal_state'),
+        'user_email': item.get('user_email'),
+        'phone_verified': _phone_verified_bool(item.get('user_phone_verified')),
         'profile_personal_email_audience': item.get('profile_personal_email_audience'),
         'profile_personal_phone_number_audience': item.get('profile_personal_phone_number_audience'),
         'profile_personal_tag_line_audience': item.get('profile_personal_tag_line_audience'),
         'profile_personal_image_audience': item.get('profile_personal_image_audience'),
+        'profile_personal_city_audience': item.get('profile_personal_city_audience'),
+        'profile_personal_state_audience': item.get('profile_personal_state_audience'),
+        'profile_personal_moderated': item.get('profile_personal_moderated'),
         'circle_relationship': item.get('circle_relationship'),
         'circle_date': item.get('circle_date'),
         'circle_event': item.get('circle_event'),
@@ -162,38 +258,34 @@ def _map_descendant_row(item):
         'circle_geotag': item.get('circle_geotag'),
         'circle_city': item.get('circle_city'),
         'circle_state': item.get('circle_state'),
+        'circle_introduced_by': item.get('circle_introduced_by'),
     }
     if is_deleted:
-        row.update(tombstone_network_fields(item['profile_personal_uid'], True))
+        row.update(tombstone_network_fields(uid, True))
+    return row
+
+
+def _map_descendant_row(item):
+    """Child of a frontier node: BFS parent is the DB referrer."""
+    uid = item['profile_personal_uid']
+    bfs_parent = _visible_referred_by(item.get('profile_personal_referred_by'))
+    row = _map_common_fields(item, uid)
+    row['profile_personal_referred_by'] = bfs_parent
+    row['parent_uid'] = bfs_parent if bfs_parent != uid else None
     return row
 
 
 def _map_ancestor_row(item):
-    is_deleted = is_profile_deleted(item)
+    """
+    Parent discovered by walking up from a frontier child.
+    BFS parent is that child (attachment toward the viewer), not the DB referrer.
+    """
     uid = item['profile_personal_referred_by']
-    row = {
-        'uid': uid,
-        'is_deleted': is_deleted,
-        'profile_personal_referred_by': _visible_referred_by(item.get('profile_personal_uid')),
-        'profile_personal_first_name': item.get('profile_personal_first_name'),
-        'profile_personal_last_name': item.get('profile_personal_last_name'),
-        'profile_personal_tag_line': item.get('profile_personal_tag_line'),
-        'profile_personal_phone_number': item.get('profile_personal_phone_number'),
-        'profile_personal_image': item.get('profile_personal_image'),
-        'profile_personal_email_audience': item.get('profile_personal_email_audience'),
-        'profile_personal_phone_number_audience': item.get('profile_personal_phone_number_audience'),
-        'profile_personal_tag_line_audience': item.get('profile_personal_tag_line_audience'),
-        'profile_personal_image_audience': item.get('profile_personal_image_audience'),
-        'circle_relationship': item.get('circle_relationship'),
-        'circle_date': item.get('circle_date'),
-        'circle_event': item.get('circle_event'),
-        'circle_note': item.get('circle_note'),
-        'circle_geotag': item.get('circle_geotag'),
-        'circle_city': item.get('circle_city'),
-        'circle_state': item.get('circle_state'),
-    }
-    if is_deleted:
-        row.update(tombstone_network_fields(uid, True))
+    frontier_child = item.get('profile_personal_uid')
+    row = _map_common_fields(item, uid)
+    # Preserve historical inversion of referred_by for ancestor rows.
+    row['profile_personal_referred_by'] = _visible_referred_by(frontier_child)
+    row['parent_uid'] = frontier_child if frontier_child and frontier_child != uid else None
     return row
 
 
@@ -211,18 +303,11 @@ def _fetch_descendants(db, referrer_uids, target_uid, uid_filter=None):
         SELECT
             pp.profile_personal_uid,
             pp.profile_personal_referred_by,
-            pp.profile_personal_first_name,
-            pp.profile_personal_last_name,
-            CASE WHEN pp.profile_personal_tag_line_audience IS NOT NULL THEN pp.profile_personal_tag_line ELSE NULL END as profile_personal_tag_line,
-            CASE WHEN pp.profile_personal_phone_number_audience IS NOT NULL THEN pp.profile_personal_phone_number ELSE NULL END as profile_personal_phone_number,
-            CASE WHEN pp.profile_personal_image_audience IS NOT NULL THEN pp.profile_personal_image ELSE NULL END as profile_personal_image,
-            pp.profile_personal_email_audience,
-            pp.profile_personal_phone_number_audience,
-            pp.profile_personal_tag_line_audience,
-            pp.profile_personal_image_audience,
-            pp.profile_personal_is_deleted,
+            {_profile_select_columns('pp')},
             c.*
         FROM profile_personal AS pp
+        LEFT JOIN every_circle.users AS u
+            ON u.user_uid = pp.profile_personal_user_id
         LEFT JOIN every_circle.circles AS c
             ON c.circle_related_person_id = pp.profile_personal_uid
             AND c.circle_profile_id = '{target_uid}'
@@ -248,20 +333,13 @@ def _fetch_ancestors(db, frontier_uids, target_uid):
         SELECT
             pp.profile_personal_uid,
             pp.profile_personal_referred_by,
-            pp_parent.profile_personal_first_name,
-            pp_parent.profile_personal_last_name,
-            CASE WHEN pp_parent.profile_personal_tag_line_audience IS NOT NULL THEN pp_parent.profile_personal_tag_line ELSE NULL END as profile_personal_tag_line,
-            CASE WHEN pp_parent.profile_personal_phone_number_audience IS NOT NULL THEN pp_parent.profile_personal_phone_number ELSE NULL END as profile_personal_phone_number,
-            CASE WHEN pp_parent.profile_personal_image_audience IS NOT NULL THEN pp_parent.profile_personal_image ELSE NULL END as profile_personal_image,
-            pp_parent.profile_personal_email_audience,
-            pp_parent.profile_personal_phone_number_audience,
-            pp_parent.profile_personal_tag_line_audience,
-            pp_parent.profile_personal_image_audience,
-            pp_parent.profile_personal_is_deleted,
+            {_profile_select_columns('pp_parent')},
             c.*
         FROM profile_personal AS pp
         LEFT JOIN profile_personal AS pp_parent
             ON pp_parent.profile_personal_uid = pp.profile_personal_referred_by
+        LEFT JOIN every_circle.users AS u
+            ON u.user_uid = pp_parent.profile_personal_user_id
         LEFT JOIN every_circle.circles AS c
             ON c.circle_related_person_id = pp_parent.profile_personal_uid
             AND c.circle_profile_id = '{target_uid}'
@@ -317,10 +395,27 @@ def _fetch_neighbors(
     return neighbors
 
 
-def _to_response_row(target_uid, item):
+def _sort_key(item):
+    return (
+        item.get('degree') or 0,
+        (item.get('profile_personal_last_name') or '').lower(),
+        (item.get('profile_personal_first_name') or '').lower(),
+        item.get('uid') or '',
+    )
+
+
+def _to_response_row(target_uid, item, view='full'):
+    profile_uid = item['uid']
+    parent_uid = item.get('parent_uid')
+    if parent_uid == profile_uid:
+        parent_uid = None
+
     row = {
         "target_uid": target_uid,
-        "network_profile_personal_uid": item['uid'],
+        "viewer_profile_uid": target_uid,
+        "profile_uid": profile_uid,
+        "network_profile_personal_uid": profile_uid,
+        "parent_uid": parent_uid,
         "is_deleted": bool(item.get('is_deleted')),
         "profile_personal_referred_by": _visible_referred_by(item.get('profile_personal_referred_by')),
         "profile_personal_first_name": item.get('profile_personal_first_name'),
@@ -328,10 +423,17 @@ def _to_response_row(target_uid, item):
         "profile_personal_tag_line": item.get('profile_personal_tag_line'),
         "profile_personal_phone_number": item.get('profile_personal_phone_number'),
         "profile_personal_image": item.get('profile_personal_image'),
+        "profile_personal_city": item.get('profile_personal_city'),
+        "profile_personal_state": item.get('profile_personal_state'),
+        "user_email": item.get('user_email'),
+        "phone_verified": bool(item.get('phone_verified')),
         "profile_personal_email_audience": item.get('profile_personal_email_audience'),
         "profile_personal_phone_number_audience": item.get('profile_personal_phone_number_audience'),
         "profile_personal_tag_line_audience": item.get('profile_personal_tag_line_audience'),
         "profile_personal_image_audience": item.get('profile_personal_image_audience'),
+        "profile_personal_city_audience": item.get('profile_personal_city_audience'),
+        "profile_personal_state_audience": item.get('profile_personal_state_audience'),
+        "profile_personal_moderated": item.get('profile_personal_moderated'),
         "circle_relationship": item.get('circle_relationship'),
         "circle_date": item.get('circle_date'),
         "circle_event": item.get('circle_event'),
@@ -339,15 +441,49 @@ def _to_response_row(target_uid, item):
         "circle_geotag": item.get('circle_geotag'),
         "circle_city": item.get('circle_city'),
         "circle_state": item.get('circle_state'),
+        "circle_introduced_by": item.get('circle_introduced_by'),
         "degree": item['degree'],
     }
+    if view == 'graph':
+        return {k: v for k, v in row.items() if k in _GRAPH_VIEW_KEYS}
     return row
+
+
+def _build_edges(nodes):
+    edges = []
+    for node in nodes:
+        parent_uid = node.get('parent_uid')
+        child_uid = node.get('profile_uid')
+        if not parent_uid or not child_uid or parent_uid == child_uid:
+            continue
+        edges.append({
+            'from': parent_uid,
+            'to': child_uid,
+            'degree': node.get('degree'),
+        })
+    return edges
+
+
+def _build_network_payload(target_uid, degree, nodes_by_uid, view='full'):
+    sorted_items = sorted(nodes_by_uid.values(), key=_sort_key)
+    nodes = [_to_response_row(target_uid, item, view=view) for item in sorted_items]
+    return {
+        'viewer_profile_uid': target_uid,
+        'max_degree': degree,
+        'nodes': nodes,
+        'edges': _build_edges(nodes),
+    }
 
 
 class NetworkPath(Resource):
     def get(self, target_uid, degree):
         print('target_uid', target_uid)
         print('degree', degree)
+
+        view = (request.args.get('view') or 'full').strip().lower()
+        if view not in ('full', 'graph'):
+            view = 'full'
+        response_format = (request.args.get('format') or 'structured').strip().lower()
 
         max_nodes = 200
         seen = {target_uid}
@@ -399,16 +535,19 @@ class NetworkPath(Resource):
 
                 frontier = next_frontier
 
-        final_rows = [
-            _to_response_row(target_uid, item)
-            for item in sorted(nodes_by_uid.values(), key=lambda x: x['degree'])
-        ]
+        payload = _build_network_payload(target_uid, degree, nodes_by_uid, view=view)
 
         print('\n=== GRAPH RELATIONSHIPS DEBUG ===')
-        print(f'Total nodes: {len(final_rows)}')
+        print(f'Total nodes: {len(payload["nodes"])}')
+        print(f'Edges: {len(payload["edges"])}')
         print(f'Non-essential nodes: {non_essential_count}')
         print(f'Path-only mode active: {non_essential_count >= max_nodes}')
         print('=== END GRAPH RELATIONSHIPS ===\n')
 
-        json_output = json.dumps(final_rows, ensure_ascii=False, sort_keys=False)
+        if response_format == 'flat':
+            body = payload['nodes']
+        else:
+            body = payload
+
+        json_output = json.dumps(body, ensure_ascii=False, sort_keys=False)
         return Response(json_output, mimetype='application/json')
